@@ -1,0 +1,76 @@
+[package]
+name = "frust-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A thin accelerator that sits on top of your installed Rust toolchain: shared compile cache, central target directories, queued build locks and a clean build UI."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Seggys116/frust"
+homepage = "https://github.com/Seggys116/frust"
+authors = ["Zak Noble-Clarke"]
+exclude = [".github/", ".claude/", "install.sh", "install.ps1"]
+keywords = ["cargo", "build", "cache", "rustc", "incremental"]
+categories = ["development-tools::cargo-plugins", "development-tools::build-utils"]
+default-run = "frust"
+
+[lib]
+name = "frust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frust"
+path = "src/bin/frust.rs"
+
+[[bin]]
+name = "fcargo"
+path = "src/bin/fcargo.rs"
+
+[[bin]]
+name = "frustc"
+path = "src/bin/frustc.rs"
+
+[[bin]]
+name = "frustdoc"
+path = "src/bin/frustdoc.rs"
+
+[[bin]]
+name = "frustup"
+path = "src/bin/frustup.rs"
+
+[[bin]]
+name = "fclippy"
+path = "src/bin/fclippy.rs"
+
+[[bin]]
+name = "frustfmt"
+path = "src/bin/frustfmt.rs"
+
+# The rustc wrapper cargo invokes through RUSTC_WRAPPER. Not meant to be run by hand.
+[[bin]]
+name = "frust-wrap"
+path = "src/bin/frust-wrap.rs"
+
+[dependencies]
+blake3 = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/frust-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"

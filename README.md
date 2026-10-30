@@ -1,0 +1,113 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: pixel-art wordmark above an animated build progress bar" width="880">
+
+**A thin accelerator that sits on top of the Rust toolchain you already have.**
+
+[![CI](https://github.com/Seggys116/frust/actions/workflows/ci.yml/badge.svg)](https://github.com/Seggys116/frust/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-ce422b.svg)](https://github.com/Seggys116/frust/blob/main/LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-ffd23f.svg)](https://www.rust-lang.org)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-30363d.svg)
+
+[Install](#install) · [How it works](#how-it-works) · [Use](#use) · [Builds that overlap](#builds-that-overlap) · [Results](#results) · [Docs](https://github.com/Seggys116/frust/blob/main/docs/how-it-works.md)
+
+<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880">
+
+</div>
+
+<br>
+
+> frust does not ship a compiler, patch cargo or re-implement its command line. It asks your installed `cargo` and
+> `rustc` what they are, then wraps them. Every argument, `+toolchain`, stdout, stderr and exit code passes through.
+
+<table>
+<tr>
+<td width="25%" valign="top"><b>Compile cache</b><br><sub>Shared across projects and clean rebuilds. A hit restores the exact outputs without starting rustc, as a copy-on-write clone.</sub></td>
+<td width="25%" valign="top"><b>Central targets</b><br><sub>One directory per workspace and toolchain. Projects stay clean and switching toolchains never invalidates the others.</sub></td>
+<td width="25%" valign="top"><b>Build locks</b><br><sub>A fair queue in front of cargo's own. Identical concurrent builds share one build, and waiters see who holds the lock.</sub></td>
+<td width="25%" valign="top"><b>Clean display</b><br><sub>Colour, live progress, cache counters and terminal integration. Plain cargo output when piped.</sub></td>
+</tr>
+</table>
+
+## How it works
+
+You run `fcargo`. frust takes the build lock, points cargo at a central target directory and starts your own cargo, which
+runs `frust-wrap` in place of rustc for each crate. A cache hit restores the stored outputs without starting the compiler.
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/flow.svg" alt="cargo calls frust-wrap, which looks up a content-hashed key: a hit restores outputs without running rustc, a miss runs rustc and stores the result" width="880"></p>
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+
+## Install
+
+**macOS and Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Seggys116/frust/main/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/Seggys116/frust/main/install.ps1 | iex
+```
+
+**Anywhere with Rust**
+
+```sh
+cargo binstall frust-rs   # prebuilt binaries
+cargo install frust-rs    # from source
+```
+
+Binaries are checksummed and installed to `~/.local/bin` (`%LOCALAPPDATA%\frust\bin` on Windows). Run `frust doctor`
+afterwards to check your setup. The crates.io package is `frust-rs` because the name `frust` belongs to an unrelated crate.
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+
+## Use
+
+Use `fcargo` wherever you would use `cargo`:
+
+```sh
+fcargo build --release
+fcargo +nightly test -p mycrate -- --nocapture
+fclippy --all-targets
+```
+
+| Command | Purpose |
+|---|---|
+| `frust stats` | Hit rate, time saved, cache and target sizes |
+| `frust doctor` | Check the environment frust relies on |
+| `frust locks` | Show running and queued builds |
+| `frust compact` / `frust gc` | Shrink target directories and prune the cache |
+| `frust env` | Print shell exports so IDEs and rust-analyzer share the cache |
+| `frust where` | Print the central target directory for this workspace |
+
+Anything frust does not recognise is passed straight to cargo. Set `FRUST_BYPASS=1` to run cargo completely untouched.
+
+## Builds that overlap
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/locks.svg" alt="Builds in different profiles run at once, builds in the same profile run in order, and identical builds share one build" width="880"></p>
+
+Builds in different profiles run in parallel. Builds in the same profile queue in order, and an identical build joins the
+one already running instead of waiting. A `--target` build also takes its profile's host slot, so it queues behind other
+builds of that profile.
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+
+## Results
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Bar chart: release clean rebuild 9x to 28x faster, debug 2x to 10x, branch switch 3.7x, disk 40 to 47 percent smaller" width="880"></p>
+
+Measured with `frust bench` on Apple Silicon, ranges over several runs. See the full
+[benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md).
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+
+## Learn more
+
+[How it works](https://github.com/Seggys116/frust/blob/main/docs/how-it-works.md) &middot; [Configuration](https://github.com/Seggys116/frust/blob/main/docs/configuration.md) &middot; [Benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md) &middot; [Contributing](https://github.com/Seggys116/frust/blob/main/CONTRIBUTING.md) &middot; [Security](https://github.com/Seggys116/frust/blob/main/SECURITY.md) &middot; [Changelog](https://github.com/Seggys116/frust/blob/main/CHANGELOG.md)
+
+<br>
+
+<p align="center"><sub>MIT licensed &middot; &copy; 2026 Zak Noble-Clarke</sub></p>

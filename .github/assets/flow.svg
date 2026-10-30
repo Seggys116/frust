@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 360" width="960" height="360" role="img" aria-labelledby="t d">
+<title id="t">How frust works</title>
+<desc id="d">Diagram: you run fcargo; frust takes the build lock and starts your cargo; cargo runs frust-wrap in place of rustc for each crate; a cache hit restores outputs, a miss runs rustc and stores them.</desc>
+<rect width="960" height="360" rx="18" fill="#0d1117"/>
+<rect x="1" y="1" width="958" height="358" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
+<g shape-rendering="crispEdges"><rect x="50" y="40" width="160" height="56" fill="#0d1117" stroke="#6e7681" stroke-width="4"/></g>
+<text x="130" y="73" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">fcargo build</text>
+<text x="130" y="28" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">what you type</text>
+<g shape-rendering="crispEdges"><rect x="400" y="40" width="160" height="56" fill="#0d1117" stroke="#ce422b" stroke-width="4"/></g>
+<text x="480" y="73" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">frust</text>
+<text x="480" y="28" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">queue lock, central target, display</text>
+<g shape-rendering="crispEdges"><rect x="750" y="40" width="160" height="56" fill="#0d1117" stroke="#6e7681" stroke-width="4"/></g>
+<text x="830" y="73" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">cargo</text>
+<text x="830" y="28" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">your own cargo, unchanged</text>
+<rect shape-rendering="crispEdges" x="208" y="66" width="194" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="558" y="66" width="194" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="828" y="94" width="4" height="58" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="128" y="148" width="704" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="128" y="148" width="4" height="54" fill="#30363d"/>
+<text x="480" y="140" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">for every crate, cargo runs frust-wrap in place of rustc</text>
+<g shape-rendering="crispEdges"><rect x="50" y="200" width="160" height="56" fill="#0d1117" stroke="#ce422b" stroke-width="4"/></g>
+<text x="130" y="233" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">frust-wrap</text>
+<text x="130" y="276" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">the RUSTC_WRAPPER</text>
+<g shape-rendering="crispEdges"><rect x="290" y="200" width="160" height="56" fill="#0d1117" stroke="#ce422b" stroke-width="4"/></g>
+<text x="370" y="233" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">cache lookup</text>
+<text x="370" y="276" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">content-hashed key</text>
+<g shape-rendering="crispEdges"><rect x="600" y="180" width="150" height="50" fill="#0d1117" stroke="#ffd23f" stroke-width="4"/></g>
+<text x="675" y="210" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#ffd23f">restore</text>
+<text x="675" y="250" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">outputs and diagnostics, no rustc</text>
+<g shape-rendering="crispEdges"><rect x="600" y="270" width="150" height="50" fill="#0d1117" stroke="#6e7681" stroke-width="4"/></g>
+<text x="675" y="300" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">rustc</text>
+<text x="675" y="340" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">real compile</text>
+<g shape-rendering="crispEdges"><rect x="790" y="270" width="120" height="50" fill="#0d1117" stroke="#6e7681" stroke-width="4"/></g>
+<text x="850" y="300" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9">store</text>
+<text x="850" y="340" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e">for next time</text>
+<rect shape-rendering="crispEdges" x="208" y="226" width="84" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="448" y="226" width="79" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="523" y="203" width="4" height="94" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="523" y="203" width="79" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="523" y="293" width="79" height="4" fill="#30363d"/>
+<rect shape-rendering="crispEdges" x="748" y="293" width="44" height="4" fill="#30363d"/>
+<text x="534" y="200" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" font-weight="bold" fill="#ffd23f">hit</text>
+<text x="534" y="318" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" font-weight="bold" fill="#8b949e">miss</text>
+<rect shape-rendering="crispEdges" x="-6" y="-6" width="12" height="12" fill="#ffd23f" opacity="0"><animateMotion path="M130,68 L830,68 L830,150 L130,150 L130,228 L525,228 L525,205 L675,205" dur="8.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.03;0.4;1"/><animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.03;0.4;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></rect>
+<rect shape-rendering="crispEdges" x="-6" y="-6" width="12" height="12" fill="#c9d1d9" opacity="0"><animateMotion path="M130,68 L830,68 L830,150 L130,150 L130,228 L525,228 L525,295 L675,295 L850,295" dur="8.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.5;0.96;1"/><animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.5;0.96;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></rect>
+</svg>
