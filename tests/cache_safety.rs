@@ -106,6 +106,7 @@ fn native_library_outside_the_target_is_keyed_by_content() {
     assert_eq!(sb.count_cache("hit", "nat"), 0);
 }
 
+#[cfg(target_os = "macos")]
 fn minos(binary: &Path) -> String {
     let out = Command::new("otool").arg("-l").arg(binary).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

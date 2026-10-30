@@ -105,8 +105,13 @@ impl Sandbox {
             .env("FRUST_RENDER", "off")
             .env("FRUST_LOCK_TIMEOUT_SECS", "120")
             .env("NO_COLOR", "1")
+            .env("CARGO_TERM_COLOR", "never")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_INCREMENTAL")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_BUILD_RUSTFLAGS")
             .env_remove("FRUST_EVENTS");
     }
 
