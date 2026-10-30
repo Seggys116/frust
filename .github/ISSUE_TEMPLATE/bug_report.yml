@@ -1,0 +1,30 @@
+name: Bug report
+description: Something is wrong or slower than plain cargo
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps or a small project that reproduces it. Try `FRUST_BYPASS=1` and `FRUST_CACHE=off` and say which one makes it go away.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `frust doctor`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: frust version and platform
+      placeholder: "frust 0.1.0, macOS 15 arm64, rustc 1.89"
+    validations:
+      required: true
