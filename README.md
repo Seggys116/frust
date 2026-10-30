@@ -111,3 +111,9 @@ Measured with `frust bench` on Apple Silicon, ranges over several runs. See the 
 <br>
 
 <p align="center"><sub>MIT licensed &middot; &copy; 2026 Zak Noble-Clarke</sub></p>
+
+<div align="center">
+
+<a href="https://www.buymeacoffee.com/seggy116"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-violet.png" alt="Buy me a coffee" height="50" /></a>
+
+</div>
