@@ -108,6 +108,7 @@ impl Sandbox {
             .env("CARGO_TERM_COLOR", "never")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CI")
             .env_remove("CARGO_INCREMENTAL")
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
