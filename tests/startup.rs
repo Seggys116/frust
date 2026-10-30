@@ -5,11 +5,26 @@ mod common;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
+use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
 use common::{Sandbox, assert_success, stderr, stdout};
+
+const PINNED: &str = "1.98.1";
+
+/// Two tests would otherwise make rustup install the same toolchain at once, which it does not tolerate.
+fn ensure_pinned_toolchain() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let out = Command::new("rustup")
+            .args(["toolchain", "install", PINNED, "--profile", "minimal", "--no-self-update"])
+            .output()
+            .expect("rustup is required to run these tests");
+        assert!(out.status.success(), "installing {PINNED} failed: {}", String::from_utf8_lossy(&out.stderr));
+    });
+}
 
 /// `cargo test` exports `RUSTUP_TOOLCHAIN`, which would override `rust-toolchain.toml`, so commands here run without it.
 fn fcargo(sb: &Sandbox, dir: &Path, args: &[&str], envs: &[(&str, &Path)]) -> Output {
@@ -74,6 +89,7 @@ fn second_build_uses_both_caches() {
 
 #[test]
 fn probe_cache_follows_toolchain_file_and_plus_toolchain() {
+    ensure_pinned_toolchain();
     let sb = Sandbox::new("startup-tc");
     let app = sb.project("app", &[], "fn main() {}\n");
     assert_success(&fcargo(&sb, &app, &["build"], &[]));
@@ -181,6 +197,7 @@ fn probe_cache_notices_a_toolchain_update_behind_an_unchanged_proxy() {
 
 #[test]
 fn probe_cache_follows_rustup_toolchain_env() {
+    ensure_pinned_toolchain();
     let sb = Sandbox::new("startup-env");
     let app = sb.project("app", &[], "fn main() {}\n");
     assert_success(&fcargo(&sb, &app, &["build"], &[]));

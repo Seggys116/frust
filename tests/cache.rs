@@ -19,7 +19,12 @@ fn second_project_reuses_the_dependency_from_the_cache() {
     assert_eq!(sb.count_cache("hit", "leaf"), 0);
 
     assert_success(&sb.bin("fcargo").arg("build").current_dir(&b).output().unwrap());
-    assert_eq!(sb.count_cache("hit", "leaf"), 1, "second project restores leaf from the cache");
+    assert_eq!(
+        sb.count_cache("hit", "leaf"),
+        1,
+        "second project restores leaf from the cache; events: {:#?}",
+        sb.cache_events()
+    );
 
     let out = run_binary(&sb.central_target(&b), "debug", "app");
     assert_success(&out);
