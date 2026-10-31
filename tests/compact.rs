@@ -48,6 +48,12 @@ fn compiled(out: &std::process::Output) -> Vec<String> {
     stderr(out).lines().filter(|l| l.trim_start().starts_with("Compiling")).map(|l| l.trim().to_string()).collect()
 }
 
+fn listing(dir: &Path) -> String {
+    let mut names: Vec<String> = fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    names.sort();
+    format!("{}: {}", dir.display(), names.join(" "))
+}
+
 fn hashes_of(dir: &Path, prefix: &str) -> Vec<String> {
     let mut out: Vec<String> = fs::read_dir(dir)
         .map(|rd| {
@@ -65,12 +71,20 @@ fn hashes_of(dir: &Path, prefix: &str) -> Vec<String> {
 fn compact_keeps_the_current_build_fresh_and_removes_superseded_variants() {
     let sb = Sandbox::new("compact");
     let app = project(&sb);
-    build(&sb, &app, &[]);
-    build(&sb, &app, &["--features", "x"]);
+    let first = build(&sb, &app, &[]);
+    let second = build(&sb, &app, &["--features", "x"]);
     build(&sb, &app, &["--release", "--features", "x"]);
     let target = sb.central_target(&app);
     let debug = target.join("debug");
-    assert_eq!(hashes_of(&debug.join(".fingerprint"), "app-").len(), 2, "two variants of app before compaction");
+    assert_eq!(
+        hashes_of(&debug.join(".fingerprint"), "app-").len(),
+        2,
+        "two variants of app before compaction\n{}\n{}\nfirst build:\n{}\nsecond build:\n{}",
+        listing(&debug.join(".fingerprint")),
+        listing(&debug.join("deps")),
+        stderr(&first),
+        stderr(&second)
+    );
 
     let out = sb.bin("frust").args(["compact", "--yes"]).output().unwrap();
     assert_success(&out);

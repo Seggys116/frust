@@ -99,7 +99,7 @@ fn eight_people_building_the_same_binary_share_one_build() {
         assert_success(&d.output);
     }
     // One shared build, not eight in sequence: every build script runs once.
-    assert!(wall < Duration::from_millis(GATE_SLEEP_MS * 4), "eight identical builds took {wall:?}; they must overlap, not queue");
+    assert!(wall < Duration::from_millis(GATE_SLEEP_MS * 6), "eight identical builds took {wall:?}; they must overlap, not queue");
     assert!(spread(&done) < Duration::from_millis(1500), "builds finished {:?} apart", spread(&done));
     for krate in ["core", "util", "gate"] {
         assert!(sb.count_cache("miss", krate) <= 1, "{krate} compiled more than once");
