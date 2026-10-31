@@ -921,6 +921,9 @@ fn swap_binaries(extract: &Path, install_dir: &Path, backup: &Path) -> Result<()
         touched.push(name.clone());
         if let Err(err) = install_file(&extract.join(name), &install_dir.join(name)) {
             let problems = rollback(&touched, install_dir, backup);
+            if problems.is_empty() {
+                cleanup_leftovers(install_dir);
+            }
             return Err(if problems.is_empty() {
                 format!("cannot replace {name}: {err}; the previous binaries were restored")
             } else {
@@ -928,6 +931,8 @@ fn swap_binaries(extract: &Path, install_dir: &Path, backup: &Path) -> Result<()
             });
         }
     }
+    // The running executable's `.old` cannot be deleted on Windows; the next update removes it.
+    cleanup_leftovers(install_dir);
     Ok(())
 }
 

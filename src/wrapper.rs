@@ -1013,7 +1013,8 @@ impl JobFile {
         let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("job-") && n.ends_with(".json"));
         let cwd = env::current_dir().ok()?;
         let inside = path.parent().is_some_and(|parent| cwd.join(parent) == cwd.join(deferred));
-        (named && inside).then_some(JobFile(path))
+        // Lazy on purpose: building a JobFile for a refused path would delete it on drop.
+        (named && inside).then(|| JobFile(path))
     }
 }
 
@@ -2026,8 +2027,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn variables_that_are_not_unicode_are_kept_by_their_bytes_when_filtered_in_and_dropped_otherwise() {
-        use std::os::unix::ffi::OsStringExt;
-        let bad = |bytes: &[u8]| OsString::from_vec(bytes.to_vec());
+        // SAFETY: on unix the encoded form of an OsString is its raw bytes, so any byte string is valid.
+        let bad = |bytes: &[u8]| unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) };
         let kept = keyed_env([
             (OsString::from("CARGO_PKG_NAME"), bad(b"na\xffme")),
             (bad(b"CARGO_\xfe"), OsString::from("v")),
@@ -2094,7 +2095,10 @@ mod tests {
         let second = acquire_slot(&dir, 2).expect("second");
         assert!(acquire_slot(&dir, 2).is_none(), "the pool is exhausted");
         drop(first);
-        assert!(acquire_slot(&dir, 2).is_some(), "a released slot is free again");
+        // A child forked by another test thread keeps a copy of the descriptor until it execs, so the release can lag briefly.
+        let again = (0..100).find_map(|_| acquire_slot(&dir, 2).or_else(|| (std::thread::sleep(Duration::from_millis(20)), None).1));
+        assert!(again.is_some(), "a released slot is free again");
+        drop(again);
         assert!(acquire_slot(&dir, 0).is_none());
         drop(second);
         assert!((1..=4).contains(&slot_count()));

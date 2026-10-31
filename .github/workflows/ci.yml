@@ -51,7 +51,7 @@ jobs:
       - run: rustup toolchain install 1.98.1 nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-targets
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast
 
   # Every trusted stamp is compared with a fresh content hash, so a stamp that lies fails the suite.
   test-audit:
@@ -65,7 +65,7 @@ jobs:
       # The toolchain tests select these; installing them here avoids concurrent rustup auto-installs, which corrupt a toolchain.
       - run: rustup toolchain install 1.98.1 nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast
         env:
           FRUST_CACHE_TRUST_STAMPS: audit
 

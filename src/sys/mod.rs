@@ -514,6 +514,8 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         let old = SystemTime::now() - Duration::from_secs(7200);
         File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
+        // std cannot open a directory without backup semantics on Windows, so only unix ages it first.
+        #[cfg(unix)]
         File::open(&sub).unwrap().set_modified(old).unwrap();
         for path in [&file, &sub] {
             set_mtime_now(path).unwrap();
