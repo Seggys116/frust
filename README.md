@@ -99,9 +99,9 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Bar chart: release clean rebuild 9x to 28x faster, debug 2x to 10x, branch switch 3.7x, disk 40 to 47 percent smaller" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Bar chart: release clean rebuild 12x faster, debug clean rebuild 5.7x, second project 2.5x, disk 14 percent smaller" width="880"></p>
 
-Measured with `frust bench` on Apple Silicon, ranges over several runs. See the full
+Measured with `frust bench` on Apple Silicon (median of 7 runs, warm cache). An uncached compile and an incremental edit are no faster than cargo. See the full
 [benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md).
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>

@@ -35,31 +35,30 @@ measurements on their own.
 
 ## Results
 
-`frust bench` generates two identical projects (12 local crates plus `serde` and `serde_json`, release profile with
-fat LTO and one codegen unit), builds them with plain cargo and with frust under an isolated state directory, and
-cleans up after itself. Figures below are ranges over several runs on macOS (Apple Silicon, APFS, rustc 1.99.0) on a
-machine that was often heavily loaded, so absolute times swing; the ratios are what to read.
+Median of 7 runs from `frust bench --runs 7` on macOS (Apple M4 Max, 16 cores, APFS, rustc 1.99.0), with 12 local crates
+plus `serde` and `serde_json`. The machine was not idle (load average 7 before, 9 after), so absolute times carry
+noise; ratios are of medians and the spread is in the report.
 
-| Measure | Result |
-|---|---|
-| Release clean rebuild (cache warm) | 9x to 28x faster than cargo (for example 335ms vs 4.8s) |
-| Release build of a second project | 1.7x to 2.8x faster |
-| Debug clean rebuild (cache warm) | 2x to 10x faster |
-| Debug build of a second project | 0.9x to 3.2x (workspace crates are keyed by their path, so only registry dependencies are shared between projects) |
-| 29-member workspace, debug clean rebuild | 1.4x to 3.3x faster; `-p` binary 2.3x to 5.3x |
-| Branch switch back to a state built before | 3.7x faster (all units restored) |
-| Eight identical builds at once | one build, finishing together (`tests/stress.rs`) |
-| Edit of a small project | slower than cargo by about 12% inside cargo (cost of storing each state), plus roughly 3-8 ms of frust startup |
-| Cold build, empty cache | no faster than cargo; the wrapper costs under 3% |
-| No-op build overhead | +3 ms to +10 ms |
-| Release binary vs cargo, same target dir | byte-identical |
-| Release binary vs cargo, different target dir | 48 bytes differ (Mach-O UUID and signature, which plain cargo also varies) |
-| Release binary run time | the same (median of 20 runs) |
-| Two projects on disk | 40% to 47% smaller than cargo (clones shared with the cache, compression) |
-| One target directory after six configuration changes | cargo 327 MiB; frust 84.5 MiB after `frust compact`; 113 MiB with automatic compaction |
-| Rebuild after compaction | 0 units recompiled, binary output unchanged |
+| Measure | cargo | frust | Result |
+|---|---|---|---|
+| Release clean rebuild (cache warm) | 4.22s | 352ms | 12.0x faster |
+| Debug clean rebuild (cache warm) | 2.64s | 467ms | 5.7x faster |
+| Debug build of a second project (cache warm) | 2.72s | 1.11s | 2.5x faster (workspace crates are keyed by their path, so only registry dependencies are shared between projects) |
+| Release build of a second project (cache warm) | 4.19s | 2.52s | 1.7x faster |
+| Cold build, empty cache (debug / release) | 2.71s / 4.21s | 2.89s / 4.36s | 7% / 4% slower |
+| No-op build | 32ms | 38ms | +6 ms |
+| Incremental edit of a small project | 113ms | 203ms | slower (each state is stored for the cache) |
+| Release binary vs cargo, same target dir | | | byte-identical |
+| Release binary vs cargo, different target dir | | | 48 bytes differ (Mach-O UUID and signature, which plain cargo also varies) |
+| Release binary run time (median of 20) | 1595us | 1665us | the same within noise, outputs equal |
+| Two projects on disk | 273.1 MiB | 235.3 MiB | 14% smaller (37.7 MiB; clones counted once) |
+| One target directory after six configuration changes | 321.6 MiB | 85.4 MiB after `frust compact`; 126 MiB with automatic compaction | 73% / 61% smaller |
+| 100 edits across crates | 168.2 MiB target, 121.6 MiB incremental | 41.5 MiB target, 23.0 MiB incremental | 75% smaller target; 427 units compiled by each |
+| Rebuild after compaction | | | 0 units recompiled, binary output unchanged |
+| Eight identical builds at once | | | one build, finishing together (`tests/stress.rs`) |
 
-The figures above predate the current benchmark methodology and are being refreshed.
+Maintenance is timed separately: the daily gc pass took 15ms and a full auto-compaction pass 1.06s. Frust's speed
+rows run with both switched off.
 
 What is not faster: an uncached compile. rustc sets that floor, and changing flags to beat it would change the
 executable. A single fresh project's target directory has the same content as cargo's; it is smaller only through

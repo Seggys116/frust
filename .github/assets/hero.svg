@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" role="img" aria-labelledby="t d">
 <title id="t">frust</title>
-<desc id="d">Pixel art: the word FRUST shimmers above two racing lanes: cargo fills slowly in 4.8 seconds while frust finishes in 335 milliseconds.</desc>
+<desc id="d">Pixel art: the word FRUST shimmers above two racing lanes: cargo fills slowly in 4.2 seconds while frust finishes in 352 milliseconds.</desc>
 <rect width="960" height="300" rx="18" fill="#0d1117"/>
 <rect x="1" y="1" width="958" height="298" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
 <rect x="88" y="64" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.75;0.1" dur="4.25s" begin="3.86s" repeatCount="indefinite"/></rect>
@@ -249,7 +249,7 @@
 <rect x="779" y="234" width="12" height="12" fill="#21262d"><animate attributeName="fill" values="#21262d;#ffb089;#ffd23f;#ffd23f;#21262d;#21262d" keyTimes="0;0.0930;0.1130;0.95;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></rect>
 </g>
 <text x="480" y="180" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" letter-spacing="2" fill="#6e7681">RELEASE CLEAN REBUILD, WARM CACHE</text>
-<text x="813" y="209" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9" opacity="0">4.8s<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.820;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
-<text x="813" y="245" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#ffd23f" opacity="0">335ms<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.130;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
-<text x="480" y="280" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" font-weight="bold" fill="#ffb089" opacity="0">14x faster<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.840;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
+<text x="813" y="209" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#c9d1d9" opacity="0">4.2s<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.820;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
+<text x="813" y="245" text-anchor="start" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="bold" fill="#ffd23f" opacity="0">352ms<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.130;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
+<text x="480" y="280" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" font-weight="bold" fill="#ffb089" opacity="0">12x faster<animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.840;0.98;1" calcMode="discrete" dur="8.0s" repeatCount="indefinite"/></text>
 </svg>

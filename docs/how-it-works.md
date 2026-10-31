@@ -172,6 +172,7 @@ runs on Windows in CI, but it has had much less real-world use than the Unix por
 | APFS compression and dedupe | macOS only | not available |
 | Stamp trust | the allow-list of local filesystems above | NTFS and ReFS only |
 | Large-file hashing | memory map for registry and git sources, plain reads otherwise | plain reads |
+| Dead incremental directories | attributed by object links (macOS) or DWARF codegen-unit names (Linux) | an older directory of a crate is treated as superseded by a newer sibling, as the linker leaves no proof of ownership |
 | Detached helpers | new session, locks inherited | detached process in its own process group; handles are not inherited, so a helper takes its locks again by path |
 
 On Windows, frust also enables virtual terminal processing on the console so the ANSI display works. Which cargo to

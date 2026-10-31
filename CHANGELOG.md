@@ -2,10 +2,11 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.0]
 
 ### Added
 
+* Shared compile cache, central target directories, cooperative build lock and build display.
 * Native Windows support alongside macOS and Linux, through a platform layer in `src/sys/` with Unix and Windows
   backends: build locks with `LockFileEx` on a sentinel byte, Ctrl-C reported as exit code 130, a job object around
   cargo, ANSI virtual terminal processing, no POSIX mode bits (access follows inherited ACLs) and copy-on-write
@@ -52,6 +53,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 * Compaction on Linux recognises dead incremental directories of binaries by reading the codegen-unit names in the
   DWARF data of ELF files, so they are removed even though their objects are gone.
+* On Windows, binaries share one fingerprint directory across feature sets, so only the older incremental directories of a
+  crate are treated as superseded.
 * The toolchain probe runs one query before the parallel ones. Before, the first use of an uninstalled toolchain named
   by `rust-toolchain.toml` made rustup auto-install it from several processes at once, which left it without `cargo`.
 * Dependency files for profile directories whose path contains spaces are rewritten and restored correctly.
@@ -66,7 +69,3 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Manifests are not rewritten when nothing changed.
 * The lock hand-off between builds is faster: quicker waiter polling, a build log written in batches, coalesced
   display redraws and an event feed read only when it has grown.
-
-## [0.1.0]
-
-* Initial release: shared compile cache, central target directories, cooperative build lock and build display.
