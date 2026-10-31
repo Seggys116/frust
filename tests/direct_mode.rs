@@ -67,7 +67,7 @@ fn settled_inputs_are_recorded_with_stamps_and_serve_the_next_build() {
     assert_eq!(sb.count_cache("miss", "leaf"), 1);
     assert!(recorded_stamps(&sb) > 0, "settled inputs carry stamps: {:#?}", manifest_values(&sb));
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 3, "manifests are written in the current format");
+        assert_eq!(manifest["format"], 4, "manifests are written in the current format");
     }
 
     clean(&sb, &a);
@@ -134,7 +134,7 @@ fn manifests_in_an_older_format_are_ignored_and_rewritten() {
     assert_eq!(sb.count_cache("hit", "leaf"), 0, "a manifest without the current format serves nothing");
     assert_eq!(app_output(&sb, &a), "41");
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 3, "the manifest is rewritten in the current format");
+        assert_eq!(manifest["format"], 4, "the manifest is rewritten in the current format");
     }
 
     clean(&sb, &a);
@@ -335,4 +335,108 @@ fn with_stamp_trust_off_a_forged_record_is_just_a_miss_and_no_violation_is_recor
     assert!(violations(&sb).is_empty());
     assert!(quarantine_markers(&sb).is_empty());
     assert_eq!(audits_passed(&sb), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_metadata_probes_restore_shared_names_without_running_the_compiler() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let sb = Sandbox::new("direct-metadata-probes");
+    let out_dir = sb.root.join("probe");
+    fs::create_dir(&out_dir).unwrap();
+    let compiler = sb.root.join("counted-rustc");
+    let calls = sb.root.join("compiler-calls");
+    fs::write(&compiler, r#"#!/bin/sh
+for arg do
+    case "$arg" in
+        --emit|--emit=*) printf '%s\n' compile >> "$FRUST_PROBE_CALLS"; break ;;
+    esac
+done
+exec rustc "$@"
+"#).unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+    let a = sb.root.join("location.rs");
+    let b = sb.root.join("file.rs");
+    let c = sb.root.join("third.rs");
+    let sibling = sb.root.join("independent.rs");
+    let failed = sb.root.join("failed.rs");
+    for (source, text) in [
+        (&a, "pub fn location() -> u32 { 11 }\n"),
+        (&b, "pub fn file() -> u32 { 22 }\n"),
+        (&c, "pub fn third() -> u32 { 33 }\n"),
+        (&sibling, "pub fn independent() -> u32 { 44 }\n"),
+        (&failed, "compile_error!(\"intentional capability probe failure\");\n"),
+    ] {
+        fs::write(source, text).unwrap();
+    }
+    settle(&failed);
+    let command = |source: &Path, krate: &str| -> Command {
+        let mut cmd = sb.bin("frustc");
+        cmd.args(["--edition=2021", "--crate-type=lib", "--emit=dep-info,metadata", "--crate-name"])
+            .arg(krate).arg("--out-dir").arg(&out_dir).arg(source).current_dir(&sb.root)
+            .env("FRUST_RUSTC", &compiler).env("FRUST_PROBE_CALLS", &calls)
+            .env("FRUST_CACHE", "on").env("FRUST_CACHE_TRUST_STAMPS", "off")
+            .env_remove("FRUST_RUSTC_ID").env_remove("RUSTC_BOOTSTRAP");
+        cmd
+    };
+    let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
+    let artifacts = || (fs::read(out_dir.join("foo.d")).unwrap(), fs::read(out_dir.join("libfoo.rmeta")).unwrap());
+
+    assert_success(&command(&a, "foo").output().unwrap());
+    let first = artifacts();
+    assert_success(&command(&b, "foo").output().unwrap());
+    let second = artifacts();
+    assert_eq!(count(), 2);
+    assert_ne!(first.1, second.1);
+    assert_success(&command(&a, "foo").output().unwrap());
+    assert_eq!(artifacts(), first);
+    assert_success(&command(&b, "foo").output().unwrap());
+    assert_eq!(artifacts(), second);
+    assert_eq!(count(), 2, "each successful probe restores its own metadata without invoking rustc");
+
+    fs::write(&a, "pub fn changed_location() -> u64 { 111 }\n").unwrap();
+    settle(&a);
+    assert_success(&command(&a, "foo").output().unwrap());
+    assert_eq!(count(), 3, "an edited probe must compile again");
+    assert_ne!(artifacts().1, first.1);
+
+    // Distinct crates may share an out-dir without sharing their dep-info or metadata filenames.
+    let foo = command(&c, "foo").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let libfoo = command(&sibling, "libfoo").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    assert_success(&foo.wait_with_output().unwrap());
+    assert_success(&libfoo.wait_with_output().unwrap());
+    assert_eq!(count(), 5);
+    let sibling_metadata = fs::read(out_dir.join("liblibfoo.rmeta")).unwrap();
+    for name in ["libfoo.d", "libfoo", "foo.notes", "libfoo.notes", "foo-extra.d", "foo_extra.d"] {
+        fs::write(out_dir.join(name), b"independent sibling changed after the compile").unwrap();
+    }
+    fs::create_dir(out_dir.join("foo.dSYM")).unwrap();
+    fs::write(out_dir.join("foo.dSYM/member"), b"independent bundle").unwrap();
+    assert_success(&command(&b, "foo").output().unwrap());
+    assert_eq!(artifacts(), second);
+    assert_eq!(count(), 5);
+    assert_eq!(fs::read(out_dir.join("liblibfoo.rmeta")).unwrap(), sibling_metadata);
+    for name in ["libfoo.d", "libfoo", "foo.notes", "libfoo.notes", "foo-extra.d", "foo_extra.d"] {
+        assert_eq!(fs::read(out_dir.join(name)).unwrap(), b"independent sibling changed after the compile");
+    }
+    assert_eq!(fs::read(out_dir.join("foo.dSYM/member")).unwrap(), b"independent bundle");
+
+    for expected_calls in [6, 7] {
+        let output = command(&failed, "foo").output().unwrap();
+        assert!(!output.status.success());
+        assert!(common::stderr(&output).contains("intentional capability probe failure"));
+        assert_eq!(count(), expected_calls, "failed capability probes always execute the real compiler");
+    }
+    let mut repeated_emit = command(&a, "foo");
+    repeated_emit.args(["--emit=link", "--emit=dep-info,metadata"]);
+    assert_success(&repeated_emit.output().unwrap());
+    assert_eq!(count(), 8);
+    assert!(out_dir.join("libfoo.rlib").is_file(), "rustc merges repeated emit options");
+    frust::sys::rename(&out_dir.join("libfoo.rlib"), &out_dir.join("previous-rlib")).unwrap();
+    assert_success(&repeated_emit.output().unwrap());
+    assert_eq!(count(), 9, "ambiguous repeated emits use the compiler again");
+    assert!(out_dir.join("libfoo.rlib").is_file(), "the repeated compile must recreate its linked artifact");
+    assert_eq!(sb.count_cache("hit", "foo"), 3);
 }

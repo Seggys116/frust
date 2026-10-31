@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, Per
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::{LockKind, StdStream};
 
@@ -44,7 +44,7 @@ impl DirectoryWatcher {
 
     pub fn wait(&mut self, timeout: Duration) -> io::Result<bool> {
         let mut fd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let millis = timeout.as_millis().saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0));
+        let millis = timeout.as_millis().saturating_add(u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000)));
         // SAFETY: `fd` is one live pollfd and the timeout is clamped to poll's range.
         let rc = unsafe { libc::poll(&mut fd, 1, millis.min(libc::c_int::MAX as u128) as libc::c_int) };
         if rc < 0 {
@@ -236,6 +236,42 @@ pub fn unlock(file: &File) -> io::Result<()> {
     file.unlock()
 }
 
+pub fn open_session_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+}
+
+fn session_record_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
+    // SAFETY: flock is plain data; zero length locks the whole file, including future bytes.
+    let mut record: libc::flock = unsafe { std::mem::zeroed() };
+    record.l_type = kind;
+    record.l_whence = libc::SEEK_SET as _;
+    // SAFETY: the descriptor remains open and record is initialized for F_SETLK.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &record) } == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN)) {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+pub fn try_lock_session(file: &File) -> io::Result<()> {
+    file.try_lock().map_err(io::Error::from)?;
+    if let Err(error) = session_record_lock(file, libc::F_WRLCK as _) {
+        let _ = file.unlock();
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn unlock_session(file: &File) {
+    let _ = session_record_lock(file, libc::F_UNLCK as _);
+    let _ = file.unlock();
+}
+
 pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
     opts.mode(mode)
 }
@@ -323,12 +359,14 @@ fn cstr(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 }
 
+pub fn open_directory_for_times(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 pub fn set_mtime_now(path: &Path) -> io::Result<()> {
     let c = cstr(path)?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let stamp = libc::timespec { tv_sec: now.as_secs() as libc::time_t, tv_nsec: now.subsec_nanos() as _ };
-    // SAFETY: `c` is a valid NUL-terminated path and `times` points to two initialised timespecs.
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [stamp, stamp].as_ptr(), 0) };
+    // SAFETY: `c` is a valid NUL-terminated path; null times selects the filesystem's current time.
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), 0) };
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 

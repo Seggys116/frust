@@ -101,10 +101,13 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Bar chart: release clean rebuild 12x faster, debug clean rebuild 5.7x, second project 2.5x, disk 14 percent smaller" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured debug build times: cold, warm restore, no-op and real warm-session edit; warm restore 21.6x faster" width="880"></p>
 
-Measured with `frust bench` on Apple Silicon (median of 7 runs, warm cache). An uncached compile and an incremental edit are no faster than cargo. See the full
-[benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md).
+Measured on Intel(R) Core(TM) Ultra 7 255H, ext4, rustc 1.97.1: median of 7 runs. A warm debug clean rebuild was 21.6x faster. Combined target and cache storage after 200 edits was 35.6% smaller than Cargo, with compaction assessed after every build. Initial two-project combined allocation was 221.1 MiB for Cargo versus 260.2 MiB for frust. The figures include cold-build, no-op and edit overhead; paired release binaries and runtime outputs matched. See the [method and complete results](docs/benchmarks.md).
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm-cache release rebuilds with default release, ThinLTO and full/fat LTO settings" width="880"></p>
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Combined target and cache allocation after 200 edits, including automatic and disabled cache compression" width="880"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 

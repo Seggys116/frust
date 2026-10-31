@@ -730,7 +730,14 @@ impl Session {
         };
         trace(&self.cfg, started, "cargo finished");
 
-        // Hand the lock on before the summary so waiters start at once; a signalled build is not a result to share.
+        // A queued build cannot take the profile before due maintenance has had its nonblocking cleanup opportunity.
+        if code == 0 && self.lock_target.starts_with(self.dirs.targets()) {
+            let report = crate::compact::auto_compact(&self.dirs, &self.lock_target, &self.cfg);
+            if self.cfg.debug {
+                eprintln!("frust: auto-compact {report:?}");
+            }
+        }
+        // A signalled build is not a result to share.
         if let Some(guard) = guard.take() {
             let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
             guard.finish(BuildResult { code, units: progress.done, interrupted });
@@ -765,13 +772,6 @@ impl Session {
         } else if code == 0 && progress.done > 0 && expected.is_none() {
             // Without the display only cache events are counted, which undercounts; use only to seed a first estimate.
             history::remember_units(&self.dirs, &history_keys, progress.done);
-        }
-        // After the summary and the lock hand-off, so waiters never pay for it; only touches directories under the frust targets dir.
-        if code == 0 && self.lock_target.starts_with(self.dirs.targets()) {
-            let report = crate::compact::auto_compact(&self.dirs, &self.lock_target, &self.cfg);
-            if self.cfg.debug {
-                eprintln!("frust: auto-compact {report:?}");
-            }
         }
         if code == 0 {
             crate::update::notice(&self.dirs);
@@ -860,7 +860,7 @@ impl Session {
         let child_started = Instant::now();
         signals::supervise(child.id());
         let sub = self.parsed.subcommand.as_deref().unwrap_or("");
-        let mut planning_due = crate::unit_graph::supported(sub);
+        let mut planning_gate = PlanningGate { pending: crate::unit_graph::supported(sub) };
         let mut planning = None;
         if let Some(lock) = lock.as_deref_mut() {
             lock.log_start(true, true);
@@ -882,10 +882,10 @@ impl Session {
             if exited_at.is_some_and(|t| t.elapsed() >= LINGER) {
                 break;
             }
-            // Only a still-running build needs planning after the first display tick.
-            if planning_due && status.is_none() && child_started.elapsed() >= TICK {
-                planning_due = false;
-                planning = crate::unit_graph::Pending::start(&self.cargo, &planning_args, &[], &self.env_vars);
+            if let Some(pending) = planning_gate.start_if_due(child_started.elapsed(), status.is_none(), || {
+                crate::unit_graph::Pending::start(&self.cargo, &planning_args, &[], &self.env_vars)
+            }) {
+                planning = Some(pending);
             }
             let ready = wait_readable(&streams, TICK);
             let mut lines: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
@@ -938,6 +938,24 @@ impl Session {
         };
         signals::clear();
         status.map(signals::exit_code).unwrap_or(1)
+    }
+}
+
+struct PlanningGate {
+    pending: bool,
+}
+
+impl PlanningGate {
+    // The clock and launcher are supplied at the boundary so tests need no scheduler timing assumptions.
+    fn start_if_due<T>(&mut self, elapsed: Duration, running: bool, launch: impl FnOnce() -> Option<T>) -> Option<T> {
+        if !running {
+            self.pending = false;
+        }
+        if !self.pending || elapsed < TICK {
+            return None;
+        }
+        self.pending = false;
+        launch()
     }
 }
 
@@ -1469,6 +1487,44 @@ pub fn tool_main(tool: &str, args: Vec<OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_build_does_not_launch_a_planner_before_the_tick_or_after_exit() {
+        let mut gate = PlanningGate { pending: true };
+        let mut launches = 0;
+        for elapsed in [Duration::ZERO, Duration::from_millis(20), TICK - Duration::from_nanos(1)] {
+            assert!(gate.start_if_due(elapsed, true, || {
+                launches += 1;
+                Some(())
+            }).is_none());
+        }
+        for elapsed in [TICK, TICK * 10] {
+            assert!(gate.start_if_due(elapsed, false, || {
+                launches += 1;
+                Some(())
+            }).is_none());
+        }
+        assert_eq!(launches, 0, "the production launch callback never runs for a completed short build");
+    }
+
+    #[test]
+    fn quiet_build_launches_once_at_the_tick_and_failed_launches_do_not_repeat() {
+        for succeeds in [false, true] {
+            let mut gate = PlanningGate { pending: true };
+            let mut launches = 0;
+            assert_eq!(gate.start_if_due(TICK, true, || {
+                launches += 1;
+                succeeds.then_some(7)
+            }), succeeds.then_some(7));
+            assert!(gate.start_if_due(TICK * 2, true, || {
+                launches += 1;
+                Some(9)
+            }).is_none());
+            assert_eq!(launches, 1);
+        }
+        let mut unsupported = PlanningGate { pending: false };
+        assert!(unsupported.start_if_due::<()>(TICK * 10, true, || panic!("unsupported command launched planning")).is_none());
+    }
 
     fn pairs(list: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         list.iter().map(|(k, v)| (os(k), os(v))).collect()

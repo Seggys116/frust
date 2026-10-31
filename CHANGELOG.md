@@ -2,6 +2,74 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0]
+
+### Added
+
+* `FRUST_CACHE_COMPRESSION=auto` stores compressible cache payloads as bounded LZ4 blocks on Linux filesystems
+  without copy-on-write clones. `off` writes raw payloads; both settings can restore existing raw and compressed
+  entries. Cache budgets account for the payloads' stored allocation.
+* Opt-in `FRUST_LINK=smart` uses Apple's native linker directly for eligible macOS incremental development binaries,
+  retaining static Rust linkage and the current incremental state. Explicit linker settings, custom drivers, tests,
+  release builds and unsupported invocations keep their original link path.
+* Release benchmarks cover ordinary release, ThinLTO and full/fat LTO, with real function-body edits, alternating
+  build order, raw samples, actual compiler invocation audits, same-path binary identity and runtime output checks.
+  Growth benchmarks compare combined target and cache allocation with compression enabled and disabled. Native-link
+  profiling measures real application edits and separates the current binary's native-link phase from total build time.
+
+### Changed
+
+* Encoded cache manifests use format 4 so older readers do not restore compressed payloads as compiler outputs.
+  Existing format-3 raw manifests remain readable.
+* Completed metadata-only incremental reuse data with unknown ownership can expire after the configured idle
+  retention (7 days by default), without cache coverage or a permanent newest-directory exemption. Target pressure
+  can reclaim safely aged metadata reuse state after an hour with the defaults; fresh and uncertain state stays.
+* Daily automatic GC retires eligible central-target payloads after 30 idle days. Foreground sampling is bounded;
+  the detached collector drains eligible targets with a complete activity scan, and `FRUST_GC_SYNC=1` drains inline.
+  Target/profile directories, `deps` and `.fingerprint` roots, and Cargo lock files remain; unknown or user-managed layouts
+  are skipped. Cache and target budgets
+  remain separate; the target budget is soft and does not impose a universal disk cap.
+* Release publication requires the tag to match the package version and the latest main-branch push CI run for the
+  exact release commit to have completed successfully before any release binaries are built.
+
+### Performance
+
+* Bounded, jobserver-aware workers hash source and dependency inputs with ordered key assembly and balance uneven
+  input sizes. Small input sets stay sequential, and large-file hashing no longer starts a separate Rayon pool.
+* Compaction creates cache-coverage indexes only when needed and reuses memoized file information. Deferred stores
+  reserve helper capacity before preparing outputs, avoiding duplicate preparation when the helper pool is full.
+* Queued builds wake on Linux inotify and macOS kqueue notifications, retaining FIFO checks and timed polling as
+  fallbacks. Follower logs flush in bounded batches instead of flushing every record.
+* Display-enabled builds defer unit-graph planning until the first display tick and poll it alongside compiler output.
+  Short builds avoid the extra Cargo process, and planning is cancelled before the build lock is released. Target
+  selection, tuning and lock scoping share an invocation-local snapshot of Cargo configuration.
+
+### Fixed
+
+* Restored output timestamps use the Unix filesystem clock, preventing fast cache hits from making Cargo's subsequent
+  dependency and build-script timestamps older than their restored inputs.
+* Successful metadata-only compiler probes can cache exact un-hashed output names; failed capability probes continue
+  to run the compiler. Current inputs and stored payloads are checked before a cached result is accepted.
+* Cache keys include explicitly selected linker executables and native inputs, with unreadable inputs bypassing the
+  cache and changes during compilation preventing storage.
+* Build locks are explicitly released even while forked processes retain cloned descriptors, so process startup cannot
+  prolong a completed build's ownership.
+* Due compaction runs after Cargo exits and before the build-lock handoff, so queued builds cannot continually take
+  the profile before cleanup. Incomplete passes retry after 30 seconds instead of the completed-pass 10-minute
+  interval; retries and cheap skips preserve the last successful pass time for hourly age reassessment.
+* Crashed incremental working sessions and orphan session locks can be reclaimed after a one-hour grace using
+  compiler-compatible guards and identity revalidation. Recent, held, malformed and uncertain state is retained.
+* Idle-target cleanup first prunes expired finalized incremental reuse data in bounded batches, allowing progress
+  through long build histories. Held compiler sessions protect their state and all program outputs; remaining
+  program-output retirement requires joint admission of every profile. Session payloads are removed before locks,
+  and preserved structural roots and activity times allow safe retries after partial removal.
+* Maintenance reserves every canonical Cargo profile lock name, including absent alternatives, and profile
+  retirement preserves their identities. Structural symlinks and unsafe central paths decline cleanup;
+  nested native-output symlinks do not prevent unrelated cleanup and are not followed outside the managed tree.
+* Benchmark no-op checks require zero actual compiler calls, Cargo compile notices and cache events. Warm restores
+  distinguish declared Cargo-unit compilations from build-script capability probes, and unavailable audits remain
+  unknown rather than being reported as zero. Runtime output checks cover every measured executable launch.
+
 ## [0.1.1]
 
 ### Fixed

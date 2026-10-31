@@ -28,10 +28,6 @@ const READ_BUF: usize = 256 * 1024;
 #[cfg_attr(not(unix), allow(dead_code))]
 const MMAP_MIN_BYTES: u64 = 1024 * 1024;
 
-// Below this the cost of waking rayon's global pool exceeds the gain.
-#[cfg_attr(not(unix), allow(dead_code))]
-const RAYON_MIN_BYTES: u64 = 4 * 1024 * 1024;
-
 thread_local! {
     static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
@@ -243,11 +239,8 @@ fn hash_mapped(path: &Path, stamp: &Stamp, at_ns: i128, immutable: bool) -> Opti
         return None;
     }
     let mut hasher = blake3::Hasher::new();
-    let mapped = if stamp.size >= RAYON_MIN_BYTES {
-        hasher.update_mmap_rayon(path).is_ok()
-    } else {
-        hasher.update_mmap(path).is_ok()
-    };
+    // Parallelism belongs to the bounded outer workers, including Cargo's jobserver budget.
+    let mapped = hasher.update_mmap(path).is_ok();
     mapped.then(|| hasher.finalize().to_hex().to_string())
 }
 
@@ -339,7 +332,11 @@ impl Hasher {
             self.memo().insert(path.to_path_buf(), hashed.clone());
             return Ok(hashed);
         }
-        let current = Stamp::read(path)?;
+        self.hash_observed(path, persist, Stamp::read(path)?)
+    }
+
+    fn hash_observed(&self, path: &Path, persist: bool, current: Stamp) -> io::Result<Hashed> {
+        let immutable = self.in_immutable_root(path);
         if !self.believes(path, &current) {
             return hash_with_stamp_in(path, immutable);
         }
@@ -349,7 +346,7 @@ impl Hasher {
         {
             return Ok(known.clone());
         }
-        let persist = persist_ok && current.size >= PERSIST_MIN_BYTES;
+        let persist = persist && self.persist_dir.is_some() && current.size >= PERSIST_MIN_BYTES;
         if persist && let Some(hash) = self.persisted(path, &current) {
             // Recorded only after settling, so date it just past the settle margin to keep it reusable.
             let at_ns = current.mtime_ns.max(current.ctime_ns) + SETTLE_MARGIN_NS + 1;
@@ -471,7 +468,7 @@ impl DirWalk<'_> {
                     return Err(format!("{} is too large to hash", dir.display()));
                 }
                 // Recursive dirs are build script outputs every dependent links, so the persistent memo avoids rehashing per dependent.
-                let hashed = self.hasher.hash(&path, recursive).map_err(|e| format!("{}: {e}", path.display()))?;
+                let hashed = self.hasher.hash_observed(&path, recursive, Stamp::of(&meta)).map_err(|e| format!("{}: {e}", path.display()))?;
                 self.watch.push((path, hashed.stamp));
                 self.entries.push((rel, hashed.hash));
             } else {
@@ -601,6 +598,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_directory_observation_never_replaces_the_opened_files_stamp_on_a_miss() {
+        let dir = scratch("observed-stamp");
+        let file = dir.join("input");
+        fs::write(&file, b"before").unwrap();
+        let observed = Stamp::read(&file).unwrap();
+        fs::write(&file, b"after, with different contents").unwrap();
+        let hashed = Hasher::ephemeral().hash_observed(&file, false, observed).unwrap();
+        assert!(hashed.stable);
+        assert_ne!(hashed.stamp, observed);
+        assert_eq!(hashed.stamp, Stamp::read(&file).unwrap());
+        assert_eq!(hashed.hash, plain(b"after, with different contents"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
     }
@@ -616,7 +628,7 @@ mod tests {
         let medium = dir.join("medium");
         let large = dir.join("large");
         let small = dir.join("small");
-        let (medium_bytes, large_bytes) = (pattern(MMAP_MIN_BYTES as usize + 12_345), pattern(RAYON_MIN_BYTES as usize + 777));
+        let (medium_bytes, large_bytes) = (pattern(MMAP_MIN_BYTES as usize + 12_345), pattern(8 * MMAP_MIN_BYTES as usize + 777));
         fs::write(&medium, &medium_bytes).unwrap();
         fs::write(&large, &large_bytes).unwrap();
         fs::write(&small, pattern(4096)).unwrap();
@@ -624,7 +636,7 @@ mod tests {
         let settled = now_ns() + 10 * SETTLE_MARGIN_NS;
         let mapped = |path: &Path| hash_mapped(path, &Stamp::read(path).unwrap(), settled, true);
         assert_eq!(mapped(&medium), Some(plain(&medium_bytes)), "update_mmap path");
-        assert_eq!(mapped(&large), Some(plain(&large_bytes)), "update_mmap_rayon path");
+        assert_eq!(mapped(&large), Some(plain(&large_bytes)), "large mappings keep the same hash");
         assert_eq!(mapped(&small), None, "small files are read, not mapped");
         assert_eq!(hash_mapped(&large, &Stamp::read(&large).unwrap(), now_ns(), true), None, "a file inside the settle margin is read, not mapped");
         assert_eq!(hash_mapped(&large, &Stamp::read(&large).unwrap(), settled, false), None, "a file that may be edited in place is read, not mapped");
@@ -637,7 +649,7 @@ mod tests {
         let settled = 10 * SETTLE_MARGIN_NS;
         assert!(may_map(&stamp(MMAP_MIN_BYTES), settled, true));
         assert!(!may_map(&stamp(MMAP_MIN_BYTES), settled, false), "outside the immutable roots, however large");
-        assert!(!may_map(&stamp(RAYON_MIN_BYTES * 8), settled, false));
+        assert!(!may_map(&stamp(MMAP_MIN_BYTES * 32), settled, false));
         assert!(!may_map(&stamp(MMAP_MIN_BYTES - 1), settled, true));
         assert!(!may_map(&stamp(MMAP_MIN_BYTES), 1_000_000_001 + SETTLE_MARGIN_NS - 1, true));
     }
@@ -666,7 +678,7 @@ mod tests {
         for (name, bytes) in [
             ("small", pattern(4096)),
             ("medium", pattern(MMAP_MIN_BYTES as usize + 12_345)),
-            ("large", pattern(RAYON_MIN_BYTES as usize + 777)),
+            ("large", pattern(8 * MMAP_MIN_BYTES as usize + 777)),
         ] {
             let path = dir.join(name);
             fs::write(&path, &bytes).unwrap();
@@ -680,7 +692,7 @@ mod tests {
     fn files_are_read_rather_than_mapped_off_unix() {
         let dir = scratch("unmapped");
         let big = dir.join("big");
-        fs::write(&big, pattern(RAYON_MIN_BYTES as usize + 1)).unwrap();
+        fs::write(&big, pattern(8 * MMAP_MIN_BYTES as usize + 1)).unwrap();
         let settled = now_ns() + 10 * SETTLE_MARGIN_NS;
         assert_eq!(hash_mapped(&big, &Stamp::read(&big).unwrap(), settled, true), None);
         let _ = fs::remove_dir_all(&dir);

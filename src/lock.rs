@@ -356,6 +356,7 @@ pub struct Request<'a> {
 pub struct BuildLock {
     /// Explicitly unlocked by `Drop::drop` before these files close.
     _level: File,
+    activity_path: PathBuf,
     _slots: Vec<File>,
     slot_dirs: Vec<PathBuf>,
     mode: Option<Mode>,
@@ -463,6 +464,7 @@ impl Drop for BuildLock {
         for dir in &self.slot_dirs {
             let _ = fs::remove_file(dir.join("owner.json"));
         }
+        let _ = sys::set_mtime_now(&self.activity_path);
         // A concurrent fork can keep cloned descriptors alive until exec; closing ours is not enough.
         release(&self._level, &self._slots);
         if let Some(log) = log {
@@ -597,6 +599,61 @@ pub fn dir_for(dirs: &Dirs, target_dir: &Path) -> PathBuf {
 
 pub fn slot_dir_for(dirs: &Dirs, target_dir: &Path, slot: &str) -> PathBuf {
     lock_dir(dirs, target_dir).join("slots").join(slot)
+}
+
+pub struct TargetMaintenanceGuard {
+    file: File,
+}
+
+impl TargetMaintenanceGuard {
+    pub fn activity(&self) -> io::Result<SystemTime> {
+        self.file.metadata()?.modified()
+    }
+}
+
+impl Drop for TargetMaintenanceGuard {
+    fn drop(&mut self) {
+        let _ = sys::unlock(&self.file);
+    }
+}
+
+/// None means no matching build-lock history; maintenance never creates or refreshes that history.
+pub fn target_activity(dirs: &Dirs, target: &Path) -> io::Result<Option<SystemTime>> {
+    let dir = lock_dir(dirs, target);
+    let recorded = match fs::read_to_string(dir.join("target")) {
+        Ok(recorded) => recorded,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if sys::canonicalize(Path::new(&recorded))? != sys::canonicalize(target)? {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(dir.join("lock")) {
+        Ok(meta) if meta.is_file() => meta.modified().map(Some),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn try_target_maintenance(dirs: &Dirs, target: &Path) -> io::Result<Option<TargetMaintenanceGuard>> {
+    if target_activity(dirs, target)?.is_none() {
+        return Ok(None);
+    }
+    let file = File::options().read(true).write(true).open(lock_dir(dirs, target).join("lock"))?;
+    match sys::try_lock(&file, LockKind::Exclusive) {
+        Ok(()) => {
+            let guard = TargetMaintenanceGuard { file };
+            let held = sys::fstat(&guard.file)?;
+            let named = sys::lstat(&lock_dir(dirs, target).join("lock"))?;
+            if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Ok(None);
+            }
+            Ok(Some(guard))
+        }
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 pub fn acquire(
@@ -844,7 +901,7 @@ fn take_ownership(
         followed: followed.is_some_and(|h| h.owner.pid == build.pid),
         build,
     });
-    BuildLock { _level: level, _slots: slot_files, slot_dirs, mode, holder, joined, last_publish: None, published: None, log }
+    BuildLock { _level: level, activity_path: dir.join("lock"), _slots: slot_files, slot_dirs, mode, holder, joined, last_publish: None, published: None, log }
 }
 
 fn remove_logs(dir: &Path) {

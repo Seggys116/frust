@@ -2,14 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache;
 use crate::compact::{self, Category};
 use crate::config::Config;
 use crate::fsx;
+use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::stats;
 use crate::sys::{self, LockKind, Meta};
@@ -25,6 +26,9 @@ const DEFERRED_MAX_AGE: Duration = Duration::from_secs(86_400);
 pub const AUTO_CHILD_FLAG: &str = "--auto-background";
 /// Room for an entry's directory and `meta.json` on top of the stored files when sizes come from the recorded byte counts.
 const ENTRY_OVERHEAD_BYTES: u64 = 8192;
+const AUTO_TARGET_RETIREMENTS: usize = 2;
+// Foreground sampling is bounded; detached and explicitly synchronous collectors drain complete candidates.
+const TARGET_SCAN_NODES: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -108,6 +112,7 @@ pub struct Plan {
     pub trim_ledger: bool,
     /// Lock directories are rechecked just before removal: a build may have started using one since planning.
     pub lock_max_idle: Duration,
+    target_retirements: HashMap<PathBuf, TargetRetirement>,
 }
 
 impl Plan {
@@ -141,8 +146,12 @@ pub fn plan(dirs: &Dirs, opts: &GcOptions) -> Plan {
 }
 
 pub fn plan_maintenance(dirs: &Dirs, opts: &GcOptions) -> Plan {
-    let mut plan = Plan { lock_max_idle: opts.lock_max_idle, ..Plan::default() };
+    let mut plan = Plan {
+        lock_max_idle: opts.lock_max_idle,
+        ..Plan::default()
+    };
     let evicted = plan_cache(dirs, opts, &mut plan, false);
+    plan_idle_targets(dirs, opts, &mut plan, AUTO_TARGET_RETIREMENTS);
     plan_scratch(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
     plan_target_temps(dirs, opts, &mut plan);
@@ -158,7 +167,7 @@ fn is_incremental_object(name: &str) -> bool {
     name.ends_with(".rcgu.o") && name.split('.').count() == 5 && !name.contains("-cgu.")
 }
 
-/// Every edit of a path crate stores a new entry under the same output names, so unbounded they bloat the cache; where rustc keeps no objects beside outputs (outside macOS) nothing is recognised.
+/// Explicit unit identities work on every platform; legacy entries are recognised by their incremental objects.
 pub fn superseded_incremental_entries(dirs: &Dirs, keep: usize) -> Vec<(PathBuf, u64)> {
     superseded_among(&scan_entries(dirs), keep)
 }
@@ -167,8 +176,14 @@ pub fn superseded_incremental_entries(dirs: &Dirs, keep: usize) -> Vec<(PathBuf,
 struct ScannedEntry {
     path: PathBuf,
     used: SystemTime,
-    unit: Option<Vec<String>>,
+    unit: Option<IncrementalUnit>,
     estimate: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum IncrementalUnit {
+    Explicit(String),
+    Legacy(Vec<String>),
 }
 
 /// Stored files are rounded up to blocks, so the sum errs high and never hides an entry over the cap.
@@ -176,16 +191,31 @@ fn estimate_entry_bytes(meta: &cache::EntryMeta) -> Option<u64> {
     if meta.files.is_empty() {
         return None;
     }
-    Some(ENTRY_OVERHEAD_BYTES + meta.files.iter().map(|f| f.bytes.div_ceil(4096) * 4096).sum::<u64>())
+    Some(
+        ENTRY_OVERHEAD_BYTES
+            + meta
+                .files
+                .iter()
+                .map(|f| f.stored_bytes.unwrap_or(f.bytes).div_ceil(4096) * 4096)
+                .sum::<u64>(),
+    )
 }
 
-fn unit_identity(meta: &cache::EntryMeta) -> Option<Vec<String>> {
+fn unit_identity(meta: &cache::EntryMeta) -> Option<IncrementalUnit> {
+    if let Some(unit) = &meta.incremental_unit {
+        return cache::valid_key(unit).then(|| IncrementalUnit::Explicit(unit.clone()));
+    }
     if !meta.files.iter().any(|f| is_incremental_object(&f.name)) {
         return None;
     }
-    let mut unit: Vec<String> = meta.files.iter().map(|f| f.name.clone()).filter(|n| !n.ends_with(".o") && !n.ends_with(".d")).collect();
+    let mut unit: Vec<String> = meta
+        .files
+        .iter()
+        .map(|f| f.name.clone())
+        .filter(|n| !n.ends_with(".o") && !n.ends_with(".d"))
+        .collect();
     unit.sort();
-    (!unit.is_empty()).then_some(unit)
+    (!unit.is_empty()).then_some(IncrementalUnit::Legacy(unit))
 }
 
 fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
@@ -213,7 +243,7 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
 }
 
 fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)> {
-    let mut units: HashMap<&Vec<String>, Vec<(SystemTime, &Path)>> = HashMap::new();
+    let mut units: HashMap<&IncrementalUnit, Vec<(SystemTime, &Path)>> = HashMap::new();
     for entry in scanned {
         if let Some(unit) = &entry.unit {
             units.entry(unit).or_default().push((entry.used, entry.path.as_path()));
@@ -277,14 +307,330 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
 }
 
 fn plan_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
+    plan_idle_targets(dirs, opts, plan, usize::MAX);
     for target in stats::targets(dirs) {
-        if !target.root_exists || target.idle > opts.target_max_idle {
-            plan.removals.push(Removal { class: Class::TargetDir, path: target.path, bytes: target.allocated_bytes });
+        if !target_path_safe(dirs, &target.path).unwrap_or(false) {
             continue;
         }
-        let Ok(profiles) = fs::read_dir(&target.path) else { continue };
+        if plan.target_retirements.contains_key(&target.path) {
+            continue;
+        }
+        let Ok(profiles) = fs::read_dir(&target.path) else {
+            continue;
+        };
         for profile in profiles.flatten() {
             plan_profile(&profile.path(), opts, plan);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetRetirement {
+    identity: (u64, u64),
+    layout: Vec<(PathBuf, u64, u64)>,
+    profiles: Vec<PathBuf>,
+    activity: SystemTime,
+    idle: Duration,
+    bytes: u64,
+    bounded: bool,
+}
+
+fn old_enough(time: SystemTime, idle: Duration) -> bool {
+    SystemTime::now()
+        .duration_since(time)
+        .is_ok_and(|age| age > idle)
+}
+
+fn idle_target_candidates(dirs: &Dirs, idle: Duration) -> Vec<(SystemTime, PathBuf)> {
+    let mut candidates = Vec::new();
+    let Ok(workspaces) = fs::read_dir(dirs.targets()) else {
+        return candidates;
+    };
+    for workspace in workspaces
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+    {
+        let Ok(targets) = fs::read_dir(workspace.path()) else {
+            continue;
+        };
+        for target in targets
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        {
+            let path = target.path();
+            if let Ok(Some(activity)) = lock::target_activity(dirs, &path)
+                && old_enough(activity, idle)
+            {
+                candidates.push((activity, path));
+            }
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+fn plan_idle_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, limit: usize) {
+    let mut candidates = idle_target_candidates(dirs, opts.target_max_idle);
+    if limit != usize::MAX && !candidates.is_empty() {
+        let offset = (fsx::unix_now() / 86_400) as usize % candidates.len();
+        candidates.rotate_left(offset);
+    }
+    let attempts = limit.saturating_mul(4);
+    let mut planned = 0;
+    for (_, target) in candidates.into_iter().take(attempts) {
+        let Ok(Some(snapshot)) =
+            retirement_snapshot(dirs, &target, opts.target_max_idle, limit != usize::MAX)
+        else {
+            continue;
+        };
+        if snapshot.bytes == 0 {
+            continue;
+        }
+        plan.removals.push(Removal {
+            class: Class::TargetDir,
+            path: target.clone(),
+            bytes: snapshot.bytes,
+        });
+        plan.target_retirements.insert(target, snapshot);
+        planned += 1;
+        if planned == limit {
+            break;
+        }
+    }
+}
+
+fn target_path_safe(dirs: &Dirs, target: &Path) -> io::Result<bool> {
+    if !sys::lstat(target)?.is_dir()
+        || !sys::lstat(&dirs.targets()).is_ok_and(|m| m.is_dir())
+        || target.parent().and_then(Path::parent) != Some(dirs.targets().as_path())
+        || !target
+            .parent()
+            .is_some_and(|p| sys::lstat(p).is_ok_and(|m| m.is_dir()))
+        || !sys::canonicalize(target)?.starts_with(sys::canonicalize(&dirs.targets())?)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn retirement_snapshot(
+    dirs: &Dirs,
+    target: &Path,
+    idle: Duration,
+    bounded: bool,
+) -> io::Result<Option<TargetRetirement>> {
+    if !target_path_safe(dirs, target)? {
+        return Ok(None);
+    }
+    let root = sys::lstat(target)?;
+    let Some(activity) = lock::target_activity(dirs, target)? else {
+        return Ok(None);
+    };
+    if !old_enough(activity, idle) {
+        return Ok(None);
+    }
+    let mut layout = Vec::new();
+    let mut profiles = Vec::new();
+    for child in fs::read_dir(target)? {
+        let child = child?;
+        let meta = sys::lstat(&child.path())?;
+        layout.push((child.path(), meta.dev(), meta.ino()));
+        if bounded && layout.len() > 256 {
+            return Ok(None);
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        if child.path().join("deps").is_dir() {
+            profiles.push(child.path());
+        } else {
+            for nested in fs::read_dir(child.path())? {
+                let nested = nested?;
+                let meta = sys::lstat(&nested.path())?;
+                layout.push((nested.path(), meta.dev(), meta.ino()));
+                if bounded && layout.len() > 256 {
+                    return Ok(None);
+                }
+                if meta.is_dir() && nested.path().join("deps").is_dir() {
+                    profiles.push(nested.path());
+                }
+            }
+        }
+    }
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+    layout.sort();
+    profiles.sort();
+    let mut newest = activity;
+    let mut bytes = 0u64;
+    let mut seen = HashSet::new();
+    let mut nodes = if bounded {
+        TARGET_SCAN_NODES
+    } else {
+        usize::MAX
+    };
+    let deadline = bounded.then(|| Instant::now() + Duration::from_millis(250));
+    for profile in &profiles {
+        if !profile_contents_known(profile, &mut nodes, deadline)? {
+            return Ok(None);
+        }
+        for child in fs::read_dir(profile)? {
+            let child = child?;
+            if cargo_lock_name(&child.file_name()) {
+                continue;
+            }
+            if !scan_retirement_activity(
+                &child.path(),
+                &mut newest,
+                &mut bytes,
+                &mut seen,
+                &mut nodes,
+                deadline,
+            )? {
+                return Ok(None);
+            }
+            if ["deps", ".fingerprint"].iter().any(|name| child.file_name() == *name) {
+                bytes = bytes.saturating_sub(sys::lstat(&child.path())?.allocated());
+            }
+        }
+    }
+    if !old_enough(newest, idle) {
+        return Ok(None);
+    }
+    Ok(Some(TargetRetirement {
+        identity: (root.dev(), root.ino()),
+        layout,
+        profiles,
+        activity,
+        idle,
+        bytes,
+        bounded,
+    }))
+}
+
+fn cargo_lock_name(name: &std::ffi::OsStr) -> bool {
+    [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"]
+        .iter()
+        .any(|known| name == *known)
+}
+
+fn retirement_scan_budget(nodes: &mut usize, deadline: Option<Instant>) -> bool {
+    if *nodes == 0 || deadline.is_some_and(|end| Instant::now() >= end) {
+        return false;
+    }
+    *nodes -= 1;
+    true
+}
+
+fn profile_contents_known(
+    profile: &Path,
+    nodes: &mut usize,
+    deadline: Option<Instant>,
+) -> io::Result<bool> {
+    if !sys::lstat(&profile.join("deps")).is_ok_and(|m| m.is_dir())
+        || !sys::lstat(&profile.join(".fingerprint")).is_ok_and(|m| m.is_dir())
+    {
+        return Ok(false);
+    }
+    let mut deps_inodes = HashSet::new();
+    for entry in fs::read_dir(profile.join("deps"))? {
+        if !retirement_scan_budget(nodes, deadline) {
+            return Ok(false);
+        }
+        let meta = sys::lstat(&entry?.path())?;
+        if meta.is_file() {
+            deps_inodes.insert((meta.dev(), meta.ino()));
+        }
+    }
+    for child in fs::read_dir(profile)? {
+        if !retirement_scan_budget(nodes, deadline) {
+            return Ok(false);
+        }
+        let child = child?;
+        let name = child.file_name();
+        if cargo_lock_name(&name) {
+            if !sys::lstat(&child.path())?.is_file() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let meta = sys::lstat(&child.path())?;
+        if meta.is_dir()
+            && ["deps", ".fingerprint", "incremental", "build", "examples"]
+                .iter()
+                .any(|known| name == *known)
+        {
+            continue;
+        }
+        if meta.is_file() && deps_inodes.contains(&(meta.dev(), meta.ino())) {
+            continue;
+        }
+        if meta.is_file() && name.to_string_lossy().ends_with(".d") {
+            let binary = name
+                .to_string_lossy()
+                .strip_suffix(".d")
+                .unwrap()
+                .to_string();
+            if sys::lstat(&profile.join(binary))
+                .is_ok_and(|m| deps_inodes.contains(&(m.dev(), m.ino())))
+            {
+                continue;
+            }
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn scan_retirement_activity(
+    path: &Path,
+    newest: &mut SystemTime,
+    bytes: &mut u64,
+    seen: &mut HashSet<(u64, u64)>,
+    nodes: &mut usize,
+    deadline: Option<Instant>,
+) -> io::Result<bool> {
+    type DirectoryFrame = (PathBuf, (u64, u64), fs::ReadDir);
+    let mut pending = Some(path.to_path_buf());
+    let mut directories: Vec<DirectoryFrame> = Vec::new();
+    loop {
+        if let Some(path) = pending.take() {
+            if !retirement_scan_budget(nodes, deadline) {
+                return Ok(false);
+            }
+            let meta = sys::lstat(&path)?;
+            if !meta.file_type().is_symlink() && !meta.is_file() && !meta.is_dir() {
+                return Ok(false);
+            }
+            *newest = (*newest).max(meta.modified()?);
+            let identity = (meta.dev(), meta.ino());
+            let first = seen.insert(identity);
+            if first {
+                *bytes = bytes.saturating_add(meta.allocated());
+            }
+            if meta.is_dir() {
+                if !first {
+                    return Ok(false);
+                }
+                let children = fs::read_dir(&path)?;
+                directories.push((path, identity, children));
+            }
+        }
+        while let Some((_, _, entries)) = directories.last_mut() {
+            if let Some(child) = entries.next() {
+                pending = Some(child?.path());
+                break;
+            }
+            let (directory, identity, _) = directories.pop().unwrap();
+            let after = sys::lstat(&directory)?;
+            if !after.is_dir() || (after.dev(), after.ino()) != identity {
+                return Ok(false);
+            }
+            *newest = (*newest).max(after.modified()?);
+        }
+        if pending.is_none() {
+            return Ok(true);
         }
     }
 }
@@ -645,6 +991,15 @@ fn lock_dir_stale(dir: &Path, max_idle: Duration) -> bool {
     if !meta.is_dir() || !sys::owned_by_me(dir) {
         return false;
     }
+    if let Ok(recorded) = fs::read_to_string(dir.join("target")) {
+        let target = Path::new(&recorded);
+        if target.exists()
+            && let Some(home) = dir.parent().and_then(Path::parent)
+            && target.starts_with(home.join("targets"))
+        {
+            return false;
+        }
+    }
     let lock = dir.join("lock");
     if lock.exists() && flock_held(&lock) != Some(false) {
         return false;
@@ -756,14 +1111,30 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
     // Cargo's locks stay held on each profile for the rest of the run, and variants are rechecked under them.
     let mut profiles: HashMap<PathBuf, Option<ProfileGuard>> = HashMap::new();
     for removal in &plan.removals {
-        if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession)
-            && let Some(profile) = compact::profile_of(&removal.path)
-        {
-            let guard = profiles.entry(profile.clone()).or_insert_with(|| ProfileGuard::acquire(&profile));
+        let mut incremental_root = None;
+        if removal.class == Class::TargetDir {
+            if let Some(snapshot) = plan.target_retirements.get(&removal.path) {
+                let mut bytes = 0;
+                let result = retire_target(dirs, &removal.path, snapshot, &mut bytes);
+                freed += bytes;
+                if let Err(error) = result {
+                    failures.push((removal.path.clone(), error));
+                }
+            }
+            continue;
+        }
+        if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession) {
+            let Some(profile) = compact::profile_of(&removal.path) else { continue };
+            let guard = profiles
+                .entry(profile.clone())
+                .or_insert_with(|| ProfileGuard::acquire(&profile));
             let Some(guard) = guard else {
                 failures.push((
                     removal.path.clone(),
-                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "a build holds this target directory; skipped"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "a build holds this target directory; skipped",
+                    ),
                 ));
                 continue;
             };
@@ -773,6 +1144,10 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             if removal.class == Class::IncrementalSession && !guard.incremental.contains(&removal.path) {
                 continue;
             }
+            let root = profile.join("incremental");
+            if removal.path.starts_with(&root) {
+                incremental_root = Some(root);
+            }
         }
         // A build may have started using a lock directory since planning.
         if removal.class == Class::Metadata
@@ -781,7 +1156,11 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
         {
             continue;
         }
-        match fsx::remove_any(&removal.path) {
+        let result = match incremental_root {
+            Some(root) => compact::remove_incremental_payload(&root, &removal.path),
+            None => fsx::remove_any(&removal.path),
+        };
+        match result {
             Ok(()) => freed += removal.bytes,
             Err(err) => failures.push((removal.path.clone(), err)),
         }
@@ -794,6 +1173,59 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
         let _ = fsx::write_atomic(&dirs.ledger(), trimmed.as_bytes());
     }
     (freed, failures)
+}
+
+fn retire_target(dirs: &Dirs, target: &Path, expected: &TargetRetirement, freed: &mut u64) -> io::Result<()> {
+    if !target_path_safe(dirs, target)? {
+        return Ok(());
+    }
+    let Some(guard) = lock::try_target_maintenance(dirs, target)? else {
+        return Ok(());
+    };
+    if guard.activity()? != expected.activity {
+        return Ok(());
+    }
+    let mut profile_locks = Vec::new();
+    for profile in &expected.profiles {
+        let meta = sys::lstat(profile)?;
+        if !meta.is_dir()
+            || !expected
+                .layout
+                .contains(&(profile.clone(), meta.dev(), meta.ino()))
+        {
+            return Ok(());
+        }
+        let Some(profile_lock) = compact::ProfileLock::try_acquire(profile) else {
+            return Ok(());
+        };
+        profile_locks.push(profile_lock);
+    }
+    let Some(current) = retirement_snapshot(dirs, target, expected.idle, expected.bounded)? else {
+        return Ok(());
+    };
+    if &current != expected || guard.activity()? != expected.activity {
+        return Ok(());
+    }
+    for profile in &expected.profiles {
+        let report = compact::prune_expired_incremental(profile, expected.idle);
+        *freed = freed.saturating_add(report.removed_bytes).min(expected.bytes);
+        if let Some((path, error)) = report.errors.first() {
+            return Err(io::Error::other(format!("incremental retirement {}: {error}", path.display())));
+        }
+    }
+    let Some(current) = retirement_snapshot(dirs, target, expected.idle, expected.bounded)? else { return Ok(()) };
+    if current.identity != expected.identity || current.layout != expected.layout
+        || current.profiles != expected.profiles || current.activity != expected.activity
+        || guard.activity()? != expected.activity
+    {
+        return Ok(());
+    }
+    compact::remove_profile_payloads_with(&expected.profiles, |_, bytes| {
+        *freed = freed.saturating_add(bytes).min(expected.bytes);
+    })?;
+    drop(profile_locks);
+    drop(guard);
+    Ok(())
 }
 
 struct ProfileGuard {
@@ -826,8 +1258,7 @@ impl ProfileGuard {
     }
 }
 
-/// The marker flock lets exactly one of several concurrent processes claim the day's collection, and a crashed claimant releases it with its process.
-/// The claim is made before anything is spawned, so concurrent builds start one collector between them; the collector itself runs detached unless `FRUST_GC_SYNC` asks for it inline.
+/// Claims daily collection under a process-held lock before spawning; FRUST_GC_SYNC runs it inline.
 pub fn maybe_auto_gc(dirs: &Dirs, cfg: &Config) -> bool {
     let marker = dirs.auto_gc_marker();
     if mtime_age(&marker).is_some_and(|age| age < AUTO_GC_EVERY) || !dirs.root().is_dir() {
@@ -852,14 +1283,52 @@ pub fn maybe_auto_gc(dirs: &Dirs, cfg: &Config) -> bool {
         if spawn_collector(dirs, cfg) {
             return true;
         }
+        let Ok(file) = File::options().read(true).write(true).open(&marker) else {
+            return false;
+        };
+        if sys::try_lock(&file, LockKind::Exclusive).is_err() {
+            return false;
+        }
+        run_maintenance(dirs, cfg, false);
+        let _ = file.set_len(0);
+        let _ = file.set_modified(SystemTime::UNIX_EPOCH);
+        return true;
     }
-    run_maintenance(dirs, cfg);
+    run_maintenance(dirs, cfg, true);
+    let _ = file.set_modified(SystemTime::now());
     true
 }
 
-fn run_maintenance(dirs: &Dirs, cfg: &Config) {
-    let plan = plan_maintenance(dirs, &GcOptions::new(cfg.cache_max_bytes));
+fn drain_idle_targets(dirs: &Dirs, opts: &GcOptions) {
+    let candidates = idle_target_candidates(dirs, opts.target_max_idle);
+    for batch in candidates.chunks(AUTO_TARGET_RETIREMENTS) {
+        let mut plan = Plan::default();
+        for (_, target) in batch {
+            let Ok(Some(snapshot)) = retirement_snapshot(dirs, target, opts.target_max_idle, false)
+            else {
+                continue;
+            };
+            if snapshot.bytes == 0 {
+                continue;
+            }
+            plan.removals.push(Removal {
+                class: Class::TargetDir,
+                path: target.clone(),
+                bytes: snapshot.bytes,
+            });
+            plan.target_retirements.insert(target.clone(), snapshot);
+        }
+        let _ = execute_removals(dirs, &plan);
+    }
+}
+
+fn run_maintenance(dirs: &Dirs, cfg: &Config, drain: bool) {
+    let opts = GcOptions::new(cfg.cache_max_bytes);
+    let plan = plan_maintenance(dirs, &opts);
     let _ = execute_removals(dirs, &plan);
+    if drain {
+        drain_idle_targets(dirs, &opts);
+    }
     let _ = cache::sweep_evicted(dirs, EVICTED_MIN_AGE);
 }
 
@@ -870,7 +1339,9 @@ pub fn run_auto_child(dirs: &Dirs, cfg: &Config) -> i32 {
     if sys::try_lock(&file, LockKind::Exclusive).is_err() {
         return 0;
     }
-    compact::at_background_priority(|| run_maintenance(dirs, cfg));
+    compact::at_background_priority(|| run_maintenance(dirs, cfg, true));
+    let _ = file.set_len(1);
+    let _ = file.set_modified(SystemTime::now());
     0
 }
 
@@ -972,6 +1443,35 @@ mod tests {
     }
 
     #[test]
+    fn encoded_entry_budgets_use_stored_allocation_instead_of_artifact_size() {
+        let home = home("encoded-sizes");
+        let dirs = Dirs::at(&home);
+        let path = store_entry(
+            &home,
+            &format!("aa{}", "3".repeat(38)),
+            &[("f0", 4096)],
+            5000,
+        );
+        let meta_path = path.join("meta.json");
+        let mut meta: cache::EntryMeta =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta.files[0].bytes = 100 * 1024 * 1024;
+        meta.files[0].encoding = cache::payload::Encoding::Lz4BlocksV1;
+        meta.files[0].stored_bytes = Some(fsx::allocated_size(&path.join("f0")));
+        meta.files[0].decoded_bytes = Some(meta.files[0].bytes);
+        meta.files[0].content_hash = Some("ab".repeat(32));
+        assert_eq!(
+            estimate_entry_bytes(&meta),
+            Some(ENTRY_OVERHEAD_BYTES + 4096)
+        );
+        fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let options = GcOptions::new(32 * 1024);
+        assert!(cache_removals(&plan_maintenance(&dirs, &options)).is_empty());
+        assert!(cache_removals(&plan(&dirs, &options)).is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn only_entries_beyond_the_newest_two_of_an_incremental_unit_are_superseded() {
         let home = home("superseded");
         let dirs = Dirs::at(&home);
@@ -984,5 +1484,52 @@ mod tests {
         assert_eq!(superseded, vec![oldest]);
         assert!(middle.exists() && newest.exists() && plain.exists());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_incremental_units_keep_two_states_without_mixing_other_units_or_legacy_entries() {
+        let home = home("explicit-units");
+        let dirs = Dirs::at(&home);
+        let files = [("libx-0123456789abcdef.rlib", 100)];
+        let mut entries = Vec::new();
+        for i in 0..7 {
+            let path = store_entry(&home, &format!("{i:040x}"), &files, (7 - i) * 1000);
+            let meta_path = path.join("meta.json");
+            let modified = fs::metadata(&meta_path).unwrap().modified().unwrap();
+            let mut meta: cache::EntryMeta =
+                serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            assert!(
+                meta.incremental_unit.is_none(),
+                "legacy metadata defaults to no explicit unit"
+            );
+            meta.incremental_unit = match i {
+                0..=3 => Some("ab".repeat(20)),
+                4 => Some("cd".repeat(20)),
+                5 => Some("invalid".to_string()),
+                _ => None,
+            };
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            File::options()
+                .write(true)
+                .open(&meta_path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            entries.push(path);
+        }
+        let superseded: Vec<_> = superseded_incremental_entries(&dirs, 2)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(superseded, entries[..2]);
+        assert!(entries[2..].iter().all(|path| path.exists()));
+        let meta: cache::EntryMeta =
+            serde_json::from_slice(&fs::read(entries[3].join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.incremental_unit, Some("ab".repeat(20)));
+        assert_ne!(
+            IncrementalUnit::Explicit("ab".repeat(20)),
+            IncrementalUnit::Legacy(vec!["ab".repeat(20)])
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 }

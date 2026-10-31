@@ -8,6 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use common::{Sandbox, stderr, stdout};
 
@@ -111,7 +112,39 @@ fn run_update(sb: &Sandbox, install: &Path, release: &Release, args: &[&str]) ->
         .env("FRUST_UPDATE_API_URL", &release.api_url)
         .env("FRUST_UPDATE_DOWNLOAD_BASE", &release.base_url)
         .stdin(Stdio::null());
-    cmd.output().unwrap()
+    copied_output(&mut cmd).unwrap()
+}
+
+fn copied_output(cmd: &mut Command) -> std::io::Result<Output> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match cmd.output() {
+            // A parallel fork can briefly inherit a writable descriptor to the fixture's copied executable.
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_copied_executable_waits_for_a_writable_handle_to_close() {
+    let sb = Sandbox::new("update-busy");
+    let install = make_install(&sb);
+    let exe = install.join("frust");
+    let writable = fs::OpenOptions::new().write(true).open(&exe).unwrap();
+    assert_eq!(Command::new(&exe).arg("--version").output().unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        drop(writable);
+    });
+    let out = copied_output(Command::new(&exe).arg("--version")).unwrap();
+    release.join().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let missing = copied_output(&mut Command::new(install.join("missing"))).unwrap_err();
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
 }
 
 fn assert_replaced(install: &Path) {

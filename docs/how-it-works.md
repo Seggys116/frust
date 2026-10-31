@@ -17,13 +17,16 @@ The cache uses a two-step key, the same idea as ccache's direct mode.
 So an edited dependency, a changed `option_env!` value, a different feature set, profile, flag or compiler
 all miss. Nothing is cached when it cannot be done safely:
 
-* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (at most 4 entries per unit; a hit leaves no incremental session, so the first edit after a restore compiles that crate and its dependents in full; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
+* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (at most 4 entries per unit, reduced to the newest 2 by maintenance on every platform; a hit leaves no incremental session, so the first edit after a restore compiles that crate and its dependents in full; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
 * anything with `--print`, unknown `--emit` kinds, stdin input, response files or non-UTF-8 arguments,
 * tool chains such as `clippy-driver rustc ...`,
 * (workspace packages you are building are cached too when non-incremental, i.e. release builds; `FRUST_CACHE_PRIMARY=off` disables this.)
 * (Incrementally compiled units in unoptimised dev builds are cached, keyed without the session directory and without `CARGO_PRIMARY_PACKAGE`, so `-p` and whole-workspace builds share entries, and kept apart from non-incremental entries. Their outputs are functionally equivalent but not byte-identical to a non-incremental build. Release builds are non-incremental, so release byte-identity is unaffected. `FRUST_CACHE_INCREMENTAL=off` disables this.)
 
 Because rustc flags are hashed as opaque text, new flags in future compilers need no support.
+
+New incremental entries record their existing unit identity in metadata for portable retention. Older entries
+remain readable and retain the object-name fallback; entries without either identity keep their existing limit.
 
 If a `RUSTC_WRAPPER` is already set (for example `sccache`), frust leaves it in place and the compile cache
 stays inactive. `frust doctor` says so.
@@ -63,16 +66,21 @@ Related lookup behaviour:
 
 * Candidates are verified newest first: inputs without a recorded stamp, then by descending recorded modification
   time, because an edited file is the likeliest mismatch and ends a failing check early. A candidate with more than
-  16 inputs is verified by four threads.
+  16 inputs can use up to four workers, subject to the foreground worker budget below.
 * A candidate whose cache entry was evicted is skipped before any of its inputs is read.
 * On Unix, files of 1 MiB or more under the cargo registry sources or git checkouts, which nobody edits in
-  place, that have been untouched for the settle margin are hashed through a memory map, and files of 4 MiB or
-  more with rayon's thread pool. Every other file is read, because truncating a mapped file faults the reader.
+  place, that have been untouched for the settle margin are hashed through a memory map. Hashing each file stays
+  serial; parallelism comes from the bounded workers across files. Every other file is read, because truncating
+  a mapped file faults the reader.
   Windows always reads, because a mapped file cannot be replaced or deleted there and cargo does both to its
   outputs.
 * Pre-key hashing of more than eight `--extern` inputs runs in parallel, with ordered key assembly. Workers are capped at four and half the available CPU count; smaller sets stay sequential.
-* A manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
-  format number (currently 3); one in another format is ignored and rewritten.
+* Foreground hashing, candidate verification, output storage and restores share the same worker policy. With an
+  inherited Cargo jobserver, the caller uses its existing slot and each additional worker needs a token acquired
+  without waiting. If none is available, work stays on the caller. Without a jobserver, CPU and worker-count caps
+  still apply. Detached stores run serially and do not borrow Cargo tokens.
+* A current-format manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
+  format number: new writes use 4, legacy format 3 remains readable, and other formats are ignored and rewritten.
 * Evicting an entry is one rename into `tmp/evicted` under `FRUST_HOME`, so a concurrent restore fails cleanly
   and recompiles; `frust gc` and the daily maintenance delete such entries once they are an hour old.
 
@@ -101,34 +109,81 @@ dependency), only one should compile it.
 So the entry for a crate can appear a moment after cargo has moved on. A build started in that moment simply
 misses or waits on the key lock.
 
+## Cache payload storage
+
+`FRUST_CACHE_COMPRESSION=auto` is the default. New regular-file payloads are compressed with LZ4 only on Linux
+when a probe on the cache filesystem finds that reflinks do not work. Reflink-capable cache filesystems and other
+platforms keep raw payloads. Files smaller than 64 KiB stay raw, and a compressed file is kept only when it saves
+at least 12.5 percent and 4 KiB. Dep-info, stderr and directory bundles stay raw. The codec is pure Rust and needs
+no external compression program.
+
+Restores decode bounded 1 MiB blocks and check the exact decoded length, content hash and end of the payload
+before replacing the destination. Original file permissions, including executable bits, are preserved. Damaged
+or truncated payloads fail the restore, allowing another candidate or the compiler to supply the outputs.
+
+`FRUST_CACHE_COMPRESSION=off` changes new writes only; existing compressed entries can still be restored. Legacy
+raw entries remain readable without conversion. New manifests use format 4 so older readers ignore them, and
+encoded entries use a separate key domain from the keys older writers compute.
+
 ## Smaller build directories
 
 * Opt-in `FRUST_TUNE=on` builds dependencies without debug info in dev profiles (about a tenth smaller, no
   compile-time cost). `line-tables-only` was measured to be both slower and larger, so it is not used. Skipped
   when your project or cargo config defines any profile.
-* Reused artifacts are copy-on-write clones on APFS (macOS), btrfs and XFS (Linux) and ReFS, including Dev Drive
-  (Windows). Elsewhere they are copied.
-* Automatic compaction (after successful builds, `FRUST_AUTO_COMPACT`) removes artifacts no current fingerprint references, keeps the newest incremental session of every crate (so edit builds stay incremental) and keeps the other profile warm for `FRUST_COMPACT_KEEP_DAYS`. Cargo sees every unit as fresh afterwards, and anything removed that the compile cache holds comes back as a restore. On macOS it also compresses idle files with APFS transparent compression (verified byte-for-byte on write) and deduplicates identical files as clones; those two steps exist only on macOS.
-* Automatic compaction is synchronous but cheap when there is nothing to do. It runs after the build's summary and
-  lock hand-off, on a thread at background CPU and I/O priority, and at most once every 10 minutes per target
-  directory. Between hourly reassessments, it is skipped when a change signature (modification times and entry
-  names of a few directories per profile, plus the number of cache entries) matches the last complete pass, or
-  when the target grew by less than 64 MiB since then. Once an hour has elapsed since the last actual pass,
+* Raw artifacts are restored as copy-on-write clones where supported, including APFS (macOS), btrfs and XFS
+  (Linux) and ReFS, including Dev Drive (Windows). Elsewhere they are copied. Encoded payloads are restored to
+  ordinary compiler artifacts with their original bytes and permissions.
+* Cache and target budgets are separate. The cache budget counts the allocation of stored payloads, while the
+  target budget counts the restored target tree. Consider both when comparing disk use; shared reflink blocks
+  can be counted in both trees when their reported allocations are added.
+* Automatic compaction (after successful builds, `FRUST_AUTO_COMPACT`) reclaims superseded artifacts and completed
+  stale incremental sessions while preserving current outputs and fresh incremental state. Other profiles stay
+  warm for `FRUST_COMPACT_KEEP_DAYS`. Retiring a profile preserves its directory, `deps` and `.fingerprint` roots,
+  and Cargo lock files, so processes waiting on those locks keep the same identities. Preserved root modification
+  times are restored through opened handles on success, error or unwinding, so an interrupted removal can be retried.
+  On macOS compaction also
+  compresses idle files with APFS transparent compression (verified byte-for-byte on write) and deduplicates
+  identical files as clones; those two steps exist only on macOS.
+* Cache coverage is checked while holding the profile locks. APFS clone groups provide a fast proof; elsewhere,
+  frust compares complete contents and permissions against raw entries or verifies matching encoded payloads.
+  Proofs are reused only while file stamps match and are bounded per pass by time, bytes read and decoded, and
+  the number of remembered files. A missing or damaged payload, mismatch or exhausted budget leaves coverage
+  unproven, so the existing age rules decide what can be removed. Current outputs and fresh incremental sessions
+  keep their existing protection.
+* Automatic compaction is synchronous but cheap when there is nothing to do. It runs after Cargo exits and before
+  the build lock is handed to a waiter, at background CPU and I/O priority. A completed pass is throttled for
+  10 minutes per target; an incomplete pass retries after 30 seconds. Cargo profile locks are taken without
+  waiting, so another active build is skipped. Between hourly reassessments, a completed pass can be skipped when
+  a change signature (modification times and entry names of a few directories per profile, plus the number of cache
+  entries) matches the last complete pass, or when the target grew by less than 64 MiB since then. Once an hour has
+  elapsed since the last completed full pass,
   the next due check reassesses idle sessions, expired profiles and settled files even without further growth.
-  A pass that skipped a busy profile, hit its budget or encountered an error stays incomplete and is retried
-  when next due. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files
-  that did not compress; compressibility is judged from a sample of two 64 KiB blocks, and a file that would save
+  A busy profile, exhausted work budget or error leaves a pass incomplete without resetting that successful-pass
+  time. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files that did not
+  compress; compressibility is judged from a sample of two 64 KiB blocks, and a file that would save
   less than 5 percent is left alone. The dedupe and compression stage stops after 2 seconds or 512 MiB of work per
   pass, and the next due pass continues. Explicit `frust compact` has no budget.
 * Dead incremental directories (those of a configuration nobody builds any more) are recognised by the codegen
   units they hold. Besides rlib members and object files, frust reads the DWARF string tables of ELF binaries
   (Linux) for rustc's `<source>/@/<codegen unit>` names, so binaries whose objects are gone are still matched.
-* `frust gc` removes superseded artifact variants, stale incremental sessions, idle target directories and
-  entries over the cache budget (`FRUST_CACHE_MAX_GIB`, default 16). A lighter version runs automatically at most
-  once a day, started by the next `fcargo` command in a detached background process (`FRUST_GC_SYNC=1` runs it
-  inline). It covers the cache budget, scratch and temporary files and metadata, not idle target directories or
-  stale variants, and it sizes cache entries from their recorded byte counts, measuring them only when the cache is
-  over its budget. An explicit `frust gc` measures every entry.
+* `frust gc` removes superseded artifact variants, stale incremental sessions, eligible idle central-target
+  payloads and entries over the cache budget (`FRUST_CACHE_MAX_GIB`, default 16). Daily automatic GC covers the
+  cache budget, scratch and temporary files, metadata and central-target retirement. It sizes cache entries from
+  recorded stored allocations (legacy entries use their existing byte counts), measuring them only when the
+  cache is over its budget. An explicit `frust gc` measures every entry.
+* A central target becomes eligible for payload retirement after 30 days without activity. If the detached
+  collector cannot start, foreground fallback examines at most eight candidates and retires at most two targets,
+  with bounded activity scans. The daily detached collector drains eligible targets using a
+  complete iterative activity scan that does not follow symlinks, with no fixed per-day target-count limit.
+  `FRUST_GC_SYNC=1` performs that drain inline. The cache is scanned once per collection.
+  Before deletion, activity and layout are revalidated under an exclusive frust target guard and all
+  Cargo profile locks. Expired finalized incremental reuse data is pruned in bounded batches first, so a long build
+  history does not require every historical session lock to be held at once. A busy compiler session retains its
+  own state and prevents retirement of every program output; other expired reuse data can still be reclaimed.
+  Activity and layout are checked again after pruning, and the remaining profiles are admitted together under
+  compiler-compatible session guards before program outputs are removed. Target/profile directories, `deps` and
+  `.fingerprint` roots, and Cargo lock files remain. Fresh activity, unreadable state and unknown or user-managed layouts
+  are preserved.
 
 ## Sharing a repo between builds
 
@@ -144,7 +199,8 @@ misses or waits on the key lock.
 * Builds in the same profile with different commands (`check` then `build`, `-p a` then `-p b`) queue in order.
   Cargo serialises them on its own lock anyway; the queue shows who you are waiting for.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
-  busy, so running them during builds cannot break a build. `tests/stress.rs` runs eight builds against
+  busy. Maintenance reserves all canonical Cargo profile lock names, including missing ones, so different Cargo
+  versions cannot bypass each other's lock files. `tests/stress.rs` runs eight builds against
   continuous compaction and gc.
 * Queued builds subscribe to directory changes through kqueue on macOS and inotify on Linux, waking promptly when
   ownership or queue state changes. Notifications are hints: FIFO checks and OS locks still decide ownership.
@@ -158,13 +214,32 @@ misses or waits on the key lock.
 
 ## Incremental data and compaction
 
-Plain cargo keeps stale incremental sessions, whole incremental directories of configurations nobody uses
-any more, and a hard-linked object alias for every incremental compile that is never removed. Measured over 200
-edits with feature toggles, cargo's target grew from 122 MiB to 295 MiB. With automatic compaction frust's target
-stays flat (about 83-88 MiB), and the next build after compaction is a no-op. Compaction keeps the newest session of
-every crate, so edit builds remain incremental, and compresses files by category: only the categories that
-measured a latency cost (proc-macro dylibs, executables) wait an hour before being compressed.
-`frust bench --growth` and `frust bench --latency` reproduce these measurements.
+Completed stale sessions are reclaimed while fresh current state stays available for edits. Dead configurations
+can be recognised through their objects and codegen-unit names. Metadata-only check builds have no such object
+proof, so their ownership remains unknown. Their completed reuse data can still expire after
+`FRUST_COMPACT_INCREMENTAL_IDLE_DAYS` (7 days by default), even without a matching cache entry. A sole newest
+unknown directory has no permanent exemption. All entries and modification times must be readable and settled;
+working state, object files, symlinks and uncertain timestamps decline this expiry path.
+
+With the defaults, target-budget pressure can reclaim safe metadata-only reuse state after one hour rather than
+waiting seven days. Fresh sessions and necessary live outputs remain protected. Cache coverage can permit earlier
+reclamation of known superseded outputs, but missing or corrupt cache entries do not disable the ordinary age rules.
+The 8 GiB target budget is soft: current outputs, fresh or uncertain state and busy profiles can leave a target
+above it. No cleanup policy here imposes a universal hard disk cap, and no work runs while frust is not invoked.
+
+Abandoned `-working` sessions and orphan session lock files have a separate one-hour grace for both modification
+and change times. Cleanup requires
+compiler-compatible session locks, rechecks file identities and siblings, and preserves recent, held, malformed
+or uncertain state. On Unix the guard covers both whole-file and POSIX record locking; Windows uses the compiler's
+whole-file locking range. Ordinary Cargo lock files are retained.
+
+Session payload directories are removed before their lock files. If payload removal fails, the remaining data
+keeps its lock identity so a later cleanup can validate and retry it safely.
+
+The [latest growth results](benchmarks.md) replay 200 edits across 12 local crates: Cargo used 371.1 MiB, while
+frust used 174.4 MiB of target allocation plus 64.5 MiB of cache allocation with automatic compression. That
+experiment assessed compaction after every build, rather than the default ten-minute interval. Its final unchanged
+rebuilds made zero compiler calls and cache events. These workload measurements are not a bound on other projects.
 
 ## Platforms
 

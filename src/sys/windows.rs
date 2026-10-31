@@ -353,6 +353,18 @@ pub fn unlock(file: &File) -> io::Result<()> {
     if err.raw_os_error() == Some(ERROR_NOT_LOCKED) { Ok(()) } else { Err(err) }
 }
 
+pub fn open_session_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+}
+
+pub fn try_lock_session(file: &File) -> io::Result<()> {
+    file.try_lock().map_err(io::Error::from)
+}
+
+pub fn unlock_session(file: &File) {
+    let _ = file.unlock();
+}
+
 pub fn with_mode(opts: &mut OpenOptions, _mode: u32) -> &mut OpenOptions {
     opts
 }
@@ -569,6 +581,10 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+}
+
+pub fn open_directory_for_times(path: &Path) -> io::Result<File> {
+    open_handle(path, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, true)
 }
 
 pub fn set_mtime_now(path: &Path) -> io::Result<()> {

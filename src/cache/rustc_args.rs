@@ -8,6 +8,8 @@ pub struct RustcArgs {
     pub crate_name: String,
     pub out_dir: PathBuf,
     pub extra_filename: String,
+    /// Without a disambiguating suffix, only explicit metadata-only libraries have a fixed output set.
+    pub metadata_only_library: bool,
     pub paths: Vec<(usize, PathArg)>,
     pub libs: Vec<NativeLib>,
     pub out_dir_args: Vec<usize>,
@@ -88,6 +90,8 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
     let mut out_dir = None;
     let mut extra_filename = String::new();
     let mut emit: Option<Vec<String>> = None;
+    let mut emit_occurrences = 0;
+    let mut crate_types = Vec::new();
     let mut paths = Vec::new();
     let mut libs = Vec::new();
     let mut out_dir_args = Vec::new();
@@ -122,10 +126,21 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
                 out_dir_args.push(i);
             }
             "--emit" => {
+                emit_occurrences += 1;
                 emit = next.map(split_list);
                 i += 1;
             }
-            _ if arg.starts_with("--emit=") => emit = Some(split_list(&arg["--emit=".len()..])),
+            _ if arg.starts_with("--emit=") => {
+                emit_occurrences += 1;
+                emit = Some(split_list(&arg["--emit=".len()..]));
+            }
+            "--crate-type" => {
+                if let Some(value) = next {
+                    crate_types.extend(split_list(value));
+                }
+                i += 1;
+            }
+            _ if arg.starts_with("--crate-type=") => crate_types.extend(split_list(&arg["--crate-type=".len()..])),
             "--extern" => {
                 if let Some((name, path)) = next.and_then(|v| v.split_once('=')) {
                     paths.push((i + 1, PathArg::Extern { name: name.to_string(), path: PathBuf::from(path) }));
@@ -189,7 +204,6 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
             _ if arg.starts_with("--target=") => paths.push((i, PathArg::Target(arg["--target=".len()..].to_string()))),
             "--cfg"
             | "--check-cfg"
-            | "--crate-type"
             | "--edition"
             | "--cap-lints"
             | "--json"
@@ -218,6 +232,8 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
         crate_name: crate_name.ok_or(Skip::NotACompile)?,
         out_dir: out_dir.ok_or(Skip::NotACompile)?,
         extra_filename,
+        metadata_only_library: emit_occurrences == 1 && emit.len() == 2 && emit.iter().any(|e| e == "metadata")
+            && !crate_types.is_empty() && crate_types.iter().all(|kind| matches!(kind.as_str(), "lib" | "rlib")),
         paths,
         libs,
         out_dir_args,
@@ -356,6 +372,40 @@ mod tests {
         let mut args = BASE.to_vec();
         args.extend(extra);
         parse(&os(&args))
+    }
+
+    #[test]
+    fn only_explicit_metadata_libraries_have_a_fixed_unhashed_output_set() {
+        let eligible = |flags: &[&str]| {
+            let mut args = vec!["--crate-name=probe", "--out-dir=/o"];
+            args.extend_from_slice(flags);
+            parse(&os(&args)).map(|parsed| parsed.metadata_only_library)
+        };
+        for flags in [
+            vec!["--crate-type=lib", "--emit=dep-info,metadata"],
+            vec!["--crate-type", "rlib", "--emit", "metadata,dep-info"],
+            vec!["--crate-type=lib,rlib", "--emit=dep-info,metadata"],
+        ] {
+            assert_eq!(eligible(&flags), Ok(true), "{flags:?}");
+        }
+        for flags in [
+            vec!["--emit=dep-info,metadata"],
+            vec!["--crate-type=bin", "--emit=dep-info,metadata"],
+            vec!["--crate-type=lib,dylib", "--emit=dep-info,metadata"],
+            vec!["--crate-type=lib", "--crate-type=bin", "--emit=dep-info,metadata"],
+            vec!["--crate-type=lib", "--emit=dep-info"],
+            vec!["--crate-type=lib", "--emit=dep-info,metadata,link"],
+            vec!["--crate-type=lib", "--emit=dep-info,metadata,metadata"],
+            vec!["--crate-type=lib", "--emit=link", "--emit=dep-info,metadata"],
+            vec!["--crate-type=lib", "--emit=link", "--emit", "dep-info,metadata"],
+            vec!["--crate-type=lib", "--emit", "metadata=custom.rmeta", "--emit=dep-info,metadata"],
+            vec!["--crate-type=lib", "--emit=dep-info=custom.d", "--emit", "dep-info,metadata"],
+            vec!["--crate-type=lib", "--emit", "metadata", "--emit=dep-info,metadata"],
+        ] {
+            assert_eq!(eligible(&flags), Ok(false), "{flags:?}");
+        }
+        assert_eq!(eligible(&["--crate-type=lib", "--emit=dep-info,metadata=custom.rmeta"]), Err(Skip::UnsupportedEmit));
+        assert_eq!(eligible(&["--crate-type=lib", "--emit=dep-info,metadata", "-o", "custom.rmeta"]), Err(Skip::NotACompile));
     }
 
     #[test]

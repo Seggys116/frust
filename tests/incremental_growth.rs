@@ -155,6 +155,107 @@ fn build(sb: &Sandbox, app: &Path, args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn maintenance_retains_the_two_latest_incremental_states_for_restores() {
+    let sb = Sandbox::new("inc-retained");
+    let project = sb.project("app", &[], "fn main() {}\n");
+    let source = project.join("src/main.rs");
+    let target = sb.central_target(&project);
+    let dirs = Dirs::at(sb.home());
+    let opts = eager();
+    for value in 0..5 {
+        fs::write(&source, format!("fn main() {{ println!(\"{value}\"); }}\n")).unwrap();
+        common::settle(&source);
+        build(&sb, &project, &[]);
+        let report = compact::auto_compact_with(&dirs, &target, &opts);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), value.to_string());
+        assert!(build(&sb, &project, &[]).is_empty(), "maintenance must leave the current state fresh");
+    }
+    let entries = fs::read_dir(dirs.store()).unwrap().flatten()
+        .flat_map(|shard| fs::read_dir(shard.path()).unwrap().flatten())
+        .filter_map(|entry| fs::read(entry.path().join("meta.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<frust::cache::EntryMeta>(&bytes).ok())
+        .filter(|meta| meta.incremental_unit.is_some())
+        .count();
+    assert_eq!(entries, 2);
+    let misses = sb.count_cache("miss", "app");
+    for value in [3, 4] {
+        fs::write(&source, format!("fn main() {{ println!(\"{value}\"); }}\n")).unwrap();
+        common::settle(&source);
+        assert_success(&sb.bin("fcargo").arg("clean").current_dir(&project).output().unwrap());
+        build(&sb, &project, &[]);
+        assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), value.to_string());
+    }
+    assert_eq!(sb.count_cache("miss", "app"), misses, "both retained states must restore without compiling");
+    assert!(sb.count_cache("hit", "app") >= 2);
+}
+
+#[test]
+fn expired_check_only_variants_are_reclaimed_without_cache_and_the_current_check_stays_fresh() {
+    fn age_tree(path: &Path) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                age_tree(&entry.unwrap().path());
+            }
+        }
+        common::age(path, Duration::from_secs(8 * 86400));
+    }
+    let sb = Sandbox::new("inc-check-idle");
+    let app = sb.project("app", &[], "fn main() { println!(\"41\"); }\n");
+    let manifest = app.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(manifest, format!("{text}\n[features]\na = []\nb = []\n")).unwrap();
+    let check = |feature: Option<&str>| {
+        let mut command = sb.bin("fcargo");
+        command.args(["check", "-v"]).env("FRUST_CACHE", "off").env("FRUST_AUTO_COMPACT", "off").current_dir(&app);
+        if let Some(feature) = feature {
+            command.args(["--features", feature]);
+        }
+        let output = command.output().unwrap();
+        assert_success(&output);
+        output
+    };
+    check(Some("a"));
+    check(Some("b"));
+    let target = sb.central_target(&app);
+    let profile = target.join("debug");
+    let prior: Vec<_> = fs::read_dir(profile.join("incremental")).unwrap().map(|e| e.unwrap().path()).collect();
+    check(None);
+    let current: Vec<_> = fs::read_dir(profile.join("incremental")).unwrap().map(|e| e.unwrap().path()).filter(|p| !prior.contains(p)).collect();
+    assert!(!prior.is_empty() && !current.is_empty(), "real checks must create distinct incremental variants");
+    let analysis = compact::analyze(&profile).unwrap();
+    for dir in compact::incremental_dirs(&profile, &analysis) {
+        assert_eq!(dir.owner, compact::IncrementalOwner::Unknown, "metadata-only state has no object ownership proof");
+    }
+    for path in &prior {
+        age_tree(path);
+    }
+    let current_outputs: Vec<_> = fs::read_dir(profile.join("deps")).unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|path| path.file_name().and_then(|n| n.to_str()).and_then(compact::artifact_hash).is_some_and(|hash| analysis.live.contains(hash)))
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        }).collect();
+    let mut opts = AutoOptions::from_env(&Config::from_env());
+    opts.enabled = true;
+    opts.cache_enabled = false;
+    opts.compress = false;
+    let report = compact::auto_compact_with(&Dirs::at(sb.home()), &target, &opts);
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert!(prior.iter().all(|p| !p.exists()), "expired check-only reuse states are reclaimed");
+    assert!(current.iter().all(|p| p.exists()), "the fresh current incremental state stays");
+    for (path, bytes) in current_outputs {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    let repeated = check(None);
+    assert!(!stderr(&repeated).lines().any(|line| line.trim_start().starts_with("Compiling ") || line.trim_start().starts_with("Checking ")), "maintenance preserves Cargo freshness: {}", stderr(&repeated));
+    assert_eq!(sb.count_cache("hit", "app") + sb.count_cache("miss", "app"), 0);
+    build(&sb, &app, &[]);
+    assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), "41");
+}
+
+#[test]
 fn incremental_state_stays_bounded_and_builds_stay_incremental_under_auto_compaction() {
     let sb = Sandbox::new("inc-growth");
     let mut chain = Chain::new(&sb);

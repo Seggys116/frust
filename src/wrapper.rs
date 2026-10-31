@@ -8,7 +8,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,10 +70,16 @@ const KEY_POLL_MAX: Duration = Duration::from_millis(40);
 /// Bumped whenever `StoreJob` changes shape; a helper meeting another format stores nothing.
 const JOB_FORMAT: u32 = 2;
 
+static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
+static DETACHED_STORE: AtomicBool = AtomicBool::new(false);
+
 pub fn run(args: Vec<OsString>) -> i32 {
     if let Some(job) = deferred_entry(&args) {
+        DETACHED_STORE.store(true, Ordering::Relaxed);
         return deferred_main(job);
     }
+    // SAFETY: startup has opened no files; pipe validation rejects stale descriptor numbers.
+    JOBSERVER.get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() });
     let started = Instant::now();
     let cfg = Config::from_env();
     let args = crate::linking::prepare(&args, cfg.debug).unwrap_or(args);
@@ -92,9 +98,17 @@ fn passthrough(args: &[OsString]) -> i32 {
         eprintln!("frust-wrap: expected a compiler command");
         return 2;
     };
-    let err = sys::exec_replace(Command::new(tool).args(rest));
+    let err = sys::exec_replace(compiler_command(tool).args(rest));
     eprintln!("frust-wrap: cannot run {}: {err}", Path::new(tool).display());
     127
+}
+
+fn compiler_command(tool: &OsString) -> Command {
+    let mut cmd = Command::new(tool);
+    if let Some(Some(client)) = JOBSERVER.get() {
+        client.configure(&mut cmd);
+    }
+    cmd
 }
 
 struct Plan {
@@ -412,6 +426,12 @@ impl Plan {
                 "entry metadata names a file outside its directory",
             ));
         }
+        if meta.files.iter().any(|file| !file.encoding.is_raw() && (file.text || file.dir)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded entry metadata marks an artifact as text or a directory",
+            ));
+        }
         if !self.parsed.out_dir.is_dir() {
             fs::create_dir_all(&self.parsed.out_dir)?;
         }
@@ -424,7 +444,7 @@ impl Plan {
                 let text = dep_info_resolved(&fs::read_to_string(&src)?, profile);
                 fsx::write_atomic(&dst, text.as_bytes())?;
             } else {
-                fsx::clone_replace(&src, &dst)?;
+                cache::payload::restore(&src, &dst, file)?;
                 // Clones keep the old mtime, but cargo treats outputs older than their dependencies' outputs as stale.
                 if !file.dir {
                     fsx::touch(&dst);
@@ -448,7 +468,7 @@ impl Plan {
         let preexisting: HashMap<String, Stamp> =
             self.prefixed_outputs(|_| true).into_iter().filter_map(|(name, stamp)| Some((name, stamp?))).collect();
         self.debug(&format!("{} earlier outputs scanned in {}ms", preexisting.len(), started.elapsed().as_millis()));
-        let mut child = match Command::new(&self.args[0]).args(&self.args[1..]).stderr(Stdio::piped()).spawn() {
+        let mut child = match compiler_command(&self.args[0]).args(&self.args[1..]).stderr(Stdio::piped()).spawn() {
             Ok(child) => child,
             Err(err) => {
                 eprintln!("frust-wrap: cannot run {}: {err}", Path::new(&self.args[0]).display());
@@ -512,7 +532,10 @@ impl Plan {
         key_lock: Option<&File>,
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
-        let Some((slot, slot_path)) = acquire_slot(&deferred, slot_count()) else { return Ok(false) };
+        let Some((slot, slot_path)) = acquire_slot(&deferred, slot_count()) else {
+            self.debug(&format!("deferred store slots busy or unavailable for {}; storing inline", self.parsed.crate_name));
+            return Ok(false);
+        };
         let Some(frozen) = self.freeze(captured, preexisting) else { return Ok(false) };
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
         let mut keep: Vec<&File> = vec![&slot];
@@ -590,18 +613,20 @@ impl Plan {
         for name in &names {
             let path = self.parsed.out_dir.join(name);
             // A bundle's inner files can change without its own stamp moving.
-            if sys::stat(&path).ok()?.is_dir() {
+            let meta = sys::stat(&path).ok()?;
+            if meta.is_dir() {
                 return None;
             }
-            outputs.push((name.clone(), Stamp::read(&path).ok()?));
+            outputs.push((name.clone(), Stamp::of(&meta)));
         }
         let mut inputs = HashMap::new();
         for file in &cache::depinfo::parse(&dep_text).files {
             let path = self.resolve(&self.norm(file));
-            if path.is_dir() {
+            let meta = sys::stat(&path).ok()?;
+            if meta.is_dir() {
                 continue;
             }
-            inputs.insert(path.clone(), Stamp::read(&path).ok()?);
+            inputs.insert(path, Stamp::of(&meta));
         }
         let frozen = Frozen { names, dep_name, dep_text, outputs, inputs };
         (!frozen.has_coarse_stamp()).then_some(frozen)
@@ -616,6 +641,17 @@ impl Plan {
     fn prefixed_outputs(&self, wants_stamp: impl Fn(&str) -> bool) -> Vec<(String, Option<Stamp>)> {
         let mut found = Vec::new();
         if self.parsed.extra_filename.is_empty() {
+            if self.parsed.metadata_only_library {
+                for name in [format!("{}.d", self.parsed.crate_name), format!("lib{}.rmeta", self.parsed.crate_name)] {
+                    let path = self.parsed.out_dir.join(&name);
+                    if let Ok(meta) = sys::lstat(&path)
+                        && meta.is_file()
+                    {
+                        let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
+                        found.push((name, stamp));
+                    }
+                }
+            }
             return found;
         }
         let prefixes = [
@@ -624,10 +660,11 @@ impl Plan {
         ];
         if let Ok(entries) = fs::read_dir(&self.parsed.out_dir) {
             for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
+                let filename = entry.file_name();
+                let name = filename.to_string_lossy();
                 if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
                     let stamp = if wants_stamp(&name) { Stamp::read(&entry.path()).ok() } else { None };
-                    found.push((name, stamp));
+                    found.push((name.into_owned(), stamp));
                 }
             }
         }
@@ -659,6 +696,13 @@ impl Plan {
                     names.insert(name.to_string_lossy().into_owned());
                 }
             }
+        }
+        // An unhashed metadata entry is useful only when both of its mandatory outputs belong to this compile.
+        if self.parsed.extra_filename.is_empty() && self.parsed.metadata_only_library
+            && ![format!("{}.d", self.parsed.crate_name), format!("lib{}.rmeta", self.parsed.crate_name)]
+                .iter().all(|name| names.contains(name))
+        {
+            return Vec::new();
         }
         names.into_iter().collect()
     }
@@ -699,18 +743,21 @@ impl Plan {
                 return self.skip_store(&format!("{} changed during the compile", path.display()), compile_ms);
             }
         }
-        let mut inputs = Vec::new();
-        for file in &info.files {
-            let path = self.resolve(&self.norm(file));
-            if path.is_dir() {
-                continue;
-            }
-            let hashed = self.hasher.hash(&path, self.persistable_source(&path))?;
+        let paths: Vec<_> = info.files.iter().map(|file| self.resolve(&self.norm(file))).collect();
+        let threads = extern_hash_threads(paths.len(), thread::available_parallelism().map_or(1, |n| n.get()));
+        // Keep failures beside their input so validation and entry keys retain dep-info order.
+        let hashed = parallel_with_threads(&paths, threads, |_, path| {
+            Ok(if path.is_dir() { None } else { Some(self.hasher.hash(path, self.persistable_source(path))) })
+        })?;
+        let mut inputs = Vec::with_capacity(paths.len());
+        for ((file, path), hashed) in info.files.iter().zip(&paths).zip(hashed) {
+            let Some(hashed) = hashed else { continue };
+            let hashed = hashed?;
             if !hashed.stable {
                 return self.skip_store(&format!("{} changed while being hashed", path.display()), compile_ms);
             }
             // Other units' outputs gain hard links as cargo uplifts them, which moves ctime without touching content.
-            if frozen.is_some_and(|f| !f.input_unchanged(&path, &hashed.stamp, !path.starts_with(&self.profile_abs))) {
+            if frozen.is_some_and(|f| !f.input_unchanged(path, &hashed.stamp, !path.starts_with(&self.profile_abs))) {
                 return self.skip_store(&format!("{} changed after the compile", path.display()), compile_ms);
             }
             // Target-profile files come from units that finished under cargo's lock; the rest get the "file too new" check.
@@ -718,7 +765,7 @@ impl Plan {
                 return self.skip_store(&format!("{} was modified during the compile", path.display()), compile_ms);
             }
             // Recorded only for a file that had settled when hashed, and not on a volume whose stamps are distrusted.
-            let stamp = if self.trust.records_stamps(hashed.stamp.dev, &path) { StampRecord::of(&hashed) } else { None };
+            let stamp = if self.trust.records_stamps(hashed.stamp.dev, path) { StampRecord::of(&hashed) } else { None };
             inputs.push(Input { path: self.norm(file), stamp, hash: hashed.hash });
         }
         let envs: Vec<(String, Option<String>)> = info
@@ -803,22 +850,38 @@ impl Plan {
     ) -> io::Result<EntryMeta> {
         // The staging directory is private until one rename publishes it, so files are cloned straight to final names.
         let (out_dir, profile) = (&self.parsed.out_dir, &self.profile);
+        let compress = cache_compression_requested() && cache::payload::compression_supported(staged);
         let files = parallel(names, |i, name| {
             let src = out_dir.join(name);
             let stored = format!("f{i}");
             let text = name.ends_with(".d");
-            let bytes;
-            if text {
+            let payload = if text {
                 let raw = if name == dep_info.0 { dep_info.1.to_string() } else { fs::read_to_string(&src)? };
                 let body = dep_info_tokenised(&raw, profile);
-                bytes = body.len() as u64;
+                let bytes = body.len() as u64;
                 fs::write(staged.join(&stored), body)?;
+                cache::payload::StoredPayload {
+                    bytes,
+                    encoding: cache::payload::Encoding::Raw,
+                    stored_bytes: None,
+                    decoded_bytes: None,
+                    content_hash: None,
+                }
             } else {
-                fsx::clone_new(&src, &staged.join(&stored))?;
-                bytes = fsx::allocated_size(&src);
-            }
+                cache::payload::store(&src, &staged.join(&stored), compress)?
+            };
             let dir = !text && src.is_dir();
-            Ok(StoredFile { name: name.clone(), stored, text, bytes, dir })
+            Ok(StoredFile {
+                name: name.clone(),
+                stored,
+                text,
+                bytes: payload.bytes,
+                dir,
+                encoding: payload.encoding,
+                stored_bytes: payload.stored_bytes,
+                decoded_bytes: payload.decoded_bytes,
+                content_hash: payload.content_hash,
+            })
         })?;
         let stderr_text = String::from_utf8_lossy(captured).replace(&self.profile, PROFILE_TOKEN);
         fs::write(staged.join("stderr"), stderr_text)?;
@@ -827,6 +890,7 @@ impl Plan {
             version: self.version(),
             compile_ms,
             created_unix: fsx::unix_now(),
+            incremental_unit: if self.parsed.incremental() { self.unit.clone() } else { None },
             files,
             stderr: "stderr".to_string(),
         };
@@ -887,10 +951,18 @@ fn same_file(a: &Stamp, b: &Stamp) -> bool {
     (a.dev, a.ino, a.size, a.mtime_ns) == (b.dev, b.ino, b.size, b.mtime_ns)
 }
 
-fn parallel<T: Sync, R: Send>(items: &[T], job: impl Fn(usize, &T) -> io::Result<R> + Sync) -> io::Result<Vec<R>> {
-    const PER_THREAD: usize = 8;
-    const MAX_THREADS: usize = 4;
-    let threads = items.len().div_ceil(PER_THREAD).clamp(1, MAX_THREADS);
+fn cache_compression_requested() -> bool {
+    !matches!(env::var("FRUST_CACHE_COMPRESSION").as_deref(), Ok("off" | "0" | "false" | "no"))
+}
+
+fn parallel<T: Sync, R: Send>(
+    items: &[T],
+    job: impl Fn(usize, &T) -> io::Result<R> + Sync,
+) -> io::Result<Vec<R>> {
+    let threads = extern_hash_threads(
+        items.len(),
+        thread::available_parallelism().map_or(1, |n| n.get()),
+    );
     parallel_with_threads(items, threads, job)
 }
 
@@ -899,27 +971,111 @@ fn parallel_with_threads<T: Sync, R: Send>(
     threads: usize,
     job: impl Fn(usize, &T) -> io::Result<R> + Sync,
 ) -> io::Result<Vec<R>> {
+    let budget = worker_budget(threads.min(items.len()));
+    parallel_with_limit(items, budget.threads, job)
+}
+
+struct WorkerBudget {
+    threads: usize,
+    _tokens: Vec<jobserver::Acquired>,
+}
+
+impl WorkerBudget {
+    fn reserve(desired: usize, client: Option<&jobserver::Client>) -> Self {
+        let mut tokens = Vec::new();
+        if let Some(client) = client {
+            for _ in 1..desired {
+                match client.try_acquire() {
+                    Ok(Some(token)) => tokens.push(token),
+                    _ => break,
+                }
+            }
+        }
+        let threads = if client.is_some() {
+            tokens.len() + 1
+        } else {
+            desired.max(1)
+        };
+        Self {
+            threads,
+            _tokens: tokens,
+        }
+    }
+}
+
+fn worker_budget(desired: usize) -> WorkerBudget {
+    let cpus = thread::available_parallelism().map_or(1, |n| n.get());
+    worker_budget_for(
+        desired,
+        cpus,
+        DETACHED_STORE.load(Ordering::Relaxed),
+        JOBSERVER.get().and_then(Option::as_ref),
+    )
+}
+
+fn worker_budget_for(
+    desired: usize,
+    cpus: usize,
+    detached: bool,
+    client: Option<&jobserver::Client>,
+) -> WorkerBudget {
+    if detached {
+        return WorkerBudget::reserve(1, None);
+    }
+    // The caller owns Cargo's implicit slot; every additional foreground worker needs a token.
+    WorkerBudget::reserve(desired.min(cpus).clamp(1, 4), client)
+}
+
+fn parallel_with_limit<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    job: impl Fn(usize, &T) -> io::Result<R> + Sync,
+) -> io::Result<Vec<R>> {
     let threads = threads.min(items.len());
     if threads <= 1 {
-        return items.iter().enumerate().map(|(i, item)| job(i, item)).collect();
-    }
-    let chunk = items.len().div_ceil(threads);
-    let job = &job;
-    thread::scope(|scope| {
-        let workers: Vec<_> = items
-            .chunks(chunk)
+        return items
+            .iter()
             .enumerate()
-            .map(|(c, part)| {
-                scope.spawn(move || {
-                    part.iter().enumerate().map(|(i, item)| job(c * chunk + i, item)).collect::<io::Result<Vec<R>>>()
-                })
+            .map(|(i, item)| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(i, item)))
+                    .unwrap_or_else(|_| Err(io::Error::other("worker thread panicked")))
             })
             .collect();
-        let mut results = Vec::with_capacity(items.len());
-        for worker in workers {
-            results.extend(worker.join().map_err(|_| io::Error::other("worker thread panicked"))??);
+    }
+    let next = AtomicUsize::new(0);
+    let failed_at = AtomicUsize::new(usize::MAX);
+    let worker = || {
+        let mut results = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= items.len() || i >= failed_at.load(Ordering::Relaxed) {
+                break;
+            }
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(i, &items[i])))
+                    .unwrap_or_else(|_| Err(io::Error::other("worker thread panicked")));
+            if result.is_err() {
+                failed_at.fetch_min(i, Ordering::Relaxed);
+                results.push((i, result));
+                break;
+            }
+            results.push((i, result));
         }
-        Ok(results)
+        results
+    };
+    thread::scope(|scope| {
+        let workers: Vec<_> = (1..threads).map(|_| scope.spawn(worker)).collect();
+        let mut results = worker();
+        for handle in workers {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("worker thread panicked"))?,
+            );
+        }
+        // Completion order never changes output names, entry keys, or which input error is reported.
+        results.sort_unstable_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, result)| result).collect()
     })
 }
 
@@ -1212,6 +1368,7 @@ fn forward(pipe: impl io::Read) -> Vec<u8> {
 /// Stamps are not part of the key: it names content only.
 fn entry_key(prekey: &str, inputs: &[Input], envs: &[(String, Option<String>)]) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"frust-entry-payload-v1\0");
     hasher.update(prekey.as_bytes());
     for input in inputs {
         hasher.update(b"\0i");
@@ -1367,18 +1524,28 @@ fn audit_selection(trusted: &[&Path], seed: u64) -> Vec<usize> {
 
 /// Stops handing out work after the first failure; a panicking worker counts as one.
 fn all_parallel<T: Sync>(items: &[T], check: impl Fn(&T) -> bool + Sync) -> bool {
+    let budget = worker_budget(VERIFY_THREADS.min(items.len()));
+    let threads = budget.threads;
+    if threads <= 1 {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| items.iter().all(check))).unwrap_or(false);
+    }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let worker = || {
         while !failed.load(Ordering::Relaxed) {
-            let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+            let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                break;
+            };
             if !check(item) {
                 failed.store(true, Ordering::Relaxed);
             }
         }
     };
     thread::scope(|scope| {
-        let handles: Vec<_> = (0..VERIFY_THREADS.min(items.len())).map(|_| scope.spawn(worker)).collect();
+        let handles: Vec<_> = (1..threads).map(|_| scope.spawn(worker)).collect();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)).is_err() {
+            failed.store(true, Ordering::Relaxed);
+        }
         for handle in handles {
             if handle.join().is_err() {
                 failed.store(true, Ordering::Relaxed);
@@ -1675,7 +1842,7 @@ fn toolchain_id(tool: &OsString, cwd: &Path) -> Option<String> {
     if let Some(id) = env::var("FRUST_RUSTC_ID").ok().filter(|v| !v.is_empty()) {
         return Some(id);
     }
-    let output = Command::new(tool).arg("-vV").current_dir(cwd).stdin(Stdio::null()).output().ok()?;
+    let output = compiler_command(tool).arg("-vV").current_dir(cwd).stdin(Stdio::null()).output().ok()?;
     output.status.success().then(|| crate::paths::short_hash(&output.stdout))
 }
 
@@ -1825,6 +1992,179 @@ mod tests {
         let before = key(&s.0, &[&arg]).unwrap();
         fs::write(&rlib, b"v2").unwrap();
         assert_ne!(before, key(&s.0, &[&arg]).unwrap());
+    }
+
+    #[test]
+    fn inherited_jobserver_budget_child() {
+        let Some(mode) = env::var_os("FRUST_TEST_JOBSERVER_CHILD") else {
+            return;
+        };
+        // SAFETY: the parent configured valid inherited pipes for this isolated test process.
+        let client = JOBSERVER
+            .get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() })
+            .as_ref()
+            .expect("inherited jobserver");
+        let initial = client.available().unwrap();
+        assert_eq!(initial, 2);
+        if mode == "probe" {
+            return;
+        }
+        let budget = WorkerBudget::reserve(4, Some(client));
+        assert!((1..=3).contains(&budget.threads));
+        assert_eq!(client.available().unwrap(), initial - (budget.threads - 1));
+        #[cfg(any(target_os = "linux", windows))]
+        assert_eq!(
+            budget.threads, 3,
+            "supported nonblocking clients use only the available tokens"
+        );
+        drop(budget);
+        assert_eq!(client.available().unwrap(), initial);
+
+        let mut held = Vec::new();
+        while let Ok(Some(token)) = client.try_acquire() {
+            held.push(token);
+        }
+        let budget = WorkerBudget::reserve(4, Some(client));
+        assert_eq!(
+            budget.threads, 1,
+            "an exhausted or unsupported jobserver stays on the caller"
+        );
+        drop((budget, held));
+        assert_eq!(client.available().unwrap(), initial);
+        assert_eq!(worker_budget_for(4, 1, false, None).threads, 1);
+        assert_eq!(worker_budget_for(99, 64, false, None).threads, 4);
+        assert_eq!(worker_budget_for(4, 8, true, Some(client)).threads, 1);
+        assert_eq!(
+            client.available().unwrap(),
+            initial,
+            "a detached store owns no implicit Cargo token"
+        );
+
+        let mut probe = compiler_command(&env::current_exe().unwrap().into_os_string());
+        probe
+            .args([
+                "--exact",
+                "wrapper::tests::inherited_jobserver_budget_child",
+                "--nocapture",
+            ])
+            .env("FRUST_TEST_JOBSERVER_CHILD", "probe");
+        let result = probe.output().unwrap();
+        assert!(
+            result.status.success(),
+            "compiler handoff failed: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert_eq!(client.available().unwrap(), initial);
+    }
+
+    #[test]
+    fn inherited_jobserver_tokens_are_returned_and_compiler_handoff_preserves_them() {
+        let client = jobserver::Client::new(2).unwrap();
+        let mut child = Command::new(env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "wrapper::tests::inherited_jobserver_budget_child",
+                "--nocapture",
+            ])
+            .env("FRUST_TEST_JOBSERVER_CHILD", "budget");
+        client.configure(&mut child);
+        let result = child.output().unwrap();
+        assert!(
+            result.status.success(),
+            "jobserver child failed: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(client.available().unwrap(), 2);
+    }
+
+    #[test]
+    fn dynamic_workers_finish_other_inputs_while_one_is_slow_and_preserve_order() {
+        let items: Vec<_> = (0..32).collect();
+        let finished = AtomicUsize::new(0);
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let results = parallel_with_limit(&items, 2, |i, item| {
+            if i == 0 {
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+            } else if finished.fetch_add(1, Ordering::Relaxed) == items.len() - 2 {
+                release.send(()).unwrap();
+            }
+            Ok(item * 7)
+        })
+        .unwrap();
+        assert_eq!(results, items.iter().map(|i| i * 7).collect::<Vec<_>>());
+        assert_eq!(finished.into_inner(), items.len() - 1);
+    }
+
+    #[test]
+    fn worker_limit_includes_the_caller_and_every_item_runs_once() {
+        let caller = thread::current().id();
+        let barrier = std::sync::Barrier::new(4);
+        let identities = Mutex::new(std::collections::HashSet::new());
+        let seen: Vec<_> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+        let values = parallel_with_limit(&seen, 4, |i, visits| {
+            identities.lock().unwrap().insert(thread::current().id());
+            if i < 4 {
+                barrier.wait();
+            }
+            assert_eq!(visits.fetch_add(1, Ordering::Relaxed), 0);
+            Ok(i)
+        })
+        .unwrap();
+        assert_eq!(values, (0..seen.len()).collect::<Vec<_>>());
+        let identities = identities.into_inner().unwrap();
+        assert_eq!(identities.len(), 4);
+        assert!(identities.contains(&caller));
+        assert!(
+            seen.iter()
+                .all(|visits| visits.load(Ordering::Relaxed) == 1)
+        );
+    }
+
+    #[test]
+    fn serial_and_parallel_jobs_turn_panics_into_the_same_io_error() {
+        for threads in [1, 3] {
+            let error = parallel_with_limit(&[0, 1, 2, 3, 4], threads, |i, _| {
+                if i == 2 {
+                    panic!("hashing failed");
+                }
+                Ok(i)
+            }).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "worker thread panicked");
+        }
+    }
+
+    #[test]
+    fn dynamic_workers_report_the_first_input_failure_after_later_work_fails() {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let err = parallel_with_limit(&[0, 1, 2, 3], 2, |i, _| -> io::Result<()> {
+            if i == 0 {
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+                Err(io::Error::other("first input"))
+            } else {
+                release.send(()).unwrap();
+                Err(io::Error::other("later input"))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "first input");
+        assert!(
+            parallel_with_limit(&[] as &[u32], 4, |_, _| Ok(()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2051,6 +2391,18 @@ mod tests {
     }
 
     #[test]
+    fn serial_verification_treats_a_caller_panic_as_a_failed_candidate() {
+        let caller = thread::current().id();
+        let visits = AtomicUsize::new(0);
+        assert!(!all_parallel(&[42], |_| {
+            assert_eq!(thread::current().id(), caller);
+            visits.fetch_add(1, Ordering::Relaxed);
+            panic!("verification failed");
+        }));
+        assert_eq!(visits.into_inner(), 1);
+    }
+
+    #[test]
     fn parallel_verification_checks_each_item_once_and_stops_on_a_failure() {
         let items: Vec<u32> = (0..200).collect();
         let seen = AtomicUsize::new(0);
@@ -2205,6 +2557,138 @@ mod tests {
     }
 
     #[test]
+    fn encoded_entry_keys_cannot_alias_legacy_raw_entry_keys() {
+        let prekey = "ab".repeat(20);
+        let inputs = vec![Input { path: "src/lib.rs".to_string(), hash: "cd".repeat(32), stamp: None }];
+        let envs = vec![("WATCHED".to_string(), Some("value".to_string()))];
+        let mut legacy = blake3::Hasher::new();
+        legacy.update(prekey.as_bytes());
+        for input in &inputs {
+            legacy.update(b"\0i");
+            legacy.update(input.path.as_bytes());
+            legacy.update(input.hash.as_bytes());
+        }
+        for (name, value) in &envs {
+            legacy.update(b"\0e");
+            legacy.update(name.as_bytes());
+            legacy.update(value.as_deref().unwrap_or("<unset>").as_bytes());
+        }
+        let old_key = legacy.finalize().to_hex()[..40].to_string();
+        assert_ne!(entry_key(&prekey, &inputs, &envs), old_key);
+        let old_empty_key = blake3::hash(prekey.as_bytes()).to_hex()[..40].to_string();
+        assert_ne!(entry_key(&prekey, &[], &[]), old_empty_key);
+    }
+
+    #[test]
+    fn staged_payloads_restore_exact_bytes_and_raw_dep_info() {
+        let s = Scratch::new("payload-restore");
+        let (job, _, rlib) = fixture(&s);
+        let expected = vec![b'k'; 2 * 1024 * 1024 + 333];
+        fs::write(&rlib, &expected).unwrap();
+        let plan = Plan::from_job(&job).unwrap();
+        let staged = plan.cache.stage().unwrap();
+        let meta = plan
+            .stage_entry(&staged, &job.names, (&job.dep_name, &job.dep_text), b"", 7)
+            .unwrap();
+        let binary = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
+        let dep = meta.files.iter().find(|f| f.name == "k.d").unwrap();
+        assert!(dep.text && dep.encoding.is_raw());
+        if cache_compression_requested() && cache::payload::compression_supported(&staged) {
+            assert!(!binary.encoding.is_raw());
+            assert!(binary.stored_bytes.unwrap() < binary.bytes);
+        }
+        fs::write(&rlib, b"changed").unwrap();
+        fs::write(rlib.parent().unwrap().join("k.d"), b"changed").unwrap();
+        plan.restore(&staged, &meta).unwrap();
+        assert_eq!(fs::read(&rlib).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(rlib.parent().unwrap().join("k.d")).unwrap(),
+            job.dep_text
+        );
+    }
+
+    #[test]
+    fn malformed_encoded_flags_reject_before_any_destination_is_changed() {
+        let s = Scratch::new("payload-flags");
+        let (job, _, rlib) = fixture(&s);
+        let mut plan = Plan::from_job(&job).unwrap();
+        let staged = plan.cache.stage().unwrap();
+        let mut meta = plan.stage_entry(&staged, &job.names, (&job.dep_name, &job.dep_text), b"", 7).unwrap();
+        let binary = meta.files.iter().position(|file| file.name == "libk.rlib").unwrap();
+        let dep_info = rlib.parent().unwrap().join("k.d");
+        let sibling = rlib.parent().unwrap().join("unrelated-output");
+        fs::write(&rlib, b"existing artifact").unwrap();
+        fs::write(&dep_info, b"existing dep-info").unwrap();
+        fs::write(&sibling, b"existing sibling").unwrap();
+        fs::write(staged.join(&meta.files[binary].stored), b"UTF-8 text that is not an encoded payload").unwrap();
+        meta.files[binary].encoding = cache::payload::Encoding::Lz4BlocksV1;
+        meta.files[binary].decoded_bytes = Some(1);
+        meta.files[binary].content_hash = Some("0".repeat(64));
+        for (text, dir) in [(true, false), (false, true), (true, true)] {
+            meta.files[binary].text = text;
+            meta.files[binary].dir = dir;
+            assert_eq!(plan.restore(&staged, &meta).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&rlib).unwrap(), b"existing artifact");
+            assert_eq!(fs::read(&dep_info).unwrap(), b"existing dep-info");
+            assert_eq!(fs::read(&sibling).unwrap(), b"existing sibling");
+        }
+        plan.parsed.out_dir = s.0.join("absent-output-directory");
+        assert!(plan.restore(&staged, &meta).is_err());
+        assert!(!plan.parsed.out_dir.exists());
+    }
+
+    #[test]
+    fn many_store_inputs_keep_dep_info_order_and_reject_later_edits() {
+        let s = Scratch::new("store-many");
+        let (mut job, src, _) = fixture(&s);
+        let mut files = vec![src];
+        for i in (0..33).rev() {
+            let path = s.0.join(format!("input-{i}.rs"));
+            fs::write(&path, format!("pub fn value() -> usize {{ {i} }}\n")).unwrap();
+            files.push(path);
+        }
+        let deps = PathBuf::from(job.args.last().unwrap());
+        job.dep_text = format!(
+            "{}: {}\n",
+            deps.join("k.d").display(),
+            files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        fs::write(deps.join("k.d"), &job.dep_text).unwrap();
+        job.outputs = job
+            .names
+            .iter()
+            .map(|name| (name.clone(), wire(&deps.join(name))))
+            .collect();
+        job.inputs = files
+            .iter()
+            .map(|path| (path.clone(), wire(path)))
+            .collect();
+        run_deferred(&job);
+        let cache = Cache::new(&Dirs::at(&job.home));
+        let candidates = cache.candidates(&job.prekey);
+        assert_eq!(candidates.len(), 1);
+        let inputs = &candidates[0].inputs;
+        assert_eq!(inputs.len(), files.len());
+        for (input, path) in inputs.iter().zip(&files) {
+            assert_eq!(input.path, path.to_string_lossy());
+            assert_eq!(input.hash, cache::hash_file(path).unwrap());
+        }
+        assert_eq!(candidates[0].key, entry_key(&job.prekey, inputs, &[]));
+        job.home = s.0.join("after-edit");
+        fs::write(&files[17], b"pub fn changed() {}\n").unwrap();
+        run_deferred(&job);
+        assert_eq!(
+            rows(&job),
+            0,
+            "a changed frozen input must prevent publication"
+        );
+    }
+
+    #[test]
     fn a_changed_input_output_or_watched_file_means_nothing_is_stored() {
         let s = Scratch::new("deferred-changed");
         let (job, src, _) = fixture(&s);
@@ -2346,24 +2830,114 @@ mod tests {
     }
 
     #[test]
+    fn unhashed_metadata_discovery_owns_only_two_exact_regular_files() {
+        let s = Scratch::new("unhashed-metadata");
+        let (mut job, _, rlib) = fixture(&s);
+        for arg in &mut job.args {
+            if arg == "--emit=dep-info,link" {
+                *arg = "--emit=dep-info,metadata".into();
+            }
+        }
+        job.args.push("--crate-type=lib".into());
+        let plan = Plan::from_job(&job).unwrap();
+        let deps = rlib.parent().unwrap();
+        fs::write(deps.join("libk.rmeta"), b"old metadata").unwrap();
+        let before: HashMap<_, _> = plan.prefixed_outputs(|_| true).into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap())).collect();
+        assert_eq!(before.len(), 2);
+        fs::write(deps.join("k.d"), b"new dependency information").unwrap();
+        fs::write(deps.join("libk.rmeta"), b"new metadata with a different size").unwrap();
+        for name in ["libk.d", "liblibk.rmeta", "libk", "k_extra.d", "k-other.d", "k.notes", "libk.notes", "k.d.other"] {
+            fs::write(deps.join(name), b"another compile wrote this sibling").unwrap();
+        }
+        fs::create_dir(deps.join("k.dSYM")).unwrap();
+        assert_eq!(plan.output_files(&[], &before), ["k.d", "libk.rmeta"]);
+        let now: HashMap<_, _> = plan.prefixed_outputs(|_| true).into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap())).collect();
+        assert!(plan.output_files(&[], &now).is_empty(), "unchanged outputs do not belong to a new compile");
+        let captured = serde_json::json!({ "artifact": deps.join("k.notes") }).to_string();
+        assert_eq!(plan.output_files(captured.as_bytes(), &before), ["k.d", "k.notes", "libk.rmeta"]);
+        sys::rename(&deps.join("libk.rmeta"), &deps.join("previous-rmeta")).unwrap();
+        fs::create_dir(deps.join("libk.rmeta")).unwrap();
+        assert!(plan.output_files(&[], &before).is_empty(), "a missing regular metadata output prevents storage");
+        #[cfg(unix)]
+        {
+            sys::rename(&deps.join("libk.rmeta"), &deps.join("unrelated-directory")).unwrap();
+            std::os::unix::fs::symlink(deps.join("previous-rmeta"), deps.join("libk.rmeta")).unwrap();
+            assert_eq!(plan.prefixed_outputs(|_| true).iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["k.d"]);
+            assert!(plan.output_files(&[], &before).is_empty(), "a symlink is not owned by metadata discovery");
+        }
+    }
+
+    #[test]
+    fn unhashed_link_outputs_still_require_authoritative_artifact_notifications() {
+        let s = Scratch::new("unhashed-link");
+        let (job, _, _) = fixture(&s);
+        let plan = Plan::from_job(&job).unwrap();
+        assert!(plan.prefixed_outputs(|_| true).is_empty());
+        assert!(plan.output_files(&[], &HashMap::new()).is_empty());
+        let captured = serde_json::json!({ "artifact": plan.parsed.out_dir.join("libk.rlib") }).to_string();
+        assert_eq!(plan.output_files(captured.as_bytes(), &HashMap::new()), ["libk.rlib"]);
+    }
+
+    #[test]
     fn a_store_stays_inline_unless_the_profile_volume_is_trusted() {
         let s = Scratch::new("freeze");
         let (job, src, rlib) = fixture(&s);
         let deps = rlib.parent().unwrap().to_path_buf();
         let captured: String = ["k.d", "libk.rlib"]
             .iter()
-            .map(|n| format!("{}\n", serde_json::json!({ "artifact": deps.join(n).to_string_lossy() })))
+            .map(|n| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({ "artifact": deps.join(n).to_string_lossy() })
+                )
+            })
             .collect();
-        let freeze = |job: &StoreJob| Plan::from_job(job).expect("plan").freeze(captured.as_bytes(), &HashMap::new());
+        let freeze = |job: &StoreJob| {
+            Plan::from_job(job)
+                .expect("plan")
+                .freeze(captured.as_bytes(), &HashMap::new())
+        };
 
-        let off = StoreJob { trust: "off".to_string(), ..job.clone() };
-        assert!(freeze(&off).is_none(), "stamps are not believed, so the store is not deferred");
+        let off = StoreJob {
+            trust: "off".to_string(),
+            ..job.clone()
+        };
+        assert!(
+            freeze(&off).is_none(),
+            "stamps are not believed, so the store is not deferred"
+        );
 
-        let fine = [&src, &rlib, &deps.join("k.d")].iter().all(|p| !Stamp::read(p).unwrap().coarse());
+        let fine = [&src, &rlib, &deps.join("k.d")]
+            .iter()
+            .all(|p| !Stamp::read(p).unwrap().coarse());
         if hashing::fs_trusted(&s.0) && fine {
             let frozen = freeze(&job).expect("a trusted volume with fine stamps defers");
             assert_eq!(frozen.names, job.names);
-            assert!(frozen.inputs.contains_key(&src));
+            assert_eq!(frozen.inputs.get(&src), Some(&Stamp::read(&src).unwrap()));
+            for (name, observed) in &frozen.outputs {
+                assert_eq!(*observed, Stamp::read(&deps.join(name)).unwrap());
+            }
+            let directory = s.0.join("include");
+            fs::create_dir(&directory).unwrap();
+            let dep_text = format!(
+                "{}: {} {}\n",
+                deps.join("k.d").display(),
+                src.display(),
+                directory.display()
+            );
+            fs::write(deps.join("k.d"), &dep_text).unwrap();
+            let frozen = freeze(&job).expect("directory inputs are ignored");
+            assert_eq!(frozen.inputs.len(), 1);
+            let dep_text = format!(
+                "{}: {} {}\n",
+                deps.join("k.d").display(),
+                src.display(),
+                s.0.join("missing.rs").display()
+            );
+            fs::write(deps.join("k.d"), dep_text).unwrap();
+            assert!(freeze(&job).is_none(), "missing files cannot be frozen");
         }
     }
 

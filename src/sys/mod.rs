@@ -122,6 +122,105 @@ pub fn unlock(file: &File) -> io::Result<()> {
     imp::unlock(file)
 }
 
+static SESSION_LOCK_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub struct SessionLocks {
+    files: Vec<(PathBuf, File)>,
+    locked: usize,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SessionLocks {
+    pub fn metadata(&self, path: &Path) -> io::Result<Meta> {
+        self.files.iter().find(|(candidate, _)| candidate == path)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)).and_then(|(_, file)| fstat(file))
+    }
+
+    pub fn matches_path(&self, path: &Path) -> bool {
+        self.files.iter().find(|(candidate, _)| candidate == path)
+            .is_some_and(|(_, file)| session_identity_matches(path, file))
+    }
+
+    pub fn revalidate(&self) -> bool {
+        self.files.iter().all(|(path, file)| session_identity_matches(path, file))
+    }
+}
+
+fn session_identity_matches(path: &Path, file: &File) -> bool {
+    let (Ok(current), Ok(opened)) = (lstat(path), fstat(file)) else { return false };
+    current.is_file() && !current.file_type().is_symlink() && current.nlink() == 1 && opened.nlink() == 1
+        && current.ino() != 0 && current.ino() == opened.ino() && current.dev() == opened.dev()
+}
+
+impl Drop for SessionLocks {
+    fn drop(&mut self) {
+        for (_, file) in &self.files[..self.locked] {
+            imp::unlock_session(file);
+        }
+        self.files.clear();
+    }
+}
+
+/// Open and validate every descriptor before locking, so a duplicate can never close a held POSIX alias.
+pub fn try_session_locks(paths: &[PathBuf]) -> io::Result<SessionLocks> {
+    let serial = match SESSION_LOCK_SERIAL.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+    };
+    let mut guard = SessionLocks { files: Vec::new(), locked: 0, _serial: serial };
+    let mut identities = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for path in paths {
+        if !names.insert(path) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        if !matches!(fs_type_name(path).as_deref(), Some("ext4" | "xfs" | "btrfs" | "tmpfs" | "overlay" | "zfs" | "f2fs" | "ramfs" | "bcachefs" | "apfs" | "hfs" | "ntfs" | "refs")) {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        let before = lstat(path)?;
+        if !before.is_file() || before.file_type().is_symlink() || before.nlink() != 1 || before.ino() == 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let file = imp::open_session_lock(path)?;
+        let opened = fstat(&file)?;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.is_file() || opened.nlink() != 1 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        if !identities.insert((opened.dev(), opened.ino())) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        guard.files.push((path.clone(), file));
+    }
+    for (_, file) in &guard.files {
+        imp::try_lock_session(file)?;
+        guard.locked += 1;
+    }
+    if !guard.revalidate() {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+    Ok(guard)
+}
+
+pub struct SessionLock {
+    inner: SessionLocks,
+    path: PathBuf,
+}
+
+impl SessionLock {
+    pub fn metadata(&self) -> io::Result<Meta> {
+        self.inner.metadata(&self.path)
+    }
+
+    pub fn matches_path(&self, path: &Path) -> bool {
+        self.inner.matches_path(path)
+    }
+}
+
+pub fn try_session_lock(path: &Path) -> io::Result<SessionLock> {
+    Ok(SessionLock { inner: try_session_locks(&[path.to_path_buf()])?, path: path.to_path_buf() })
+}
+
 /// Notifications are scheduling hints; callers must recheck their state.
 pub struct DirectoryWatcher {
     inner: Option<imp::DirectoryWatcher>,
@@ -190,6 +289,10 @@ pub const SYSROOT_DYLIB_DIR: &str = imp::SYSROOT_DYLIB_DIR;
 
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename(from, to)
+}
+
+pub fn open_directory_for_times(path: &Path) -> io::Result<File> {
+    imp::open_directory_for_times(path)
 }
 
 pub fn set_mtime_now(path: &Path) -> io::Result<()> {

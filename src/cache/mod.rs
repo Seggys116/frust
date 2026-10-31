@@ -2,6 +2,7 @@
 
 pub mod depinfo;
 pub mod hashing;
+pub mod payload;
 pub mod rustc_args;
 
 use std::fs::{self, OpenOptions};
@@ -22,8 +23,8 @@ pub const PROFILE_TOKEN: &str = "{{FRUST_PROFILE_DIR}}";
 
 const MAX_CANDIDATES: usize = 8;
 
-/// Manifests of any other format (such as ones written before stamps carried a birth time) are ignored and rewritten.
-const MANIFEST_FORMAT: u32 = 3;
+/// Format four hides encoded entries from older readers; format three remains readable for raw entries.
+const MANIFEST_FORMAT: u32 = 4;
 
 /// A volume where a stamp once lied stays distrusted this long after its latest violation.
 const QUARANTINE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -48,6 +49,14 @@ pub struct StoredFile {
     pub stored: String,
     pub text: bool,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "payload::Encoding::is_raw")]
+    pub encoding: payload::Encoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     /// A directory output (such as a `.dSYM` bundle); entries stored before this field existed read as `false`.
     #[serde(default)]
     pub dir: bool,
@@ -59,6 +68,8 @@ pub struct EntryMeta {
     pub version: String,
     pub compile_ms: u64,
     pub created_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_unit: Option<String>,
     pub files: Vec<StoredFile>,
     pub stderr: String,
 }
@@ -111,18 +122,20 @@ impl Cache {
 
     /// Empty for a missing, unreadable or other-format manifest.
     pub fn candidates(&self, prekey: &str) -> Vec<Candidate> {
-        let Ok(bytes) = fs::read(self.manifest_path(prekey)) else {
-            return Vec::new();
-        };
-        match serde_json::from_slice::<Manifest>(&bytes) {
-            Ok(manifest) if manifest.format == MANIFEST_FORMAT => manifest.candidates,
-            _ => Vec::new(),
-        }
+        self.read_manifest(prekey).map(|m| m.candidates).unwrap_or_default()
+    }
+
+    fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
+        let bytes = fs::read(self.manifest_path(prekey)).ok()?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
+        matches!(manifest.format, 3 | MANIFEST_FORMAT).then_some(manifest)
     }
 
     /// Drops candidates whose entry is gone so lookups do not hash their inputs for nothing; the manifest is left alone when nothing changes.
     pub fn add_candidate(&self, prekey: &str, candidate: Candidate) {
-        let existing = self.candidates(prekey);
+        let manifest = self.read_manifest(prekey);
+        let current_format = manifest.as_ref().is_some_and(|m| m.format == MANIFEST_FORMAT);
+        let existing = manifest.map(|m| m.candidates).unwrap_or_default();
         let unchanged_front = existing.first() == Some(&candidate);
         let before = existing.len();
         let mut rows = Vec::with_capacity(MAX_CANDIDATES);
@@ -137,7 +150,7 @@ impl Cache {
                 rows.push(old);
             }
         }
-        if unchanged_front && rows.len() == before {
+        if current_format && unchanged_front && rows.len() == before {
             return;
         }
         let manifest = Manifest { format: MANIFEST_FORMAT, candidates: rows };
@@ -540,8 +553,8 @@ mod tests {
     }
 
     #[test]
-    fn manifest_format_three_is_current_and_format_two_is_ignored_yet_listed() {
-        assert_eq!(MANIFEST_FORMAT, 3);
+    fn manifest_format_four_writes_and_format_three_migrates_without_losing_raw_entries() {
+        assert_eq!(MANIFEST_FORMAT, 4);
         let (dir, cache) = scratch("format-bump");
         publish_entry(&cache, 1);
         let prekey = key(0x7b);
@@ -562,9 +575,17 @@ mod tests {
             key: key(1),
         };
         cache.add_candidate(&prekey, candidate.clone());
-        assert!(fs::read_to_string(&path).unwrap().contains("\"format\":3"));
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(current.contains("\"format\":4"));
+        assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
+        fs::write(&path, current.replace("\"format\":4", "\"format\":3")).unwrap();
+        assert_eq!(cache.candidates(&prekey), vec![candidate.clone()], "legacy raw entries remain reusable");
+        cache.add_candidate(&prekey, candidate.clone());
+        assert!(fs::read_to_string(&path).unwrap().contains("\"format\":4"), "even an unchanged legacy candidate migrates");
+        let stored: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_ne!(stored.format, 3, "old readers reject the new manifest");
         assert_eq!(cache.candidates(&prekey), vec![candidate]);
-        assert_eq!(manifest_keys(&path), Some(vec![key(1)]), "and of a format 3 manifest");
+        assert_eq!(manifest_keys(&path), Some(vec![key(1)]), "gc can list format four");
         let _ = fs::remove_dir_all(&dir);
     }
 

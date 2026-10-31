@@ -51,33 +51,28 @@ fn workspace(sb: &Sandbox) -> PathBuf {
     root
 }
 
-struct Finished {
-    output: Output,
-    at: Instant,
+fn concurrently(sb: &Sandbox, dir: &Path, jobs: &[Vec<&str>]) -> Vec<Output> {
+    concurrently_while(sb, dir, jobs, || {})
 }
 
-fn concurrently(sb: &Sandbox, dir: &Path, jobs: &[Vec<&str>]) -> Vec<Finished> {
+fn concurrently_while(sb: &Sandbox, dir: &Path, jobs: &[Vec<&str>], running: impl FnOnce()) -> Vec<Output> {
     let barrier = Arc::new(Barrier::new(jobs.len()));
-    let handles: Vec<_> = jobs
-        .iter()
-        .map(|args| {
-            let mut cmd = sb.bin("fcargo");
-            cmd.args(args).current_dir(dir).env("FRUST_RENDER", "plain");
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                let output = cmd.output().unwrap();
-                Finished { output, at: Instant::now() }
+    thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|args| {
+                let mut cmd = sb.bin("fcargo");
+                cmd.args(args).current_dir(dir).env("FRUST_RENDER", "plain");
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    cmd.output().unwrap()
+                })
             })
-        })
-        .collect();
-    handles.into_iter().map(|h| h.join().unwrap()).collect()
-}
-
-fn spread(done: &[Finished]) -> Duration {
-    let first = done.iter().map(|d| d.at).min().unwrap();
-    let last = done.iter().map(|d| d.at).max().unwrap();
-    last - first
+            .collect();
+        running();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 fn binary_output(sb: &Sandbox, ws: &Path, profile: &str, name: &str) -> String {
@@ -90,17 +85,45 @@ fn binary_output(sb: &Sandbox, ws: &Path, profile: &str, name: &str) -> String {
 fn eight_people_building_the_same_binary_share_one_build() {
     let sb = Sandbox::new("eight");
     let ws = workspace(&sb);
-    let started = Instant::now();
+    write(
+        &ws.join("gate/build.rs"),
+        r#"use std::io::Write;
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let dir = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let mut runs = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("runs")).unwrap();
+    writeln!(runs, "run").unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("open").exists() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "gate was never opened");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+"#,
+    );
     let jobs: Vec<Vec<&str>> = (0..8).map(|_| vec!["build", "-p", "app"]).collect();
-    let done = concurrently(&sb, &ws, &jobs);
-    let wall = started.elapsed();
+    let done = concurrently_while(&sb, &ws, &jobs, || {
+        let dirs = frust::paths::Dirs::at(sb.home());
+        let started = Instant::now();
+        let locks = loop {
+            let locks = frust::lock::list(&dirs);
+            if (locks.len() == 1 && locks[0].joiners.len() == 7 && ws.join("gate/runs").exists())
+                || started.elapsed() >= Duration::from_secs(60)
+            {
+                break locks;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        // Open even on timeout, so the scoped build threads can finish before the assertion unwinds.
+        write(&ws.join("gate/open"), "open");
+        assert!(locks.len() == 1 && locks[0].joiners.len() == 7, "expected one holder and seven followers: {locks:#?}");
+    });
 
     for d in &done {
-        assert_success(&d.output);
+        assert_success(d);
     }
-    // One shared build, not eight in sequence: every build script runs once.
-    assert!(wall < Duration::from_millis(GATE_SLEEP_MS * 6), "eight identical builds took {wall:?}; they must overlap, not queue");
-    assert!(spread(&done) < Duration::from_millis(1500), "builds finished {:?} apart", spread(&done));
+    // Followers recheck freshness in turn; process startup time is not a measure of shared compilation.
+    assert_eq!(fs::read_to_string(ws.join("gate/runs")).unwrap(), "run\n", "the shared build script must run exactly once");
     for krate in ["core", "util", "gate"] {
         assert!(sb.count_cache("miss", krate) <= 1, "{krate} compiled more than once");
         assert_eq!(sb.count_cache("hit", krate), 0, "{krate} was needlessly restored");
@@ -109,6 +132,7 @@ fn eight_people_building_the_same_binary_share_one_build() {
     let again = sb.bin("fcargo").args(["build", "-p", "app"]).current_dir(&ws).output().unwrap();
     assert_success(&again);
     assert!(stderr(&again).contains("Finished"), "{}", stderr(&again));
+    assert_eq!(fs::read_to_string(ws.join("gate/runs")).unwrap(), "run\n", "a fresh build must not rerun the build script");
 }
 
 #[test]
@@ -127,7 +151,7 @@ fn different_binaries_and_profiles_in_one_workspace_all_succeed() {
     ];
     let done = concurrently(&sb, &ws, &jobs);
     for d in &done {
-        assert_success(&d.output);
+        assert_success(d);
     }
     assert_eq!(binary_output(&sb, &ws, "debug", "app"), "app 80 open");
     assert_eq!(binary_output(&sb, &ws, "debug", "tool"), "tool 40");
@@ -142,7 +166,7 @@ fn debug_and_release_builds_run_in_parallel() {
     let done = concurrently(&sb, &ws, &[vec!["build", "-p", "app"], vec!["build", "--release", "-p", "app"]]);
     let wall = started.elapsed();
     for d in &done {
-        assert_success(&d.output);
+        assert_success(d);
     }
     // Two sequential builds would each pay the slow build script.
     assert!(
@@ -196,7 +220,7 @@ fn compact_and_gc_running_during_builds_break_nothing() {
     assert!(runs >= 2, "maintenance never ran ({runs})");
 
     for d in &done {
-        assert_success(&d.output);
+        assert_success(d);
     }
     assert_eq!(binary_output(&sb, &ws, "debug", "app"), "app 80 open");
     assert_eq!(binary_output(&sb, &ws, "debug", "tool"), "tool 40");

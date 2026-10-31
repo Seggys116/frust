@@ -1,6 +1,6 @@
 [package]
 name = "frust-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A thin accelerator that sits on top of your installed Rust toolchain: shared compile cache, central target directories, queued build locks and a clean build UI."
@@ -52,7 +52,9 @@ name = "frust-wrap"
 path = "src/bin/frust-wrap.rs"
 
 [dependencies]
-blake3 = { version = "1", features = ["mmap", "rayon"] }
+blake3 = { version = "1", features = ["mmap"] }
+jobserver = "0.1.35"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

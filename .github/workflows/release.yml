@@ -11,8 +11,55 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: verify release commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require matching version and successful CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          CI_WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/ci.yml
+        run: |
+          set -euo pipefail
+          release_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')"
+          if [ "$RELEASE_TAG" != "v$release_version" ]; then
+            echo "::error::Release tag $RELEASE_TAG must match package version v$release_version. CI: $CI_WORKFLOW_URL"
+            exit 1
+          fi
+          RELEASE_COMMIT_SHA="$(git rev-parse HEAD)"
+          if ! ci_runs="$(gh api --method GET "repos/$GH_REPO/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f head_sha="$RELEASE_COMMIT_SHA" -f per_page=100)"; then
+            echo "::error::Cannot verify CI for $RELEASE_COMMIT_SHA. CI: $CI_WORKFLOW_URL"
+            exit 1
+          fi
+          if ! ci_run="$(jq -c --arg sha "$RELEASE_COMMIT_SHA" \
+            '[.workflow_runs[] | select(.head_sha == $sha and .head_branch == "main" and .event == "push")] | sort_by([.created_at, .id]) | last' <<< "$ci_runs")"; then
+            echo "::error::Cannot read CI evidence for $RELEASE_COMMIT_SHA. CI: $CI_WORKFLOW_URL"
+            exit 1
+          fi
+          if [ -z "$ci_run" ] || [ "$ci_run" = "null" ]; then
+            echo "::error::No main/push CI run found for $RELEASE_COMMIT_SHA. CI: $CI_WORKFLOW_URL"
+            exit 1
+          fi
+          ci_status="$(jq -r '.status // "unknown"' <<< "$ci_run")"
+          ci_conclusion="$(jq -r '.conclusion // "none"' <<< "$ci_run")"
+          ci_url="$(jq -r --arg fallback "$CI_WORKFLOW_URL" '.html_url // $fallback' <<< "$ci_run")"
+          if [ "$ci_status" != completed ] || [ "$ci_conclusion" != success ]; then
+            echo "::error::Latest main/push CI for $RELEASE_COMMIT_SHA is $ci_status/$ci_conclusion: $ci_url"
+            exit 1
+          fi
+          echo "Verified $RELEASE_TAG at $RELEASE_COMMIT_SHA against successful CI: $ci_url"
+
   build:
     name: build (${{ matrix.target }})
+    needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

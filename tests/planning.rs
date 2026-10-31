@@ -1,4 +1,4 @@
-//! Exact progress estimates should cost nothing on builds that finish before the first display tick.
+//! Quiet builds launch one planner, and a completed build never waits for a slow planner.
 
 #![cfg(unix)]
 
@@ -28,12 +28,7 @@ case " $* " in
     printf '{"units":[{"mode":"build"}]}\n'
     exit 0 ;;
 esac
-if [ "$FRUST_TEST_MODE" = fast ]; then
-  # Finish before a display tick, but let an eagerly spawned planner reach its marker.
-  sleep 0.02
-else
-  while [ ! -f "$FRUST_TEST_PLANNER_REQUESTS" ]; do sleep 0.01; done
-fi
+while [ ! -f "$FRUST_TEST_PLANNER_REQUESTS" ]; do sleep 0.01; done
 printf '{"reason":"build-finished","success":true}\n'
 "#;
 
@@ -56,7 +51,6 @@ impl Scene {
     }
 
     fn run(&self, mode: &str) {
-        // Keep the short-build check independent of the other fixtures' process creation.
         let _serial = SERIAL.lock().unwrap_or_else(|err| err.into_inner());
         let stderr = self.sb.root.join("stderr");
         let mut cmd = self.sb.bin("fcargo");
@@ -84,13 +78,6 @@ impl Scene {
             thread::sleep(Duration::from_millis(5));
         }
     }
-}
-
-#[test]
-fn fast_build_does_not_request_a_unit_graph() {
-    let scene = Scene::new("planning-fast");
-    scene.run("fast");
-    assert!(!scene.requests.exists(), "a build that finishes before the first display tick needs no planner");
 }
 
 #[test]

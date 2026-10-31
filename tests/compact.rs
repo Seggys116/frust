@@ -246,10 +246,11 @@ fn age_reassessment_cleans_unchanged_target(signature_matches: bool) {
     let target = dirs.targets().join("age-reassessment");
     let profile = target.join("debug");
     let deps = profile.join("deps");
-    let session = profile.join("incremental").join("app-1abc").join("s-current");
+    let session = profile.join("incremental").join("app-1abc").join("s-0000000001-0000001-0000000000000000000000000");
     fs::create_dir_all(&deps).unwrap();
     fs::create_dir_all(&session).unwrap();
     fs::write(session.join("dep-graph.bin"), b"current session").unwrap();
+    fs::write(session.parent().unwrap().join("s-0000000001-0000001.lock"), b"").unwrap();
     let fingerprints = profile.join(".fingerprint");
     let old_unit = fingerprints.join("app-0000000000000001");
     let current_unit = fingerprints.join("app-0000000000000002");

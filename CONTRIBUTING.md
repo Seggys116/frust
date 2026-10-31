@@ -46,5 +46,14 @@ behind `src/sys/mod.rs`. CI fails the lint job if platform calls appear elsewher
 
 ## Releases
 
-Maintainers tag `vX.Y.Z`. The release workflow builds archives for Linux, macOS and Windows, publishes them with
-checksums, and the install scripts and `cargo binstall` pick them up.
+1. Update the package version in `Cargo.toml` and the root package in `Cargo.lock`, and add the release's factual
+   changes to `CHANGELOG.md`. Review `cargo package --locked --list` and run `cargo publish --locked --dry-run`.
+2. Commit the complete release contents and push them to `main`. Wait for the latest push-triggered CI run for that
+   exact commit SHA to finish successfully, including the platform tests, stamp audits, MSRV and cross-target checks.
+3. Create `vX.Y.Z` at that same tested commit, matching the package version exactly, and push the tag. Do not add or
+   amend release changes after CI passes without running CI on the resulting commit again.
+
+The release workflow rejects a mismatched version, missing CI run, unfinished CI run or unsuccessful latest CI run
+before building archives. It builds all eight binaries for Linux, macOS and Windows, publishes archives with SHA-256
+checksums, and the install scripts and `cargo binstall` pick them up. Publishing the crate also requires the
+`CARGO_REGISTRY_TOKEN` repository secret; without it, the workflow skips crates.io publication.

@@ -3,7 +3,7 @@
 mod common;
 
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Sandbox, assert_success, stderr, stdout};
 use frust::ui::vt::Vt;
@@ -80,17 +80,50 @@ fn osc_sequences_follow_configuration() {
 fn concurrent_builds_queue_instead_of_clashing() {
     let sb = Sandbox::new("lock");
     let p = sb.project("slow", &[], "fn main() {}\n");
-    fs::write(p.join("build.rs"), "fn main() { std::thread::sleep(std::time::Duration::from_millis(1800)); }\n").unwrap();
+    fs::write(p.join("build.rs"), r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    std::fs::write("gate-started", b"started").unwrap();
+    let started = std::time::Instant::now();
+    while !std::path::Path::new("gate-open").exists() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "gate never opened");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+"#).unwrap();
 
-    let first = sb.bin("fcargo").arg("build").env("FRUST_RENDER", "plain").current_dir(&p).spawn_piped();
-    std::thread::sleep(Duration::from_millis(500));
-    let second = sb.bin("fcargo").arg("build").env("FRUST_RENDER", "plain").current_dir(&p).output().unwrap();
-    let first = first.wait_with_output().unwrap();
+    let mut first = sb.bin("fcargo").arg("build").env("FRUST_RENDER", "plain").current_dir(&p).spawn_captured(&sb, "first");
+    if !wait_until(|| p.join("gate-started").exists()) {
+        fs::write(p.join("gate-open"), b"open").unwrap();
+        first.stop();
+        let first = first.finish();
+        panic!("holder never reached the build script: {}", stderr(&first));
+    }
+    let holder_pid = first.child.id();
+    let second = sb.bin("fcargo").arg("build").env("FRUST_RENDER", "plain").current_dir(&p).spawn_captured(&sb, "second");
+    let dirs = frust::paths::Dirs::at(sb.home());
+    let joined = wait_until(|| frust::lock::list(&dirs).iter().any(|lock| {
+        lock.holder.as_ref().is_some_and(|holder| holder.owner.pid == holder_pid) && lock.joiners.len() == 1
+    }));
+    fs::write(p.join("gate-open"), b"open").unwrap();
+    let second = second.finish();
+    let first = first.finish();
     assert_success(&first);
     assert_success(&second);
+    assert!(joined, "follower never joined the holder: {}", stderr(&second));
     let text = stderr(&second);
     // An identical build in the same repo joins the running one instead of queueing behind it.
     assert!(text.contains("joined    running build of") || text.contains("shared    build of"), "second build must join the first: {text}");
+}
+
+fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 #[test]
@@ -145,12 +178,49 @@ fn ui_demo_snapshot_renders_headlessly() {
     assert!(text.lines().all(|l| l.chars().count() <= 70 || l.starts_with("  ") || l.starts_with("warning")), "{text}");
 }
 
-trait SpawnPiped {
-    fn spawn_piped(&mut self) -> std::process::Child;
+struct BuildChild {
+    child: std::process::Child,
+    stdout: std::path::PathBuf,
+    stderr: std::path::PathBuf,
 }
 
-impl SpawnPiped for std::process::Command {
-    fn spawn_piped(&mut self) -> std::process::Child {
-        self.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+impl BuildChild {
+    fn stop(&mut self) {
+        common::kill_tree(self.child.id());
+        let _ = self.child.wait();
+    }
+
+    fn finish(mut self) -> std::process::Output {
+        if !wait_until(|| self.child.try_wait().unwrap().is_some()) {
+            self.stop();
+            panic!("build never finished: {}", fs::read_to_string(&self.stderr).unwrap());
+        }
+        std::process::Output {
+            status: self.child.wait().unwrap(),
+            stdout: fs::read(&self.stdout).unwrap(),
+            stderr: fs::read(&self.stderr).unwrap(),
+        }
+    }
+}
+
+impl Drop for BuildChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            self.stop();
+        }
+    }
+}
+
+trait SpawnCaptured {
+    fn spawn_captured(&mut self, sb: &Sandbox, tag: &str) -> BuildChild;
+}
+
+impl SpawnCaptured for std::process::Command {
+    fn spawn_captured(&mut self, sb: &Sandbox, tag: &str) -> BuildChild {
+        let stdout = sb.root.join(format!("{tag}.stdout"));
+        let stderr = sb.root.join(format!("{tag}.stderr"));
+        self.stdout(fs::File::create(&stdout).unwrap()).stderr(fs::File::create(&stderr).unwrap());
+        let child = common::own_group(self).spawn().unwrap();
+        BuildChild { child, stdout, stderr }
     }
 }
