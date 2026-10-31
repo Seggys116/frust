@@ -57,7 +57,7 @@ fn ansi_renderer_leaves_a_clean_final_screen() {
     let screen = vt.plain_text();
     assert!(screen.contains("Finished"), "{screen}");
     assert!(screen.contains("units"), "{screen}");
-    assert!(!screen.contains("0/~") && !screen.contains('>'), "no live region may remain: {screen}");
+    assert!(!screen.contains('%') && !screen.contains('▸'), "no live region may remain: {screen}");
     assert!(vt.cursor_visible());
 }
 

@@ -98,6 +98,11 @@ impl Model {
         }
     }
 
+    /// An exact count replaces the history estimate once cargo has planned the build.
+    pub fn set_expected(&mut self, expected: u32) {
+        self.expected = Some(expected).filter(|&n| n > 0);
+    }
+
     pub fn done(&self) -> u32 {
         self.stats.units
     }

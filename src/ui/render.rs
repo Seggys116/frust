@@ -7,16 +7,20 @@ use super::term::{Paint, fmt_duration, fmt_ms, hyperlink, visible_width};
 use super::{RunStats, UiOptions};
 
 const MIN_BAR_WIDTH: usize = 12;
+/// Wider than this the bar stops reading as one glance, so spare columns stay empty.
+const MAX_BAR_WIDTH: usize = 56;
 /// Columns left free at the right edge so a full line never autowraps.
 const RIGHT_MARGIN: usize = 2;
-const MOUTH_FRAMES: usize = 3;
 pub const MAX_UNIT_LINES: usize = 4;
 const VERB_COLS: usize = 9;
 const FRAME_MS: u128 = 80;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const PAC_OPEN: &str = "ᗧ";
-const PAC_CLOSED: &str = "●";
-const PAC_DOT: &str = "·";
+const BAR_FILL: &str = "━";
+const BAR_HEAD: &str = "╸";
+const BAR_TRACK: &str = "─";
+const SHIMMER_WIDTH: usize = 6;
+/// A unit running this long is worth noticing, so its timer turns yellow.
+const SLOW_UNIT: Duration = Duration::from_secs(5);
 
 pub const TITLE_PUSH: &str = "\x1b[22;0t";
 pub const TITLE_POP: &str = "\x1b[23;0t";
@@ -45,7 +49,7 @@ pub fn live_region(m: &Model, p: Paint, elapsed: Duration, now: Instant, width: 
     }
     // Active units are stored in start order, so the longest-running come first.
     for unit in m.active.iter().take(MAX_UNIT_LINES) {
-        lines.push(unit_line(unit, p, now));
+        lines.push(unit_line(unit, p, now, width));
     }
     if m.active.len() > MAX_UNIT_LINES {
         lines.push(format!("    {}", p.dim(&format!("+ {} more", m.active.len() - MAX_UNIT_LINES))));
@@ -53,8 +57,8 @@ pub fn live_region(m: &Model, p: Paint, elapsed: Duration, now: Instant, width: 
     lines
 }
 
-fn unit_line(unit: &ActiveUnit, p: Paint, now: Instant) -> String {
-    let mut line = format!("    {} {}", p.cyan(">"), unit.name);
+fn unit_line(unit: &ActiveUnit, p: Paint, now: Instant, width: usize) -> String {
+    let mut line = format!("    {} {}", p.cyan("▸"), p.bold(&unit.name));
     if let Some(v) = &unit.version {
         line.push(' ');
         line.push_str(&p.dim(&format!("v{v}")));
@@ -64,39 +68,59 @@ fn unit_line(unit: &ActiveUnit, p: Paint, now: Instant) -> String {
         line.push_str(&p.dim("(build script)"));
     }
     let running = now.saturating_duration_since(unit.started);
-    format!("{line}  {}", p.dim(&fmt_duration(running)))
+    let timer = fmt_duration(running);
+    let timer = if running >= SLOW_UNIT { p.yellow(&timer) } else { p.dim(&timer) };
+    let gap = width.saturating_sub(RIGHT_MARGIN + visible_width(&line) + visible_width(&timer));
+    format!("{line}{}{timer}", " ".repeat(gap.max(2)))
 }
 
 fn progress_line(m: &Model, p: Paint, elapsed: Duration, width: usize) -> String {
     let frame = (elapsed.as_millis() / FRAME_MS) as usize;
     let done = m.done().to_string();
-    let count = match m.total() {
-        Some(total) => format!("{}{}", p.bold(&done), p.dim(&format!("/~{total}"))),
-        None => p.bold(&done),
-    };
-    let mut tail = format!("  {}  {}", count, p.dim(&fmt_duration(elapsed)));
+    let mut tail = String::new();
+    if let (Some(total), Some(pct)) = (m.total(), m.percent()) {
+        tail.push_str(&format!("  {}", p.bold(&format!("{pct:>3}%"))));
+        tail.push_str(&format!("  {}{}", p.bold(&done), p.dim(&format!("/{total}"))));
+    } else {
+        tail.push_str(&format!("  {}", p.bold(&done)));
+    }
+    tail.push_str(&format!("  {}", p.dim(&fmt_duration(elapsed))));
     if m.cache_hits + m.cache_misses > 0 {
         tail.push_str(&format!(
-            "  {}{}{}",
-            p.dim("cache "),
-            p.green(&m.cache_hits.to_string()),
-            p.dim(&format!(" hit / {} miss", m.cache_misses))
+            "  {} {} {}",
+            p.green(&format!("{} hit", m.cache_hits)),
+            p.dim("·"),
+            p.dim(&format!("{} miss", m.cache_misses))
         ));
     }
     let lead = format!("  {} ", p.cyan(SPINNER[frame % SPINNER.len()]));
-    let bar_width = width.saturating_sub(RIGHT_MARGIN + visible_width(&lead) + visible_width(&tail));
+    let bar_width = width.saturating_sub(RIGHT_MARGIN + visible_width(&lead) + visible_width(&tail)).min(MAX_BAR_WIDTH);
     format!("{lead}{}{tail}", bar(m, p, frame, bar_width))
 }
 
-/// Without an estimate Pac-Man laps the track instead of sitting at the finished fraction.
+/// A fine line that fills in half-cell steps; without a total a short segment sweeps back and forth.
 fn bar(m: &Model, p: Paint, frame: usize, width: usize) -> String {
     let width = width.max(MIN_BAR_WIDTH);
-    let pac = match m.total() {
-        Some(total) => (m.done().min(total) as usize * width / total as usize).min(width - 1),
-        None => frame % width,
+    let Some(total) = m.total() else {
+        let span = width - SHIMMER_WIDTH;
+        let step = frame % (2 * span);
+        let at = if step <= span { step } else { 2 * span - step };
+        return format!(
+            "{}{}{}",
+            p.dim(&BAR_TRACK.repeat(at)),
+            p.cyan(&BAR_FILL.repeat(SHIMMER_WIDTH)),
+            p.dim(&BAR_TRACK.repeat(width - SHIMMER_WIDTH - at))
+        );
     };
-    let mouth = if (frame / MOUTH_FRAMES).is_multiple_of(2) { PAC_OPEN } else { PAC_CLOSED };
-    format!("{}{}{}", " ".repeat(pac), p.yellow(mouth), p.dim(&PAC_DOT.repeat(width - 1 - pac)))
+    let halves = (m.done().min(total) as usize * width * 2 / total as usize).min(width * 2);
+    let (full, head) = (halves / 2, halves % 2);
+    let rest = width - full - head;
+    format!(
+        "{}{}{}",
+        p.cyan(&BAR_FILL.repeat(full)),
+        if head == 1 { p.cyan(BAR_HEAD) } else { String::new() },
+        p.dim(&BAR_TRACK.repeat(rest))
+    )
 }
 
 /// Whole seconds only: the lock age is known to the second, so fractions would be false precision.
@@ -468,45 +492,71 @@ mod tests {
     }
 
     #[test]
-    fn progress_line_shows_fraction_and_counters() {
+    fn progress_line_shows_percent_fraction_and_counters() {
         let mut m = Model::new(Some(87));
         m.stats.units = 37;
         m.cache_hits = 20;
         m.cache_misses = 5;
         let line = strip_ansi(&progress_line(&m, Paint::new(true), Duration::from_millis(12_300), 100));
-        assert!(line.contains("37/~87"));
+        assert!(line.contains(" 42%"), "{line}");
+        assert!(line.contains("37/87"), "{line}");
+        assert!(!line.contains('~'), "the total is exact, not an estimate: {line}");
         assert!(line.contains("12.3s"));
-        assert!(line.contains("cache 20 hit / 5 miss"));
-        assert_eq!(visible_width(&line), 100 - RIGHT_MARGIN, "the bar fills the width");
-        assert_eq!(line.chars().filter(|c| *c == PAC_OPEN.chars().next().unwrap() || *c == PAC_CLOSED.chars().next().unwrap()).count(), 1);
+        assert!(line.contains("20 hit · 5 miss"), "{line}");
+        assert!(visible_width(&line) <= 100 - RIGHT_MARGIN, "never wider than the terminal");
+        let narrow = strip_ansi(&progress_line(&m, Paint::new(true), Duration::from_millis(12_300), 80));
+        assert_eq!(visible_width(&narrow), 80 - RIGHT_MARGIN, "the bar fills a narrow terminal");
     }
 
     #[test]
-    fn pacman_sits_at_the_finished_fraction() {
+    fn the_bar_fills_in_half_cell_steps() {
         let mut m = Model::new(Some(10));
         let p = Paint::new(false);
         let at = |m: &Model| strip_ansi(&bar(m, p, 0, 40));
         let cells = at(&m);
-        assert_eq!((cells.chars().count(), cells.find(PAC_OPEN)), (40, Some(0)), "nothing eaten yet");
-        assert_eq!(cells.matches(PAC_DOT).count(), 39);
+        assert_eq!(cells.chars().count(), 40);
+        assert_eq!(cells.matches(BAR_TRACK).count(), 40, "nothing done yet");
         m.stats.units = 5;
         let cells = at(&m);
-        assert_eq!(cells.chars().take_while(|c| *c == ' ').count(), 20);
-        assert_eq!(cells.matches(PAC_DOT).count(), 19);
+        assert_eq!((cells.matches(BAR_FILL).count(), cells.matches(BAR_HEAD).count(), cells.matches(BAR_TRACK).count()), (20, 0, 20));
+        m.stats.units = 1;
+        let cells = at(&m);
+        assert_eq!((cells.matches(BAR_FILL).count(), cells.matches(BAR_HEAD).count(), cells.matches(BAR_TRACK).count()), (4, 0, 36));
+        let mut odd = Model::new(Some(80));
+        odd.stats.units = 1;
+        let cells = at(&odd);
+        assert_eq!(cells.matches(BAR_HEAD).count(), 1, "a sub-cell fraction shows the half-step head: {cells}");
+        assert_eq!(cells.chars().count(), 40);
         m.stats.units = 10;
         let cells = at(&m);
-        assert!(cells.ends_with(PAC_OPEN) && !cells.contains(PAC_DOT), "{cells:?}");
+        assert!(cells.chars().all(|c| c.to_string() == BAR_FILL), "{cells:?}");
     }
 
     #[test]
-    fn indeterminate_pacman_laps_the_track() {
+    fn without_a_total_a_segment_sweeps_the_track() {
         let m = Model::new(None);
         let p = Paint::new(false);
         let a = strip_ansi(&bar(&m, p, 0, 30));
-        let b = strip_ansi(&bar(&m, p, 1, 30));
+        let b = strip_ansi(&bar(&m, p, 3, 30));
         assert_ne!(a, b);
         assert_eq!(a.chars().count(), 30);
-        assert_eq!(strip_ansi(&bar(&m, p, 30, 30)), a, "wraps after one lap");
+        assert_eq!(a.matches(BAR_FILL).count(), SHIMMER_WIDTH);
+        assert!(a.starts_with(BAR_FILL), "starts at the left edge");
+        let turn = strip_ansi(&bar(&m, p, 24, 30));
+        assert!(turn.ends_with(BAR_FILL), "reaches the right edge: {turn}");
+        assert_eq!(strip_ansi(&bar(&m, p, 48, 30)), a, "wraps after a full sweep");
+    }
+
+    #[test]
+    fn unit_timers_align_at_the_right_edge_and_slow_ones_stand_out() {
+        let now = Instant::now();
+        let unit = ActiveUnit { name: "serde".into(), version: Some("1.0.200".into()), local: false, build_script: false, started: now - Duration::from_millis(1200) };
+        let line = strip_ansi(&unit_line(&unit, Paint::new(true), now, 60));
+        assert_eq!(visible_width(&line), 60 - RIGHT_MARGIN, "{line:?}");
+        assert!(line.starts_with("    ▸ serde v1.0.200"), "{line:?}");
+        assert!(line.ends_with("1.20s"), "{line:?}");
+        let slow = ActiveUnit { started: now - Duration::from_secs(9), ..unit };
+        assert!(unit_line(&slow, Paint::new(true), now, 60).contains("\x1b[33m"), "slow units turn yellow");
     }
 
     #[test]

@@ -63,6 +63,12 @@ enum Progress {
     Indeterminate,
 }
 
+impl Ui {
+    pub fn set_expected_units(&mut self, expected: u32) {
+        self.model.set_expected(expected);
+    }
+}
+
 pub struct Ui {
     opts: UiOptions,
     paint: Paint,
@@ -466,7 +472,7 @@ mod tests {
         assert_eq!(lines[0], "frust build my-app  rustc 1.99.0");
         assert_eq!(lines[n - 2], "  ✔ Finished dev profile [unoptimized + debuginfo] in 8.70s");
         assert_eq!(lines[n - 1], "    1 warning  ·  13 units  ·  3 cached  ·  7 compiled  ·  3 fresh  ·  saved ~3.70s");
-        assert!(!lines.iter().any(|l| l.contains("/~14")), "live progress line left behind");
+        assert!(!lines.iter().any(|l| l.contains("/14") && l.contains('%')), "live progress line left behind");
         assert!(!lines.iter().any(|l| l.trim_start().starts_with("> ")), "live unit line left behind");
         assert!(vt.cursor_visible());
         assert_eq!(stats.units, 13);
@@ -499,10 +505,11 @@ mod tests {
         let vt = replay(&buf.contents(), 100);
         let screen = vt.screen();
         assert_eq!(screen.len(), 3);
-        assert!(screen[1].contains("0/~14"), "{}", screen[1]);
+        assert!(screen[1].contains("0/14"), "{}", screen[1]);
         assert!(screen[1].contains("2.70s"), "{}", screen[1]);
-        assert!(screen[1].contains("cache 1 hit / 0 miss"), "{}", screen[1]);
-        assert_eq!(screen[2], "    > syn v2.0.1  2.10s");
+        assert!(screen[1].contains("1 hit · 0 miss"), "{}", screen[1]);
+        assert!(screen[2].starts_with("    ▸ syn v2.0.1") && screen[2].ends_with("2.10s"), "{}", screen[2]);
+        assert_eq!(screen[2].chars().count(), 78, "the timer sits at the right edge");
     }
 
     #[test]
@@ -514,8 +521,9 @@ mod tests {
         ui.tick(ms(start, 1100));
         let screen = replay(&buf.contents(), 100).screen();
         assert_eq!(screen.len(), 7);
-        assert_eq!(screen[2], "    > crate0 v1.0.0  0.10s");
-        assert_eq!(screen[5], "    > crate3 v1.0.0  0.10s");
+        for (row, name) in [(2, "crate0"), (5, "crate3")] {
+            assert!(screen[row].starts_with(&format!("    ▸ {name} v1.0.0")) && screen[row].ends_with("0.10s"), "{}", screen[row]);
+        }
         assert_eq!(screen[6], "    + 5 more");
     }
 

@@ -19,6 +19,7 @@ pub mod stats;
 pub mod style;
 pub mod sys;
 pub mod toolchain;
+pub mod unit_graph;
 pub mod ui;
 pub mod update;
 pub mod workspace;

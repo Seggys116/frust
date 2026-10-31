@@ -59,6 +59,11 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
   by `rust-toolchain.toml` made rustup auto-install it from several processes at once, which left it without `cargo`.
 * Dependency files for profile directories whose path contains spaces are rewritten and restored correctly.
 * A non-UTF-8 environment variable no longer aborts the wrapper.
+* The terminal progress signal (OSC 9;4) now carries an exact percent. When the display is on, frust asks cargo for its
+  unit graph under the build lock (about 0.1 s, bounded to 5 s, and skipped for subcommands whose stream does not match
+  it), so the bar fills from 0 to 100 instead of looping or stopping at an old estimate.
+* The live display is redrawn as a fine line bar with half-cell steps, percent, exact unit count, elapsed time and cache
+  hits, and unit timers aligned at the right edge. The animated Pac-Man bar is gone.
 
 ### Performance
 

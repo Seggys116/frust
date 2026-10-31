@@ -629,7 +629,7 @@ impl Session {
         let workspace_name = workspace::display_name(self.root.as_deref());
         let key = self.root.as_deref().map(workspace::workspace_key).unwrap_or_else(|| "_loose".into());
         let history_keys = self.history_keys(&key, sub, rest);
-        let expected = history::expected_units(&self.dirs, &history_keys);
+        let mut expected = history::expected_units(&self.dirs, &history_keys);
 
         let feed_path = self.dirs.tmp().join(format!("feed-{}.jsonl", std::process::id()));
         let mut feed = Feed::new(feed_path.clone());
@@ -689,6 +689,14 @@ impl Session {
             cmd.env("FRUST_EVENTS", &feed_path);
         }
 
+        // Planned under the build lock so it never races a concurrent resolve; failing or timing out keeps the history estimate.
+        if let Some(ui) = ui.as_mut()
+            && crate::unit_graph::supported(sub)
+            && let Some(exact) = crate::unit_graph::count(&self.cargo, &command, rest, &self.env_vars)
+        {
+            expected = Some(exact);
+            ui.set_expected_units(exact);
+        }
         let mut progress = Progress { expected, ..Progress::default() };
         trace(&self.cfg, started, "lock acquired, starting cargo");
         let code = match (style, ui.as_mut()) {
