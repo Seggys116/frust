@@ -1,5 +1,8 @@
 //! `frust compact` must not change what cargo considers fresh or what a binary does.
 
+// The variant tests are unix-only, which leaves their helpers unused on Windows.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 mod common;
 
 use std::fs::{self, File};
@@ -67,6 +70,8 @@ fn hashes_of(dir: &Path, prefix: &str) -> Vec<String> {
     out
 }
 
+// Windows names a binary without a hash, so feature variants of a bin share one fingerprint directory and none is superseded.
+#[cfg(unix)]
 #[test]
 fn compact_keeps_the_current_build_fresh_and_removes_superseded_variants() {
     let sb = Sandbox::new("compact");
@@ -119,6 +124,8 @@ fn compact_keeps_the_current_build_fresh_and_removes_superseded_variants() {
     assert!(compiled(&build(&sb, &app, &[])).is_empty());
 }
 
+// Windows names a binary without a hash, so feature variants of a bin share one fingerprint directory and none is superseded.
+#[cfg(unix)]
 #[test]
 fn compact_refuses_to_remove_without_confirmation_but_dry_run_changes_nothing() {
     let sb = Sandbox::new("compact-confirm");
@@ -138,6 +145,8 @@ fn compact_refuses_to_remove_without_confirmation_but_dry_run_changes_nothing() 
     assert_eq!(hashes_of(&fingerprints, "app-"), before);
 }
 
+// Windows names a binary without a hash, so feature variants of a bin share one fingerprint directory and none is superseded.
+#[cfg(unix)]
 #[test]
 fn compact_skips_a_profile_a_build_is_using() {
     let sb = Sandbox::new("compact-busy");
@@ -225,6 +234,8 @@ fn allocated(dir: &Path) -> u64 {
 
 const MAIN_WITH_TEST: &str = "fn main() { let tag = if cfg!(feature = \"x\") { \"x\" } else { \"plain\" }; println!(\"{} {}\", tag, leaf::all(1)); }\n#[test]\nfn adds() { assert_eq!(leaf::all(1), leaf::all(1)); }\n";
 
+// Windows names a binary without a hash, so feature variants of a bin share one fingerprint directory and none is superseded.
+#[cfg(unix)]
 #[test]
 fn auto_compaction_shrinks_the_target_and_keeps_every_build_warm() {
     let sb = Sandbox::new("auto-compact");

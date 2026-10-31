@@ -898,6 +898,7 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
         }
     }
     let mut out = Vec::new();
+    let mut unattributable: Vec<usize> = Vec::new();
     let mut cgus_by_crate: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
     let Ok(crates) = fs::read_dir(profile.join("incremental")) else { return out };
     for krate in crates.flatten() {
@@ -935,13 +936,27 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
             IncrementalOwner::Live
         } else if !units.is_empty() && units.iter().all(|h| analysis.dead.contains(h)) {
             IncrementalOwner::Dead
-        // COFF objects carry no codegen-unit names and the MSVC linker keeps no links, so nothing proves an orphan there.
+        // COFF objects carry no codegen-unit names and the MSVC linker keeps no links, so ownership is settled below by recency.
         } else if units.is_empty() && objects > 0 && !cfg!(windows) {
             IncrementalOwner::Orphan
         } else {
             IncrementalOwner::Unknown
         };
+        if cfg!(windows) && units.is_empty() && objects > 0 {
+            unattributable.push(out.len());
+        }
         out.push(IncrementalDir { path, crate_name, owner, units, touched });
+    }
+    // Without any proof of ownership, a directory is superseded only when a sibling of the same crate was touched after it.
+    let newest: HashMap<String, SystemTime> = unattributable.iter().fold(HashMap::new(), |mut m, &i| {
+        let e = m.entry(out[i].crate_name.clone()).or_insert(SystemTime::UNIX_EPOCH);
+        *e = (*e).max(out[i].touched);
+        m
+    });
+    for &i in &unattributable {
+        if out[i].touched < newest[&out[i].crate_name] {
+            out[i].owner = IncrementalOwner::Orphan;
+        }
     }
     // An unattributed directory is an orphan only if its crate has no live unit or another directory is the live one.
     let live_dirs: HashSet<String> = out.iter().filter(|d| d.owner == IncrementalOwner::Live).map(|d| d.crate_name.clone()).collect();
