@@ -365,11 +365,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compressed_executables_keep_original_permissions() {
-        use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         let source = scratch.0.join("source");
         fs::write(&source, vec![0x7f; MIN_BYTES as usize * 2]).unwrap();
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+        sys::set_path_mode(&source, 0o751).unwrap();
         let encoded = scratch.0.join("f0");
         let meta = metadata(store(&source, &encoded, true).unwrap());
         assert_eq!(meta.encoding, Encoding::Lz4BlocksV1);

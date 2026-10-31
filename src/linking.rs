@@ -541,27 +541,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_utf8_arguments_are_declined() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let non_utf8 = OsString::from_vec(vec![0xff]);
-        let mut args = compile();
-        args.push(non_utf8.clone());
-        assert!(eligible(&args).is_err());
-        args.pop();
-        args[0] = non_utf8.clone();
-        assert!(eligible(&args).is_err());
-        assert!(!driver_environment_supported(|_| Some(non_utf8.clone())));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn non_utf8_arguments_are_declined() {
-        use std::os::windows::ffi::OsStringExt;
-
-        let non_utf8 = OsString::from_wide(&[0xd800]);
+        let non_utf8 = sys::non_utf8_os_string();
         let mut args = compile();
         args.push(non_utf8.clone());
         assert!(eligible(&args).is_err());

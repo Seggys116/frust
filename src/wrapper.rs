@@ -2863,7 +2863,7 @@ mod tests {
         #[cfg(unix)]
         {
             sys::rename(&deps.join("libk.rmeta"), &deps.join("unrelated-directory")).unwrap();
-            std::os::unix::fs::symlink(deps.join("previous-rmeta"), deps.join("libk.rmeta")).unwrap();
+            sys::link_tool(&deps.join("previous-rmeta"), &deps.join("libk.rmeta")).unwrap();
             assert_eq!(plan.prefixed_outputs(|_| true).iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["k.d"]);
             assert!(plan.output_files(&[], &before).is_empty(), "a symlink is not owned by metadata discovery");
         }

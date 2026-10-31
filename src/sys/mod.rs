@@ -616,3 +616,8 @@ mod tests {
         assert_eq!(pipe.read(&mut buf).unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+pub(crate) fn non_utf8_os_string() -> OsString {
+    imp::non_utf8_os_string()
+}

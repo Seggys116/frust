@@ -1042,3 +1042,9 @@ mod compact_hashing_tests {
         assert_eq!(linux_fs_name(0xdead), "magic-dead");
     }
 }
+
+#[cfg(test)]
+pub(super) fn non_utf8_os_string() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![0xff])
+}
