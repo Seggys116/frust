@@ -26,17 +26,17 @@ frust bench --linking --quick --runs 7 --json
 
 ## Results
 
-Measured 2026-10-31 on Intel(R) Core(TM) Ultra 7 255H, 16 cores, Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. Load average for the general build rows was 2.59 before and 2.26 after; for the profile matrix it was 2.24 before and 2.66 after. Results describe these generated workloads on this machine.
+Measured 2026-10-31 on Intel(R) Core(TM) Ultra 7 255H, 16 cores, Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. Load average for the general build rows was 3.25 before and 3.04 after; for the profile matrix it was 3.96 before and 2.61 after. Results describe these generated workloads on this machine.
 
 ![Debug cold builds, warm restores, no-op builds and real warm-session edits](../.github/assets/results.svg)
 
 | Debug build | Cargo ms [min, max] | frust ms [min, max] | Result |
 |---|---:|---:|---:|
-| Cold build | 3336 [2825, 3531] | 3595 [3024, 3677] | +259 ms |
-| Warm restore | 3483 [2863, 3567] | 161 [160, 168] | 21.6x faster |
-| No-op build | 18 [17, 18] | 20 [18, 21] | +2 ms |
-| First edit after restore | 89 [79, 104] | 113 [91, 151] | +24 ms |
-| Warm-session edit | 91 [84, 101] | 105 [95, 139] | +14 ms |
+| Cold build | 4773 [3156, 5123] | 5184 [3373, 5275] | +411 ms |
+| Warm restore | 5066 [3197, 5086] | 175 [170, 182] | 28.9x faster |
+| No-op build | 20 [19, 21] | 21 [21, 23] | +1 ms |
+| First edit after restore | 95 [89, 100] | 121 [107, 130] | +26 ms |
+| Warm-session edit | 93 [86, 100] | 113 [99, 176] | +20 ms |
 
 The uncached, no-op and edit rows expose overhead alongside the cache gains.
 
@@ -44,20 +44,22 @@ The uncached, no-op and edit rows expose overhead alongside the cache gains.
 
 | Release profile | Build | Cargo ms [min, max] | frust ms [min, max] | Result |
 |---|---|---:|---:|---:|
-| Release defaults | Cold build | 3629 [3552, 3730] | 3853 [3758, 3937] | +224 ms |
-| Release defaults | Warm restore | 3671 [3614, 3711] | 146 [144, 148] | 25.1x faster |
-| Release defaults | No-op | 18 [17, 20] | 20 [18, 21] | +2 ms |
-| Release defaults | Body edit | 67 [65, 71] | 71 [69, 79] | +4 ms |
-| ThinLTO | Cold build | 5022 [4976, 5092] | 5199 [5140, 5291] | +177 ms |
-| ThinLTO | Warm restore | 5049 [4893, 5082] | 149 [145, 166] | 33.9x faster |
-| ThinLTO | No-op | 19 [18, 20] | 20 [19, 21] | +1 ms |
-| ThinLTO | Body edit | 1758 [1715, 1827] | 1819 [1741, 1929] | +61 ms |
-| Full / fat LTO | Cold build | 4989 [4959, 5100] | 5128 [5034, 5164] | +139 ms |
-| Full / fat LTO | Warm restore | 4920 [4865, 5052] | 145 [141, 177] | 33.9x faster |
-| Full / fat LTO | No-op | 18 [17, 19] | 20 [19, 21] | +2 ms |
-| Full / fat LTO | Body edit | 1703 [1629, 1786] | 1701 [1664, 1773] | -2 ms |
+| Release defaults | Cold build | 5071 [5042, 5093] | 5174 [5147, 5214] | +103 ms |
+| Release defaults | Warm restore | 5086 [5044, 5117] | 161 [149, 180] | 31.6x faster |
+| Release defaults | No-op | 20 [18, 21] | 21 [20, 22] | +1 ms |
+| Release defaults | Body edit | 76 [67, 80] | 79 [73, 83] | +3 ms |
+| ThinLTO | Cold build | 7263 [6963, 7496] | 7296 [7244, 7708] | +33 ms |
+| ThinLTO | Warm restore | 7181 [7092, 7397] | 159 [156, 165] | 45.2x faster |
+| ThinLTO | No-op | 20 [19, 22] | 22 [21, 23] | +2 ms |
+| ThinLTO | Body edit | 2407 [2364, 2519] | 2389 [2360, 2583] | -18 ms |
+| Full / fat LTO | Cold build | 6832 [6590, 7388] | 7093 [6760, 7436] | +261 ms |
+| Full / fat LTO | Warm restore | 6725 [6524, 7379] | 158 [154, 168] | 42.6x faster |
+| Full / fat LTO | No-op | 19 [19, 22] | 21 [20, 23] | +2 ms |
+| Full / fat LTO | Body edit | 2216 [2136, 2279] | 2204 [2131, 2217] | -12 ms |
 
 Release defaults use `lto=false`, 16 codegen units and unwinding; ThinLTO uses `lto="thin"` with the same codegen/panic settings; full/fat LTO uses `lto="fat"`, one codegen unit and `panic="abort"`. Cargo’s `lto=false` permits thin local LTO; it is not the same setting as `lto="off"`.
+
+Median paired cold-build differences (frust minus Cargo) were Release defaults +114 ms (7/7 positive pairs); ThinLTO +307 ms (6/7 positive pairs); Full / fat LTO +184 ms (5/7 positive pairs). These are medians of paired differences; the cold-build table result cells subtract the separately computed tool medians.
 
 All paired release executables were byte-identical, including cold versus restored outputs. Each warm restore executed zero declared Cargo-unit or unknown compiler calls and 1 build-script capability probe. The separate release runtime check also matched output on every one of its 10 measured launches per binary; process-launch timing is not a program-throughput result.
 
@@ -75,4 +77,4 @@ Automatic compression used 60.7% less cache allocation and 29.4% less combined a
 
 After the initial two-project debug builds, combined allocation was 221.1 MiB for Cargo and 260.2 MiB for frust including its cache: 17.7% larger. Cache storage has an initial cost; total savings depend on the workload and accumulated build history.
 
-The configured-linker baseline took 35 [30, 46] ms within the 87 [83, 97] ms build. Each of the 7 real body edits compiled exactly one current main binary and executed the expected changed output. The configured linker was retained.
+The configured-linker baseline took 36 [30, 42] ms within the 92 [82, 99] ms build. Each of the 7 real body edits compiled exactly one current main binary and executed the expected changed output. The configured linker was retained.
