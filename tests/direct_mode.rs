@@ -202,7 +202,7 @@ fn forge_leaf_hashes(sb: &Sandbox) -> usize {
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         for candidate in value["candidates"].as_array_mut().unwrap() {
             for input in candidate["inputs"].as_array_mut().unwrap() {
-                if input["path"].as_str().is_some_and(|p| p.ends_with("src/lib.rs")) && input["stamp"].is_object() {
+                if input["path"].as_str().is_some_and(|p| Path::new(p).ends_with(Path::new("src").join("lib.rs"))) && input["stamp"].is_object() {
                     input["hash"] = serde_json::json!("0".repeat(64));
                     forged += 1;
                 }
@@ -263,7 +263,7 @@ fn a_stamp_that_lies_forces_a_recompile_is_logged_and_quarantines_the_volume() {
     assert_eq!(logged[0]["recorded"], "0".repeat(64));
     assert_eq!(logged[0]["fresh"], leaf_hash());
     assert_eq!(logged[0]["dev"], dev);
-    assert!(logged[0]["input"].as_str().is_some_and(|p| p.ends_with("src/lib.rs")));
+    assert!(logged[0]["input"].as_str().is_some_and(|p| Path::new(p).ends_with(Path::new("src").join("lib.rs"))));
     assert!(logged[0]["t"].as_u64().is_some_and(|t| t > 0));
     let markers = quarantine_markers(&sb);
     assert_eq!(markers.len(), 1, "{markers:?}");
@@ -273,7 +273,7 @@ fn a_stamp_that_lies_forces_a_recompile_is_logged_and_quarantines_the_volume() {
     for manifest in manifest_values(&sb) {
         for candidate in manifest["candidates"].as_array().unwrap() {
             for input in candidate["inputs"].as_array().unwrap() {
-                if input["path"].as_str().is_some_and(|p| p.ends_with("src/lib.rs")) {
+                if input["path"].as_str().is_some_and(|p| Path::new(p).ends_with(Path::new("src").join("lib.rs"))) {
                     assert_eq!(input["hash"], leaf_hash(), "the manifest was repaired");
                 }
             }

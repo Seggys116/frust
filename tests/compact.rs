@@ -4,9 +4,9 @@ mod common;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use common::{Sandbox, assert_success, run_binary, stderr, stdout};
+use common::{Sandbox, age, assert_success, run_binary, stderr, stdout};
 use frust::compact::{self, AutoOptions};
 use frust::config::Config;
 use frust::gc::{self, Class, GcOptions};
@@ -150,10 +150,6 @@ fn compact_skips_a_profile_a_build_is_using() {
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(!failures.is_empty(), "removal under a held lock is reported, not done");
     assert_eq!(hashes_of(&debug.join(".fingerprint"), "app-"), before);
-}
-
-fn age(path: &Path, by: Duration) {
-    File::open(path).unwrap().set_modified(SystemTime::now() - by).unwrap();
 }
 
 fn plan_has(plan: &gc::Plan, class: Class, path: &Path) -> bool {
@@ -358,7 +354,7 @@ fn auto_compaction_never_disturbs_a_build_and_is_cheap_when_not_due() {
 
     // Default interval: right after a pass, the next is not due.
     let report = compact::auto_compact_with(&dirs, &target, &eager());
-    assert!(report.skipped.is_none());
+    assert!(report.skipped.is_none(), "{report:?}");
     let mut defaults = eager();
     defaults.every = Duration::from_secs(600);
     assert_eq!(compact::auto_compact_with(&dirs, &target, &defaults).skipped, Some("not due"));

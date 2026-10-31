@@ -5,19 +5,15 @@ mod common;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use common::{Sandbox, assert_success, run_binary, stderr, stdout};
+use common::{Sandbox, age, assert_success, run_binary, stderr, stdout};
 use frust::gc::{self, Class, GcOptions};
 use frust::paths::Dirs;
 
 const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
 const LEAF: &str = "pub fn value() -> u32 { 41 }\n";
 const WAIT_CAP: Duration = Duration::from_secs(30);
-
-fn age(path: &Path, by: Duration) {
-    File::open(path).unwrap().set_modified(SystemTime::now() - by).unwrap();
-}
 
 fn deferred_dir(sb: &Sandbox) -> PathBuf {
     sb.home().join("tmp").join("deferred")

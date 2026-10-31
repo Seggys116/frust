@@ -5,28 +5,14 @@ mod common;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use common::{Sandbox, assert_success, run_binary, stdout};
+use common::{Sandbox, age, assert_success, run_binary, stdout};
 use frust::gc::{self, Class, GcOptions};
 use frust::paths::Dirs;
 
 const LEAF_V1: &str = "pub fn value() -> u32 { 41 }\npub fn tag() -> &'static str { option_env!(\"FRUST_TEST_TAG\").unwrap_or(\"unset\") }\n";
 const MAIN: &str = "fn main() { println!(\"{} {}\", leaf::value(), leaf::tag()); }\n";
-
-fn age(path: &Path, by: Duration) {
-    #[cfg(unix)]
-    // A read-only descriptor suffices for the owner, and works for directories too.
-    let file = File::open(path).unwrap();
-    #[cfg(windows)]
-    let file = {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        // Windows needs write access to set times, and backup semantics to open a directory at all.
-        fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
-    };
-    file.set_modified(SystemTime::now() - by).unwrap();
-}
 
 /// A source edited while rustc runs must not be stored under its new hash with output from the old content.
 #[test]
@@ -48,7 +34,7 @@ fn source_edited_during_compile_is_not_stored_under_its_new_hash() {
             leaf_src.display()
         ),
         &format!(
-            "@echo off\r\nrustc %*\r\nset status=%ERRORLEVEL%\r\nfor %%a in (%*) do if \"%%a\"==\"leaf\" copy /Y \"{}\" \"{}\" >nul\r\nexit /b %status%\r\n",
+            "@echo off\r\nrustc %*\r\nset status=%ERRORLEVEL%\r\nfor %%a in (%*) do if \"%%a\"==\"leaf\" type \"{}\" > \"{}\"\r\nexit /b %status%\r\n",
             edited.display(),
             leaf_src.display()
         ),

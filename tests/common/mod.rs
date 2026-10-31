@@ -295,3 +295,17 @@ impl Sandbox {
         cmd
     }
 }
+
+pub fn age(path: &Path, by: std::time::Duration) {
+    #[cfg(unix)]
+    // A read-only descriptor suffices for the owner, and works for directories too.
+    let file = std::fs::File::open(path).unwrap();
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // Windows needs write access to set times, and backup semantics to open a directory at all.
+        std::fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
+    };
+    file.set_modified(std::time::SystemTime::now() - by).unwrap();
+}

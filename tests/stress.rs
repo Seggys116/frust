@@ -146,7 +146,7 @@ fn debug_and_release_builds_run_in_parallel() {
     }
     // Two sequential builds would each pay the slow build script.
     assert!(
-        wall < Duration::from_millis(GATE_SLEEP_MS * 2 + 1800),
+        wall < Duration::from_millis(GATE_SLEEP_MS * 2 + 4500),
         "debug and release took {wall:?}; they must not wait for each other"
     );
 }

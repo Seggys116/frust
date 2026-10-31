@@ -374,7 +374,7 @@ fn config_flag_target_dir_is_respected() {
     let sb = Sandbox::new("ws-cfgtd");
     let ws = workspace(&sb, "ws");
     let dir = sb.root.join("cli-config-target");
-    let setting = format!("build.target-dir=\"{}\"", dir.display());
+    let setting = format!("build.target-dir='{}'", dir.display());
     assert_eq!(cargo_target_directory(sb.cargo().args(["--config", &setting]).current_dir(&ws)), dir);
     assert_success(&fcargo(&sb, &ws, &["--config", &setting, "build"]));
     assert!(dir.join(app_rel()).is_file(), "--config build.target-dir must win over the central dir");
@@ -386,7 +386,7 @@ fn target_dir_in_member_cargo_config_is_respected() {
     let ws = workspace(&sb, "ws");
     let member = ws.join("crates/ws-app");
     let dir = sb.root.join("member-config-target");
-    write(&member.join(".cargo/config.toml"), &format!("[build]\ntarget-dir = \"{}\"\n", dir.display()));
+    write(&member.join(".cargo/config.toml"), &format!("[build]\ntarget-dir = '{}'\n", dir.display()));
     // Plain cargo reads config from the working directory upwards, so it uses this dir.
     assert_eq!(cargo_target_directory(sb.cargo().current_dir(&member)), dir);
     assert_success(&fcargo(&sb, &member, &["build"]));

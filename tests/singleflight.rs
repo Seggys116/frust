@@ -6,9 +6,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use common::{Sandbox, assert_success, run_binary, stdout};
+use common::{Sandbox, age, assert_success, run_binary, stdout};
 use frust::gc::{self, Class, GcOptions};
 use frust::paths::Dirs;
 
@@ -30,10 +30,6 @@ fn slow_leaf() -> String {
     }
     src.push_str("    v }\n");
     src
-}
-
-fn age(path: &Path, by: Duration) {
-    File::open(path).unwrap().set_modified(SystemTime::now() - by).unwrap();
 }
 
 fn key_lock_files(root: &Path) -> Vec<PathBuf> {

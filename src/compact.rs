@@ -935,7 +935,8 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
             IncrementalOwner::Live
         } else if !units.is_empty() && units.iter().all(|h| analysis.dead.contains(h)) {
             IncrementalOwner::Dead
-        } else if units.is_empty() && objects > 0 {
+        // COFF objects carry no codegen-unit names and the MSVC linker keeps no links, so nothing proves an orphan there.
+        } else if units.is_empty() && objects > 0 && !cfg!(windows) {
             IncrementalOwner::Orphan
         } else {
             IncrementalOwner::Unknown
