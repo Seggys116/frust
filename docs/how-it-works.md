@@ -184,10 +184,13 @@ With a terminal on stderr, frust runs cargo with `--message-format json-render-d
 display. `FRUST_RENDER` selects `auto` (default), `ansi`, `plain` (no escape codes, for logs and snapshots)
 or `off`. Redirected output is cargo's own, unmodified.
 
-The live line is a full-width Pac-Man bar: he sits at the finished fraction, eats the dots as units complete, and
-laps the track while the total is unknown. The total is the unit count of the last similar build (the same
-command and arguments, else the same command in this workspace), and the bar holds below 100% until cargo
-reports the end. Errors and warnings are restyled in frust's palette with their text and columns unchanged, and
+The live line is a fine progress bar that fills in half-cell steps, with the percent, the exact unit count, the elapsed
+time and the cache hits and misses; below it, each running unit has its own timer aligned at the right edge, and a timer
+turns yellow after five seconds. For `build`, `check`, `run` and `test`, frust asks cargo for its unit graph under the
+build lock (about a tenth of a second, bounded to five) and uses that count as the total, so the percent is exact and
+the same value is sent to the terminal as OSC 9;4 progress. If the plan fails, the total falls back to the unit count of
+the last similar build (the same command and arguments, else the same command in this workspace), and without either the
+bar shows a sweeping segment instead of a percent. The bar holds below 100% until cargo reports the end. Errors and warnings are restyled in frust's palette with their text and columns unchanged, and
 the summary leads with the verdict, then error and warning counts, then the cache counters.
 
 OSC features are auto-enabled only for terminals known to support them (Ghostty, WezTerm, iTerm2, Windows
