@@ -4,10 +4,8 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
 
-use common::{Sandbox, assert_success, run_binary, stdout};
+use common::{Sandbox, assert_success, run_binary, settle, stdout};
 
 fn lib_source(value: u32) -> String {
     format!("pub fn value() -> u32 {{ {value} }}\npub fn name() -> &'static str {{ \"pathdep\" }}\n")
@@ -20,6 +18,7 @@ fn path_crate(dir: &Path, value: u32) {
     fs::write(dir.join("Cargo.toml"), "[package]\nname = \"pathdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
         .unwrap();
     fs::write(dir.join("src").join("lib.rs"), lib_source(value)).unwrap();
+    settle(&dir.join("src").join("lib.rs"));
 }
 
 fn app_with_path_dep(sb: &Sandbox, dir: &str, dep_path: &str) -> PathBuf {
@@ -33,13 +32,14 @@ fn app_with_path_dep(sb: &Sandbox, dir: &str, dep_path: &str) -> PathBuf {
     )
     .unwrap();
     fs::write(app.join("src").join("main.rs"), MAIN).unwrap();
+    settle(&app.join("src").join("main.rs"));
     app
 }
 
 /// The pause keeps the edit clear of the "file too new" rule, which declines to store a compile whose inputs just changed.
 fn edit(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
-    thread::sleep(Duration::from_millis(300));
+    settle(path);
 }
 
 fn build(sb: &Sandbox, project: &Path) {

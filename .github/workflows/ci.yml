@@ -27,6 +27,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked
+      - name: platform primitives stay behind src/sys
+        run: |
+          if grep -rn --include='*.rs' -E 'libc::|std::os::(unix|windows|fd)|OsStrExt|MetadataExt|PermissionsExt|CommandExt|ExitStatusExt' src \
+            | grep -v -e '^src/sys/' -e '^src/compact.rs'; then
+            echo "platform-specific calls belong in src/sys (the macOS apfs module in src/compact.rs is the one exception)"
+            exit 1
+          fi
 
   test:
     name: test (${{ matrix.os }})
@@ -38,9 +45,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # The toolchain tests select these; installing them here avoids concurrent rustup auto-installs, which corrupt a toolchain.
+      - run: rustup toolchain install 1.98.1 nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-targets
       - run: cargo test --locked
+
+  # Every trusted stamp is compared with a fresh content hash, so a stamp that lies fails the suite.
+  test-audit:
+    name: test-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # The toolchain tests select these; installing them here avoids concurrent rustup auto-installs, which corrupt a toolchain.
+      - run: rustup toolchain install 1.98.1 nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+        env:
+          FRUST_CACHE_TRUST_STAMPS: audit
 
   msrv:
     name: msrv 1.89

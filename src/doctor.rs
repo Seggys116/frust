@@ -2,7 +2,9 @@
 
 use std::env;
 use std::path::Path;
+use std::time::SystemTime;
 
+use crate::cache::{self, TrustMode, TrustSummary};
 use crate::config::Config;
 use crate::fsx;
 use crate::paths::Dirs;
@@ -72,6 +74,9 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
         check("compile cache", Status::Warn, "disabled by FRUST_CACHE=off")
     });
 
+    let now = SystemTime::now();
+    checks.push(trust_check(TrustMode::from_env(), &cache::trust_summary(dirs, now), now));
+
     let root = dirs.root();
     match std::fs::create_dir_all(root) {
         Ok(()) => {
@@ -116,4 +121,65 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
 
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+fn trust_check(mode: TrustMode, summary: &TrustSummary, now: SystemTime) -> Check {
+    let counts = format!("{} violation(s) logged, {} audit(s) passed", summary.violations, summary.audits_passed);
+    match summary.quarantined.iter().map(|(_, when)| *when).max() {
+        Some(last) => check(
+            "stamp trust",
+            Status::Warn,
+            format!(
+                "mode {}, {} volume(s) quarantined, last violation {}; {counts}; see stamp-trust/violations.jsonl under the state directory",
+                mode.name(),
+                summary.quarantined.len(),
+                ago(now, last)
+            ),
+        ),
+        None => check("stamp trust", Status::Ok, format!("mode {}, no volume quarantined, {counts}", mode.name())),
+    }
+}
+
+fn ago(now: SystemTime, then: SystemTime) -> String {
+    let secs = now.duration_since(then).map_or(0, |d| d.as_secs());
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn stamp_trust_warns_only_while_a_volume_is_quarantined() {
+        let now = SystemTime::now();
+        let clean = TrustSummary { quarantined: Vec::new(), violations: 0, audits_passed: 12 };
+        let ok = trust_check(TrustMode::On, &clean, now);
+        assert_eq!((ok.name, ok.status), ("stamp trust", Status::Ok));
+        assert!(ok.detail.contains("mode on") && ok.detail.contains("12 audit(s) passed"), "{}", ok.detail);
+
+        let hit = TrustSummary {
+            quarantined: vec![(1, now - Duration::from_secs(7200)), (2, now - Duration::from_secs(90))],
+            violations: 3,
+            audits_passed: 0,
+        };
+        let warn = trust_check(TrustMode::Audit, &hit, now);
+        assert_eq!(warn.status, Status::Warn);
+        assert!(warn.detail.contains("mode audit") && warn.detail.contains("2 volume(s) quarantined"), "{}", warn.detail);
+        assert!(warn.detail.contains("last violation 1m ago") && warn.detail.contains("3 violation(s)"), "{}", warn.detail);
+    }
+
+    #[test]
+    fn ages_are_shown_in_the_largest_whole_unit() {
+        let now = SystemTime::now();
+        for (secs, text) in [(5, "5s ago"), (59, "59s ago"), (60, "1m ago"), (7200, "2h ago"), (3 * 86_400 + 5, "3d ago")] {
+            assert_eq!(ago(now, now - Duration::from_secs(secs)), text);
+        }
+        assert_eq!(ago(now, now + Duration::from_secs(10)), "0s ago", "a time in the future is shown as now");
+    }
 }

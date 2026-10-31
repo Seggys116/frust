@@ -135,7 +135,7 @@ fn compact_skips_a_profile_a_build_is_using() {
 
     // Hold cargo's own lock the way a running build does.
     let lock = File::options().read(true).write(true).open(debug.join(".cargo-lock")).unwrap();
-    lock.lock().unwrap();
+    frust::sys::lock(&lock, frust::sys::LockKind::Exclusive).unwrap();
     let out = sb.bin("frust").args(["compact", "--yes"]).output().unwrap();
     assert_success(&out);
     assert!(stdout(&out).contains("skipped"), "{}", stdout(&out));
@@ -143,7 +143,7 @@ fn compact_skips_a_profile_a_build_is_using() {
     drop(lock);
 
     let lock = File::options().read(true).write(true).open(debug.join(".cargo-lock")).unwrap();
-    lock.lock().unwrap();
+    frust::sys::lock(&lock, frust::sys::LockKind::Exclusive).unwrap();
     let dirs = Dirs::at(sb.home());
     let plan = gc::plan(&dirs, &GcOptions::new(u64::MAX));
     assert!(plan.removals.iter().any(|r| r.class == Class::StaleVariant), "the superseded variant is planned");
@@ -204,6 +204,8 @@ fn eager() -> AutoOptions {
     opts.min_growth = 0;
     opts.uncached_dead_grace = Duration::ZERO;
     opts.max_target_bytes = u64::MAX;
+    opts.pass_budget = Duration::from_secs(3600);
+    opts.pass_bytes = u64::MAX;
     opts
 }
 
@@ -261,7 +263,7 @@ fn auto_compaction_shrinks_the_target_and_keeps_every_build_warm() {
     demote.keep_other_profile = Duration::ZERO;
     let report = compact::auto_compact_with(&dirs, &target, &demote);
     assert!(report.demoted_profiles.iter().any(|p| p.ends_with("release")), "{report:?}");
-    assert!(!target.join("release").join("app").exists());
+    assert!(!target.join("release").join(common::exe("app")).exists());
     let hits = sb.count_cache("hit", "leaf");
     build(&sb, &app, rx);
     assert!(sb.count_cache("hit", "leaf") > hits, "release dependencies are restored from the cache");
@@ -283,7 +285,7 @@ fn artifact(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
 /// A new inode on a proc-macro dylib makes macOS recheck its signature (about 100 ms), so fresh hot files wait to settle.
 #[test]
 fn auto_compaction_leaves_fresh_proc_macros_in_place_and_compresses_libraries_at_once() {
-    use std::os::unix::fs::MetadataExt;
+    let ino = |p: &Path| frust::sys::stat(p).unwrap().ino();
     let sb = Sandbox::new("auto-hot");
     let app = project(&sb);
     let mac = app.join("mac");
@@ -300,15 +302,19 @@ fn auto_compaction_leaves_fresh_proc_macros_in_place_and_compresses_libraries_at
     let dirs = Dirs::at(sb.home());
     let deps = target.join("debug").join("deps");
     let rlib = artifact(&deps, "libleaf-", ".rlib");
-    let dylib = artifact(&deps, "libmac-", if cfg!(target_os = "macos") { ".dylib" } else { ".so" });
-    let (rlib_inode, dylib_inode) = (fs::metadata(&rlib).unwrap().ino(), fs::metadata(&dylib).unwrap().ino());
+    let dylib = if cfg!(windows) {
+        artifact(&deps, "mac-", ".dll")
+    } else {
+        artifact(&deps, "libmac-", if cfg!(target_os = "macos") { ".dylib" } else { ".so" })
+    };
+    let (rlib_inode, dylib_inode) = (ino(&rlib), ino(&dylib));
 
     let report = compact::auto_compact_with(&dirs, &target, &eager());
     assert!(report.skipped.is_none(), "{:?}", report.skipped);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!(fs::metadata(&dylib).unwrap().ino(), dylib_inode, "a fresh proc-macro dylib was rewritten: {report:?}");
+    assert_eq!(ino(&dylib), dylib_inode, "a fresh proc-macro dylib was rewritten: {report:?}");
     if report.supported {
-        assert_ne!(fs::metadata(&rlib).unwrap().ino(), rlib_inode, "rlibs are compressed or deduplicated at once: {report:?}");
+        assert_ne!(ino(&rlib), rlib_inode, "rlibs are compressed or deduplicated at once: {report:?}");
     }
     assert!(compiled(&build(&sb, &app, &[])).is_empty());
 
@@ -318,7 +324,7 @@ fn auto_compaction_leaves_fresh_proc_macros_in_place_and_compresses_libraries_at
     let report = compact::auto_compact_with(&dirs, &target, &settled);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     if report.supported {
-        assert_ne!(fs::metadata(&dylib).unwrap().ino(), dylib_inode, "settled outputs are compressed or deduplicated: {report:?}");
+        assert_ne!(ino(&dylib), dylib_inode, "settled outputs are compressed or deduplicated: {report:?}");
     }
     assert!(compiled(&build(&sb, &app, &[])).is_empty(), "compaction made something stale");
     let run = run_binary(&target, "debug", "app");
@@ -337,7 +343,7 @@ fn auto_compaction_never_disturbs_a_build_and_is_cheap_when_not_due() {
     let before = hashes_of(&debug.join(".fingerprint"), "app-");
 
     let lock = File::options().read(true).write(true).open(debug.join(".cargo-lock")).unwrap();
-    lock.lock().unwrap();
+    frust::sys::lock(&lock, frust::sys::LockKind::Exclusive).unwrap();
     let report = compact::auto_compact_with(&dirs, &target, &eager());
     assert!(report.busy.iter().any(|p| p == &debug), "{report:?}");
     assert_eq!(hashes_of(&debug.join(".fingerprint"), "app-"), before);
@@ -345,7 +351,7 @@ fn auto_compaction_never_disturbs_a_build_and_is_cheap_when_not_due() {
 
     // Another pass in progress (holding the marker): this one does nothing.
     let marker = File::options().read(true).write(true).create(true).truncate(false).open(target.join(compact::AUTO_MARKER)).unwrap();
-    marker.lock().unwrap();
+    frust::sys::lock(&marker, frust::sys::LockKind::Exclusive).unwrap();
     let report = compact::auto_compact_with(&dirs, &target, &eager());
     assert_eq!(report.skipped, Some("another compaction is running"));
     drop(marker);

@@ -134,6 +134,10 @@ fn assert_tree_clean(ws: &Path) {
     }
 }
 
+fn app_rel() -> String {
+    format!("debug/{}", common::exe("ws-app"))
+}
+
 fn run_exe(path: &Path, args: &[&str]) -> Output {
     Command::new(path).args(args).output().unwrap_or_else(|e| panic!("cannot run {}: {e}", path.display()))
 }
@@ -171,7 +175,7 @@ fn workspace_build_uses_central_target_and_keeps_tree_clean() {
     assert_success(&fcargo(&sb, &ws, &["build"]));
     let central = sb.central_target(&ws);
     assert!(central.starts_with(sb.home().join("targets")), "{}", central.display());
-    let out = run_exe(&central.join("debug/ws-app"), &[]);
+    let out = run_exe(&central.join(app_rel()), &[]);
     assert_eq!(stdout(&out).trim(), "core=41 macro=42 build=hello-from-build loud=false");
     assert_tree_clean(&ws);
     let marker = fs::read_to_string(central.parent().unwrap().join("workspace")).unwrap();
@@ -187,7 +191,7 @@ fn member_subdirectory_resolves_the_same_central_dir_as_the_root() {
     assert_eq!(sb.central_target(&member), from_root);
     assert_eq!(sb.central_target(&ws.join("crates/ws-core/src")), from_root);
     assert_success(&fcargo(&sb, &member, &["build"]));
-    assert!(from_root.join("debug/ws-app").is_file());
+    assert!(from_root.join(app_rel()).is_file());
     assert_tree_clean(&ws);
 }
 
@@ -205,8 +209,8 @@ fn workspaces_with_the_same_directory_name_get_distinct_central_dirs() {
     write(&b.join("crates/ws-core/src/lib.rs"), "pub fn answer() -> u32 {\n    wsdep::base() + 2\n}\n");
     assert_success(&fcargo(&sb, &a, &["build"]));
     assert_success(&fcargo(&sb, &b, &["build"]));
-    assert!(stdout(&run_exe(&ta.join("debug/ws-app"), &[])).starts_with("core=41 "));
-    assert!(stdout(&run_exe(&tb.join("debug/ws-app"), &[])).starts_with("core=42 "));
+    assert!(stdout(&run_exe(&ta.join(app_rel()), &[])).starts_with("core=41 "));
+    assert!(stdout(&run_exe(&tb.join(app_rel()), &[])).starts_with("core=42 "));
     assert_tree_clean(&a);
     assert_tree_clean(&b);
 }
@@ -219,8 +223,9 @@ fn check_all_targets_and_doc_use_the_central_dir() {
     assert_success(&fcargo(&sb, &ws, &["check", "--workspace", "--all-targets"]));
     assert!(central.join("debug/.fingerprint").is_dir(), "check wrote its fingerprints centrally");
     assert_success(&fcargo(&sb, &ws, &["build", "--workspace", "--all-targets"]));
-    assert!(central.join("debug/examples/demo").is_file(), "--all-targets built the example");
-    assert_eq!(stdout(&run_exe(&central.join("debug/examples/demo"), &[])).trim(), "demo");
+    let demo = central.join("debug/examples").join(common::exe("demo"));
+    assert!(demo.is_file(), "--all-targets built the example");
+    assert_eq!(stdout(&run_exe(&demo, &[])).trim(), "demo");
     assert_success(&fcargo(&sb, &ws, &["doc", "--workspace", "--no-deps"]));
     assert!(central.join("doc/ws_core/index.html").is_file(), "docs went to the central dir");
     assert!(central.join("doc/ws_macros/index.html").is_file());
@@ -252,9 +257,9 @@ fn package_selection_and_features() {
     let central = sb.central_target(&ws);
     assert_success(&fcargo(&sb, &ws, &["build", "-p", "ws-core"]));
     assert!(!deps_with_prefix(&central.join("debug/deps"), "libws_core-").is_empty());
-    assert!(!central.join("debug/ws-app").exists(), "-p ws-core must not build the app");
+    assert!(!central.join(app_rel()).exists(), "-p ws-core must not build the app");
     assert_success(&fcargo(&sb, &ws, &["build", "-p", "ws-app", "--features", "loud"]));
-    assert!(stdout(&run_exe(&central.join("debug/ws-app"), &[])).ends_with("loud=true\n"));
+    assert!(stdout(&run_exe(&central.join(app_rel()), &[])).ends_with("loud=true\n"));
     let run = fcargo(&sb, &ws, &["run", "-q", "-p", "ws-app", "--features", "ws-app/loud"]);
     assert_success(&run);
     assert_eq!(stdout(&run).trim(), "core=41 macro=42 build=hello-from-build loud=true");
@@ -276,7 +281,7 @@ fn manifest_path_resolves_the_workspace_it_names() {
             .unwrap_or_default()
     };
     assert!(
-        sb.central_target(&ws).join("debug/ws-app").is_file(),
+        sb.central_target(&ws).join(app_rel()).is_file(),
         "--manifest-path {} built under {:?}, but `frust where` in the workspace says {}",
         manifest.display(),
         keys(),
@@ -306,7 +311,7 @@ fn chdir_flag_resolves_the_target_workspace() {
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.join("debug/ws-app").is_file())
+        .filter(|p| p.join(app_rel()).is_file())
         .collect();
     assert_eq!(built.len(), 1, "nightly build in {}", key_dir.display());
     assert!(!sb.root.join("target").exists());
@@ -331,14 +336,14 @@ fn toolchain_file_and_plus_toolchain_get_their_own_central_dirs() {
 
     let out = sb.bin("fcargo").arg("build").env_remove("RUSTUP_TOOLCHAIN").current_dir(&ws).output().unwrap();
     assert_success(&out);
-    assert!(pinned.join("debug/ws-app").is_file(), "rust-toolchain.toml selects {}", pinned.display());
+    assert!(pinned.join(app_rel()).is_file(), "rust-toolchain.toml selects {}", pinned.display());
     let version = sb.bin("fcargo").arg("--version").env_remove("RUSTUP_TOOLCHAIN").current_dir(&ws).output().unwrap();
     assert!(stdout(&version).starts_with("cargo 1.98.1"), "{}", stdout(&version));
 
     let out = sb.bin("fcargo").args(["+stable", "build"]).env_remove("RUSTUP_TOOLCHAIN").current_dir(&ws).output().unwrap();
     assert_success(&out);
     let stable_dir = pinned.parent().unwrap().join(&stable_id);
-    assert!(stable_dir.join("debug/ws-app").is_file(), "+stable builds into {}", stable_dir.display());
+    assert!(stable_dir.join(app_rel()).is_file(), "+stable builds into {}", stable_dir.display());
     assert_tree_clean(&ws);
 }
 
@@ -348,7 +353,7 @@ fn explicit_target_dir_flag_is_respected_in_a_workspace() {
     let ws = workspace(&sb, "ws");
     let dir = sb.root.join("my-target");
     assert_success(&fcargo(&sb, &ws, &["build", "--target-dir", dir.to_str().unwrap()]));
-    assert!(dir.join("debug/ws-app").is_file());
+    assert!(dir.join(app_rel()).is_file());
     assert!(!sb.home().join("targets").exists(), "no central dir when --target-dir is given");
     assert_tree_clean(&ws);
 }
@@ -361,7 +366,7 @@ fn cargo_build_target_dir_env_is_respected() {
     assert_eq!(cargo_target_directory(sb.cargo().env("CARGO_BUILD_TARGET_DIR", &dir).current_dir(&ws)), dir);
     let out = sb.bin("fcargo").arg("build").env("CARGO_BUILD_TARGET_DIR", &dir).current_dir(&ws).output().unwrap();
     assert_success(&out);
-    assert!(dir.join("debug/ws-app").is_file(), "CARGO_BUILD_TARGET_DIR must win over the central dir");
+    assert!(dir.join(app_rel()).is_file(), "CARGO_BUILD_TARGET_DIR must win over the central dir");
 }
 
 #[test]
@@ -372,7 +377,7 @@ fn config_flag_target_dir_is_respected() {
     let setting = format!("build.target-dir=\"{}\"", dir.display());
     assert_eq!(cargo_target_directory(sb.cargo().args(["--config", &setting]).current_dir(&ws)), dir);
     assert_success(&fcargo(&sb, &ws, &["--config", &setting, "build"]));
-    assert!(dir.join("debug/ws-app").is_file(), "--config build.target-dir must win over the central dir");
+    assert!(dir.join(app_rel()).is_file(), "--config build.target-dir must win over the central dir");
 }
 
 #[test]
@@ -385,7 +390,7 @@ fn target_dir_in_member_cargo_config_is_respected() {
     // Plain cargo reads config from the working directory upwards, so it uses this dir.
     assert_eq!(cargo_target_directory(sb.cargo().current_dir(&member)), dir);
     assert_success(&fcargo(&sb, &member, &["build"]));
-    assert!(dir.join("debug/ws-app").is_file(), "fcargo must honour the member's build.target-dir like cargo");
+    assert!(dir.join(app_rel()).is_file(), "fcargo must honour the member's build.target-dir like cargo");
 }
 
 #[test]
@@ -394,7 +399,7 @@ fn alias_from_cargo_config_uses_the_central_dir() {
     let ws = workspace(&sb, "ws");
     write(&ws.join(".cargo/config.toml"), "[alias]\nbapp = \"build -p ws-app --features loud\"\n");
     assert_success(&fcargo(&sb, &ws, &["bapp"]));
-    let exe = sb.central_target(&ws).join("debug/ws-app");
+    let exe = sb.central_target(&ws).join(app_rel());
     assert!(exe.is_file());
     assert!(stdout(&run_exe(&exe, &[])).ends_with("loud=true\n"));
     assert_tree_clean(&ws);
@@ -447,7 +452,7 @@ fn install_from_path_uses_the_cache_but_no_central_dir() {
     let root = sb.root.join("install-root");
     let out = fcargo(&sb, &ws, &["install", "--path", "crates/ws-app", "--root", root.to_str().unwrap()]);
     assert_success(&out);
-    let exe = root.join("bin/ws-app");
+    let exe = root.join("bin").join(common::exe("ws-app"));
     assert_eq!(stdout(&run_exe(&exe, &[])).trim(), "core=41 macro=42 build=hello-from-build loud=false");
     assert!(!sb.home().join("targets").exists(), "install must not get a central target dir");
     assert!(!sb.cache_events().is_empty(), "install compiles through the cache wrapper");

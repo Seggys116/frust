@@ -1,7 +1,7 @@
 //! Small `O_APPEND` writes are atomic on local filesystems, so concurrent writers never interleave.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,17 +48,39 @@ pub fn now_ms() -> u64 {
 }
 
 fn append(path: &Path, line: &[u8]) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+    let open = || OpenOptions::new().create(true).append(true).open(path);
+    let file = match open() {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            open()
+        }
+        other => other,
+    };
+    if let Ok(mut file) = file {
         let _ = file.write_all(line);
     }
 }
 
 /// Record an event in the ledger and, for cache events, the per-run feed if one is configured.
 pub fn record(dirs: &Dirs, event: &Event) {
-    let Ok(mut line) = serde_json::to_vec(event) else { return };
+    record_waited(dirs, event, 0);
+}
+
+/// A cache event of a compile that queued behind another process's compile of the same unit carries `waited_ms`; zero leaves the record unchanged.
+pub fn record_waited(dirs: &Dirs, event: &Event, waited_ms: u64) {
+    let encoded = if waited_ms > 0 {
+        serde_json::to_value(event).and_then(|mut value| {
+            if let Some(map) = value.as_object_mut() {
+                map.insert("waited_ms".to_string(), waited_ms.into());
+            }
+            serde_json::to_vec(&value)
+        })
+    } else {
+        serde_json::to_vec(event)
+    };
+    let Ok(mut line) = encoded else { return };
     line.push(b'\n');
     append(&dirs.ledger(), &line);
     if matches!(event, Event::Cache { .. })
@@ -82,6 +104,11 @@ impl Feed {
     }
 
     pub fn poll(&mut self) -> Vec<Event> {
+        // A path stat is one syscall and still follows a replaced file, unlike a held handle.
+        match fs::metadata(&self.path) {
+            Ok(meta) if meta.len() != self.offset => {}
+            _ => return Vec::new(),
+        }
         let Ok(mut file) = File::open(&self.path) else { return Vec::new() };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return Vec::new();
@@ -121,5 +148,41 @@ mod tests {
         fs::write(&path, format!("{line}\n{line}\n")).unwrap();
         assert_eq!(feed.poll().len(), 1);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn waited_time_is_recorded_only_when_there_was_a_wait() {
+        let root = std::env::temp_dir().join(format!("frust-waited-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dirs = Dirs::at(&root);
+        let event = Event::Cache {
+            t: 1,
+            result: CacheResult::Miss,
+            krate: "serde".into(),
+            version: "1.0.0".into(),
+            compile_ms: 900,
+            saved_ms: 0,
+            bytes: 10,
+        };
+        record_waited(&dirs, &event, 0);
+        record_waited(&dirs, &event, 42);
+        let rows: Vec<serde_json::Value> =
+            fs::read_to_string(dirs.ledger()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].get("waited_ms").is_none());
+        assert_eq!(rows[1]["waited_ms"], 42);
+        assert!(serde_json::from_value::<Event>(rows[1].clone()).is_ok(), "readers that do not know the field still parse the event");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn append_creates_missing_parent_and_appends() {
+        let root = std::env::temp_dir().join(format!("frust-append-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("a").join("b").join("feed.jsonl");
+        append(&path, b"one\n");
+        append(&path, b"two\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        fs::remove_dir_all(&root).unwrap();
     }
 }

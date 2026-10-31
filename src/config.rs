@@ -37,7 +37,15 @@ pub struct Config {
     pub lock_timeout: Option<Duration>,
     pub lock: bool,
     pub debug: bool,
+    pub gc_sync: bool,
+    /// Store compile results before the wrapper exits instead of in a detached helper.
+    pub store_sync: bool,
+    /// How long a compile waits for another process compiling the same unit.
+    pub keylock_wait: Duration,
 }
+
+/// Upper bound on waiting for another process's compile of the same unit.
+pub const KEY_WAIT_CAP: Duration = Duration::from_secs(300);
 
 impl Config {
     pub fn from_env() -> Config {
@@ -68,6 +76,13 @@ impl Config {
                 .filter(|&s| s > 0)
                 .map(Duration::from_secs),
             debug: flag("FRUST_DEBUG", false),
+            gc_sync: flag("FRUST_GC_SYNC", false),
+            store_sync: flag("FRUST_STORE_SYNC", false),
+            keylock_wait: env::var("FRUST_KEYLOCK_WAIT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(KEY_WAIT_CAP),
         }
     }
 }

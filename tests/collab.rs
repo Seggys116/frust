@@ -4,8 +4,7 @@ mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -71,8 +70,8 @@ impl Scene {
             .env("FRUST_TEST_GATE", &self.gate)
             .env("FRUST_TEST_STARTED", &self.started)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        common::own_group(&mut cmd);
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -156,16 +155,15 @@ impl Running {
         (status, self.stderr())
     }
 
-    fn signal_group(&self, signal: i32) {
-        // SAFETY: signalling the process group we created for this child.
-        unsafe { libc::kill(-(self.pid() as i32), signal) };
+    fn kill_group(&self) {
+        common::kill_tree(self.pid());
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            self.signal_group(libc::SIGKILL);
+            self.kill_group();
             let _ = self.child.wait();
         }
     }
@@ -263,7 +261,7 @@ fn killing_the_holder_lets_the_waiter_proceed() {
     waiter.wait_stderr("the wait line", |e| e.contains(&format!("pid {}", holder.pid())));
 
     // Ctrl-C style: the whole group (fcargo, cargo, rustc, build script) dies at once.
-    holder.signal_group(libc::SIGKILL);
+    holder.kill_group();
     let (status, _) = holder.finish();
     assert!(!status.success());
     let waiter_pid = u64::from(waiter.pid());
@@ -298,12 +296,22 @@ fn signals_while_queued_withdraw_the_ticket() {
     let scene = Scene::new("collab-signal");
     let holder = scene.build("off", &[]);
     scene.wait_started();
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    // SIGTERM has no Windows counterpart; Ctrl-Break stands in for the interrupt there.
+    #[cfg(unix)]
+    let signals = [2, 15];
+    #[cfg(windows)]
+    let signals = [2];
+    for signal in signals {
         let waiter = scene.waiter("off", &[]);
         waiter.wait_stderr("the wait line", |e| e.contains("waiting for build lock"));
         assert_eq!(scene.tickets().len(), 1);
-        // SAFETY: signalling only the waiting fcargo process.
-        unsafe { libc::kill(waiter.pid() as i32, signal) };
+        #[cfg(unix)]
+        {
+            // SAFETY: signalling only the waiting fcargo process.
+            unsafe { libc::kill(waiter.pid() as i32, signal) };
+        }
+        #[cfg(windows)]
+        common::interrupt(&waiter.child);
         let (status, err) = waiter.finish();
         assert_eq!(status.code(), Some(128 + signal), "{err}");
         assert!(err.contains("interrupted while waiting for build lock"), "{err}");
@@ -314,6 +322,8 @@ fn signals_while_queued_withdraw_the_ticket() {
     assert_ok(status, &err);
 }
 
+// File modes have no Windows equivalent.
+#[cfg(unix)]
 #[test]
 fn lock_state_is_shared_on_a_group_writable_home() {
     use std::os::unix::fs::PermissionsExt;
@@ -323,7 +333,7 @@ fn lock_state_is_shared_on_a_group_writable_home() {
     scene.open_gate();
     let (status, err) = scene.build("off", &[]).finish();
     assert_ok(status, &err);
-    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&scene.sb.home().join("locks")), 0o775);
     assert_eq!(mode(&scene.lock_dir.join("queue")), 0o775);
     assert_eq!(mode(&scene.lock_dir.join("lock")), 0o664);

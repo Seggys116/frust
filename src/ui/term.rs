@@ -1,7 +1,10 @@
 //! Terminal plumbing shared by the renderer, the virtual terminal and the front end.
 
 use std::env;
+use std::io::{self, IsTerminal};
 use std::time::Duration;
+
+use crate::sys;
 
 pub const RESET: &str = "\x1b[0m";
 pub const LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
@@ -238,22 +241,28 @@ pub fn fmt_ms(ms: u64) -> String {
     fmt_duration(Duration::from_millis(ms))
 }
 
-fn ioctl_width(fd: i32) -> Option<u16> {
-    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    // SAFETY: TIOCGWINSZ only writes a `winsize` through the pointer we pass.
-    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws as *mut libc::winsize) };
-    (rc == 0 && ws.ws_col > 0).then_some(ws.ws_col)
-}
-
 pub fn terminal_width() -> u16 {
-    ioctl_width(libc::STDERR_FILENO)
+    sys::terminal_columns()
         .or_else(|| env::var("COLUMNS").ok().and_then(|v| v.trim().parse::<u16>().ok()).filter(|&w| w > 0))
         .unwrap_or(100)
 }
 
+pub fn is_tty_stream(s: sys::StdStream) -> bool {
+    match s {
+        sys::StdStream::Stdout => io::stdout().is_terminal(),
+        sys::StdStream::Stderr => io::stderr().is_terminal(),
+    }
+}
+
+// Only the standard descriptors can be named without raw descriptor access.
+#[cfg(unix)]
 pub fn is_tty(fd: i32) -> bool {
-    // SAFETY: isatty only inspects the descriptor.
-    unsafe { libc::isatty(fd) == 1 }
+    match fd {
+        0 => io::stdin().is_terminal(),
+        1 => is_tty_stream(sys::StdStream::Stdout),
+        2 => is_tty_stream(sys::StdStream::Stderr),
+        _ => false,
+    }
 }
 
 /// Precedence: non-empty `NO_COLOR`, then `CLICOLOR_FORCE` (not empty or `0`), then `TERM=dumb`, then tty.
@@ -275,7 +284,7 @@ pub fn colour_enabled() -> bool {
         env::var("NO_COLOR").ok().as_deref(),
         env::var("CLICOLOR_FORCE").ok().as_deref(),
         env::var("TERM").ok().as_deref(),
-        is_tty(libc::STDERR_FILENO),
+        sys::ansi_terminal(sys::StdStream::Stderr),
     )
 }
 

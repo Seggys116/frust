@@ -1,0 +1,8 @@
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "use sys::lock: std locks the whole file mandatorily on Windows" },
+    { path = "std::fs::File::lock_shared", reason = "use sys::lock: std locks the whole file mandatorily on Windows" },
+    { path = "std::fs::File::try_lock", reason = "use sys::try_lock: std locks the whole file mandatorily on Windows" },
+    { path = "std::fs::File::try_lock_shared", reason = "use sys::try_lock: std locks the whole file mandatorily on Windows" },
+    { path = "std::fs::File::unlock", reason = "use sys::unlock" },
+    { path = "std::fs::rename", reason = "use sys::rename: it retries transient sharing violations on Windows" },
+]

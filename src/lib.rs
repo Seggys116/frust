@@ -17,8 +17,10 @@ pub mod run;
 pub mod signals;
 pub mod stats;
 pub mod style;
+pub mod sys;
 pub mod toolchain;
 pub mod ui;
+pub mod update;
 pub mod workspace;
 pub mod wrapper;
 
@@ -50,10 +52,7 @@ pub fn main_for(persona: Persona) -> i32 {
 }
 
 fn dispatch_by_name(argv0: &OsString, args: Vec<OsString>) -> i32 {
-    let name = std::path::Path::new(argv0)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = sys::tool_name(argv0);
     match name.as_str() {
         "frust" | "" => cli::frust_main(args),
         "fcargo" => run::cargo_main(args),

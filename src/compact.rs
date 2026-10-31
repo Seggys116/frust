@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::fsx;
 use crate::paths::Dirs;
 use crate::stats;
+use crate::sys;
 
 /// The most compression or deduplication could save below this is a few 4 KiB blocks, not worth a rewrite.
 pub const MIN_FILE_BYTES: u64 = 16 * 1024;
@@ -190,21 +191,108 @@ pub fn breakdown(target: &Path) -> Breakdown {
     b
 }
 
-fn tally_of(meta: &fs::Metadata) -> Tally {
-    Tally { files: 1, logical: meta.len(), allocated: meta.blocks() * 512, compressed: u64::from(apfs::is_compressed(meta)) }
+fn tally_of(meta: &sys::Meta) -> Tally {
+    Tally { files: 1, logical: meta.len(), allocated: meta.allocated(), compressed: u64::from(apfs::is_compressed(meta)) }
 }
 
-fn walk_files(root: &Path, visit: &mut dyn FnMut(&Path, &fs::Metadata)) {
+fn walk_files(root: &Path, visit: &mut dyn FnMut(&Path, &sys::Meta)) {
     let Ok(entries) = fs::read_dir(root) else { return };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        if meta.is_dir() {
-            walk_files(&path, visit);
-        } else if meta.is_file() {
-            visit(&path, &meta);
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            walk_files(&entry.path(), visit);
+        } else if kind.is_file()
+            && let Ok(meta) = sys::lstat(&entry.path())
+        {
+            visit(&entry.path(), &meta);
         }
     }
+}
+
+const WALK_THREADS: usize = 4;
+
+type Skip<'a> = &'a (dyn Fn(&str, bool) -> bool + Sync);
+type Visit<'a, T> = &'a (dyn Fn(&mut T, &Path, &sys::Meta) + Sync);
+
+fn walk_into<T>(dir: &Path, skip: Skip<'_>, acc: &mut T, visit: Visit<'_, T>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if skip(&entry.file_name().to_string_lossy(), kind.is_dir()) {
+            continue;
+        }
+        if kind.is_dir() {
+            walk_into(&entry.path(), skip, acc, visit);
+        } else if kind.is_file()
+            && let Ok(meta) = sys::lstat(&entry.path())
+        {
+            visit(acc, &entry.path(), &meta);
+        }
+    }
+}
+
+/// The subtrees two levels down are shared among a few scoped threads; the union of the results equals a serial walk.
+fn walk_parallel<T: Send>(root: &Path, skip: Skip<'_>, init: &(dyn Fn() -> T + Sync), visit: Visit<'_, T>) -> Vec<T> {
+    let mut first = init();
+    let mut jobs = vec![root.to_path_buf()];
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for dir in &jobs {
+            let Ok(entries) = fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else { continue };
+                if skip(&entry.file_name().to_string_lossy(), kind.is_dir()) {
+                    continue;
+                }
+                if kind.is_dir() {
+                    next.push(entry.path());
+                } else if kind.is_file()
+                    && let Ok(meta) = sys::lstat(&entry.path())
+                {
+                    visit(&mut first, &entry.path(), &meta);
+                }
+            }
+        }
+        jobs = next;
+    }
+    jobs.sort();
+    let claimed = AtomicUsize::new(0);
+    let workers = WALK_THREADS.min(jobs.len());
+    let mut out = vec![first];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut acc = init();
+                    while let Some(dir) = jobs.get(claimed.fetch_add(1, Ordering::Relaxed)) {
+                        walk_into(dir, skip, &mut acc, visit);
+                    }
+                    acc
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.join() {
+                Ok(acc) => out.push(acc),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+    });
+    out
+}
+
+/// Runs `f` on its own thread at background CPU and I/O priority, so the settings end with the thread.
+pub fn at_background_priority<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            sys::lower_thread_priority();
+            f()
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Compressed files keep their data in the resource fork, where extent probing cannot see it, so APFS uses `getattrlist`.
@@ -220,7 +308,7 @@ pub fn physical_size(roots: &[&Path]) -> u64 {
             if !inodes.insert((meta.dev(), meta.ino())) {
                 return;
             }
-            let allocated = meta.blocks() * 512;
+            let allocated = meta.allocated();
             total += match apfs::clone_info(path) {
                 Some((group, private)) if !groups.insert((meta.dev(), group)) => private.min(allocated),
                 _ => allocated,
@@ -325,7 +413,7 @@ fn uplifted_hashes(profile: &Path) -> HashSet<String> {
             .unwrap_or_default();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
+            let Ok(meta) = sys::lstat(&entry.path()) else { continue };
             if !meta.is_file() || name.starts_with('.') || name.ends_with(".d") || artifact_hash(&name).is_some() {
                 continue;
             }
@@ -348,8 +436,8 @@ fn uplifted_hashes(profile: &Path) -> HashSet<String> {
     out
 }
 
-fn same_content(a: &Path, a_meta: &fs::Metadata, b: &Path) -> bool {
-    let Ok(b_meta) = fs::symlink_metadata(b) else { return false };
+fn same_content(a: &Path, a_meta: &sys::Meta, b: &Path) -> bool {
+    let Ok(b_meta) = sys::lstat(b) else { return false };
     if (a_meta.dev(), a_meta.ino()) == (b_meta.dev(), b_meta.ino()) {
         return true;
     }
@@ -435,7 +523,7 @@ pub fn unit_paths(profile: &Path, units: &HashSet<String>) -> HashMap<String, Ve
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let Some(hash) = artifact_hash(&name) else { continue };
-                let meta = fs::symlink_metadata(e.path()).ok();
+                let meta = sys::lstat(&e.path()).ok();
                 let linked = meta.as_ref().filter(|m| m.is_file() && m.nlink() > 1).map(|m| (m.dev(), m.ino()));
                 if units.contains(hash) {
                     if let Some(i) = linked {
@@ -506,11 +594,10 @@ pub fn newest_session(krate: &Path) -> Option<(SystemTime, PathBuf)> {
 
 // Each incremental compile hard-links its objects into `deps/` under a new name and never removes older names; this is the dominant growth.
 fn archive_members(path: &Path) -> Option<Vec<String>> {
-    use std::os::unix::fs::FileExt;
     let file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut magic = [0u8; 8];
-    file.read_exact_at(&mut magic, 0).ok()?;
+    sys::read_exact_at(&file, &mut magic, 0).ok()?;
     if &magic != b"!<arch>\n" {
         return None;
     }
@@ -519,7 +606,7 @@ fn archive_members(path: &Path) -> Option<Vec<String>> {
     let mut pos = 8u64;
     while pos + 60 <= len {
         let mut header = [0u8; 60];
-        file.read_exact_at(&mut header, pos).ok()?;
+        sys::read_exact_at(&file, &mut header, pos).ok()?;
         if &header[58..60] != b"`\n" {
             return None;
         }
@@ -535,14 +622,14 @@ fn archive_members(path: &Path) -> Option<Vec<String>> {
                 return None;
             }
             let mut buf = vec![0u8; n];
-            file.read_exact_at(&mut buf, data).ok()?;
+            sys::read_exact_at(&file, &mut buf, data).ok()?;
             out.push(String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string());
         } else if raw == "//" {
             if size > 64 * 1024 * 1024 {
                 return None;
             }
             gnu_names = vec![0u8; size as usize];
-            file.read_exact_at(&mut gnu_names, data).ok()?;
+            sys::read_exact_at(&file, &mut gnu_names, data).ok()?;
         } else if raw == "/" || raw == "/SYM64/" {
         } else if let Some(offset) = raw.strip_prefix('/') {
             let offset: usize = offset.parse().ok()?;
@@ -558,7 +645,6 @@ fn archive_members(path: &Path) -> Option<Vec<String>> {
 }
 
 fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
-    use std::os::unix::fs::FileExt;
     const MH_MAGIC_64: u32 = 0xfeed_facf;
     const LC_SYMTAB: u32 = 0x2;
     const N_OSO: u8 = 0x66;
@@ -566,7 +652,7 @@ fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
     let len = file.metadata().ok()?.len();
     let u32_at = |b: &[u8], o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
     let mut header = [0u8; 32];
-    file.read_exact_at(&mut header, 0).ok()?;
+    sys::read_exact_at(&file, &mut header, 0).ok()?;
     if u32_at(&header, 0)? != MH_MAGIC_64 {
         return None;
     }
@@ -576,7 +662,7 @@ fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
         return None;
     }
     let mut cmds = vec![0u8; sizeofcmds];
-    file.read_exact_at(&mut cmds, 32).ok()?;
+    sys::read_exact_at(&file, &mut cmds, 32).ok()?;
     let mut off = 0usize;
     for _ in 0..ncmds {
         let cmd = u32_at(&cmds, off)?;
@@ -590,7 +676,7 @@ fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
                 return None;
             }
             let mut syms = vec![0u8; (nsyms * 16) as usize];
-            file.read_exact_at(&mut syms, symoff).ok()?;
+            sys::read_exact_at(&file, &mut syms, symoff).ok()?;
             let mut out = Vec::new();
             for entry in syms.as_chunks::<16>().0 {
                 if entry[4] != N_OSO {
@@ -601,7 +687,7 @@ fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
                     continue;
                 }
                 let mut buf = vec![0u8; (strsize - strx).min(4096) as usize];
-                file.read_exact_at(&mut buf, stroff + strx).ok()?;
+                sys::read_exact_at(&file, &mut buf, stroff + strx).ok()?;
                 let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
                 out.push(String::from_utf8_lossy(&buf[..end]).into_owned());
             }
@@ -613,6 +699,102 @@ fn macho_debug_objects(path: &Path) -> Option<Vec<String>> {
         off += size;
     }
     Some(Vec::new())
+}
+
+/// rustc names each DWARF compile unit `<source>/@/<codegen unit>`, so an ELF image lists its codegen units even after its objects are gone.
+fn elf_debug_cgus(path: &Path) -> Option<Vec<String>> {
+    const SHF_COMPRESSED: u64 = 0x800;
+    let file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut header = [0u8; 64];
+    sys::read_exact_at(&file, &mut header, 0).ok()?;
+    if &header[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let wide = match header[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let big = match header[5] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let int = |b: &[u8], o: usize, n: usize| -> Option<u64> {
+        let s = b.get(o..o + n)?;
+        Some(if big { s.iter().fold(0u64, |v, x| (v << 8) | u64::from(*x)) } else { s.iter().rev().fold(0u64, |v, x| (v << 8) | u64::from(*x)) })
+    };
+    let word = if wide { 8 } else { 4 };
+    let (shoff, at) = if wide { (int(&header, 0x28, 8)?, 0x3a) } else { (int(&header, 0x20, 4)?, 0x2e) };
+    let (shentsize, shnum, shstrndx) = (int(&header, at, 2)? as usize, int(&header, at + 2, 2)? as usize, int(&header, at + 4, 2)? as usize);
+    if shnum == 0 || shentsize < 4 * word + 8 || shoff + (shnum * shentsize) as u64 > len {
+        return None;
+    }
+    let mut table = vec![0u8; shnum * shentsize];
+    sys::read_exact_at(&file, &mut table, shoff).ok()?;
+    // (name offset, flags, file offset, size) of each section header.
+    let section = |i: usize| -> Option<(u64, u64, u64, u64)> {
+        let s = table.get(i * shentsize..(i + 1) * shentsize)?;
+        Some((int(s, 0, 4)?, int(s, 8, word)?, int(s, 8 + 2 * word, word)?, int(s, 8 + 3 * word, word)?))
+    };
+    let read = |offset: u64, size: u64| -> Option<Vec<u8>> {
+        if offset.checked_add(size)? > len || size > 512 * 1024 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        sys::read_exact_at(&file, &mut buf, offset).ok()?;
+        Some(buf)
+    };
+    let (_, _, names_off, names_size) = section(shstrndx)?;
+    let names = read(names_off, names_size)?;
+    let mut out = Vec::new();
+    for i in 0..shnum {
+        let (name, flags, offset, size) = section(i)?;
+        let name = names.get(name as usize..).and_then(|n| n.split(|b| *b == 0).next()).unwrap_or_default();
+        if !matches!(name, b".debug_str" | b".debug_line_str") || flags & SHF_COMPRESSED != 0 {
+            continue;
+        }
+        for s in read(offset, size)?.split(|b| *b == 0) {
+            if let Some(at) = s.windows(3).rposition(|w| w == b"/@/") {
+                out.push(String::from_utf8_lossy(&s[at + 3..]).into_owned());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The codegen units `deps/` artifacts of `krate` name, by unit hash; objects are named `<crate>-<hash>.<cgu>.<tag>.rcgu.o`.
+fn named_cgus(profile: &Path, krate: &str) -> HashMap<String, HashSet<String>> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for sub in ["deps", "examples"] {
+        let Ok(entries) = fs::read_dir(profile.join(sub)) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (Some(hash), Some(owner)) = (artifact_hash(&name), artifact_crate(&name)) else { continue };
+            if owner != krate {
+                continue;
+            }
+            let path = e.path();
+            let from_objects = |objects: Vec<String>| -> Vec<String> {
+                objects
+                    .iter()
+                    .filter_map(|o| Path::new(o).file_name()?.to_str()?.strip_suffix(".rcgu.o")?.split('.').nth(1).map(str::to_string))
+                    .collect()
+            };
+            let cgus = if name.ends_with(".rlib") {
+                archive_members(&path).map(from_objects)
+            } else if !name.contains('.') || name.ends_with(".so") || name.ends_with(".dylib") {
+                elf_debug_cgus(&path).or_else(|| macho_debug_objects(&path).map(from_objects))
+            } else {
+                None
+            };
+            for cgu in cgus.into_iter().flatten() {
+                out.entry(cgu).or_default().insert(hash.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn current_objects(dir: &Path, stem: &str) -> HashSet<String> {
@@ -634,13 +816,13 @@ pub fn stale_objects(profile: &Path) -> Vec<(PathBuf, u64)> {
     for sub in ["deps", "examples"] {
         let dir = profile.join(sub);
         let Ok(entries) = fs::read_dir(&dir) else { continue };
-        let mut units: HashMap<String, Vec<(String, fs::Metadata)>> = HashMap::new();
+        let mut units: HashMap<String, Vec<(String, sys::Meta)>> = HashMap::new();
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if !name.ends_with(".o") || artifact_hash(&name).is_none() {
                 continue;
             }
-            let Ok(meta) = e.metadata() else { continue };
+            let Ok(meta) = sys::lstat(&e.path()) else { continue };
             if meta.is_file() {
                 let stem = name.split('.').next().unwrap_or_default().to_string();
                 units.entry(stem).or_default().push((name, meta));
@@ -652,7 +834,7 @@ pub fn stale_objects(profile: &Path) -> Vec<(PathBuf, u64)> {
                 continue;
             }
             let current = current_objects(&dir, &stem);
-            let in_use: Vec<&fs::Metadata> = objects.iter().filter(|(n, _)| current.contains(n)).map(|o| &o.1).collect();
+            let in_use: Vec<&sys::Meta> = objects.iter().filter(|(n, _)| current.contains(n)).map(|o| &o.1).collect();
             if in_use.is_empty() {
                 continue;
             }
@@ -661,7 +843,7 @@ pub fn stale_objects(profile: &Path) -> Vec<(PathBuf, u64)> {
                 if current.contains(name) || !(attributable || meta.nlink() == 1) {
                     continue;
                 }
-                let bytes = if meta.nlink() == 1 { meta.blocks() * 512 } else { 0 };
+                let bytes = if meta.nlink() == 1 { meta.allocated() } else { 0 };
                 out.push((dir.join(name), bytes));
             }
         }
@@ -707,7 +889,7 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
             {
                 live_crates.insert(krate.to_string());
             }
-            if let Ok(meta) = e.metadata()
+            if let Ok(meta) = sys::lstat(&e.path())
                 && meta.is_file()
                 && meta.nlink() > 1
             {
@@ -716,6 +898,7 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
         }
     }
     let mut out = Vec::new();
+    let mut cgus_by_crate: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
     let Ok(crates) = fs::read_dir(profile.join("incremental")) else { return out };
     for krate in crates.flatten() {
         let path = krate.path();
@@ -730,17 +913,23 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
         };
         let mut objects = 0usize;
         let mut units = HashSet::new();
+        let mut stems = Vec::new();
         if let Ok(files) = fs::read_dir(&session) {
             for f in files.flatten() {
-                if !f.file_name().to_string_lossy().ends_with(".o") {
-                    continue;
-                }
-                let Ok(meta) = f.metadata() else { continue };
+                let file_name = f.file_name().to_string_lossy().into_owned();
+                let Some(stem) = file_name.strip_suffix(".o") else { continue };
+                let Ok(meta) = sys::lstat(&f.path()) else { continue };
                 objects += 1;
+                stems.push(stem.to_string());
                 if let Some(h) = owners.get(&(meta.dev(), meta.ino())) {
                     units.insert(h.clone());
                 }
             }
+        }
+        // Without object links in `deps/` (ELF targets keep none), session objects are matched by codegen-unit name.
+        if units.is_empty() && !stems.is_empty() {
+            let named = cgus_by_crate.entry(crate_name.clone()).or_insert_with(|| named_cgus(profile, &crate_name));
+            units.extend(stems.iter().filter_map(|s| named.get(s)).flatten().cloned());
         }
         let owner = if units.iter().any(|h| analysis.live.contains(h)) {
             IncrementalOwner::Live
@@ -794,7 +983,7 @@ pub fn incremental_anatomy(profile: &Path) -> IncrementalAnatomy {
         let mut total = 0;
         walk_files(path, &mut |_, m| {
             if seen.insert((m.dev(), m.ino())) {
-                total += m.blocks() * 512;
+                total += m.allocated();
             }
         });
         total
@@ -814,14 +1003,14 @@ pub fn incremental_anatomy(profile: &Path) -> IncrementalAnatomy {
         let Some((_, session)) = newest_session(&d.path) else { continue };
         let mut standalone = 0;
         walk_files(&session, &mut |path, m| {
-            standalone += m.blocks() * 512;
+            standalone += m.allocated();
             if !seen.insert((m.dev(), m.ino())) {
                 return;
             }
             if path.extension().is_some_and(|e| e == "o") {
-                a.newest_objects += m.blocks() * 512;
+                a.newest_objects += m.allocated();
             } else {
-                a.newest_metadata += m.blocks() * 512;
+                a.newest_metadata += m.allocated();
             }
         });
         let name = d.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -838,15 +1027,15 @@ pub fn incremental_anatomy(profile: &Path) -> IncrementalAnatomy {
             if path.extension().is_none_or(|x| x != "o") {
                 continue;
             }
-            let Ok(m) = fs::symlink_metadata(&path) else { continue };
+            let Ok(m) = sys::lstat(&path) else { continue };
             a.deps_object_files += 1;
             if !seen.insert((m.dev(), m.ino())) {
                 continue;
             }
             if stale.contains(&path) {
-                a.deps_objects_stale += m.blocks() * 512;
+                a.deps_objects_stale += m.allocated();
             } else {
-                a.deps_objects_current += m.blocks() * 512;
+                a.deps_objects_current += m.allocated();
             }
         }
     }
@@ -865,7 +1054,7 @@ impl ProfileLock {
         let names = if existing.is_empty() { vec![CARGO_LOCKS[0]] } else { existing };
         for name in names {
             let file = File::options().read(true).write(true).create(true).truncate(false).open(profile.join(name)).ok()?;
-            file.try_lock().ok()?;
+            sys::try_lock(&file, sys::LockKind::Exclusive).ok()?;
             files.push(file);
         }
         Some(ProfileLock { _files: files })
@@ -923,6 +1112,8 @@ pub struct Report {
     pub budget_evicted: u64,
     pub allocated_before: u64,
     pub allocated_after: u64,
+    /// The pass ran out of its time or byte budget and left the rest for the next due pass.
+    pub budget_stopped: bool,
 }
 
 pub fn central_targets(dirs: &Dirs) -> Vec<PathBuf> {
@@ -999,7 +1190,7 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
         if opts.include_store && store.is_dir() {
             collect_candidates(&store, true, &mut candidates);
         }
-        shrink(candidates, opts, &mut report);
+        shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report);
     }
 
     drop(locks);
@@ -1016,53 +1207,282 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
 #[derive(Debug)]
 struct Candidate {
     path: PathBuf,
-    meta: fs::Metadata,
+    meta: sys::Meta,
     in_store: bool,
 }
 
 /// Store `meta.json` files carry the LRU time and are never touched.
 fn collect_candidates(root: &Path, in_store: bool, out: &mut Vec<Candidate>) {
-    fn visit(dir: &Path, in_store: bool, out: &mut Vec<Candidate>) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') && name != ".fingerprint" {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-            if meta.is_dir() {
-                if !name.ends_with("-working") {
-                    visit(&path, in_store, out);
-                }
-                continue;
-            }
-            if !meta.is_file()
-                || meta.nlink() != 1
-                || meta.len() < MIN_FILE_BYTES
-                || meta.len() > MAX_FILE_BYTES
-                || !apfs::only_compression_flag(&meta)
-                || (in_store && name == "meta.json")
-            {
-                continue;
-            }
-            out.push(Candidate { path, meta, in_store });
+    let skip = |name: &str, is_dir: bool| (name.starts_with('.') && name != ".fingerprint") || (is_dir && name.ends_with("-working"));
+    let found = |acc: &mut Vec<Candidate>, path: &Path, meta: &sys::Meta| {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if meta.nlink() != 1
+            || meta.len() < MIN_FILE_BYTES
+            || meta.len() > MAX_FILE_BYTES
+            || !apfs::only_compression_flag(meta)
+            || (in_store && name == "meta.json")
+        {
+            return;
         }
-    }
-    visit(root, in_store, out);
+        acc.push(Candidate { path: path.to_path_buf(), meta: meta.clone(), in_store });
+    };
+    let mut all: Vec<Candidate> = walk_parallel(root, &skip, &Vec::<Candidate>::new, &found).into_iter().flatten().collect();
+    all.sort_by(|a, b| a.path.cmp(&b.path));
+    out.extend(all);
 }
 
-fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, report: &mut Report) {
-    let mut by_size: HashMap<u64, Vec<Candidate>> = HashMap::new();
+/// What a pass may spend before stopping between two files; the memo makes finished files free on the next pass.
+struct Budget {
+    deadline: Instant,
+    bytes_left: u64,
+}
+
+/// State shared by the files of one shrink pass: the optional work budget, the persistent memo and the sampler switch.
+struct ShrinkCtx {
+    budget: Option<Budget>,
+    memo: Option<Memo>,
+    memo_path: Option<PathBuf>,
+    sample: bool,
+    stopped: bool,
+}
+
+impl ShrinkCtx {
+    /// No budget, no memo and no sampling: the explicit `frust compact` behaviour.
+    fn plain() -> ShrinkCtx {
+        ShrinkCtx { budget: None, memo: None, memo_path: None, sample: false, stopped: false }
+    }
+
+    fn for_auto(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> ShrinkCtx {
+        let path = dirs.compact_memo(target);
+        ShrinkCtx {
+            budget: Some(Budget { deadline: Instant::now() + opts.pass_budget, bytes_left: opts.pass_bytes }),
+            memo: Some(Memo::load(&path)),
+            memo_path: Some(path),
+            sample: true,
+            stopped: false,
+        }
+    }
+
+    fn exhausted(&mut self) -> bool {
+        let spent = self.budget.as_ref().is_some_and(|b| b.bytes_left == 0 || Instant::now() >= b.deadline);
+        self.stopped |= spent;
+        spent
+    }
+
+    fn spend(&mut self, bytes: u64) {
+        if let Some(b) = &mut self.budget {
+            b.bytes_left = b.bytes_left.saturating_sub(bytes);
+        }
+    }
+
+    fn recall_hash(&mut self, meta: &sys::Meta) -> Option<[u8; 32]> {
+        self.memo.as_mut()?.get(&FileKey::of(meta))?.hash
+    }
+
+    fn remember_hash(&mut self, path: &Path, meta: &sys::Meta, digest: [u8; 32]) {
+        if unchanged(path, meta)
+            && let Some(memo) = &mut self.memo
+        {
+            memo.update(FileKey::of(meta), |v| v.hash = Some(digest));
+        }
+    }
+
+    fn known_incompressible(&mut self, meta: &sys::Meta) -> bool {
+        self.memo.as_mut().and_then(|m| m.get(&FileKey::of(meta))).is_some_and(|v| v.incompressible.is_some())
+    }
+
+    fn note_incompressible(&mut self, path: &Path, meta: &sys::Meta, percent: u8) {
+        if unchanged(path, meta)
+            && let Some(memo) = &mut self.memo
+        {
+            memo.update(FileKey::of(meta), |v| v.incompressible = Some(percent));
+        }
+    }
+
+    fn forget(&mut self, meta: &sys::Meta) {
+        if let Some(memo) = &mut self.memo {
+            memo.forget(&FileKey::of(meta));
+        }
+    }
+
+    /// A pass that ran to the end also drops the entries of files it no longer found.
+    fn finish(mut self) {
+        if let (Some(memo), Some(path)) = (&mut self.memo, &self.memo_path) {
+            memo.save(path, !self.stopped);
+        }
+    }
+}
+
+/// The identity a memo entry is valid for; any write to the file changes its ctime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FileKey {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileKey {
+    fn of(meta: &sys::Meta) -> FileKey {
+        FileKey { dev: meta.dev(), ino: meta.ino(), size: meta.len(), mtime: meta.mtime(), ctime: meta.ctime() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MemoValue {
+    hash: Option<[u8; 32]>,
+    /// Percent of the input an encoder kept when the file was judged not worth compressing.
+    incompressible: Option<u8>,
+}
+
+const MEMO_MAGIC: &[u8; 4] = b"FRCM";
+const MEMO_VERSION: u32 = 1;
+const MEMO_HEADER: usize = 12;
+const MEMO_RECORD: usize = 90;
+const MEMO_SUM: usize = 16;
+const MAX_MEMO_ENTRIES: usize = 40_000;
+
+/// A checksummed, bounded file per target; anything unreadable or damaged loads as empty, so it can only cost a recompute.
+#[derive(Debug, Default)]
+struct Memo {
+    entries: BTreeMap<FileKey, MemoValue>,
+    touched: HashSet<FileKey>,
+    dirty: bool,
+}
+
+impl Memo {
+    fn load(path: &Path) -> Memo {
+        fs::read(path).ok().and_then(|bytes| Memo::decode(&bytes)).unwrap_or_default()
+    }
+
+    fn get(&mut self, key: &FileKey) -> Option<MemoValue> {
+        let value = self.entries.get(key).copied()?;
+        self.touched.insert(*key);
+        Some(value)
+    }
+
+    fn update(&mut self, key: FileKey, change: impl FnOnce(&mut MemoValue)) {
+        let value = self.entries.entry(key).or_default();
+        let before = *value;
+        change(value);
+        self.dirty |= *value != before;
+        self.touched.insert(key);
+    }
+
+    fn forget(&mut self, key: &FileKey) {
+        self.dirty |= self.entries.remove(key).is_some();
+    }
+
+    fn save(&mut self, path: &Path, prune: bool) {
+        if prune {
+            let touched = &self.touched;
+            let before = self.entries.len();
+            self.entries.retain(|k, _| touched.contains(k));
+            self.dirty |= self.entries.len() != before;
+        }
+        if self.entries.len() > MAX_MEMO_ENTRIES {
+            let overflow = self.entries.len() - MAX_MEMO_ENTRIES;
+            let untouched: Vec<FileKey> = self.entries.keys().filter(|k| !self.touched.contains(*k)).take(overflow).copied().collect();
+            for key in untouched {
+                self.entries.remove(&key);
+            }
+            while self.entries.len() > MAX_MEMO_ENTRIES {
+                self.entries.pop_last();
+            }
+            self.dirty = true;
+        }
+        if !self.dirty {
+            return;
+        }
+        if self.entries.is_empty() {
+            let _ = fs::remove_file(path);
+        } else {
+            let _ = fsx::write_atomic(path, &self.encode());
+        }
+        self.dirty = false;
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(MEMO_HEADER + self.entries.len() * MEMO_RECORD + MEMO_SUM);
+        out.extend_from_slice(MEMO_MAGIC);
+        out.extend_from_slice(&MEMO_VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for (k, v) in &self.entries {
+            for n in [k.dev, k.ino, k.size] {
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            for n in [k.mtime.0, k.mtime.1, k.ctime.0, k.ctime.1] {
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            out.push(u8::from(v.hash.is_some()) | (u8::from(v.incompressible.is_some()) << 1));
+            out.push(v.incompressible.unwrap_or(0));
+            out.extend_from_slice(&v.hash.unwrap_or([0; 32]));
+        }
+        let sum = blake3::hash(&out);
+        out.extend_from_slice(&sum.as_bytes()[..MEMO_SUM]);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Memo> {
+        if bytes.len() < MEMO_HEADER + MEMO_SUM {
+            return None;
+        }
+        let (body, sum) = bytes.split_at(bytes.len() - MEMO_SUM);
+        if body[..4] != MEMO_MAGIC[..] || blake3::hash(body).as_bytes()[..MEMO_SUM] != *sum {
+            return None;
+        }
+        let word = |at: usize| {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&body[at..at + 4]);
+            u32::from_le_bytes(b)
+        };
+        let count = word(8) as usize;
+        if word(4) != MEMO_VERSION || body.len() != MEMO_HEADER + count.checked_mul(MEMO_RECORD)? {
+            return None;
+        }
+        let mut entries = BTreeMap::new();
+        for rec in body[MEMO_HEADER..].as_chunks::<MEMO_RECORD>().0 {
+            let eight = |at: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&rec[at..at + 8]);
+                b
+            };
+            let key = FileKey {
+                dev: u64::from_le_bytes(eight(0)),
+                ino: u64::from_le_bytes(eight(8)),
+                size: u64::from_le_bytes(eight(16)),
+                mtime: (i64::from_le_bytes(eight(24)), i64::from_le_bytes(eight(32))),
+                ctime: (i64::from_le_bytes(eight(40)), i64::from_le_bytes(eight(48))),
+            };
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&rec[58..90]);
+            let value = MemoValue { hash: (rec[56] & 1 != 0).then_some(digest), incompressible: (rec[56] & 2 != 0).then_some(rec[57]) };
+            entries.insert(key, value);
+        }
+        Some(Memo { entries, touched: HashSet::new(), dirty: false })
+    }
+}
+
+fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx, report: &mut Report) {
+    let mut by_size: BTreeMap<u64, Vec<Candidate>> = BTreeMap::new();
     for c in candidates {
         by_size.entry(c.meta.len()).or_default().push(c);
     }
     let mut dir_times = DirTimes::default();
-    for (_, bucket) in by_size {
+    // Largest files first, so a pass cut short by its budget has done the most valuable work.
+    'buckets: for (_, mut bucket) in by_size.into_iter().rev() {
+        if ctx.exhausted() {
+            break;
+        }
+        bucket.sort_by(|a, b| a.path.cmp(&b.path));
         if bucket.len() == 1 || !opts.dedupe {
             for c in bucket {
+                if ctx.exhausted() {
+                    break 'buckets;
+                }
                 if opts.compress && !apfs::is_compressed(&c.meta) {
-                    compress_one(&c, opts.dry_run, &mut dir_times, report);
+                    compress_one(&c, opts.dry_run, &mut dir_times, ctx, report);
                 }
             }
             continue;
@@ -1072,34 +1492,61 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, report: &mut Report
         if clone_ids.len() == 1 && !clone_ids.contains(&None) && bucket.iter().all(|c| apfs::is_compressed(&c.meta)) {
             continue;
         }
-        let mut groups: HashMap<String, Vec<Candidate>> = HashMap::new();
+        // The flag marks a digest that came from the memo rather than from reading the file just now.
+        let mut groups: BTreeMap<[u8; 32], Vec<(Candidate, bool)>> = BTreeMap::new();
         for c in bucket {
-            match content_hash(&c.path) {
-                Ok(h) => groups.entry(h).or_default().push(c),
+            if let Some(digest) = ctx.recall_hash(&c.meta) {
+                groups.entry(digest).or_default().push((c, true));
+                continue;
+            }
+            if ctx.exhausted() {
+                break 'buckets;
+            }
+            match content_digest(&c.path) {
+                Ok(digest) => {
+                    ctx.spend(c.meta.len());
+                    ctx.remember_hash(&c.path, &c.meta, digest);
+                    groups.entry(digest).or_default().push((c, false));
+                }
                 Err(err) => report.errors.push((c.path.clone(), err.to_string())),
             }
         }
         for (_, mut group) in groups {
-            // Prefer a compressed canonical copy, then one in the store, whose target copies are usually clones of it already.
-            group.sort_by_key(|c| (!apfs::is_compressed(&c.meta), !c.in_store, c.path.clone()));
-            let mut members = group.into_iter();
-            let Some(canonical) = members.next() else { continue };
-            if opts.compress && !apfs::is_compressed(&canonical.meta) {
-                compress_one(&canonical, opts.dry_run, &mut dir_times, report);
+            if ctx.exhausted() {
+                break 'buckets;
             }
-            let canon_meta = fs::symlink_metadata(&canonical.path).ok();
+            // Prefer a compressed canonical copy, then one in the store, whose target copies are usually clones of it already.
+            group.sort_by_key(|(c, _)| (!apfs::is_compressed(&c.meta), !c.in_store, c.path.clone()));
+            let mut members = group.into_iter();
+            let Some((canonical, canonical_memoised)) = members.next() else { continue };
+            if opts.compress && !apfs::is_compressed(&canonical.meta) {
+                compress_one(&canonical, opts.dry_run, &mut dir_times, ctx, report);
+            }
+            let canon_meta = sys::lstat(&canonical.path).ok();
             let canon_clone = apfs::clone_info(&canonical.path).map(|i| i.0);
-            for m in members {
+            for (m, memoised) in members {
                 if canon_clone.is_some() && apfs::clone_info(&m.path).map(|i| i.0) == canon_clone {
                     continue;
                 }
-                let saved = m.meta.blocks() * 512;
+                let saved = m.meta.allocated();
                 if opts.dry_run {
                     report.deduped_files += 1;
                     report.dedupe_saved += saved;
                     continue;
                 }
+                if ctx.exhausted() {
+                    break 'buckets;
+                }
                 let Some(cm) = canon_meta.as_ref() else { continue };
+                // A remembered digest is only a hint: the bytes are compared before anything is replaced.
+                if (canonical_memoised || memoised) && !same_bytes(&canonical.path, &m.path).unwrap_or(false) {
+                    ctx.forget(&canonical.meta);
+                    ctx.forget(&m.meta);
+                    continue;
+                }
+                if canonical_memoised || memoised {
+                    ctx.spend(m.meta.len());
+                }
                 match replace_with_clone(&canonical.path, cm, &m, &mut dir_times) {
                     Ok(()) => {
                         report.deduped_files += 1;
@@ -1112,7 +1559,7 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, report: &mut Report
     }
 }
 
-fn content_hash(path: &Path) -> io::Result<String> {
+fn content_digest(path: &Path) -> io::Result<[u8; 32]> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 256 * 1024];
@@ -1123,7 +1570,58 @@ fn content_hash(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn content_hash(path: &Path) -> io::Result<String> {
+    Ok(blake3::Hash::from_bytes(content_digest(path)?).to_hex().to_string())
+}
+
+fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (vec![0u8; 256 * 1024], vec![0u8; 256 * 1024]);
+    loop {
+        let n = fa.read(&mut x)?;
+        if n == 0 {
+            return Ok(fb.read(&mut y)? == 0);
+        }
+        fb.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+const SAMPLE_BYTES: u64 = 64 * 1024;
+/// The compression check below keeps a file only if it saves at least 5 percent.
+const SAMPLE_KEEP_PERCENT: u8 = 95;
+
+/// The head and the middle of a file big enough that sampling is cheaper than encoding all of it.
+fn sample_ranges(len: u64) -> Vec<(u64, u64)> {
+    if len < 4 * SAMPLE_BYTES {
+        return Vec::new();
+    }
+    vec![(0, SAMPLE_BYTES), ((len - SAMPLE_BYTES) / 2, SAMPLE_BYTES)]
+}
+
+/// Percent of the sampled bytes the encoder keeps; `None` when the file is not sampled or cannot be read.
+fn sample_ratio(path: &Path, len: u64, encode: &dyn Fn(&[u8]) -> Option<usize>) -> Option<u8> {
+    let ranges = sample_ranges(len);
+    if ranges.is_empty() {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let (mut raw, mut kept) = (0u64, 0u64);
+    for (offset, n) in ranges {
+        let mut buf = vec![0u8; n as usize];
+        sys::read_exact_at(&file, &mut buf, offset).ok()?;
+        kept += encode(&buf)? as u64;
+        raw += n;
+    }
+    Some((kept * 100 / raw).min(100) as u8)
 }
 
 /// Directory times are restored after each rename so the rewrite is invisible to tools comparing directory mtimes.
@@ -1134,8 +1632,9 @@ impl DirTimes {
     fn capture(&mut self, file: &Path) -> Option<PathBuf> {
         let dir = file.parent()?.to_path_buf();
         if !self.0.contains_key(&dir) {
-            let m = fs::symlink_metadata(&dir).ok()?;
-            self.0.insert(dir.clone(), (m.atime(), m.atime_nsec(), m.mtime(), m.mtime_nsec()));
+            let m = sys::lstat(&dir).ok()?;
+            let (atime, mtime) = (m.atime(), m.mtime());
+            self.0.insert(dir.clone(), (atime.0, atime.1, mtime.0, mtime.1));
         }
         Some(dir)
     }
@@ -1148,13 +1647,23 @@ impl DirTimes {
 }
 
 /// Guards against replacing a file a build rewrote after it was examined.
-fn unchanged(path: &Path, meta: &fs::Metadata) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|now| {
-        now.ino() == meta.ino() && now.len() == meta.len() && now.mtime() == meta.mtime() && now.mtime_nsec() == meta.mtime_nsec()
-    })
+fn unchanged(path: &Path, meta: &sys::Meta) -> bool {
+    sys::lstat(path).is_ok_and(|now| now.ino() == meta.ino() && now.len() == meta.len() && now.mtime() == meta.mtime())
 }
 
-fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, report: &mut Report) {
+fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mut ShrinkCtx, report: &mut Report) {
+    if ctx.known_incompressible(&c.meta) {
+        return;
+    }
+    if ctx.sample
+        && let Some(kept) = sample_ratio(&c.path, c.meta.len(), &|b| apfs::encode_lzfse_fork(b).map(|f| f.len()))
+    {
+        ctx.spend(2 * SAMPLE_BYTES);
+        if kept > SAMPLE_KEEP_PERCENT {
+            ctx.note_incompressible(&c.path, &c.meta, kept);
+            return;
+        }
+    }
     let data = match fs::read(&c.path) {
         Ok(d) => d,
         Err(err) => {
@@ -1162,13 +1671,15 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, report: 
             return;
         }
     };
+    ctx.spend(data.len() as u64);
     if data.len() as u64 != c.meta.len() {
         return;
     }
     let Some(fork) = apfs::encode_lzfse_fork(&data) else { return };
-    let before = c.meta.blocks() * 512;
+    let before = c.meta.allocated();
     let after = (fork.len() as u64).div_ceil(4096) * 4096;
     if after + 8192 > before || after > before - before / 20 {
+        ctx.note_incompressible(&c.path, &c.meta, (fork.len() as u64 * 100 / (data.len() as u64).max(1)).min(100) as u8);
         return;
     }
     if dry_run {
@@ -1181,8 +1692,8 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, report: 
     let result = (|| -> io::Result<u64> {
         apfs::write_compressed(&tmp, &c.path, &c.meta, &data, &fork)?;
         verify_same(&tmp, &data)?;
-        apfs::set_times(&tmp, (c.meta.atime(), c.meta.atime_nsec()), (c.meta.mtime(), c.meta.mtime_nsec()))?;
-        let written = fs::symlink_metadata(&tmp)?;
+        apfs::set_times(&tmp, c.meta.atime(), c.meta.mtime())?;
+        let written = sys::lstat(&tmp)?;
         if !apfs::is_compressed(&written) {
             return Err(io::Error::other("kernel did not keep the file compressed"));
         }
@@ -1190,11 +1701,11 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, report: 
             return Err(io::Error::other("file changed while compressing"));
         }
         let dir = dir_times.capture(&c.path);
-        fs::rename(&tmp, &c.path)?;
+        sys::rename(&tmp, &c.path)?;
         if let Some(dir) = dir {
             dir_times.restore(&dir);
         }
-        Ok(written.blocks() * 512)
+        Ok(written.allocated())
     })();
     match result {
         Ok(after) => {
@@ -1210,12 +1721,13 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, report: 
 }
 
 pub fn compress_file(path: &Path) -> io::Result<bool> {
-    let meta = fs::symlink_metadata(path)?;
+    let meta = sys::lstat(path)?;
     if !apfs::SUPPORTED || !meta.is_file() || meta.nlink() != 1 || apfs::is_compressed(&meta) {
         return Ok(false);
     }
     let mut report = Report::default();
-    compress_one(&Candidate { path: path.to_path_buf(), meta, in_store: false }, false, &mut DirTimes::default(), &mut report);
+    let candidate = Candidate { path: path.to_path_buf(), meta, in_store: false };
+    compress_one(&candidate, false, &mut DirTimes::default(), &mut ShrinkCtx::plain(), &mut report);
     match report.errors.pop() {
         Some((_, err)) => Err(io::Error::other(err)),
         None => Ok(report.compressed_files == 1),
@@ -1229,22 +1741,22 @@ pub fn is_compressed(meta: &fs::Metadata) -> bool {
 /// Control arm of the latency measurements: changes the inode the way compression does, without compressing.
 pub fn rewrite_plain(path: &Path) -> io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let meta = fs::symlink_metadata(path)?;
+    let meta = sys::lstat(path)?;
     let data = fs::read(path)?;
     let tmp = fsx::temp_sibling(path);
     let mut dir_times = DirTimes::default();
     let result = (|| -> io::Result<()> {
-        let mut file = File::options().write(true).create_new(true).mode(meta.permissions().mode() & 0o7777).open(&tmp)?;
+        let mut file = sys::with_mode(File::options().write(true).create_new(true), meta.mode() & 0o7777).open(&tmp)?;
         file.write_all(&data)?;
+        if !apfs::SUPPORTED {
+            file.set_modified(meta.modified()?)?;
+        }
         drop(file);
         if apfs::SUPPORTED {
-            apfs::set_times(&tmp, (meta.atime(), meta.atime_nsec()), (meta.mtime(), meta.mtime_nsec()))?;
-        } else {
-            File::open(&tmp)?.set_modified(meta.modified()?)?;
+            apfs::set_times(&tmp, meta.atime(), meta.mtime())?;
         }
         let dir = dir_times.capture(path);
-        fs::rename(&tmp, path)?;
+        sys::rename(&tmp, path)?;
         if let Some(dir) = dir {
             dir_times.restore(&dir);
         }
@@ -1276,7 +1788,7 @@ fn verify_same(path: &Path, expected: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn replace_with_clone(canonical: &Path, canon_meta: &fs::Metadata, m: &Candidate, dir_times: &mut DirTimes) -> io::Result<()> {
+fn replace_with_clone(canonical: &Path, canon_meta: &sys::Meta, m: &Candidate, dir_times: &mut DirTimes) -> io::Result<()> {
     if !unchanged(canonical, canon_meta) {
         return Err(io::Error::other("canonical copy changed"));
     }
@@ -1284,12 +1796,12 @@ fn replace_with_clone(canonical: &Path, canon_meta: &fs::Metadata, m: &Candidate
     let result = (|| -> io::Result<()> {
         apfs::clone(canonical, &tmp)?;
         fs::set_permissions(&tmp, m.meta.permissions())?;
-        apfs::set_times(&tmp, (m.meta.atime(), m.meta.atime_nsec()), (m.meta.mtime(), m.meta.mtime_nsec()))?;
+        apfs::set_times(&tmp, m.meta.atime(), m.meta.mtime())?;
         if fs::symlink_metadata(&tmp)?.len() != m.meta.len() || !unchanged(&m.path, &m.meta) {
             return Err(io::Error::other("file changed while deduplicating"));
         }
         let dir = dir_times.capture(&m.path);
-        fs::rename(&tmp, &m.path)?;
+        sys::rename(&tmp, &m.path)?;
         if let Some(dir) = dir {
             dir_times.restore(&dir);
         }
@@ -1328,6 +1840,10 @@ pub struct AutoOptions {
     pub hot_categories: Vec<Category>,
     pub cache_enabled: bool,
     pub compress: bool,
+    /// Wall time the dedupe and compression stage of one automatic pass may take before it stops between files.
+    pub pass_budget: Duration,
+    /// Bytes that stage may read or encode in one pass.
+    pub pass_bytes: u64,
 }
 
 impl AutoOptions {
@@ -1352,6 +1868,8 @@ impl AutoOptions {
             hot_categories: HOT_CATEGORIES.to_vec(),
             cache_enabled: cfg.cache,
             compress: true,
+            pass_budget: Duration::from_secs(2),
+            pass_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -1362,6 +1880,16 @@ struct AutoMarker {
     at_unix: u64,
     #[serde(default)]
     store_entries: u64,
+    /// Zero when unknown; otherwise the change signature of the state this marker describes.
+    #[serde(default)]
+    signature: u64,
+    /// False after a pass that stopped on its budget, so the next due pass continues instead of being skipped.
+    #[serde(default = "complete_by_default")]
+    complete: bool,
+}
+
+fn complete_by_default() -> bool {
+    true
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
@@ -1371,10 +1899,72 @@ fn store_entries(dirs: &Dirs) -> u64 {
     shards.flatten().map(|s| fs::read_dir(s.path()).map(|rd| rd.count() as u64).unwrap_or(0)).sum()
 }
 
+fn fold_hash(hasher: &blake3::Hasher) -> u64 {
+    let digest = hasher.finalize();
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(word).max(1)
+}
+
+/// Mixes a directory's mtime and the names it lists (and, if `deep`, its children's mtimes); `None` on any error but an absent optional directory.
+fn stamp_dir(hasher: &mut blake3::Hasher, dir: &Path, optional: bool, deep: bool) -> Option<()> {
+    hasher.update(dir.as_os_str().as_encoded_bytes());
+    let meta = match sys::stat(dir) {
+        Ok(meta) => meta,
+        Err(err) if optional && err.kind() == io::ErrorKind::NotFound => {
+            hasher.update(b"-");
+            return Some(());
+        }
+        Err(_) => return None,
+    };
+    let (secs, nanos) = meta.mtime();
+    hasher.update(&secs.to_le_bytes());
+    hasher.update(&nanos.to_le_bytes());
+    let mut listed = Vec::new();
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let stamp = if deep { Some(sys::lstat(&entry.path()).ok()?.mtime()) } else { None };
+        listed.push((entry.file_name(), stamp));
+    }
+    listed.sort();
+    for (name, stamp) in listed {
+        hasher.update(name.as_encoded_bytes());
+        hasher.update(b"\0");
+        if let Some((secs, nanos)) = stamp {
+            hasher.update(&secs.to_le_bytes());
+            hasher.update(&nanos.to_le_bytes());
+        }
+    }
+    Some(())
+}
+
+/// Covers the few directories that change when a build writes into a profile; builds always add or rename entries there.
+fn tree_signature(target: &Path) -> Option<u64> {
+    let mut hasher = blake3::Hasher::new();
+    stamp_dir(&mut hasher, target, false, false)?;
+    for profile in profile_dirs(target) {
+        stamp_dir(&mut hasher, &profile, false, false)?;
+        for (sub, optional, deep) in [("deps", false, false), (".fingerprint", true, false), ("incremental", true, true), ("build", true, false), ("examples", true, false)] {
+            stamp_dir(&mut hasher, &profile.join(sub), optional, deep)?;
+        }
+    }
+    Some(fold_hash(&hasher))
+}
+
+/// `options` is part of the signature so a pass with different settings is never mistaken for a repeat.
+fn change_signature(dirs: &Dirs, target: &Path, options: &str) -> Option<u64> {
+    let tree = tree_signature(target)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&tree.to_le_bytes());
+    hasher.update(&store_entries(dirs).to_le_bytes());
+    hasher.update(options.as_bytes());
+    Some(fold_hash(&hasher))
+}
+
 fn write_marker(file: &File, record: &AutoMarker) {
     if let Ok(bytes) = serde_json::to_vec(record) {
         let _ = file.set_len(0);
-        let _ = std::os::unix::fs::FileExt::write_all_at(file, &bytes, 0);
+        let _ = sys::write_all_at(file, &bytes, 0);
     }
 }
 
@@ -1394,41 +1984,68 @@ pub fn auto_compact_with(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> Comp
         return report;
     }
     let marker = target.join(AUTO_MARKER);
-    let age = |m: &fs::Metadata| m.modified().ok().and_then(|t| SystemTime::now().duration_since(t).ok());
     if let Ok(meta) = fs::metadata(&marker)
-        && age(&meta).is_some_and(|a| a < opts.every)
+        && marker_age(&meta).is_some_and(|a| a < opts.every)
     {
         report.skipped = Some("not due");
         return report;
     }
+    at_background_priority(|| auto_compact_pass(dirs, target, opts, report))
+}
+
+fn marker_age(m: &fs::Metadata) -> Option<Duration> {
+    m.modified().ok().and_then(|t| SystemTime::now().duration_since(t).ok())
+}
+
+fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report: Report) -> Report {
+    let marker = target.join(AUTO_MARKER);
     let Ok(file) = File::options().read(true).write(true).create(true).truncate(false).open(&marker) else {
         report.skipped = Some("cannot open the marker");
         return report;
     };
-    if file.try_lock().is_err() {
+    if sys::try_lock(&file, sys::LockKind::Exclusive).is_err() {
         report.skipped = Some("another compaction is running");
         return report;
     }
     let previous: Option<AutoMarker> = fs::read(&marker).ok().and_then(|b| serde_json::from_slice(&b).ok());
     // Another process may have finished a pass between the stat and the lock.
-    if previous.is_some() && file.metadata().ok().and_then(|m| age(&m)).is_some_and(|a| a < opts.every) {
+    if previous.is_some() && file.metadata().ok().and_then(|m| marker_age(&m)).is_some_and(|a| a < opts.every) {
         report.skipped = Some("not due");
+        return report;
+    }
+    let options_key = format!("{opts:?}");
+    let signature = change_signature(dirs, target, &options_key);
+    // Mirrors the growth check below without walking the target: an unchanged tree cannot have grown.
+    if let (Some(prev), Some(sig)) = (&previous, signature)
+        && opts.min_growth > 0
+        && prev.complete
+        && prev.signature == sig
+        && prev.allocated_after <= opts.max_target_bytes
+    {
+        let record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries, signature: sig, complete: true };
+        write_marker(&file, &record);
+        let _ = file.set_modified(SystemTime::now());
+        report.skipped = Some("nothing changed since the last pass");
+        report.allocated_before = prev.allocated_after;
+        report.allocated_after = prev.allocated_after;
         return report;
     }
     report.allocated_before = allocated(target);
     if let Some(prev) = &previous
+        && prev.complete
         && report.allocated_before < prev.allocated_after.saturating_add(opts.min_growth)
         && report.allocated_before <= opts.max_target_bytes
     {
         // Every path-crate edit still adds cache entries even when the target is bounded, so prune once enough appear.
         let entries = store_entries(dirs);
-        let mut record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries };
+        let mut record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries, signature: 0, complete: true };
         if entries >= prev.store_entries.saturating_add(STORE_ENTRIES_GROWTH) {
             let superseded = crate::gc::superseded_incremental_entries(dirs, crate::gc::INCREMENTAL_ENTRIES_KEPT);
             report.superseded_entries = superseded.len();
             remove_paths(&superseded, &mut report);
             record.store_entries = store_entries(dirs);
         }
+        record.signature = change_signature(dirs, target, &options_key).unwrap_or(0);
         write_marker(&file, &record);
         let _ = file.set_modified(SystemTime::now());
         report.skipped = Some("grew too little since the last pass");
@@ -1551,7 +2168,12 @@ pub fn auto_compact_with(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> Comp
         remove_paths(&objects, &mut report);
     }
 
-    let mut size = allocated(target);
+    // Removals only shrink the target, so one that began under the cap is still under it.
+    let mut size = if report.allocated_before <= opts.max_target_bytes || report.removed.is_empty() {
+        report.allocated_before
+    } else {
+        allocated(target)
+    };
     if size > opts.max_target_bytes {
         evictable.sort_by_key(|e| e.0);
         for (_, paths) in evictable {
@@ -1598,16 +2220,29 @@ pub fn auto_compact_with(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> Comp
                 if hot.get(len).is_some_and(|ids| apfs::clone_info(path).is_some_and(|(id, _)| ids.contains(&id))) {
                     continue;
                 }
-                if let Ok(meta) = fs::symlink_metadata(path) {
+                if let Ok(meta) = sys::lstat(path) {
                     candidates.push(Candidate { path: path.clone(), meta, in_store: true });
                 }
             }
         }
-        shrink(candidates, &CompactOptions::after_build(), &mut report);
+        let mut ctx = ShrinkCtx::for_auto(dirs, target, opts);
+        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
+        report.budget_stopped = ctx.stopped;
+        ctx.finish();
     }
+    // Taken under cargo's locks so no build can change the tree between the pass and its signature.
+    let signature = change_signature(dirs, target, &options_key);
     drop(locks);
-    report.allocated_after = allocated(target);
-    write_marker(&file, &AutoMarker { allocated_after: report.allocated_after, at_unix: fsx::unix_now(), store_entries: store_entries(dirs) });
+    let changed = !report.removed.is_empty() || report.compressed_files > 0 || report.deduped_files > 0 || !report.errors.is_empty();
+    report.allocated_after = if changed { allocated(target) } else { report.allocated_before };
+    let record = AutoMarker {
+        allocated_after: report.allocated_after,
+        at_unix: fsx::unix_now(),
+        store_entries: store_entries(dirs),
+        signature: signature.unwrap_or(0),
+        complete: !report.budget_stopped,
+    };
+    write_marker(&file, &record);
     let _ = file.set_modified(SystemTime::now());
     report
 }
@@ -1639,14 +2274,31 @@ fn remove_paths(paths: &[(PathBuf, u64)], report: &mut Report) {
     }
 }
 
+/// Files with several links are listed rather than summed, so a link seen from two subtrees is counted once.
 fn allocated(root: &Path) -> u64 {
+    type Part = (u64, Vec<(u64, u64, u64)>);
+    let parts = walk_parallel(
+        root,
+        &|_: &str, _: bool| false,
+        &Part::default,
+        &|acc: &mut Part, _: &Path, m: &sys::Meta| {
+            if m.nlink() <= 1 {
+                acc.0 += m.allocated();
+            } else {
+                acc.1.push((m.dev(), m.ino(), m.allocated()));
+            }
+        },
+    );
     let mut seen = HashSet::new();
     let mut total = 0;
-    walk_files(root, &mut |_, m| {
-        if m.nlink() <= 1 || seen.insert((m.dev(), m.ino())) {
-            total += m.blocks() * 512;
+    for (single, linked) in parts {
+        total += single;
+        for (dev, ino, bytes) in linked {
+            if seen.insert((dev, ino)) {
+                total += bytes;
+            }
         }
-    });
+    }
     total
 }
 
@@ -1659,11 +2311,22 @@ struct StoreIndex {
 impl StoreIndex {
     fn new(store: &Path) -> StoreIndex {
         let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-        walk_files(store, &mut |path, meta| {
-            if meta.len() > 0 && path.file_name().is_some_and(|n| n != "meta.json") {
-                by_size.entry(meta.len()).or_default().push(path.to_path_buf());
-            }
-        });
+        let parts = walk_parallel(
+            store,
+            &|_: &str, _: bool| false,
+            &Vec::<(u64, PathBuf)>::new,
+            &|acc: &mut Vec<(u64, PathBuf)>, path: &Path, meta: &sys::Meta| {
+                if meta.len() > 0 && path.file_name().is_some_and(|n| n != "meta.json") {
+                    acc.push((meta.len(), path.to_path_buf()));
+                }
+            },
+        );
+        for (len, path) in parts.into_iter().flatten() {
+            by_size.entry(len).or_default().push(path);
+        }
+        for paths in by_size.values_mut() {
+            paths.sort();
+        }
         StoreIndex { by_size }
     }
 
@@ -2043,8 +2706,39 @@ mod tests {
     }
 
     #[test]
+    fn elf_debug_strings_list_codegen_units() {
+        let dir = std::env::temp_dir().join(format!("frust-elf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let names = b"\0.shstrtab\0.debug_str\0.debug_line_str\0";
+        let strings = b"src/main.rs/@/0abc\0clang LLVM\0library/std/src/lib.rs/@/std.1x\0";
+        let packed = b"x/@/compressed\0";
+        let mut b = vec![0u8; 64];
+        b[0..6].copy_from_slice(b"\x7fELF\x02\x01");
+        let mut sections = vec![(0u32, 0u64, 0usize, 0usize)];
+        for (name, flags, body) in [(1u32, 0u64, &names[..]), (11, 0, &strings[..]), (22, 0x800, &packed[..])] {
+            sections.push((name, flags, b.len(), body.len()));
+            b.extend_from_slice(body);
+        }
+        let shoff = b.len();
+        for (name, flags, offset, size) in &sections {
+            let mut h = vec![0u8; 64];
+            h[0..4].copy_from_slice(&name.to_le_bytes());
+            h[8..16].copy_from_slice(&flags.to_le_bytes());
+            h[24..32].copy_from_slice(&(*offset as u64).to_le_bytes());
+            h[32..40].copy_from_slice(&(*size as u64).to_le_bytes());
+            b.extend(h);
+        }
+        b[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+        b[0x3a..0x40].copy_from_slice(&[64, 0, 4, 0, 1, 0]);
+        fs::write(dir.join("app"), &b).unwrap();
+        assert_eq!(elf_debug_cgus(&dir.join("app")).unwrap(), vec!["0abc".to_string(), "std.1x".to_string()]);
+        fs::write(dir.join("text"), b"#!/bin/sh\n").unwrap();
+        assert!(elf_debug_cgus(&dir.join("text")).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stale_objects_keep_what_the_artifacts_name() {
-        use std::os::unix::fs::MetadataExt as _;
         let root = std::env::temp_dir().join(format!("frust-stale-objects-{}", std::process::id()));
         let deps = root.join("debug").join("deps");
         let session = root.join("debug").join("incremental").join("lib-1abc").join("s-x-y-z");
@@ -2074,7 +2768,7 @@ mod tests {
         stale.sort();
         let paths: Vec<PathBuf> = stale.iter().map(|s| s.0.clone()).collect();
         assert_eq!(paths, vec![deps.join(name("c1", "t1")), deps.join(name("c2", "t1"))]);
-        let single = fs::metadata(deps.join(name("c2", "t1"))).unwrap().blocks() * 512;
+        let single = sys::stat(&deps.join(name("c2", "t1"))).unwrap().allocated();
         assert_eq!(stale.iter().map(|s| s.1).sum::<u64>(), single);
 
         // Without an artifact naming any of them, nothing is proven stale.
@@ -2106,7 +2800,7 @@ mod tests {
     fn set_mtime(path: &Path, secs_ago: u64) {
         let t = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
         for e in fs::read_dir(path).unwrap().flatten() {
-            File::open(e.path()).unwrap().set_modified(t).unwrap();
+            File::options().write(true).open(e.path()).unwrap().set_modified(t).unwrap();
         }
     }
 
@@ -2137,5 +2831,234 @@ mod tests {
         fs::write(profile.join(".fingerprint/app-aaaaaaaaaaaaaaaa/bin-app.json"), "{").unwrap();
         assert!(analyze(&profile).is_none());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("frust-maint-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn key(n: u64) -> FileKey {
+        FileKey { dev: 1, ino: n, size: 20_000, mtime: (n as i64, 5), ctime: (n as i64 + 1, 6) }
+    }
+
+    #[test]
+    fn memo_round_trips_and_rejects_damage() {
+        let mut memo = Memo::default();
+        memo.update(key(1), |v| v.hash = Some([7; 32]));
+        memo.update(key(2), |v| v.incompressible = Some(99));
+        memo.update(key(3), |v| {
+            v.hash = Some([9; 32]);
+            v.incompressible = Some(40);
+        });
+        let bytes = memo.encode();
+        let back = Memo::decode(&bytes).unwrap();
+        assert_eq!(back.entries, memo.entries);
+
+        let mut flipped = bytes.clone();
+        flipped[MEMO_HEADER + 3] ^= 1;
+        assert!(Memo::decode(&flipped).is_none(), "a damaged record is never trusted");
+        assert!(Memo::decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(Memo::decode(b"").is_none());
+        let mut other_version = bytes.clone();
+        other_version[4] = 2;
+        assert!(Memo::decode(&other_version).is_none());
+    }
+
+    #[test]
+    fn memo_prunes_vanished_files_after_a_complete_pass_only() {
+        let dir = scratch("memo-prune");
+        let path = dir.join("memo.bin");
+        let mut memo = Memo::default();
+        memo.update(key(1), |v| v.hash = Some([1; 32]));
+        memo.update(key(2), |v| v.hash = Some([2; 32]));
+        memo.save(&path, false);
+
+        let mut next = Memo::load(&path);
+        assert_eq!(next.entries.len(), 2);
+        assert!(next.get(&key(1)).is_some());
+        next.save(&path, false);
+        assert_eq!(Memo::load(&path).entries.len(), 2, "a stopped pass keeps what it did not reach");
+        next.save(&path, true);
+        let kept = Memo::load(&path);
+        assert_eq!(kept.entries.keys().copied().collect::<Vec<_>>(), vec![key(1)], "key 2 vanished");
+
+        let mut empty = Memo::load(&path);
+        empty.save(&path, true);
+        assert!(!path.exists(), "an empty memo leaves no file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memo_stays_bounded() {
+        let mut memo = Memo::default();
+        for n in 0..(MAX_MEMO_ENTRIES as u64 + 25) {
+            memo.update(key(n), |v| v.incompressible = Some(100));
+        }
+        let dir = scratch("memo-bound");
+        memo.save(&dir.join("memo.bin"), false);
+        assert_eq!(Memo::load(&dir.join("memo.bin")).entries.len(), MAX_MEMO_ENTRIES);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memo_keys_follow_every_change_of_a_file() {
+        let dir = scratch("memo-key");
+        let file = dir.join("f");
+        fs::write(&file, vec![1u8; 20_000]).unwrap();
+        let before = FileKey::of(&sys::lstat(&file).unwrap());
+        assert_eq!(before, FileKey::of(&sys::lstat(&file).unwrap()));
+        std::thread::sleep(Duration::from_millis(30));
+        fs::write(&file, vec![2u8; 20_000]).unwrap();
+        assert_ne!(before, FileKey::of(&sys::lstat(&file).unwrap()),"a rewrite of equal size changes ctime");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn budget_stops_a_pass_between_files() {
+        let mut unlimited = ShrinkCtx::plain();
+        unlimited.spend(u64::MAX);
+        assert!(!unlimited.exhausted() && !unlimited.stopped);
+
+        let mut by_bytes = ShrinkCtx::plain();
+        by_bytes.budget = Some(Budget { deadline: Instant::now() + Duration::from_secs(3600), bytes_left: 100 });
+        assert!(!by_bytes.exhausted());
+        by_bytes.spend(60);
+        assert!(!by_bytes.exhausted());
+        by_bytes.spend(60);
+        assert!(by_bytes.exhausted() && by_bytes.stopped);
+
+        let mut by_time = ShrinkCtx::plain();
+        by_time.budget = Some(Budget { deadline: Instant::now(), bytes_left: u64::MAX });
+        assert!(by_time.exhausted() && by_time.stopped);
+    }
+
+    #[test]
+    fn an_exhausted_budget_leaves_every_file_untouched() {
+        let dir = scratch("budget-shrink");
+        let mut candidates = Vec::new();
+        for name in ["a", "b", "c"] {
+            let path = dir.join(name);
+            fs::write(&path, vec![5u8; 40_000]).unwrap();
+            let meta = sys::lstat(&path).unwrap();
+            candidates.push(Candidate { path, meta, in_store: false });
+        }
+        let inodes: Vec<u64> = candidates.iter().map(|c| c.meta.ino()).collect();
+        let mut ctx = ShrinkCtx::plain();
+        ctx.budget = Some(Budget { deadline: Instant::now(), bytes_left: 0 });
+        let mut report = Report::default();
+        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
+        assert!(ctx.stopped);
+        assert_eq!((report.deduped_files, report.compressed_files), (0, 0));
+        assert!(report.errors.is_empty());
+        for (name, ino) in ["a", "b", "c"].iter().zip(inodes) {
+            assert_eq!(sys::stat(&dir.join(name)).unwrap().ino(), ino);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sampler_reads_the_head_and_the_middle_of_large_files_only() {
+        assert!(sample_ranges(4 * SAMPLE_BYTES - 1).is_empty());
+        let len = 10 * SAMPLE_BYTES;
+        let ranges = sample_ranges(len);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (0, SAMPLE_BYTES));
+        assert!(ranges[1].0 >= SAMPLE_BYTES && ranges[1].0 + ranges[1].1 <= len, "the middle sample is disjoint from the head");
+
+        let dir = scratch("sampler");
+        let big = dir.join("big");
+        fs::write(&big, vec![3u8; len as usize]).unwrap();
+        let sampled = std::cell::Cell::new(0usize);
+        let same = |b: &[u8]| {
+            sampled.set(sampled.get() + b.len());
+            Some(b.len())
+        };
+        assert_eq!(sample_ratio(&big, len, &same), Some(100));
+        assert_eq!(sampled.get(), 2 * SAMPLE_BYTES as usize, "only the two samples were read");
+        let quarter = |b: &[u8]| Some(b.len() / 4);
+        assert_eq!(sample_ratio(&big, len, &quarter), Some(25));
+        let small = dir.join("small");
+        fs::write(&small, vec![3u8; 1000]).unwrap();
+        assert_eq!(sample_ratio(&small, 1000, &same), None, "small files are encoded whole instead");
+        let refuses = |_: &[u8]| None::<usize>;
+        assert_eq!(sample_ratio(&big, len, &refuses), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn fake_target(tag: &str) -> (PathBuf, PathBuf) {
+        let root = scratch(tag);
+        let profile = root.join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::write(profile.join("deps").join("libx-0123456789abcdef.rlib"), vec![1u8; 20_000]).unwrap();
+        (root, profile)
+    }
+
+    #[test]
+    fn change_signature_tracks_the_directories_builds_write_to() {
+        let (root, profile) = fake_target("signature");
+        let first = tree_signature(&root).unwrap();
+        assert_eq!(first, tree_signature(&root).unwrap());
+
+        fs::write(profile.join("deps").join("libx-fedcba9876543210.rlib"), b"new").unwrap();
+        let after_deps = tree_signature(&root).unwrap();
+        assert_ne!(first, after_deps);
+
+        fs::create_dir_all(profile.join("incremental").join("x-1abc").join("s-1")).unwrap();
+        let after_incremental = tree_signature(&root).unwrap();
+        assert_ne!(after_deps, after_incremental);
+        std::thread::sleep(Duration::from_millis(30));
+        fs::create_dir_all(profile.join("incremental").join("x-1abc").join("s-2")).unwrap();
+        assert_ne!(after_incremental, tree_signature(&root).unwrap(), "a new session changes its crate directory");
+
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        assert_ne!(after_incremental, tree_signature(&root).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn change_signature_gives_up_on_unreadable_state_and_depends_on_options() {
+        let (root, profile) = fake_target("signature-doubt");
+        let dirs = Dirs::at(root.join("home"));
+        let a = change_signature(&dirs, &root, "a").unwrap();
+        assert_eq!(a, change_signature(&dirs, &root, "a").unwrap());
+        assert_ne!(a, change_signature(&dirs, &root, "b").unwrap());
+        fs::write(profile.join("incremental"), b"not a directory").unwrap();
+        assert!(change_signature(&dirs, &root, "a").is_none(), "a directory that cannot be listed forces a full pass");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn markers_written_before_the_signature_existed_still_parse_as_complete() {
+        let marker: AutoMarker = serde_json::from_str("{\"allocated_after\":5,\"at_unix\":7}").unwrap();
+        assert!(marker.complete);
+        assert_eq!((marker.signature, marker.store_entries), (0, 0));
+    }
+
+    #[test]
+    fn parallel_walk_visits_every_file_once() {
+        let dir = scratch("walk");
+        let mut expected = 0u64;
+        for a in 0..6 {
+            for b in 0..3 {
+                let leaf = dir.join(format!("a{a}")).join(format!("b{b}")).join("deep");
+                fs::create_dir_all(&leaf).unwrap();
+                for f in 0..4 {
+                    fs::write(leaf.join(format!("f{f}")), [0u8; 10]).unwrap();
+                    expected += 1;
+                }
+            }
+            fs::write(dir.join(format!("a{a}")).join("shallow"), [0u8; 10]).unwrap();
+            expected += 1;
+        }
+        fs::write(dir.join("top"), [0u8; 10]).unwrap();
+        expected += 1;
+        let parts = walk_parallel(&dir, &|_: &str, _: bool| false, &|| 0u64, &|n: &mut u64, _: &Path, _: &sys::Meta| *n += 1);
+        assert_eq!(parts.iter().sum::<u64>(), expected);
+        let skipping = walk_parallel(&dir, &|name: &str, _: bool| name == "deep", &|| 0u64, &|n: &mut u64, _: &Path, _: &sys::Meta| *n += 1);
+        assert_eq!(skipping.iter().sum::<u64>(), 6 + 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

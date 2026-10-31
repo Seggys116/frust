@@ -22,7 +22,7 @@
 
 <table>
 <tr>
-<td width="25%" valign="top"><b>Compile cache</b><br><sub>Shared across projects and clean rebuilds. A hit restores the exact outputs without starting rustc, as a copy-on-write clone.</sub></td>
+<td width="25%" valign="top"><b>Compile cache</b><br><sub>Shared across projects and clean rebuilds. A hit restores the exact outputs without starting rustc, as a copy-on-write clone where the filesystem supports it.</sub></td>
 <td width="25%" valign="top"><b>Central targets</b><br><sub>One directory per workspace and toolchain. Projects stay clean and switching toolchains never invalidates the others.</sub></td>
 <td width="25%" valign="top"><b>Build locks</b><br><sub>A fair queue in front of cargo's own. Identical concurrent builds share one build, and waiters see who holds the lock.</sub></td>
 <td width="25%" valign="top"><b>Clean display</b><br><sub>Colour, live progress, cache counters and terminal integration. Plain cargo output when piped.</sub></td>
@@ -61,6 +61,8 @@ cargo install frust-rs    # from source
 
 Binaries are checksummed and installed to `~/.local/bin` (`%LOCALAPPDATA%\frust\bin` on Windows). Run `frust doctor`
 afterwards to check your setup. The crates.io package is `frust-rs` because the name `frust` belongs to an unrelated crate.
+
+Windows support is new. The test suite runs on Windows in CI, but it has had far less real-world use than macOS and Linux.
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 
@@ -101,6 +103,15 @@ builds of that profile.
 
 Measured with `frust bench` on Apple Silicon, ranges over several runs. See the full
 [benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md).
+
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+
+## Updating
+
+After a successful build on an interactive terminal, frust prints a one-line notice when a newer release exists. Run
+`frust self-update` to install it; the command verifies the download's SHA-256 before replacing anything. It is not
+`frust update`, so `cargo update` keeps working. Set `FRUST_UPDATE_CHECK=off` (or run `frust self-update --disable`)
+to stop the daily check.
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 

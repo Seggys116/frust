@@ -4,11 +4,8 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
+use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -22,6 +19,7 @@ use crate::history;
 use crate::lock::{self, Acquired, BuildLock, BuildResult, Joined, LockError, LockEvent, Progress, Record, Scope, SharedFailure, WaitInfo, Waiting};
 use crate::paths::Dirs;
 use crate::signals;
+use crate::sys::{self, StdStream};
 use crate::toolchain::{Probe, resolve_tool};
 use crate::ui::{Outcome, RunStats, Style, Ui, UiOptions, term};
 use crate::workspace;
@@ -240,7 +238,7 @@ fn config_files(root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
     }
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+        .or_else(|| sys::home_var().map(|h| PathBuf::from(h).join(".cargo")));
     if let Some(home) = cargo_home {
         for file in [home.join("config.toml"), home.join("config")] {
             if !files.contains(&file) {
@@ -398,14 +396,14 @@ fn accelerator_env(cfg: &Config, probe: &Probe) -> Vec<(OsString, OsString)> {
 }
 
 fn wrapper_path() -> Option<PathBuf> {
-    let name = "frust-wrap";
+    let name = format!("frust-wrap{}", env::consts::EXE_SUFFIX);
     if let Ok(exe) = env::current_exe() {
-        let sibling = exe.with_file_name(name);
+        let sibling = exe.with_file_name(&name);
         if sibling.exists() {
             return Some(sibling);
         }
     }
-    crate::toolchain::find_on_path(name)
+    crate::toolchain::find_on_path(&name)
 }
 
 /// `line-tables-only` was measured slower and larger than `debug=0`; never applied over user-written profiles from any source.
@@ -439,7 +437,7 @@ fn exec(cargo: &Path, args: &[OsString], env_vars: &[(OsString, OsString)]) -> i
     for (k, v) in env_vars {
         cmd.env(k, v);
     }
-    let err = cmd.exec();
+    let err = sys::exec_replace(&mut cmd);
     eprintln!("frust: cannot execute {}: {err}", cargo.display());
     127
 }
@@ -488,25 +486,25 @@ fn fingerprint(
         hasher.update(bytes);
     };
     for part in parts {
-        field(part.as_bytes());
+        field(part.as_encoded_bytes());
     }
     field(b"--args");
     for arg in args {
-        field(arg.as_bytes());
+        field(arg.as_encoded_bytes());
     }
     let mut vars: Vec<(OsString, OsString)> = ambient.into_iter().filter(|(k, _)| affects_build(&k.to_string_lossy())).collect();
     // Variables frust sets win over ambient ones, as they do for the child.
     vars.retain(|(k, _)| !env_vars.iter().any(|(ek, _)| ek == k));
     vars.extend(env_vars.iter().cloned());
     if !vars.iter().any(|(k, _)| k == "CARGO_HOME")
-        && let Some(home) = env::var_os("HOME") {
+        && let Some(home) = sys::home_var() {
             vars.push((os("CARGO_HOME"), PathBuf::from(home).join(".cargo").into_os_string()));
         }
     vars.sort();
     field(b"--env");
     for (k, v) in &vars {
-        field(k.as_bytes());
-        field(v.as_bytes());
+        field(k.as_encoded_bytes());
+        field(v.as_encoded_bytes());
     }
     hasher.finalize().to_hex()[..32].to_string()
 }
@@ -577,7 +575,7 @@ impl Session {
             RenderMode::Off => None,
             RenderMode::Plain => Some(Style::Plain),
             RenderMode::Ansi => Some(Style::Ansi),
-            RenderMode::Auto => term::is_tty(libc::STDERR_FILENO).then_some(Style::Ansi),
+            RenderMode::Auto => sys::ansi_terminal(StdStream::Stderr).then_some(Style::Ansi),
         }
     }
 
@@ -621,7 +619,7 @@ impl Session {
     fn history_keys(&self, workspace_key: &str, sub: &str, rest: &[OsString]) -> Vec<String> {
         let mut exact = self.parsed.assemble(&self.tuning, sub, &[]);
         exact.extend(rest.iter().cloned());
-        let digest = crate::paths::short_hash(exact.iter().flat_map(|a| a.as_bytes().iter().copied().chain([0])).collect::<Vec<u8>>());
+        let digest = crate::paths::short_hash(exact.iter().flat_map(|a| a.as_encoded_bytes().iter().copied().chain([0])).collect::<Vec<u8>>());
         vec![format!("{workspace_key}-{sub}-{digest}"), format!("{workspace_key}-{sub}")]
     }
 
@@ -711,7 +709,7 @@ impl Session {
 
         // Hand the lock on before the summary so waiters start at once; a signalled build is not a result to share.
         if let Some(guard) = guard.take() {
-            let interrupted = signals::received().is_some() || code > 128;
+            let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
             guard.finish(BuildResult { code, units: progress.done, interrupted });
         }
         let stats = ui.as_mut().map(|ui| ui.finish(Outcome { success: code == 0, exit_code: code }, Instant::now()));
@@ -751,6 +749,9 @@ impl Session {
             if self.cfg.debug {
                 eprintln!("frust: auto-compact {report:?}");
             }
+        }
+        if code == 0 {
+            crate::update::notice(&self.dirs);
         }
         code
     }
@@ -834,7 +835,7 @@ impl Session {
             lock.log_start(true, true);
         }
 
-        let mut streams = [Stream::new(child.stdout.take().map(OwnedFd::from)), Stream::new(child.stderr.take().map(OwnedFd::from))];
+        let mut streams = [Stream::new(child.stdout.take().map(sys::Pipe::from)), Stream::new(child.stderr.take().map(sys::Pipe::from))];
         let mut chunk = vec![0u8; READ_CHUNK];
         let mut status = None;
         let mut exited_at = None::<Instant>;
@@ -874,6 +875,7 @@ impl Session {
             render_lines(ui, progress, shown, &out, &err, now);
             if let Some(lock) = lock.as_deref_mut() {
                 lock.publish(progress);
+                lock.flush_log();
             }
         }
         // Whatever is left without a trailing newline is still a line.
@@ -1101,7 +1103,7 @@ impl Joining {
 
     /// Colour is kept only when stderr is a colour terminal.
     fn replay(&self) {
-        let keep_colour = term::is_tty(libc::STDERR_FILENO) && term::colour_enabled();
+        let keep_colour = sys::ansi_terminal(StdStream::Stderr) && term::colour_enabled();
         let fix = |line: &str| if keep_colour { line.to_string() } else { term::strip_ansi(line) };
         let mut stdout = io::stdout().lock();
         let mut stderr = io::stderr().lock();
@@ -1117,22 +1119,12 @@ impl Joining {
 }
 
 struct Stream {
-    file: Option<File>,
+    file: Option<sys::Pipe>,
     buf: Vec<u8>,
 }
 
 impl Stream {
-    fn new(fd: Option<OwnedFd>) -> Stream {
-        let file = fd.map(|fd| {
-            // SAFETY: fcntl on a descriptor we own; on failure it stays blocking, which is fine as we read only after poll reports readiness.
-            unsafe {
-                let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-                if flags >= 0 {
-                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-            }
-            File::from(fd)
-        });
+    fn new(file: Option<sys::Pipe>) -> Stream {
         Stream { file, buf: Vec::new() }
     }
 
@@ -1185,26 +1177,10 @@ impl Stream {
 }
 
 fn wait_readable(streams: &[Stream; 2], timeout: Duration) -> [bool; 2] {
-    let mut fds = Vec::with_capacity(2);
-    let mut index = Vec::with_capacity(2);
-    for (i, stream) in streams.iter().enumerate() {
-        if let Some(file) = &stream.file {
-            fds.push(libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-            index.push(i);
-        }
+    if streams.iter().all(|s| s.file.is_none()) {
+        return [false; 2];
     }
-    let mut ready = [false; 2];
-    if fds.is_empty() {
-        return ready;
-    }
-    // SAFETY: `fds` is a valid array of `fds.len()` initialised pollfd structs.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout.as_millis() as libc::c_int) };
-    if rc > 0 {
-        for (fd, &i) in fds.iter().zip(&index) {
-            ready[i] = fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
-        }
-    }
-    ready
+    sys::wait_readable([streams[0].file.as_ref(), streams[1].file.as_ref()], timeout)
 }
 
 fn track_json(progress: &mut Progress, msg: &serde_json::Value) {
@@ -1278,8 +1254,8 @@ fn supervise_plain(mut cmd: Command) -> i32 {
 
 /// Output not going to a terminal passes through byte for byte so it can be logged; terminal output stays cargo's own, so followers get no output.
 fn supervise_plain_logged(cmd: Command, feed: &mut Feed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
-    let capture_out = !term::is_tty(libc::STDOUT_FILENO);
-    let capture_err = !term::is_tty(libc::STDERR_FILENO);
+    let capture_out = !io::stdout().is_terminal();
+    let capture_err = !io::stderr().is_terminal();
     lock.log_start(false, capture_out && capture_err);
     if capture_out || capture_err {
         supervise_tee(cmd, feed, progress, lock, capture_out, capture_err)
@@ -1300,7 +1276,7 @@ fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, loc
         }
     };
     signals::supervise(child.id());
-    let mut streams = [Stream::new(child.stdout.take().map(OwnedFd::from)), Stream::new(child.stderr.take().map(OwnedFd::from))];
+    let mut streams = [Stream::new(child.stdout.take().map(sys::Pipe::from)), Stream::new(child.stderr.take().map(sys::Pipe::from))];
     let mut chunk = vec![0u8; READ_CHUNK];
     let mut status = None;
     let mut exited_at = None::<Instant>;
@@ -1332,6 +1308,7 @@ fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, loc
         }
         log_lines(Some(&mut *lock), &lines[0], &lines[1]);
         lock.publish(progress);
+        lock.flush_log();
     }
     let tails: Vec<Vec<Vec<u8>>> = streams.iter_mut().map(|s| s.take_partial().into_iter().collect()).collect();
     drop(streams);
@@ -1359,6 +1336,7 @@ fn supervise_plain_publishing(cmd: Command, feed: &mut Feed, progress: &mut Prog
                     lock.log_cache(&ev);
                 }
                 lock.publish(progress);
+                lock.flush_log();
                 match stopped.recv_timeout(PUBLISH_TICK) {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     _ => break,
@@ -1500,7 +1478,7 @@ mod tests {
     #[test]
     fn streams_split_lines_across_reads_and_flush_the_tail() {
         let (reader, mut writer) = io::pipe().unwrap();
-        let mut stream = Stream::new(Some(OwnedFd::from(reader)));
+        let mut stream = Stream::new(Some(sys::Pipe::from(reader)));
         let mut chunk = vec![0u8; 4];
         let mut lines = Vec::new();
         writer.write_all(b"ab\ncdefg\nhi").unwrap();

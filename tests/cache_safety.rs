@@ -3,7 +3,6 @@
 mod common;
 
 use std::fs::{self, File};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -15,14 +14,18 @@ use frust::paths::Dirs;
 const LEAF_V1: &str = "pub fn value() -> u32 { 41 }\npub fn tag() -> &'static str { option_env!(\"FRUST_TEST_TAG\").unwrap_or(\"unset\") }\n";
 const MAIN: &str = "fn main() { println!(\"{} {}\", leaf::value(), leaf::tag()); }\n";
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 fn age(path: &Path, by: Duration) {
+    #[cfg(unix)]
     // A read-only descriptor suffices for the owner, and works for directories too.
-    File::open(path).unwrap().set_modified(SystemTime::now() - by).unwrap();
+    let file = File::open(path).unwrap();
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // Windows needs write access to set times, and backup semantics to open a directory at all.
+        fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
+    };
+    file.set_modified(SystemTime::now() - by).unwrap();
 }
 
 /// A source edited while rustc runs must not be stored under its new hash with output from the old content.
@@ -37,10 +40,15 @@ fn source_edited_during_compile_is_not_stored_under_its_new_hash() {
     fs::write(&edited, LEAF_V1.replace("41", "42")).unwrap();
     let leaf_src = sb.vendor().join("leaf-1.0.0").join("src").join("lib.rs");
     let script = sb.root.join("editing-rustc");
-    write_executable(
+    let script = common::write_fake_tool(
         &script,
         &format!(
             "#!/bin/sh\nrustc \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name leaf \"*) cp '{}' '{}' ;;\nesac\nexit $status\n",
+            edited.display(),
+            leaf_src.display()
+        ),
+        &format!(
+            "@echo off\r\nrustc %*\r\nset status=%ERRORLEVEL%\r\nfor %%a in (%*) do if \"%%a\"==\"leaf\" copy /Y \"{}\" \"{}\" >nul\r\nexit /b %status%\r\n",
             edited.display(),
             leaf_src.display()
         ),
@@ -58,10 +66,13 @@ fn source_edited_during_compile_is_not_stored_under_its_new_hash() {
     assert_eq!(sb.count_cache("hit", "leaf"), 0);
 }
 
+// The `cc` and `ar` static-library setup is Unix-specific; Windows toolchains use cl and lib.
+#[cfg(unix)]
 fn have_c_toolchain() -> bool {
     Command::new("cc").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn build_static_lib(dir: &Path, value: i32) {
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("foo.c"), format!("int foo_value(void) {{ return {value}; }}\n")).unwrap();
@@ -71,6 +82,7 @@ fn build_static_lib(dir: &Path, value: i32) {
 }
 
 /// A static library from a `-L native=` directory is bundled into the rlib, so its contents must be in the key.
+#[cfg(unix)]
 #[test]
 fn native_library_outside_the_target_is_keyed_by_content() {
     if !have_c_toolchain() {
@@ -171,8 +183,34 @@ fn crafted_entry_metadata_cannot_escape_the_output_directory() {
     assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), "41 unset");
 }
 
+#[cfg(windows)]
+#[test]
+fn private_temp_fallback_accepts_a_fresh_directory_and_refuses_a_junction() {
+    let sb = Sandbox::new("private-tmp");
+    let base = sb.root.join("tmp");
+    fs::create_dir_all(&base).unwrap();
+
+    let dir = frust::paths::private_temp_dir(&base).expect("a fresh private directory is accepted");
+    assert!(dir.starts_with(&base) && dir != base, "never the shared directory itself");
+    assert_eq!(frust::paths::private_temp_dir(&base).unwrap(), dir, "reused on the next call");
+
+    let other = sb.root.join("tmp2");
+    fs::create_dir_all(&other).unwrap();
+    let decoy = sb.root.join("decoy");
+    fs::create_dir_all(&decoy).unwrap();
+    let link = other.join(dir.file_name().unwrap());
+    // A junction needs no privilege, unlike a symlink.
+    let made = Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(&link).arg(&decoy).output().unwrap();
+    assert!(made.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&made.stdout));
+    let err = frust::paths::private_temp_dir(&other).unwrap_err();
+    assert!(err.contains("not a directory"), "a junction planted in the shared directory is refused: {err}");
+}
+
+// File modes and symlink privileges make the mode-based refusals unix-only.
+#[cfg(unix)]
 #[test]
 fn private_temp_fallback_is_0700_and_refuses_shared_directories() {
+    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new("private-tmp");
     let base = sb.root.join("tmp");
     fs::create_dir_all(&base).unwrap();
@@ -199,7 +237,7 @@ fn private_temp_fallback_is_0700_and_refuses_shared_directories() {
 }
 
 fn dead_pid() -> u32 {
-    let mut child = Command::new("true").spawn().unwrap();
+    let mut child = common::spawn_exiting();
     let pid = child.id();
     child.wait().unwrap();
     pid
@@ -257,7 +295,7 @@ fn gc_prunes_stale_metadata_and_leftover_temp_files() {
     age(&held_lock.join("queue"), Duration::from_secs(10 * 86_400));
     age(&held_lock, Duration::from_secs(10 * 86_400));
     let holder = File::open(held_lock.join("lock")).unwrap();
-    holder.lock().unwrap();
+    frust::sys::lock(&holder, frust::sys::LockKind::Exclusive).unwrap();
 
     // History: one for a workspace that has no target directory any more.
     fs::create_dir_all(home.join("history")).unwrap();
@@ -312,6 +350,7 @@ fn auto_gc_runs_once_per_day_and_spares_target_directories() {
 
     let mut cfg = frust::config::Config::from_env();
     cfg.cache_max_bytes = 0;
+    cfg.gc_sync = true;
 
     let ran: Vec<bool> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| gc::maybe_auto_gc(&dirs, &cfg))).collect();

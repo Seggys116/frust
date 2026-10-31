@@ -19,6 +19,8 @@ use term::{Paint, strip_ansi, truncate_visible};
 
 /// Title updates are limited to about four per second.
 const TITLE_MIN_GAP: Duration = Duration::from_millis(250);
+/// Live-region redraws are limited to about forty per second so a slow terminal cannot stall cargo's pipe.
+const PAINT_MIN_GAP: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
@@ -70,6 +72,7 @@ pub struct Ui {
     /// Rows the live region currently occupies below the cursor's anchor.
     live_lines: usize,
     last_frame: Vec<String>,
+    last_paint: Option<Instant>,
     cursor_hidden: bool,
     progress_sent: Option<Progress>,
     title_pushed: bool,
@@ -93,6 +96,7 @@ impl Ui {
             start: now,
             live_lines: 0,
             last_frame: Vec::new(),
+            last_paint: None,
             cursor_hidden: false,
             progress_sent: None,
             title_pushed: false,
@@ -310,29 +314,33 @@ impl Ui {
 
     /// Skips the redraw when nothing changed so idle ticks cost no output.
     fn flush(&mut self, permanent: Vec<String>, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.start);
-        let width = self.width();
-        let frame: Vec<String> = render::live_region(&self.model, self.paint, elapsed, now, width)
-            .iter()
-            .map(|line| truncate_visible(line, width))
-            .collect();
-
+        // Live-only redraws closer than the gap wait for the next tick; permanent lines always print.
+        let deferred = permanent.is_empty() && self.last_paint.is_some_and(|at| now.saturating_duration_since(at) < PAINT_MIN_GAP);
         let mut buf = String::new();
-        if !permanent.is_empty() || frame != self.last_frame || !self.cursor_hidden {
-            if !self.cursor_hidden {
-                buf.push_str("\x1b[?25l");
-                self.cursor_hidden = true;
+        if !deferred {
+            self.last_paint = Some(now);
+            let elapsed = now.saturating_duration_since(self.start);
+            let width = self.width();
+            let frame: Vec<String> = render::live_region(&self.model, self.paint, elapsed, now, width)
+                .iter()
+                .map(|line| truncate_visible(line, width))
+                .collect();
+            if !permanent.is_empty() || frame != self.last_frame || !self.cursor_hidden {
+                if !self.cursor_hidden {
+                    buf.push_str("\x1b[?25l");
+                    self.cursor_hidden = true;
+                }
+                if self.live_lines > 0 {
+                    buf.push_str(&format!("\x1b[{}A", self.live_lines));
+                }
+                buf.push_str("\r\x1b[J");
+                for line in permanent.iter().chain(frame.iter()) {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                self.live_lines = frame.len();
+                self.last_frame = frame;
             }
-            if self.live_lines > 0 {
-                buf.push_str(&format!("\x1b[{}A", self.live_lines));
-            }
-            buf.push_str("\r\x1b[J");
-            for line in permanent.iter().chain(frame.iter()) {
-                buf.push_str(line);
-                buf.push('\n');
-            }
-            self.live_lines = frame.len();
-            self.last_frame = frame;
         }
         buf.push_str(&self.osc_updates(now));
         if !buf.is_empty() {
@@ -503,10 +511,11 @@ mod tests {
         for i in 0..9 {
             ui.on_cargo_stderr(&cargo_status("Compiling", &format!("crate{i} v1.0.0")), ms(start, 1000));
         }
+        ui.tick(ms(start, 1100));
         let screen = replay(&buf.contents(), 100).screen();
         assert_eq!(screen.len(), 7);
-        assert_eq!(screen[2], "    > crate0 v1.0.0  0.00s");
-        assert_eq!(screen[5], "    > crate3 v1.0.0  0.00s");
+        assert_eq!(screen[2], "    > crate0 v1.0.0  0.10s");
+        assert_eq!(screen[5], "    > crate3 v1.0.0  0.10s");
         assert_eq!(screen[6], "    + 5 more");
     }
 
@@ -520,6 +529,25 @@ mod tests {
         assert_eq!(buf.contents().len(), before);
         ui.tick(ms(start, 2000));
         assert!(buf.contents().len() > before);
+    }
+
+    #[test]
+    fn live_redraws_are_coalesced_but_permanent_lines_print_at_once() {
+        let (mut ui, buf, start) = small_ui(Style::Ansi, Osc::default(), None);
+        ui.on_cargo_stderr(&cargo_status("Compiling", "a v1.0.0"), ms(start, 100));
+        let painted = buf.contents().len();
+        ui.on_cargo_stderr(&cargo_status("Compiling", "b v1.0.0"), ms(start, 110));
+        ui.on_cache_event(&cache_event(CacheResult::Hit, "a", 100), ms(start, 115));
+        assert_eq!(buf.contents().len(), painted, "redraw inside the gap should wait");
+        ui.on_cargo_stderr("error[E0425]: cannot find value `y` in this scope", ms(start, 120));
+        assert!(buf.contents().contains("error[E0425]"), "diagnostics print immediately");
+        ui.on_cargo_stderr(&cargo_status("Compiling", "c v1.0.0"), ms(start, 125));
+        ui.tick(ms(start, 160));
+        let screen = replay(&buf.contents(), 100).screen();
+        let text = screen.join("\n");
+        for wanted in ["a v1.0.0", "b v1.0.0", "c v1.0.0"] {
+            assert!(text.contains(wanted), "missing {wanted:?} in\n{text}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -10,12 +10,21 @@ use crate::cache;
 use crate::compact::{self, Category};
 use crate::config::Config;
 use crate::fsx;
-use crate::paths::Dirs;
+use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::stats;
+use crate::sys::{self, LockKind, Meta};
 
 /// Younger manifests and lock directories are left alone even if they look orphaned: a build may be writing them.
 const METADATA_GRACE: Duration = Duration::from_secs(3600);
 const AUTO_GC_EVERY: Duration = Duration::from_secs(86_400);
+/// Evicted cache entries are renamed aside before deletion; one that old was left by a process that died mid-delete.
+const EVICTED_MIN_AGE: Duration = Duration::from_secs(3600);
+/// Per-prekey locks, deferred-store jobs and their slot locks older than this are removed when nothing holds them.
+const DEFERRED_MAX_AGE: Duration = Duration::from_secs(86_400);
+/// Hidden flag of `frust gc` that runs one daily collection and prints nothing.
+pub const AUTO_CHILD_FLAG: &str = "--auto-background";
+/// Room for an entry's directory and `meta.json` on top of the stored files when sizes come from the recorded byte counts.
+const ENTRY_OVERHEAD_BYTES: u64 = 8192;
 
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -123,7 +132,7 @@ impl Plan {
 
 pub fn plan(dirs: &Dirs, opts: &GcOptions) -> Plan {
     let mut plan = Plan { lock_max_idle: opts.lock_max_idle, ..Plan::default() };
-    let evicted = plan_cache(dirs, opts, &mut plan);
+    let evicted = plan_cache(dirs, opts, &mut plan, true);
     plan_targets(dirs, opts, &mut plan);
     plan_scratch(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
@@ -133,7 +142,7 @@ pub fn plan(dirs: &Dirs, opts: &GcOptions) -> Plan {
 
 pub fn plan_maintenance(dirs: &Dirs, opts: &GcOptions) -> Plan {
     let mut plan = Plan { lock_max_idle: opts.lock_max_idle, ..Plan::default() };
-    let evicted = plan_cache(dirs, opts, &mut plan);
+    let evicted = plan_cache(dirs, opts, &mut plan, false);
     plan_scratch(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
     plan_target_temps(dirs, opts, &mut plan);
@@ -151,53 +160,108 @@ fn is_incremental_object(name: &str) -> bool {
 
 /// Every edit of a path crate stores a new entry under the same output names, so unbounded they bloat the cache; where rustc keeps no objects beside outputs (outside macOS) nothing is recognised.
 pub fn superseded_incremental_entries(dirs: &Dirs, keep: usize) -> Vec<(PathBuf, u64)> {
-    let mut units: HashMap<Vec<String>, Vec<(SystemTime, PathBuf)>> = HashMap::new();
-    for entry in stats::entry_dirs(dirs) {
-        let Ok(bytes) = fs::read(entry.path.join("meta.json")) else { continue };
-        let Ok(meta) = serde_json::from_slice::<cache::EntryMeta>(&bytes) else { continue };
-        if !meta.files.iter().any(|f| is_incremental_object(&f.name)) {
-            continue;
-        }
-        let mut unit: Vec<String> =
-            meta.files.iter().map(|f| f.name.clone()).filter(|n| !n.ends_with(".o") && !n.ends_with(".d")).collect();
-        if unit.is_empty() {
-            continue;
-        }
-        unit.sort();
-        units.entry(unit).or_default().push((entry.used, entry.path));
+    superseded_among(&scan_entries(dirs), keep)
+}
+
+/// What one read of an entry's `meta.json` yields: its LRU time, its unit identity if incremental, and its size by the recorded byte counts.
+struct ScannedEntry {
+    path: PathBuf,
+    used: SystemTime,
+    unit: Option<Vec<String>>,
+    estimate: Option<u64>,
+}
+
+/// Stored files are rounded up to blocks, so the sum errs high and never hides an entry over the cap.
+fn estimate_entry_bytes(meta: &cache::EntryMeta) -> Option<u64> {
+    if meta.files.is_empty() {
+        return None;
     }
+    Some(ENTRY_OVERHEAD_BYTES + meta.files.iter().map(|f| f.bytes.div_ceil(4096) * 4096).sum::<u64>())
+}
+
+fn unit_identity(meta: &cache::EntryMeta) -> Option<Vec<String>> {
+    if !meta.files.iter().any(|f| is_incremental_object(&f.name)) {
+        return None;
+    }
+    let mut unit: Vec<String> = meta.files.iter().map(|f| f.name.clone()).filter(|n| !n.ends_with(".o") && !n.ends_with(".d")).collect();
+    unit.sort();
+    (!unit.is_empty()).then_some(unit)
+}
+
+fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
     let mut out = Vec::new();
-    for (_, mut entries) in units {
-        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
-        for (_, path) in entries.into_iter().skip(keep) {
-            let bytes = fsx::allocated_size(&path);
-            out.push((path, bytes));
+    let Ok(shards) = fs::read_dir(dirs.store()) else { return out };
+    for shard in shards.flatten() {
+        let Ok(entries) = fs::read_dir(shard.path()) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let (used, meta) = match File::open(path.join("meta.json")) {
+                Ok(mut file) => {
+                    let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                    let mut bytes = Vec::new();
+                    let meta = file.read_to_end(&mut bytes).ok().and_then(|_| serde_json::from_slice::<cache::EntryMeta>(&bytes).ok());
+                    (used, meta)
+                }
+                Err(_) => (SystemTime::UNIX_EPOCH, None),
+            };
+            let unit = meta.as_ref().and_then(unit_identity);
+            let estimate = meta.as_ref().and_then(estimate_entry_bytes);
+            out.push(ScannedEntry { path, used, unit, estimate });
         }
     }
     out
 }
 
-fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) -> HashSet<String> {
+fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)> {
+    let mut units: HashMap<&Vec<String>, Vec<(SystemTime, &Path)>> = HashMap::new();
+    for entry in scanned {
+        if let Some(unit) = &entry.unit {
+            units.entry(unit).or_default().push((entry.used, entry.path.as_path()));
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut entries) in units {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+        for (_, path) in entries.into_iter().skip(keep) {
+            out.push((path.to_path_buf(), fsx::allocated_size(path)));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// With `exact` false, sizes come from the recorded byte counts unless the cache is over its cap, when they are measured so eviction stays exact.
+fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> HashSet<String> {
     let mut evicted = HashSet::new();
-    let superseded = superseded_incremental_entries(dirs, INCREMENTAL_ENTRIES_KEPT);
+    let scanned = scan_entries(dirs);
+    let superseded = superseded_among(&scanned, INCREMENTAL_ENTRIES_KEPT);
     let doomed: HashSet<&Path> = superseded.iter().map(|s| s.0.as_path()).collect();
     for (path, _) in &superseded {
         if let Some(key) = path.file_name() {
             evicted.insert(key.to_string_lossy().into_owned());
         }
     }
-    let mut entries: Vec<(SystemTime, PathBuf, u64)> = stats::entry_dirs(dirs)
-        .into_iter()
+    let mut entries: Vec<(SystemTime, PathBuf, u64)> = scanned
+        .iter()
         .filter(|e| !doomed.contains(e.path.as_path()))
         .map(|e| {
-            let bytes = fsx::allocated_size(&e.path);
-            (e.used, e.path, bytes)
+            let bytes = match e.estimate {
+                Some(estimate) if !exact => estimate,
+                _ => fsx::allocated_size(&e.path),
+            };
+            (e.used, e.path.clone(), bytes)
         })
         .collect();
-    for (path, bytes) in superseded {
+    for (path, bytes) in superseded.iter().cloned() {
         plan.removals.push(Removal { class: Class::CacheEntry, path, bytes });
     }
     let mut total: u64 = entries.iter().map(|e| e.2).sum();
+    if !exact && total > opts.max_cache_bytes {
+        for entry in &mut entries {
+            entry.2 = fsx::allocated_size(&entry.1);
+        }
+        total = entries.iter().map(|e| e.2).sum();
+    }
     entries.sort_by_key(|e| e.0);
     for (_, path, bytes) in entries {
         if total <= opts.max_cache_bytes {
@@ -332,6 +396,10 @@ fn superseded_incremental(profile: &Path, analysis: Option<&compact::Analysis>) 
 fn plan_scratch(dirs: &Dirs, plan: &mut Plan) {
     if let Ok(entries) = fs::read_dir(dirs.tmp()) {
         for entry in entries.flatten() {
+            // Held slot locks live there, and `plan_deferred` knows which of its files are in use.
+            if entry.path() == dirs.deferred() {
+                continue;
+            }
             let old = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -377,19 +445,20 @@ fn mtime_age(path: &Path) -> Option<Duration> {
 }
 
 /// Unlike mtime, ctime cannot be inherited from a cloned source file, so a fresh clone never looks old.
-fn ctime_age(meta: &fs::Metadata) -> Option<Duration> {
-    let ctime = SystemTime::UNIX_EPOCH + Duration::new(meta.ctime().max(0) as u64, meta.ctime_nsec().clamp(0, 999_999_999) as u32);
+fn ctime_age(meta: &Meta) -> Option<Duration> {
+    let (secs, nanos) = meta.ctime();
+    let ctime = SystemTime::UNIX_EPOCH + Duration::new(secs.max(0) as u64, nanos.clamp(0, 999_999_999) as u32);
     SystemTime::now().duration_since(ctime).ok()
 }
 
 fn stale_temp(path: &Path, name: &str, opts: &GcOptions) -> bool {
     let Some(pid) = fsx::temp_owner(name) else { return false };
-    let Ok(meta) = fs::symlink_metadata(path) else { return false };
+    let Ok(meta) = sys::lstat(path) else { return false };
     let Some(age) = ctime_age(&meta) else { return false };
     if pid == std::process::id() {
         return false;
     }
-    age > opts.temp_max_age || (age > opts.temp_min_age && !fsx::pid_alive(pid))
+    age > opts.temp_max_age || (age > opts.temp_min_age && !sys::pid_alive(pid))
 }
 
 fn plan_temps_in(dir: &Path, opts: &GcOptions, plan: &mut Plan) {
@@ -468,9 +537,30 @@ fn plan_target_temps(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
 fn plan_metadata(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan: &mut Plan) {
     plan_manifests(dirs, opts, evicted, plan);
     plan_locks(dirs, opts, plan);
+    plan_keylocks(dirs, plan);
+    plan_deferred(dirs, plan);
     plan_history(dirs, opts, plan);
     plan_hashmemo(dirs, opts, plan);
     plan_startup_memos(dirs, opts, plan);
+    plan_compact_memos(dirs, opts, plan);
+}
+
+/// A memo is rewritten only when its target's files change, so one untouched for a long time belongs to a target that is gone or idle.
+fn plan_compact_memos(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
+    let Ok(entries) = fs::read_dir(dirs.compact_memo_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if fsx::temp_owner(&name).is_some() {
+            if stale_temp(&path, &name, opts) {
+                plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&path), path });
+            }
+            continue;
+        }
+        if mtime_age(&path).is_some_and(|age| age > opts.hashmemo_max_age) {
+            push_metadata(plan, path);
+        }
+    }
 }
 
 fn plan_startup_memos(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
@@ -543,7 +633,7 @@ fn plan_manifests(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan
 fn flock_held(path: &Path) -> Option<bool> {
     let file = File::open(path).ok()?;
     // Exclusive probe: scoped builds hold the lock shared, so a shared probe would succeed and report idle.
-    match file.try_lock() {
+    match sys::try_lock(&file, LockKind::Exclusive) {
         Ok(()) => Some(false),
         Err(fs::TryLockError::WouldBlock) => Some(true),
         Err(fs::TryLockError::Error(_)) => None,
@@ -552,8 +642,7 @@ fn flock_held(path: &Path) -> Option<bool> {
 
 fn lock_dir_stale(dir: &Path, max_idle: Duration) -> bool {
     let Ok(meta) = fs::symlink_metadata(dir) else { return false };
-    // SAFETY: geteuid has no preconditions.
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+    if !meta.is_dir() || !sys::owned_by_me(dir) {
         return false;
     }
     let lock = dir.join("lock");
@@ -590,6 +679,31 @@ fn plan_locks(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
         if lock_dir_stale(&entry.path(), opts.lock_max_idle) {
             push_metadata(plan, entry.path());
         }
+    }
+}
+
+/// Unlinking a lock someone waits on only loses the de-duplication of one compile, never correctness.
+fn plan_keylocks(dirs: &Dirs, plan: &mut Plan) {
+    for (_, path) in sharded_files(&dirs.keylocks()) {
+        if mtime_age(&path).is_some_and(|age| age > DEFERRED_MAX_AGE) && flock_held(&path) == Some(false) {
+            push_metadata(plan, path);
+        }
+    }
+}
+
+/// Job files, their temporaries and unheld slot locks left by helpers that were killed.
+fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
+    let Ok(entries) = fs::read_dir(dirs.deferred()) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !mtime_age(&path).is_some_and(|age| age > DEFERRED_MAX_AGE) {
+            continue;
+        }
+        let is_slot = entry.file_name().to_string_lossy().starts_with(DEFERRED_SLOT_PREFIX);
+        if is_slot && flock_held(&path) != Some(false) {
+            continue;
+        }
+        push_metadata(plan, path);
     }
 }
 
@@ -631,6 +745,7 @@ fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
 pub fn execute(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
     let (freed, failures) = execute_removals(dirs, plan);
     prune_empty_workspaces(dirs);
+    let _ = cache::sweep_evicted(dirs, EVICTED_MIN_AGE);
     (freed, failures)
 }
 
@@ -711,14 +826,15 @@ impl ProfileGuard {
     }
 }
 
-/// The marker flock lets exactly one of several concurrent processes collect, and a crashed collector releases it with its process.
+/// The marker flock lets exactly one of several concurrent processes claim the day's collection, and a crashed claimant releases it with its process.
+/// The claim is made before anything is spawned, so concurrent builds start one collector between them; the collector itself runs detached unless `FRUST_GC_SYNC` asks for it inline.
 pub fn maybe_auto_gc(dirs: &Dirs, cfg: &Config) -> bool {
     let marker = dirs.auto_gc_marker();
     if mtime_age(&marker).is_some_and(|age| age < AUTO_GC_EVERY) || !dirs.root().is_dir() {
         return false;
     }
     let Ok(file) = File::options().create(true).truncate(false).write(true).open(&marker) else { return false };
-    if file.try_lock().is_err() {
+    if sys::try_lock(&file, LockKind::Exclusive).is_err() {
         return false;
     }
     let due = file.metadata().and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
@@ -728,11 +844,53 @@ pub fn maybe_auto_gc(dirs: &Dirs, cfg: &Config) -> bool {
         return false;
     }
     let _ = file.set_len(0);
-    let _ = file.write_all_at(fsx::unix_now().to_string().as_bytes(), 0);
+    let _ = sys::write_all_at(&file, fsx::unix_now().to_string().as_bytes(), 0);
     let _ = file.set_modified(SystemTime::now());
+    if !cfg.gc_sync {
+        // The collector takes the same flock, so the claim is released first.
+        drop(file);
+        if spawn_collector(dirs, cfg) {
+            return true;
+        }
+    }
+    run_maintenance(dirs, cfg);
+    true
+}
+
+fn run_maintenance(dirs: &Dirs, cfg: &Config) {
     let plan = plan_maintenance(dirs, &GcOptions::new(cfg.cache_max_bytes));
     let _ = execute_removals(dirs, &plan);
-    true
+    let _ = cache::sweep_evicted(dirs, EVICTED_MIN_AGE);
+}
+
+/// The hidden `frust gc --auto-background` entry: one maintenance run at background priority that never prints.
+pub fn run_auto_child(dirs: &Dirs, cfg: &Config) -> i32 {
+    let Ok(file) = File::options().create(true).truncate(false).write(true).open(dirs.auto_gc_marker()) else { return 0 };
+    // Held for the whole run, so a second collector exits at once.
+    if sys::try_lock(&file, LockKind::Exclusive).is_err() {
+        return 0;
+    }
+    compact::at_background_priority(|| run_maintenance(dirs, cfg));
+    0
+}
+
+/// The `frust` binary next to this executable, or one level up when running from cargo's `deps` directory.
+fn collector_binary() -> Option<PathBuf> {
+    let name = format!("frust{}", std::env::consts::EXE_SUFFIX);
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let dir = exe.parent()?;
+    [Some(dir.join(&name)), dir.parent().map(|p| p.join(&name))].into_iter().flatten().find(|p| p.is_file())
+}
+
+fn spawn_collector(dirs: &Dirs, cfg: &Config) -> bool {
+    use std::process::Command;
+    let Some(exe) = collector_binary() else { return false };
+    let gib = cfg.cache_max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let mut cmd = Command::new(exe);
+    cmd.args(["gc", AUTO_CHILD_FLAG]).env("FRUST_HOME", dirs.root()).env("FRUST_CACHE_MAX_GIB", gib.to_string());
+    sys::detach_command(&mut cmd, &[]);
+    cmd.spawn().is_ok()
 }
 
 fn prune_empty_workspaces(dirs: &Dirs) {
@@ -756,5 +914,75 @@ mod tests {
         assert_eq!(variant_of("libserde-0123456789abcdef.rmeta"), Some(("serde".into(), "0123456789abcdef".into())));
         assert_eq!(variant_of("build-script-build"), None);
         assert_eq!(variant_of("README.md"), None);
+    }
+
+    fn home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("frust-gc-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn store_entry(home: &Path, key: &str, files: &[(&str, u64)], age_secs: u64) -> PathBuf {
+        let dir = home.join("store").join(&key[..2]).join(key);
+        fs::create_dir_all(&dir).unwrap();
+        let recorded: Vec<_> = files.iter().map(|(n, b)| serde_json::json!({"name": n, "stored": n, "text": false, "bytes": b})).collect();
+        let meta = serde_json::json!({"crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "files": recorded, "stderr": ""});
+        fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        for (name, bytes) in files {
+            fs::write(dir.join(name), vec![1u8; *bytes as usize]).unwrap();
+        }
+        File::options().write(true).open(dir.join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs(age_secs)).unwrap();
+        dir
+    }
+
+    fn cache_removals(plan: &Plan) -> Vec<PathBuf> {
+        plan.removals.iter().filter(|r| r.class == Class::CacheEntry).map(|r| r.path.clone()).collect()
+    }
+
+    #[test]
+    fn recorded_sizes_round_up_to_blocks() {
+        let meta: cache::EntryMeta = serde_json::from_value(serde_json::json!({
+            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "stderr": "",
+            "files": [{"name": "a", "stored": "a", "text": false, "bytes": 1}, {"name": "b", "stored": "b", "text": false, "bytes": 4097}]
+        }))
+        .unwrap();
+        assert_eq!(estimate_entry_bytes(&meta), Some(ENTRY_OVERHEAD_BYTES + 4096 + 8192));
+        let empty: cache::EntryMeta = serde_json::from_value(serde_json::json!({
+            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "stderr": "", "files": []
+        }))
+        .unwrap();
+        assert_eq!(estimate_entry_bytes(&empty), None, "no recorded files means the directory is measured instead");
+    }
+
+    #[test]
+    fn maintenance_planning_evicts_exactly_what_the_exact_plan_does() {
+        let home = home("lazy-sizes");
+        let dirs = Dirs::at(&home);
+        let old = store_entry(&home, &format!("aa{}", "1".repeat(38)), &[("f0", 65_536)], 5000);
+        let new = store_entry(&home, &format!("bb{}", "2".repeat(38)), &[("f0", 65_536)], 10);
+        let tight = GcOptions::new(100 * 1024);
+        let exact = cache_removals(&plan(&dirs, &tight));
+        assert_eq!(exact, vec![old.clone()]);
+        assert_eq!(cache_removals(&plan_maintenance(&dirs, &tight)), exact, "over the cap, sizes are measured and the choice is the same");
+        let roomy = GcOptions::new(10 * 1024 * 1024);
+        assert!(cache_removals(&plan_maintenance(&dirs, &roomy)).is_empty());
+        assert!(new.exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn only_entries_beyond_the_newest_two_of_an_incremental_unit_are_superseded() {
+        let home = home("superseded");
+        let dirs = Dirs::at(&home);
+        let files = [("libx-0123456789abcdef.rlib", 100), ("x-0123456789abcdef.c1.t1.rcgu.o", 100)];
+        let oldest = store_entry(&home, &format!("aa{}", "1".repeat(38)), &files, 3000);
+        let middle = store_entry(&home, &format!("bb{}", "2".repeat(38)), &files, 2000);
+        let newest = store_entry(&home, &format!("cc{}", "3".repeat(38)), &files, 1000);
+        let plain = store_entry(&home, &format!("dd{}", "4".repeat(38)), &[("libx-0123456789abcdef.rlib", 100)], 4000);
+        let superseded: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
+        assert_eq!(superseded, vec![oldest]);
+        assert!(middle.exists() && newest.exists() && plain.exists());
+        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -3,7 +3,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,17 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::Dirs;
+use crate::sys;
 
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    env::split_paths(&paths).find_map(|dir| sys::find_executable_in(&dir, name))
 }
 
 pub fn resolve_tool(name: &str) -> Option<PathBuf> {
@@ -111,6 +104,8 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
         let (tc, cwd) = (tc.clone(), cwd.to_path_buf());
         thread::spawn(move || query(&tool, tc.as_deref(), args, &cwd))
     };
+    // Run one query alone first: parallel proxies would each start rustup's auto-install of a missing toolchain and corrupt it.
+    let cargo_out = query(cargo, tc.as_deref(), &["-V"], cwd);
     let rustc_handle = spawn(rustc.to_path_buf(), &["-vV"]);
     let mut sysroot_handles = Vec::new();
     if want_sysroot {
@@ -120,7 +115,6 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
             sysroot_handles.push(spawn(proxy, &["--print", "sysroot"]));
         }
     }
-    let cargo_out = query(cargo, tc.as_deref(), &["-V"], cwd);
     let rustc_out = rustc_handle.join().ok().flatten();
     let mut sysroots = Vec::new();
     let mut complete = true;
@@ -171,14 +165,23 @@ fn validation_set(sysroots: &[PathBuf]) -> Vec<(PathBuf, Option<memo::Sig>)> {
     let mut paths = Vec::new();
     for root in sysroots {
         let lib = root.join("lib");
-        paths.push(root.join("bin").join("rustc"));
-        paths.push(root.join("bin").join("cargo"));
+        let dylibs = root.join(sys::SYSROOT_DYLIB_DIR);
+        paths.push(root.join("bin").join(format!("rustc{}", env::consts::EXE_SUFFIX)));
+        paths.push(root.join("bin").join(format!("cargo{}", env::consts::EXE_SUFFIX)));
         paths.push(lib.join("rustlib").join("multirust-channel-manifest.toml"));
         paths.push(lib.clone());
-        if let Ok(entries) = fs::read_dir(&lib) {
+        if dylibs != lib {
+            paths.push(dylibs.clone());
+        }
+        let driver_prefix = format!("{}rustc_driver", env::consts::DLL_PREFIX);
+        if let Ok(entries) = fs::read_dir(&dylibs) {
             let mut drivers: Vec<PathBuf> = entries
                 .flatten()
-                .filter(|e| e.file_name().as_bytes().starts_with(b"librustc_driver"))
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.as_encoded_bytes();
+                    name.starts_with(driver_prefix.as_bytes()) && name.ends_with(env::consts::DLL_SUFFIX.as_bytes())
+                })
                 .map(|e| e.path())
                 .collect();
             drivers.sort();
@@ -195,31 +198,33 @@ fn validation_set(sysroots: &[PathBuf]) -> Vec<(PathBuf, Option<memo::Sig>)> {
 /// One slot per working directory and binary pair, so a changed input overwrites rather than accumulates.
 fn probe_slot(dirs: &Dirs, rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path) -> PathBuf {
     let mut d = memo::Digest::new("probe-slot");
-    d.bytes(cwd.as_os_str().as_bytes());
-    d.opt(toolchain.map(OsStr::as_bytes));
-    d.bytes(rustc.as_os_str().as_bytes());
-    d.bytes(cargo.as_os_str().as_bytes());
+    d.bytes(cwd.as_os_str().as_encoded_bytes());
+    d.opt(toolchain.map(OsStr::as_encoded_bytes));
+    d.bytes(rustc.as_os_str().as_encoded_bytes());
+    d.bytes(cargo.as_os_str().as_encoded_bytes());
     dirs.root().join("probe").join(format!("{}.json", d.short()))
 }
 
 fn probe_key(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path) -> Option<String> {
     let mut d = memo::Digest::new(PROBE_FORMAT);
-    d.opt(toolchain.map(OsStr::as_bytes));
+    d.opt(toolchain.map(OsStr::as_encoded_bytes));
     let mut vars: Vec<(OsString, OsString)> = env::vars_os()
         .filter(|(k, _)| {
-            let k = k.as_bytes();
-            k.starts_with(b"RUSTUP_") || matches!(k, b"RUSTC" | b"FRUST_RUSTC" | b"FRUST_CARGO" | b"HOME" | b"CARGO_HOME")
+            let k = k.as_encoded_bytes();
+            k.starts_with(b"RUSTUP_")
+                || matches!(k, b"RUSTC" | b"FRUST_RUSTC" | b"FRUST_CARGO" | b"CARGO_HOME")
+                || sys::HOME_VARS.iter().any(|home| home.as_bytes() == k)
         })
         .collect();
     vars.sort();
     for (k, v) in &vars {
-        d.bytes(k.as_bytes());
-        d.bytes(v.as_bytes());
+        d.bytes(k.as_encoded_bytes());
+        d.bytes(v.as_encoded_bytes());
     }
     for tool in [rustc, cargo] {
-        d.bytes(tool.as_os_str().as_bytes());
-        let canonical = tool.canonicalize().ok()?;
-        d.bytes(canonical.as_os_str().as_bytes());
+        d.bytes(tool.as_os_str().as_encoded_bytes());
+        let canonical = sys::canonicalize(tool).ok()?;
+        d.bytes(canonical.as_os_str().as_encoded_bytes());
         d.sig(memo::Sig::of(&canonical).as_ref());
     }
     for dir in memo::ancestor_chains(cwd) {
@@ -234,7 +239,7 @@ fn probe_key(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path) 
 fn rustup_home() -> Option<PathBuf> {
     match env::var_os("RUSTUP_HOME").filter(|v| !v.is_empty()) {
         Some(home) => Some(PathBuf::from(home)),
-        None => env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".rustup")),
+        None => sys::home_var().filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".rustup")),
     }
 }
 
@@ -245,8 +250,6 @@ fn unix_now() -> u64 {
 pub(crate) mod memo {
     use std::fs;
     use std::io;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -254,6 +257,7 @@ pub(crate) mod memo {
     use serde::{Deserialize, Serialize};
 
     use crate::paths::Dirs;
+    use crate::sys;
 
     /// Any replacement (new inode), in-place write or metadata change makes the signature differ.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,14 +271,8 @@ pub(crate) mod memo {
 
     impl Sig {
         pub fn of(path: &Path) -> Option<Sig> {
-            let m = fs::metadata(path).ok()?;
-            Some(Sig {
-                dev: m.dev(),
-                ino: m.ino(),
-                size: m.size(),
-                mtime: (m.mtime(), m.mtime_nsec()),
-                ctime: (m.ctime(), m.ctime_nsec()),
-            })
+            let m = sys::stat(path).ok()?;
+            Some(Sig { dev: m.dev(), ino: m.ino(), size: m.len(), mtime: m.mtime(), ctime: m.ctime() })
         }
 
         pub fn changed_after(&self, since: SystemTime, slack: Duration) -> bool {
@@ -318,7 +316,7 @@ pub(crate) mod memo {
 
         /// `None` when the file exists but is unreadable, since its contents are then unknown.
         pub fn file(&mut self, path: &Path) -> Option<()> {
-            self.bytes(path.as_os_str().as_bytes());
+            self.bytes(path.as_os_str().as_encoded_bytes());
             match fs::read(path) {
                 Ok(body) => {
                     self.bytes(b"present");
@@ -344,7 +342,7 @@ pub(crate) mod memo {
     /// Tools resolve against the physical directory while users type the logical one.
     pub fn ancestor_chains(dir: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
-        let canonical = dir.canonicalize().ok();
+        let canonical = sys::canonicalize(dir).ok();
         for start in [Some(dir), canonical.as_deref()].into_iter().flatten() {
             for a in start.ancestors().filter(|a| !a.as_os_str().is_empty()) {
                 if !out.iter().any(|o| o == a) {
@@ -440,7 +438,7 @@ mod tests {
         let first = memo::Sig::of(&file).unwrap();
         let staged = dir.join("bin.new");
         fs::write(&staged, "one").unwrap();
-        fs::rename(&staged, &file).unwrap();
+        sys::rename(&staged, &file).unwrap();
         assert_ne!(memo::Sig::of(&file).unwrap(), first, "same bytes, new inode: rustup's install pattern");
         assert!(memo::Sig::of(&file).unwrap().changed_after(SystemTime::now(), Duration::from_secs(2)));
         let _ = fs::remove_file(&file);

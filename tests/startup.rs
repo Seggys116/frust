@@ -3,12 +3,11 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Once;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{Sandbox, assert_success, stderr, stdout};
 
@@ -23,7 +22,36 @@ fn ensure_pinned_toolchain() {
             .output()
             .expect("rustup is required to run these tests");
         assert!(out.status.success(), "installing {PINNED} failed: {}", String::from_utf8_lossy(&out.stderr));
+        wait_for_pinned_to_settle();
     });
+}
+
+/// Longer than the probe's window for files changed just before a probe, whose results are not memoised.
+const SETTLE: Duration = Duration::from_millis(2500);
+
+/// A fresh install leaves the toolchain's binaries and libraries with new ctimes, which cannot be backdated, so wait them out.
+fn wait_for_pinned_to_settle() {
+    let out = Command::new("rustc").arg(format!("+{PINNED}")).args(["--print", "sysroot"]).output().expect("rustc proxy");
+    assert_success(&out);
+    let sysroot = PathBuf::from(stdout(&out).trim());
+    let mut paths = vec![sysroot.join("lib/rustlib/multirust-channel-manifest.toml")];
+    for dir in [sysroot.join("bin"), sysroot.join("lib")] {
+        paths.extend(fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()));
+        paths.push(dir);
+    }
+    let newest = paths
+        .iter()
+        .filter_map(|p| frust::sys::stat(p).ok())
+        .flat_map(|m| {
+            let (secs, nsec) = m.ctime();
+            [m.modified().ok(), Some(UNIX_EPOCH + Duration::new(secs.max(0) as u64, nsec as u32))]
+        })
+        .flatten()
+        .max()
+        .expect("the pinned toolchain has files");
+    if let Some(wait) = SETTLE.checked_sub(SystemTime::now().duration_since(newest).unwrap_or_default()) {
+        thread::sleep(wait);
+    }
 }
 
 /// `cargo test` exports `RUSTUP_TOOLCHAIN`, which would override `rust-toolchain.toml`, so commands here run without it.
@@ -58,15 +86,28 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
-fn executable(path: &Path, text: &str) {
-    write(path, text);
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+// Fake tools are batch files on Windows, which the PATHEXT lookup finds.
+const TOOL_EXT: &str = if cfg!(windows) { ".cmd" } else { "" };
+
+fn executable(path: &Path, unix_script: &str, windows_cmd: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    common::write_fake_tool(path, unix_script, windows_cmd);
 }
 
-fn replace(path: &Path, text: &str) {
-    let staged = path.with_extension("staged");
-    executable(&staged, text);
-    fs::rename(&staged, path).unwrap();
+fn replace(path: &Path, unix_script: &str, windows_cmd: &str) {
+    let staged = path.with_extension("staged.cmd");
+    executable(&staged, unix_script, windows_cmd);
+    frust::sys::rename(&staged, path).unwrap();
+}
+
+fn bin_file(dir: &Path, name: &str) -> PathBuf {
+    dir.join("debug").join(common::exe(name))
+}
+
+fn batch(lines: &[&str]) -> String {
+    let mut text = lines.join("\r\n");
+    text.push_str("\r\n");
+    text
 }
 
 #[test]
@@ -84,7 +125,7 @@ fn second_build_uses_both_caches() {
     assert!(traced(&second, "probe", "hit"), "{}", stderr(&second));
     assert!(traced(&second, "locate", "hit"), "{}", stderr(&second));
     let dir = where_(&sb, &app, &[]);
-    assert!(dir.join("debug/app").is_file(), "the cached answers pick the same directory as fresh ones: {}", dir.display());
+    assert!(bin_file(&dir, "app").is_file(), "the cached answers pick the same directory as fresh ones: {}", dir.display());
 }
 
 #[test]
@@ -103,7 +144,7 @@ fn probe_cache_follows_toolchain_file_and_plus_toolchain() {
     assert!(traced(&pinned_run, "probe", "miss"), "a new toolchain file must re-probe: {}", stderr(&pinned_run));
     let pinned = where_(&sb, &app, &[]);
     assert_ne!(pinned, stable, "1.98.1 has its own toolchain id");
-    assert!(pinned.join("debug/app").is_file(), "built with the pinned toolchain into {}", pinned.display());
+    assert!(bin_file(&pinned, "app").is_file(), "built with the pinned toolchain into {}", pinned.display());
 
     write(&app.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"stable\"\n");
     let back = fcargo(&sb, &app, &["build"], &[]);
@@ -118,7 +159,7 @@ fn probe_cache_follows_toolchain_file_and_plus_toolchain() {
     assert!(traced(&plus, "probe", "miss"), "+stable is a different selection: {}", stderr(&plus));
     let plus_again = fcargo(&sb, &app, &["+stable", "build"], &[]);
     assert!(traced(&plus_again, "probe", "hit"), "{}", stderr(&plus_again));
-    assert!(stable.join("debug/app").is_file());
+    assert!(bin_file(&stable, "app").is_file());
     let pinned_again = fcargo(&sb, &app, &["build"], &[]);
     assert!(traced(&pinned_again, "probe", "hit"), "each selection keeps its own entry: {}", stderr(&pinned_again));
 }
@@ -127,6 +168,7 @@ fn probe_cache_follows_toolchain_file_and_plus_toolchain() {
 struct FakeToolchain {
     proxy_rustc: PathBuf,
     proxy_cargo: PathBuf,
+    real_rustc: PathBuf,
     toolchain: PathBuf,
 }
 
@@ -134,28 +176,64 @@ impl FakeToolchain {
     fn new(sb: &Sandbox) -> FakeToolchain {
         let base = sb.root.join("fake-rustup");
         let toolchain = base.join("toolchains").join("fake");
-        let proxy_rustc = base.join("bin").join("rustc");
-        let proxy_cargo = base.join("bin").join("cargo");
-        executable(&proxy_rustc, &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", toolchain.join("bin/rustc").display()));
+        let proxy_rustc = base.join("bin").join(format!("rustc{TOOL_EXT}"));
+        let proxy_cargo = base.join("bin").join(format!("cargo{TOOL_EXT}"));
+        let real_rustc = toolchain.join("bin").join(format!("rustc{TOOL_EXT}"));
+        executable(
+            &proxy_rustc,
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", real_rustc.display()),
+            &batch(&["@echo off", &format!("call \"{}\" %*", real_rustc.display()), "exit /b %ERRORLEVEL%"]),
+        );
         executable(
             &proxy_cargo,
             "#!/bin/sh\ncase \"$1\" in\n  -V) echo \"cargo 9.9.9 (fake)\" ;;\n  locate-project) echo \"$(pwd -P)/Cargo.toml\" ;;\n  *) echo \"FAKE-BUILD id=$FRUST_RUSTC_ID target=$CARGO_TARGET_DIR\" ;;\nesac\n",
+            &batch(&[
+                "@echo off",
+                "if \"%~1\"==\"-V\" goto version",
+                "if \"%~1\"==\"locate-project\" goto locate",
+                "echo FAKE-BUILD id=%FRUST_RUSTC_ID% target=%CARGO_TARGET_DIR%",
+                "exit /b 0",
+                ":version",
+                "echo cargo 9.9.9 (fake)",
+                "exit /b 0",
+                ":locate",
+                "echo %CD%\\Cargo.toml",
+                "exit /b 0",
+            ]),
         );
         write(&toolchain.join("lib/rustlib/multirust-channel-manifest.toml"), "fake\n");
-        let fake = FakeToolchain { proxy_rustc, proxy_cargo, toolchain };
-        executable(&fake.toolchain.join("bin/rustc"), &fake.rustc_script("9.9.1"));
+        let fake = FakeToolchain { proxy_rustc, proxy_cargo, real_rustc, toolchain };
+        let (unix, windows) = fake.rustc_scripts("9.9.1");
+        executable(&fake.real_rustc, &unix, &windows);
         fake
     }
 
-    fn rustc_script(&self, release: &str) -> String {
-        format!(
+    fn rustc_scripts(&self, release: &str) -> (String, String) {
+        let unix = format!(
             "#!/bin/sh\ncase \"$1\" in\n  -vV) printf 'rustc {release} (fake)\\nbinary: rustc\\nhost: fake-host\\nrelease: {release}\\n' ;;\n  --print) echo \"{}\" ;;\n  *) exit 1 ;;\nesac\n",
             self.toolchain.display()
-        )
+        );
+        let windows = batch(&[
+            "@echo off",
+            "if \"%~1\"==\"-vV\" goto version",
+            "if \"%~1\"==\"--print\" goto print",
+            "exit /b 1",
+            ":version",
+            &format!("echo rustc {release} (fake)"),
+            "echo binary: rustc",
+            "echo host: fake-host",
+            &format!("echo release: {release}"),
+            "exit /b 0",
+            ":print",
+            &format!("echo {}", self.toolchain.display()),
+            "exit /b 0",
+        ]);
+        (unix, windows)
     }
 
     fn update(&self, release: &str) {
-        replace(&self.toolchain.join("bin/rustc"), &self.rustc_script(release));
+        let (unix, windows) = self.rustc_scripts(release);
+        replace(&self.real_rustc, &unix, &windows);
     }
 
     fn envs(&self) -> Vec<(&'static str, &Path)> {
@@ -213,7 +291,7 @@ fn probe_cache_follows_rustup_toolchain_env() {
     assert_success(&out);
     assert!(traced(&out, "probe", "miss"), "{}", stderr(&out));
     let pinned = stable.parent().unwrap().read_dir().unwrap().flatten().map(|e| e.path()).find(|p| p.is_dir() && *p != stable).expect("a second toolchain dir");
-    assert!(pinned.join("debug/app").is_file(), "RUSTUP_TOOLCHAIN=1.98.1 builds into {}", pinned.display());
+    assert!(bin_file(&pinned, "app").is_file(), "RUSTUP_TOOLCHAIN=1.98.1 builds into {}", pinned.display());
 }
 
 #[test]
@@ -234,7 +312,7 @@ fn locate_cache_follows_workspace_membership() {
     assert!(traced(&joined, "locate", "miss"), "{}", stderr(&joined));
     let ws_dir = where_(&sb, &inner, &[]);
     assert_ne!(ws_dir, alone_dir);
-    assert!(ws_dir.join("debug/inner").is_file(), "built in the outer workspace's directory {}", ws_dir.display());
+    assert!(bin_file(&ws_dir, "inner").is_file(), "built in the outer workspace's directory {}", ws_dir.display());
     assert!(traced(&fcargo(&sb, &inner, &["build"], &[]), "locate", "hit"));
 
     write(&inner.join("Cargo.toml"), "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n");
@@ -243,7 +321,7 @@ fn locate_cache_follows_workspace_membership() {
     assert_success(&left);
     assert!(traced(&left, "locate", "miss"), "{}", stderr(&left));
     assert_eq!(where_(&sb, &inner, &[]), alone_dir);
-    assert!(alone_dir.join("debug/inner").is_file());
+    assert!(bin_file(&alone_dir, "inner").is_file());
 }
 
 #[test]
@@ -252,19 +330,26 @@ fn locate_cache_follows_a_moved_workspace_behind_a_symlink() {
     let a = sb.project("a", &[], "fn main() {}\n");
     let b = sb.project("b", &[], "fn main() {}\n");
     let link = sb.root.join("current");
-    std::os::unix::fs::symlink(&a, &link).unwrap();
+    if let Err(err) = common::symlink_dir(&a, &link) {
+        eprintln!("skipped: creating symlinks needs a privilege this runner lacks ({err})");
+        return;
+    }
     assert_success(&fcargo(&sb, &link, &["build"], &[]));
     assert!(traced(&fcargo(&sb, &link, &["build"], &[]), "locate", "hit"));
     let a_dir = where_(&sb, &a, &[]);
 
+    // A Windows directory symlink is removed as a directory, a unix one as a file.
+    #[cfg(windows)]
+    fs::remove_dir(&link).unwrap();
+    #[cfg(unix)]
     fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(&b, &link).unwrap();
+    common::symlink_dir(&b, &link).unwrap();
     let moved = fcargo(&sb, &link, &["build"], &[]);
     assert_success(&moved);
     assert!(traced(&moved, "locate", "miss"), "{}", stderr(&moved));
     let b_dir = where_(&sb, &b, &[]);
     assert_ne!(a_dir, b_dir);
-    assert!(b_dir.join("debug/app").is_file(), "built for the new target of the link: {}", b_dir.display());
+    assert!(bin_file(&b_dir, "app").is_file(), "built for the new target of the link: {}", b_dir.display());
 }
 
 #[test]
@@ -312,6 +397,6 @@ fn corrupt_cache_files_are_ignored_and_replaced() {
 
     let healed = fcargo(&sb, &app, &["build"], &[]);
     assert!(traced(&healed, "probe", "hit") && traced(&healed, "locate", "hit"), "entries rewritten: {}", stderr(&healed));
-    assert!(where_(&sb, &app, &[]).join("debug/app").is_file());
+    assert!(bin_file(&where_(&sb, &app, &[]), "app").is_file());
     assert!(!sb.home().join("targets").read_dir().unwrap().flatten().any(|ws| ws.path().join("forged").exists()));
 }

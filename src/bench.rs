@@ -2,8 +2,11 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -15,21 +18,62 @@ use crate::gc::{self, GcOptions};
 use std::ops::Range;
 use crate::paths::Dirs;
 use crate::style::{Styler, duration_ms};
+use crate::sys;
 use crate::toolchain::{Probe, resolve_tool};
 use crate::workspace;
 
 const MIN_FREE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const MIN_RUNS: usize = 3;
+const DEFAULT_RUNS: usize = 5;
+// How long to keep reading a child's stderr after it exited, in case a grandchild still holds the pipe.
+const DRAIN: Duration = Duration::from_millis(500);
+
+const L_CARGO_A: &str = "cargo      project A, cold";
+const L_CARGO_B: &str = "cargo      project B, cold";
+const L_FRUST_A: &str = "frust      project A, cold cache";
+const L_FRUST_B: &str = "frust      project B, warm cache";
+const L_CARGO_CLEAN: &str = "cargo      project A, clean rebuild";
+const L_FRUST_CLEAN: &str = "frust      project A, clean rebuild";
+const L_FRUST_DISPLAY: &str = "frust      project A, clean rebuild, display on";
+const L_CARGO_NOOP: &str = "cargo      no-op build";
+const L_FRUST_NOOP: &str = "frust      no-op build";
+const L_CARGO_INC: &str = "cargo      incremental edit";
+const L_FRUST_INC: &str = "frust      incremental edit";
+const L_REL_CARGO_A: &str = "cargo      release A, cold";
+const L_REL_CARGO_B: &str = "cargo      release B, cold";
+const L_REL_FRUST_A: &str = "frust      release A, cold cache";
+const L_REL_FRUST_B: &str = "frust      release B, warm cache";
+const L_REL_CARGO_CLEAN: &str = "cargo      release A, clean rebuild";
+const L_REL_FRUST_CLEAN: &str = "frust      release A, clean rebuild";
+const L_MAINT_GC: &str = "frust      maintenance: daily gc pass (once)";
+const L_MAINT_COMPACT: &str = "frust      maintenance: auto-compaction (once)";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Measurement {
     pub label: String,
+    // Median of `runs` runs.
     pub millis: u64,
+    pub min_millis: u64,
+    pub max_millis: u64,
+    pub runs: usize,
     pub target_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Machine {
+    pub os: String,
+    pub cpu: String,
+    pub cores: usize,
+    // One-minute load average; the one after includes the benchmark's own work.
+    pub load_before: Option<f64>,
+    pub load_after: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub rustc: String,
+    pub machine: Machine,
+    pub runs: usize,
     pub registry_deps: bool,
     pub local_crates: usize,
     pub cases: Vec<Measurement>,
@@ -116,6 +160,13 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
     let json = flags.iter().any(|f| f == "--json");
     let churn_only = flags.iter().any(|f| f == "--churn");
     let s = if json { Styler::plain() } else { Styler::detect() };
+    let runs = match runs_from_flags(flags, quick) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("frust bench: {msg}");
+            return 1;
+        }
+    };
 
     let scratch = std::env::temp_dir().join(format!("frust-bench-{}", std::process::id()));
     remove_abandoned_scratch(&std::env::temp_dir());
@@ -176,8 +227,9 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
             }
         };
     }
-    let result = bench(&scratch, quick, &s, json).and_then(|mut report| {
+    let result = bench(&scratch, quick, runs, &s, json).and_then(|mut report| {
         report.churn = Some(churn_bench(&scratch.join("churn"), quick, &s, json)?);
+        report.machine.load_after = load_average();
         Ok(report)
     });
     drop(guard);
@@ -188,7 +240,13 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
             } else {
                 print_report(&report, &s);
             }
-            0
+            match failed_checks(&report) {
+                Some(why) => {
+                    eprintln!("frust bench: correctness check failed: {why}");
+                    1
+                }
+                None => 0,
+            }
         }
         Err(msg) => {
             eprintln!("frust bench: {msg}");
@@ -202,13 +260,11 @@ fn remove_abandoned_scratch(tmp: &Path) {
     let Ok(entries) = fs::read_dir(tmp) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.strip_prefix("frust-bench-").and_then(|p| p.parse::<i32>().ok()) else { continue };
-        if pid <= 0 || pid == std::process::id() as i32 || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        let Some(pid) = name.strip_prefix("frust-bench-").and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid == 0 || pid == std::process::id() || !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        // SAFETY: signal 0 only checks whether the process exists.
-        let gone = unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        if !sys::pid_alive(pid) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
@@ -233,16 +289,118 @@ struct Ctx {
     probe_id: String,
 }
 
-fn bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool) -> Result<Report, String> {
+fn runs_from_flags(flags: &[String], quick: bool) -> Result<usize, String> {
+    let raw = flags.iter().enumerate().find_map(|(i, f)| {
+        if f == "--runs" { Some(flags.get(i + 1).cloned().unwrap_or_default()) } else { f.strip_prefix("--runs=").map(str::to_string) }
+    });
+    match raw {
+        None => Ok(if quick { MIN_RUNS } else { DEFAULT_RUNS }),
+        Some(v) => v.trim().parse::<usize>().ok().filter(|n| *n >= MIN_RUNS).ok_or_else(|| format!("--runs needs an integer of at least {MIN_RUNS}, got `{v}`")),
+    }
+}
+
+// An untimed build of a trivial project per tool and profile, so first-launch costs of rustc, std, the linker and fcargo are not charged to whichever row runs first.
+fn warm_up(ctx: &Ctx, scratch: &Path) -> Result<(), String> {
+    let dir = scratch.join("warmup");
+    let project = dir.join("app");
+    write_project(&project, 0, false)?;
+    let warm = Ctx { cargo: ctx.cargo.clone(), fcargo: ctx.fcargo.clone(), home: dir.join("home"), probe_id: ctx.probe_id.clone() };
+    let target = dir.join("target");
+    let profiles: [&[&str]; 2] = [&[], &["--release"]];
+    for extra in profiles {
+        plain_build_with(&warm, &project, &target, extra)?;
+        frust_build_with(&warm, &project, extra)?;
+    }
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+}
+
+struct Row {
+    label: &'static str,
+    millis: Vec<u64>,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct Table {
+    rows: Vec<Row>,
+}
+
+impl Table {
+    fn add(&mut self, label: &'static str, run: Run, bytes: Option<u64>) {
+        let row = match self.rows.iter().position(|r| r.label == label) {
+            Some(i) => &mut self.rows[i],
+            None => {
+                self.rows.push(Row { label, millis: Vec::new(), bytes: 0 });
+                self.rows.last_mut().expect("row was just pushed")
+            }
+        };
+        row.millis.push(run.millis);
+        if let Some(b) = bytes {
+            row.bytes = b;
+        }
+    }
+
+    fn stats(&self, label: &str) -> (u64, u64, u64) {
+        let Some(row) = self.rows.iter().find(|r| r.label == label) else { return (0, 0, 0) };
+        let mut sorted = row.millis.clone();
+        let med = median(&mut sorted);
+        (med, sorted.first().copied().unwrap_or(0), sorted.last().copied().unwrap_or(0))
+    }
+
+    fn median(&self, label: &str) -> u64 {
+        self.stats(label).0
+    }
+
+    fn measurements(&self) -> Vec<Measurement> {
+        self.rows
+            .iter()
+            .map(|r| {
+                let (med, min, max) = self.stats(r.label);
+                Measurement { label: r.label.to_string(), millis: med, min_millis: min, max_millis: max, runs: r.millis.len(), target_bytes: r.bytes }
+            })
+            .collect()
+    }
+}
+
+fn print_row(m: &Measurement, s: &Styler) {
+    println!(
+        "  {:<44} {:>9}  {:>10}  {}",
+        m.label,
+        duration_ms(m.millis),
+        human_bytes(m.target_bytes),
+        s.dim(&format!("(min {}, max {}, n={})", duration_ms(m.min_millis), duration_ms(m.max_millis), m.runs))
+    );
+}
+
+fn clear(path: &Path) -> Result<(), String> {
+    fsx::remove_any(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn move_dir(from: &Path, to: &Path) -> Result<(), String> {
+    clear(to)?;
+    sys::rename(from, to).map_err(|e| format!("{}: {e}", from.display()))
+}
+
+fn fcargo_beside(exe: &Path) -> PathBuf {
+    exe.with_file_name(format!("fcargo{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn app_binary(dir: &Path) -> PathBuf {
+    dir.join(format!("app{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool) -> Result<Report, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let fcargo = exe.with_file_name("fcargo");
+    let fcargo = fcargo_beside(&exe);
     if !fcargo.exists() {
         return Err("fcargo binary not found next to frust; install all binaries".into());
     }
     let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
     let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone() };
+    let load_before = load_average();
+    warm_up(&ctx, scratch)?;
 
     let libs = if quick { 4 } else { 12 };
     let proj_a = scratch.join("a").join("app");
@@ -260,99 +418,241 @@ fn bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool) -> Result<Report,
         println!("{}", s.dim(&format!("benchmarking {libs} local crates{} on rustc {}", if registry_deps { " + registry deps" } else { "" }, probe.release)));
     }
 
-    let mut cases = Vec::new();
-    let mut record = |label: &str, run: Run, target: u64| {
-        if !quiet {
-            println!("  {:<44} {:>9}  {:>10}", label, duration_ms(run.millis), human_bytes(target));
-        }
-        cases.push(Measurement { label: label.to_string(), millis: run.millis, target_bytes: target });
-        run.millis
-    };
     guard_disk(scratch)?;
 
+    let rel = ["--release"];
     let (ta, tb) = (scratch.join("cargo-target-a"), scratch.join("cargo-target-b"));
-    record("cargo      project A, cold", plain_build(&ctx, &proj_a, &ta)?, profile_size(&ta, "debug"));
-    let cargo_b = record("cargo      project B, cold", plain_build(&ctx, &proj_b, &tb)?, profile_size(&tb, "debug"));
-    let cargo_disk = fsx::physical_size(&[&ta, &tb]);
-    guard_disk(scratch)?;
-
+    let (rta, rtb) = (scratch.join("cargo-rel-a"), scratch.join("cargo-rel-b"));
     let dirs = Dirs::at(&ctx.home);
     let ca = workspace::central_target(&dirs, Some(&canonical(&proj_a)), &ctx.probe_id);
     let cb = workspace::central_target(&dirs, Some(&canonical(&proj_b)), &ctx.probe_id);
-    record("frust      project A, cold cache", frust_build(&ctx, &proj_a)?, profile_size(&ca, "debug"));
-    let frust_b = record("frust      project B, warm cache", frust_build(&ctx, &proj_b)?, profile_size(&cb, "debug"));
-    let frust_disk = fsx::physical_size(&[&ca, &cb, &dirs.store()]);
-    let frust_du = allocated_size(&ca) + allocated_size(&cb) + allocated_size(&dirs.store());
-    guard_disk(scratch)?;
+    let (cargo_same, frust_same) = (scratch.join("cargo-rel-same-dir"), scratch.join("frust-rel-same-dir"));
 
-    fs::remove_dir_all(&ta).map_err(|e| e.to_string())?;
-    fs::remove_dir_all(&ca).map_err(|e| e.to_string())?;
-    let clean_cargo = record("cargo      project A, clean rebuild", plain_build(&ctx, &proj_a, &ta)?, profile_size(&ta, "debug"));
-    let clean_frust = record("frust      project A, clean rebuild", frust_build(&ctx, &proj_a)?, profile_size(&ca, "debug"));
+    let mut t = Table::default();
+    let (mut cargo_disk, mut frust_disk, mut frust_du) = (0, 0, 0);
+    let (mut identical_cold, mut identical_cargo) = (true, true);
+    let mut other_dir: Option<BinaryDiff> = None;
+    let acceptable = |d: &BinaryDiff| d.identical || d.only_uuid_and_signature;
+    for rep in 0..runs {
+        // The tool that goes first alternates so neither one always pays for the other's cold page cache.
+        let cargo_first = rep % 2 == 0;
+        let order = if cargo_first { [true, false] } else { [false, true] };
+        let last = rep + 1 == runs;
+        if !quiet {
+            println!("{}", s.dim(&format!("  run {} of {runs}, {} first", rep + 1, if cargo_first { "cargo" } else { "frust" })));
+        }
+        guard_disk(scratch)?;
 
-    let noop_cargo = best_of(3, || plain_build(&ctx, &proj_a, &ta))?;
-    let noop_frust = best_of(3, || frust_build(&ctx, &proj_a))?;
-    record("cargo      no-op build (best of 3)", noop_cargo.clone(), 0);
-    record("frust      no-op build (best of 3)", noop_frust.clone(), 0);
-    touch_app(&proj_a, 1)?;
-    let inc_cargo = plain_build(&ctx, &proj_a, &ta)?;
-    touch_app(&proj_a, 2)?;
-    let inc_frust = frust_build(&ctx, &proj_a)?;
-    record("cargo      incremental edit", inc_cargo, 0);
-    record("frust      incremental edit", inc_frust, 0);
+        for is_cargo in order {
+            if is_cargo {
+                clear(&ta)?;
+                clear(&tb)?;
+                t.add(L_CARGO_A, plain_build(&ctx, &proj_a, &ta)?, last.then(|| profile_size(&ta, "debug")));
+                t.add(L_CARGO_B, plain_build(&ctx, &proj_b, &tb)?, last.then(|| profile_size(&tb, "debug")));
+            } else {
+                clear(&ctx.home)?;
+                t.add(L_FRUST_A, frust_build(&ctx, &proj_a)?, last.then(|| profile_size(&ca, "debug")));
+                t.add(L_FRUST_B, frust_build(&ctx, &proj_b)?, last.then(|| profile_size(&cb, "debug")));
+            }
+        }
+        if last {
+            cargo_disk = fsx::physical_size(&[&ta, &tb]);
+            frust_disk = fsx::physical_size(&[&ca, &cb, &dirs.store()]);
+            frust_du = allocated_size(&ca) + allocated_size(&cb) + allocated_size(&dirs.store());
+        }
+        guard_disk(scratch)?;
 
-    let rel = ["--release"];
-    let (rta, rtb) = (scratch.join("cargo-rel-a"), scratch.join("cargo-rel-b"));
-    let rel_cargo_a = plain_build_with(&ctx, &proj_a, &rta, &rel)?;
-    record("cargo      release A, cold", rel_cargo_a, profile_size(&rta, "release"));
-    let rel_cargo_b = record("cargo      release B, cold", plain_build_with(&ctx, &proj_b, &rtb, &rel)?, profile_size(&rtb, "release"));
-    record("frust      release A, cold cache", frust_build_with(&ctx, &proj_a, &rel)?, profile_size(&ca, "release"));
-    let cold_hash = fsx_hash(&ca.join("release").join("app"));
-    let rel_frust_b = record("frust      release B, warm cache", frust_build_with(&ctx, &proj_b, &rel)?, profile_size(&cb, "release"));
-    guard_disk(scratch)?;
+        for is_cargo in order {
+            if is_cargo {
+                clear(&ta)?;
+                t.add(L_CARGO_CLEAN, plain_build(&ctx, &proj_a, &ta)?, last.then(|| profile_size(&ta, "debug")));
+            } else {
+                clear(&ca)?;
+                t.add(L_FRUST_CLEAN, frust_build(&ctx, &proj_a)?, last.then(|| profile_size(&ca, "debug")));
+            }
+        }
+        // The display pipeline is off in every other row; this one shows what turning it on costs.
+        clear(&ca)?;
+        t.add(L_FRUST_DISPLAY, frust_build_env(&ctx, &proj_a, &[], "plain")?, last.then(|| profile_size(&ca, "debug")));
 
-    // Plain cargo builds into frust's central directory so both see the same CARGO_TARGET_DIR path.
-    fs::remove_dir_all(ca.join("release")).map_err(|e| e.to_string())?;
-    let rel_clean_cargo = record("cargo      release A, clean rebuild", plain_build_with(&ctx, &proj_a, &ca, &rel)?, profile_size(&ca, "release"));
-    let cargo_release = scratch.join("cargo-rel-same-dir");
-    fs::rename(ca.join("release"), &cargo_release).map_err(|e| e.to_string())?;
-    let cargo_bin = cargo_release.join("app");
-    let cargo_hash = fsx_hash(&cargo_bin);
-    let rel_clean_frust = record("frust      release A, clean rebuild", frust_build_with(&ctx, &proj_a, &rel)?, profile_size(&ca, "release"));
-    let frust_bin = ca.join("release").join("app");
-    let restored_hash = fsx_hash(&frust_bin);
-    let other_dir = binary_diff(&rta.join("release").join("app"), &frust_bin)?;
+        for is_cargo in order {
+            if is_cargo {
+                t.add(L_CARGO_NOOP, plain_build(&ctx, &proj_a, &ta)?, None);
+            } else {
+                t.add(L_FRUST_NOOP, frust_build(&ctx, &proj_a)?, None);
+            }
+        }
 
-    let runs = if quick { 10 } else { RUNTIME_RUNS };
-    let runtime = compare_runtime(&cargo_bin, &frust_bin, runs)?;
+        touch_app(&proj_a, rep as u32 + 1)?;
+        for is_cargo in order {
+            if is_cargo {
+                t.add(L_CARGO_INC, plain_build(&ctx, &proj_a, &ta)?, None);
+            } else {
+                t.add(L_FRUST_INC, frust_build(&ctx, &proj_a)?, None);
+            }
+        }
+
+        if last {
+            let (gc_ms, compact_ms) = measure_maintenance(&ctx, &dirs, &ca)?;
+            t.add(L_MAINT_GC, Run { millis: gc_ms }, None);
+            t.add(L_MAINT_COMPACT, Run { millis: compact_ms }, None);
+        }
+
+        let mut cold_hash = None;
+        for is_cargo in order {
+            if is_cargo {
+                clear(&rta)?;
+                clear(&rtb)?;
+                t.add(L_REL_CARGO_A, plain_build_with(&ctx, &proj_a, &rta, &rel)?, last.then(|| profile_size(&rta, "release")));
+                t.add(L_REL_CARGO_B, plain_build_with(&ctx, &proj_b, &rtb, &rel)?, last.then(|| profile_size(&rtb, "release")));
+            } else {
+                clear(&ctx.home)?;
+                t.add(L_REL_FRUST_A, frust_build_with(&ctx, &proj_a, &rel)?, last.then(|| profile_size(&ca, "release")));
+                cold_hash = fsx_hash(&app_binary(&ca.join("release")));
+                t.add(L_REL_FRUST_B, frust_build_with(&ctx, &proj_b, &rel)?, last.then(|| profile_size(&cb, "release")));
+            }
+        }
+        guard_disk(scratch)?;
+
+        // Plain cargo builds into frust's central directory so both see the same CARGO_TARGET_DIR path.
+        let (mut cargo_hash, mut restored_hash) = (None, None);
+        for is_cargo in order {
+            clear(&ca.join("release"))?;
+            if is_cargo {
+                t.add(L_REL_CARGO_CLEAN, plain_build_with(&ctx, &proj_a, &ca, &rel)?, last.then(|| profile_size(&ca, "release")));
+                move_dir(&ca.join("release"), &cargo_same)?;
+                cargo_hash = fsx_hash(&app_binary(&cargo_same));
+            } else {
+                t.add(L_REL_FRUST_CLEAN, frust_build_with(&ctx, &proj_a, &rel)?, last.then(|| profile_size(&ca, "release")));
+                move_dir(&ca.join("release"), &frust_same)?;
+                restored_hash = fsx_hash(&app_binary(&frust_same));
+            }
+        }
+        identical_cold &= cold_hash.is_some() && cold_hash == restored_hash;
+        identical_cargo &= cargo_hash.is_some() && cargo_hash == restored_hash;
+        let diff = binary_diff(&app_binary(&rta.join("release")), &app_binary(&frust_same))?;
+        if other_dir.as_ref().is_none_or(acceptable) {
+            other_dir = Some(diff);
+        }
+    }
+
+    let runtime_runs = if quick { 10 } else { RUNTIME_RUNS };
+    let runtime = compare_runtime(&app_binary(&cargo_same), &app_binary(&frust_same), runtime_runs)?;
+    let cases = t.measurements();
     if !quiet {
-        println!("  {:<44} {:>9}", format!("cargo      release binary, median of {runs}"), micros(runtime.cargo_us));
-        println!("  {:<44} {:>9}", format!("frust      release binary, median of {runs}"), micros(runtime.frust_us));
+        println!();
+        println!("{}", s.bold(&format!("Timed rows: median of {runs} runs, spread is min and max")));
+        for m in &cases {
+            print_row(m, s);
+        }
+        println!("  {:<44} {:>9}", format!("cargo      release binary, median of {runtime_runs}"), micros(runtime.cargo_us));
+        println!("  {:<44} {:>9}", format!("frust      release binary, median of {runtime_runs}"), micros(runtime.frust_us));
     }
 
     let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     Ok(Report {
         rustc: probe.release,
+        machine: machine_context(load_before),
+        runs,
         registry_deps,
         local_crates: libs,
         cases,
         cargo_two_projects_disk: cargo_disk,
         frust_two_projects_disk: frust_disk,
         frust_two_projects_du: frust_du,
-        speedup_second_project: ratio(cargo_b, frust_b),
-        speedup_clean_rebuild: ratio(clean_cargo, clean_frust),
-        noop_overhead_ms: noop_frust.millis as i64 - noop_cargo.millis as i64,
-        release_speedup_second_project: ratio(rel_cargo_b, rel_frust_b),
-        release_speedup_clean_rebuild: ratio(rel_clean_cargo, rel_clean_frust),
-        release_binary_identical_cold_vs_restored: cold_hash.is_some() && cold_hash == restored_hash,
-        release_binary_identical_to_cargo: cargo_hash.is_some() && cargo_hash == restored_hash,
-        release_binary_other_dir: other_dir,
-        runtime_runs: runs,
+        speedup_second_project: ratio(t.median(L_CARGO_B), t.median(L_FRUST_B)),
+        speedup_clean_rebuild: ratio(t.median(L_CARGO_CLEAN), t.median(L_FRUST_CLEAN)),
+        noop_overhead_ms: t.median(L_FRUST_NOOP) as i64 - t.median(L_CARGO_NOOP) as i64,
+        release_speedup_second_project: ratio(t.median(L_REL_CARGO_B), t.median(L_REL_FRUST_B)),
+        release_speedup_clean_rebuild: ratio(t.median(L_REL_CARGO_CLEAN), t.median(L_REL_FRUST_CLEAN)),
+        release_binary_identical_cold_vs_restored: identical_cold,
+        release_binary_identical_to_cargo: identical_cargo,
+        release_binary_other_dir: other_dir.ok_or("no release comparison ran")?,
+        runtime_runs,
         runtime_median_us_cargo: runtime.cargo_us,
         runtime_median_us_frust: runtime.frust_us,
         runtime_outputs_equal: runtime.outputs_equal,
         churn: None,
     })
+}
+
+// Run once on the populated state, outside the speed rows, which turn both inline passes off.
+fn measure_maintenance(ctx: &Ctx, dirs: &Dirs, target: &Path) -> Result<(u64, u64), String> {
+    let mut cfg = FrustConfig::from_env();
+    cfg.gc_sync = true;
+    clear(&dirs.auto_gc_marker())?;
+    let started = Instant::now();
+    let ran = gc::maybe_auto_gc(dirs, &cfg);
+    let gc_ms = started.elapsed().as_millis() as u64;
+    if !ran {
+        return Err(format!("the daily gc pass did not run in {}", ctx.home.display()));
+    }
+    let mut opts = AutoOptions::from_env(&cfg);
+    opts.enabled = true;
+    opts.every = Duration::ZERO;
+    opts.min_growth = 0;
+    opts.pass_budget = Duration::from_secs(3600);
+    opts.pass_bytes = u64::MAX;
+    let started = Instant::now();
+    compact::auto_compact_with(dirs, target, &opts);
+    Ok((gc_ms, started.elapsed().as_millis() as u64))
+}
+
+fn load_average() -> Option<f64> {
+    sys::load_average()
+}
+
+#[cfg(unix)]
+fn machine_os_cpu() -> (String, String) {
+    let run = |program: &str, args: &[&str]| -> Option<String> {
+        let out = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|t| !t.is_empty())
+    };
+    let os = run("uname", &["-srm"]).unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH));
+    let cpu = run("sysctl", &["-n", "machdep.cpu.brand_string"])
+        .or_else(|| {
+            fs::read_to_string("/proc/cpuinfo").ok().and_then(|t| {
+                t.lines().find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')).map(|(_, v)| v.trim().to_string()))
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    (os, cpu)
+}
+
+#[cfg(not(unix))]
+fn machine_os_cpu() -> (String, String) {
+    let os = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let cpu = std::env::var("PROCESSOR_IDENTIFIER").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "unknown".to_string());
+    (os, cpu)
+}
+
+fn machine_cores() -> usize {
+    let from_env = || std::env::var("NUMBER_OF_PROCESSORS").ok()?.trim().parse::<usize>().ok().filter(|n| *n > 0);
+    if cfg!(windows)
+        && let Some(n) = from_env()
+    {
+        return n;
+    }
+    thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn machine_context(load_before: Option<f64>) -> Machine {
+    let (os, cpu) = machine_os_cpu();
+    Machine { os, cpu, cores: machine_cores(), load_before, load_after: load_average() }
+}
+
+fn failed_checks(r: &Report) -> Option<String> {
+    let mut failed = Vec::new();
+    if !r.release_binary_identical_cold_vs_restored {
+        failed.push("release binary restored from the cache differs from the cold build");
+    }
+    if !r.release_binary_identical_to_cargo {
+        failed.push("release binary differs from plain cargo in the same target directory");
+    }
+    if !r.runtime_outputs_equal {
+        failed.push("release binaries print different output");
+    }
+    (!failed.is_empty()).then(|| failed.join("; "))
 }
 
 struct Config {
@@ -376,7 +676,7 @@ const EDITS: usize = 20;
 fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool) -> Result<ChurnReport, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
-    let fcargo = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("fcargo");
+    let fcargo = fcargo_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
     let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
     let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone() };
     let libs = if quick { 3 } else { 6 };
@@ -432,7 +732,7 @@ fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool) -> Result<C
     let last = CHURN.iter().rfind(|c| configs.iter().any(|l| l == c.label)).ok_or("no configuration built")?;
     let auto_after_churn = compact::physical_size(&[&auto_central, &auto_dirs.store()]);
     let profile = if last.args.contains(&"--release") { "release" } else { "debug" };
-    let output_before = run_output(&central.join(profile).join("app"))?;
+    let output_before = run_output(&app_binary(&central.join(profile)))?;
 
     let cargo_size = compact::physical_size(&[&cargo_target]);
     let frust_target = compact::physical_size(&[&central]);
@@ -454,7 +754,7 @@ fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool) -> Result<C
     let breakdown_after = rows(&compact::breakdown(&central));
     let envs: Vec<(&str, &str)> = last.rustflags.map(|f| vec![("RUSTFLAGS", f)]).unwrap_or_default();
     let (_, recompiled) = build_logged(&ctx, true, &proj, &central, last.args, &envs)?;
-    let output_after = run_output(&central.join(profile).join("app"))?;
+    let output_after = run_output(&app_binary(&central.join(profile)))?;
 
     let auto_compiled_on_repeat = auto_build(last.args, &envs)?;
     guard_disk(scratch)?;
@@ -704,7 +1004,7 @@ impl GrowthScript {
 fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -> Result<GrowthReport, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
-    let fcargo = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("fcargo");
+    let fcargo = fcargo_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
     if !fcargo.exists() {
         return Err("fcargo binary not found next to frust; install all binaries".into());
     }
@@ -780,7 +1080,7 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
         match outcome {
             Ok(()) => {
                 report.repeat_compiled.push((variant, run.build(script.args())?));
-                let bin = target.join("debug").join("app");
+                let bin = app_binary(&target.join("debug"));
                 report.outputs.push((variant, String::from_utf8_lossy(&run_output(&bin)?).trim().to_string()));
             }
             Err(msg) => {
@@ -986,7 +1286,6 @@ impl LatencyCategory {
 
 /// Regular, single-link files of at least [`compact::MIN_FILE_BYTES`]; for incremental state, only newest sessions.
 fn latency_files(profile: &Path, cat: LatencyCategory) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     let newest: Vec<PathBuf> = fs::read_dir(profile.join("incremental"))
         .map(|rd| rd.flatten().filter_map(|k| compact::newest_session(&k.path()).map(|s| s.1)).collect())
@@ -996,7 +1295,7 @@ fn latency_files(profile: &Path, cat: LatencyCategory) -> Vec<PathBuf> {
         let Ok(entries) = fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {
             let path = e.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            let Ok(meta) = sys::lstat(&path) else { continue };
             if meta.is_dir() {
                 stack.push(path);
                 continue;
@@ -1053,7 +1352,6 @@ fn signed_median(values: &mut [i64]) -> i64 {
 }
 
 fn latency_bench(scratch: &Path, flags: &[String], quick: bool, s: &Styler, quiet: bool) -> Result<LatencyReport, String> {
-    use std::os::unix::fs::MetadataExt;
     let value = |name: &str| flags.iter().find_map(|f| f.strip_prefix(&format!("--{name}=")).map(str::to_string));
     let rounds = value("rounds").and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(if quick { 4 } else { 20 });
     let libs = value("libs").and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 2).unwrap_or(if quick { 4 } else { 12 });
@@ -1103,7 +1401,7 @@ fn latency_bench(scratch: &Path, flags: &[String], quick: bool, s: &Styler, quie
             "category", "files", "size", "compressed", "untouched", "rewritten", "compressed", "compr-rewr", "rewr-untch"
         );
     }
-    let allocated = |paths: &[PathBuf]| -> u64 { paths.iter().filter_map(|p| fs::symlink_metadata(p).ok()).map(|m| m.blocks() * 512).sum() };
+    let allocated = |paths: &[PathBuf]| -> u64 { paths.iter().filter_map(|p| sys::lstat(p).ok()).map(|m| m.allocated()).sum() };
     let fresh_breakdown = rows(&compact::breakdown(&target));
     if !quiet {
         let line: Vec<String> = fresh_breakdown.iter().map(|(l, b)| format!("{l} {}", human_bytes(*b))).collect();
@@ -1143,7 +1441,7 @@ fn latency_bench(scratch: &Path, flags: &[String], quick: bool, s: &Styler, quie
                 if arm == 2 {
                     // Restore the uncompressed state and let a build settle it so the next arm starts like a normal build.
                     for p in latency_files(&profile, cat).iter().chain(selected.iter()) {
-                        if fs::symlink_metadata(p).is_ok_and(|m| compact::is_compressed(&m)) {
+                        if sys::lstat(p).is_ok_and(|m| compact::is_compressed(&m)) {
                             compact::rewrite_plain(p).map_err(|e| format!("{}: {e}", p.display()))?;
                         }
                     }
@@ -1238,16 +1536,50 @@ fn build_logged(ctx: &Ctx, frust: bool, project: &Path, target: &Path, args: &[&
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let started = Instant::now();
-    let output = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
-    let millis = started.elapsed().as_millis() as u64;
-    let text = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        let tail: Vec<&str> = text.lines().rev().take(12).collect();
-        return Err(format!("build failed:\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n")));
+    let captured = spawn_capture(&mut cmd)?;
+    if !captured.success {
+        return Err(format!("build failed:\n{}", failure_tail(&captured.stderr)));
     }
-    let compiled = text.lines().filter(|l| l.trim_start().starts_with("Compiling")).count();
-    Ok((Run { millis }, compiled))
+    let compiled = captured.stderr.lines().filter(|l| l.trim_start().starts_with("Compiling")).count();
+    Ok((Run { millis: captured.millis }, compiled))
+}
+
+struct Captured {
+    success: bool,
+    stderr: String,
+    millis: u64,
+}
+
+// The clock stops when the direct child exits; a grandchild still holding stderr only delays the read by DRAIN, outside the measurement.
+fn spawn_capture(cmd: &mut Command) -> Result<Captured, String> {
+    let started = Instant::now();
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    if let Some(mut pipe) = child.stderr.take() {
+        let sink = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let millis = started.elapsed().as_millis() as u64;
+    let _ = done_rx.recv_timeout(DRAIN);
+    let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok(Captured { success: status.success(), stderr: String::from_utf8_lossy(&bytes).into_owned(), millis })
+}
+
+fn failure_tail(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().rev().take(12).collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
 fn print_churn(c: &ChurnReport, s: &Styler) {
@@ -1482,22 +1814,11 @@ fn fsx_hash(path: &Path) -> Option<String> {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    sys::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn guard_disk(scratch: &Path) -> Result<(), String> {
     fsx::require_free_space(scratch, MIN_FREE_BYTES / 2)
-}
-
-fn best_of(n: usize, mut f: impl FnMut() -> Result<Run, String>) -> Result<Run, String> {
-    let mut best: Option<Run> = None;
-    for _ in 0..n {
-        let run = f()?;
-        if best.as_ref().is_none_or(|b| run.millis < b.millis) {
-            best = Some(run);
-        }
-    }
-    best.ok_or_else(|| "no runs".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1506,17 +1827,14 @@ struct Run {
 }
 
 fn timed(cmd: &mut Command) -> Result<Run, String> {
-    let started = Instant::now();
-    let output = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
-    let elapsed: Duration = started.elapsed();
+    let captured = spawn_capture(cmd)?;
     if std::env::var_os("FRUST_DEBUG").is_some() {
-        eprintln!("--- {:?} took {}ms\n{}", cmd.get_program(), elapsed.as_millis(), String::from_utf8_lossy(&output.stderr));
+        eprintln!("--- {:?} took {}ms\n{}", cmd.get_program(), captured.millis, captured.stderr);
     }
-    if !output.status.success() {
-        let tail: String = String::from_utf8_lossy(&output.stderr).lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(format!("build failed:\n{tail}"));
+    if !captured.success {
+        return Err(format!("build failed:\n{}", failure_tail(&captured.stderr)));
     }
-    Ok(Run { millis: elapsed.as_millis() as u64 })
+    Ok(Run { millis: captured.millis })
 }
 
 fn plain_build(ctx: &Ctx, project: &Path, target: &Path) -> Result<Run, String> {
@@ -1540,13 +1858,21 @@ fn frust_build(ctx: &Ctx, project: &Path) -> Result<Run, String> {
 }
 
 fn frust_build_with(ctx: &Ctx, project: &Path, extra: &[&str]) -> Result<Run, String> {
+    frust_build_env(ctx, project, extra, "off")
+}
+
+// Inline compaction is switched off and the daily gc marker is made fresh so the speed rows never absorb maintenance; it is timed separately.
+fn frust_build_env(ctx: &Ctx, project: &Path, extra: &[&str], render: &str) -> Result<Run, String> {
+    fs::create_dir_all(&ctx.home).map_err(|e| e.to_string())?;
+    fs::write(Dirs::at(&ctx.home).auto_gc_marker(), b"").map_err(|e| e.to_string())?;
     timed(
         Command::new(&ctx.fcargo)
             .arg("build")
             .args(extra)
             .current_dir(project)
             .env("FRUST_HOME", &ctx.home)
-            .env("FRUST_RENDER", "off")
+            .env("FRUST_RENDER", render)
+            .env("FRUST_AUTO_COMPACT", "off")
             .env("CARGO_NET_OFFLINE", "true")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_TARGET_DIR"),
@@ -1676,6 +2002,17 @@ fn write_lib_with(dir: &Path, index: usize, registry: bool, growth: bool) -> Res
 fn print_report(report: &Report, s: &Styler) {
     println!();
     println!("{}", s.bold("Summary"));
+    let m = &report.machine;
+    println!("  machine                       {}, {} ({} cores), rustc {}", m.os, m.cpu, m.cores, report.rustc);
+    let load = |v: Option<f64>| v.map_or("unavailable".to_string(), |l| format!("{l:.2}"));
+    let busy = m.load_before.is_some_and(|l| l > m.cores as f64 * 0.25);
+    println!(
+        "  load average (1 min)          before {}, after {}   {}",
+        load(m.load_before),
+        load(m.load_after),
+        s.dim(if busy { "(machine was already loaded at the start: treat times as noisy)" } else { "(machine was idle at the start; the after figure includes the benchmark)" })
+    );
+    println!("  {}", s.dim(&format!("(every timed row: median of {} runs; ratios are of medians; tool order alternates per run)", report.runs)));
     println!(
         "  second project (warm cache)   {}",
         s.green(&format!("{:.1}x faster than cargo", report.speedup_second_project))
@@ -1770,6 +2107,41 @@ mod tests {
         assert!(!d.only_uuid_and_signature);
         assert!(diff_bytes(&a, &a).identical);
         assert!(!diff_bytes(&a, &a[..100]).only_uuid_and_signature);
+    }
+
+    #[test]
+    fn runs_flag_defaults_and_minimum() {
+        let flags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(runs_from_flags(&flags(&[]), false), Ok(5));
+        assert_eq!(runs_from_flags(&flags(&["--quick"]), true), Ok(3));
+        assert_eq!(runs_from_flags(&flags(&["--runs", "7"]), false), Ok(7));
+        assert_eq!(runs_from_flags(&flags(&["--runs=4", "--json"]), true), Ok(4));
+        assert!(runs_from_flags(&flags(&["--runs", "2"]), false).is_err());
+        assert!(runs_from_flags(&flags(&["--runs"]), false).is_err());
+        assert!(runs_from_flags(&flags(&["--runs=x"]), false).is_err());
+    }
+
+    #[test]
+    fn table_reports_median_and_spread() {
+        let mut t = Table::default();
+        for ms in [30, 10, 50, 20, 40] {
+            t.add("row", Run { millis: ms }, None);
+        }
+        assert_eq!(t.stats("row"), (30, 10, 50));
+        assert_eq!(t.median("missing"), 0);
+        let m = &t.measurements()[0];
+        assert_eq!((m.millis, m.min_millis, m.max_millis, m.runs), (30, 10, 50, 5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lingering_grandchild_does_not_extend_the_measurement() {
+        let started = Instant::now();
+        let captured = spawn_capture(Command::new("sh").args(["-c", "sleep 4 & echo hello >&2"])).unwrap();
+        assert!(captured.success);
+        assert!(captured.stderr.contains("hello"));
+        assert!(captured.millis < 1000);
+        assert!(started.elapsed() < Duration::from_millis(3000));
     }
 
     #[test]

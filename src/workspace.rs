@@ -2,7 +2,6 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -54,23 +53,23 @@ pub fn locate_cached(
 
 fn locate_slot(dirs: &Dirs, cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsStr>) -> PathBuf {
     let mut d = Digest::new("locate-slot");
-    d.bytes(cwd.as_os_str().as_bytes());
-    d.opt(toolchain.map(OsStr::as_bytes));
-    d.opt(manifest_path.map(OsStr::as_bytes));
+    d.bytes(cwd.as_os_str().as_encoded_bytes());
+    d.opt(toolchain.map(OsStr::as_encoded_bytes));
+    d.opt(manifest_path.map(OsStr::as_encoded_bytes));
     dirs.root().join("locate").join(format!("{}.json", d.short()))
 }
 
 fn locate_key(cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsStr>, toolchain_id: &str) -> Option<(String, Vec<PathBuf>)> {
     let mut d = Digest::new(LOCATE_FORMAT);
     d.bytes(toolchain_id.as_bytes());
-    d.opt(toolchain.map(OsStr::as_bytes));
-    d.opt(manifest_path.map(OsStr::as_bytes));
+    d.opt(toolchain.map(OsStr::as_encoded_bytes));
+    d.opt(manifest_path.map(OsStr::as_encoded_bytes));
     let mut vars: Vec<(OsString, OsString)> =
-        env::vars_os().filter(|(k, _)| k.as_bytes().starts_with(b"__CARGO") || k == "CARGO_HOME").collect();
+        env::vars_os().filter(|(k, _)| k.as_encoded_bytes().starts_with(b"__CARGO") || k == "CARGO_HOME").collect();
     vars.sort();
     for (k, v) in &vars {
-        d.bytes(k.as_bytes());
-        d.bytes(v.as_bytes());
+        d.bytes(k.as_encoded_bytes());
+        d.bytes(v.as_encoded_bytes());
     }
     let mut chain = memo::ancestor_chains(cwd);
     if let Some(manifest) = manifest_path {
@@ -107,7 +106,7 @@ pub fn locate(cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsSt
     let manifest = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     // Cargo echoes `--manifest-path` as typed but resolves symlinks otherwise; canonicalise so both spellings share one target directory and lock.
     let root = manifest.parent()?;
-    Some(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
+    Some(crate::sys::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
 }
 
 pub fn workspace_key(root: &Path) -> String {

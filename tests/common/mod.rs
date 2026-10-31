@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -43,7 +43,7 @@ impl Sandbox {
         fs::create_dir_all(self.cargo_home()).unwrap();
         fs::create_dir_all(self.vendor()).unwrap();
         let config = format!(
-            "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"{}\"\n\n[net]\noffline = true\n",
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = '{}'\n\n[net]\noffline = true\n",
             self.vendor().display()
         );
         fs::write(self.cargo_home().join("config.toml"), config).unwrap();
@@ -59,10 +59,13 @@ impl Sandbox {
         .unwrap();
         fs::write(dir.join("src").join("lib.rs"), source).unwrap();
         fs::write(dir.join(".cargo-checksum.json"), "{\"files\":{},\"package\":null}").unwrap();
+        settle(&dir.join("src").join("lib.rs"));
     }
 
     pub fn replace_vendor_source(&self, name: &str, version: &str, source: &str) {
-        fs::write(self.vendor().join(format!("{name}-{version}")).join("src").join("lib.rs"), source).unwrap();
+        let path = self.vendor().join(format!("{name}-{version}")).join("src").join("lib.rs");
+        fs::write(&path, source).unwrap();
+        settle(&path);
     }
 
     pub fn project(&self, dir: &str, deps: &[(&str, &str)], main_rs: &str) -> PathBuf {
@@ -76,6 +79,7 @@ impl Sandbox {
         }
         fs::write(path.join("Cargo.toml"), manifest).unwrap();
         fs::write(path.join("src").join("main.rs"), main_rs).unwrap();
+        settle(&path.join("src").join("main.rs"));
         path
     }
 
@@ -106,6 +110,7 @@ impl Sandbox {
             .env("FRUST_LOCK_TIMEOUT_SECS", "120")
             .env("NO_COLOR", "1")
             .env("CARGO_TERM_COLOR", "never")
+            .env("FRUST_STORE_SYNC", "1")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CI")
@@ -114,6 +119,17 @@ impl Sandbox {
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("CARGO_BUILD_RUSTFLAGS")
             .env_remove("FRUST_EVENTS");
+        #[cfg(windows)]
+        {
+            // Point the user profile at the sandbox, keeping rustup's real home so the toolchains stay found.
+            let rustup = std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".rustup")));
+            if let Some(rustup) = rustup {
+                cmd.env("RUSTUP_HOME", rustup);
+            }
+            cmd.env("USERPROFILE", &self.root).env("HOME", &self.root);
+        }
     }
 
     pub fn cache_events(&self) -> Vec<serde_json::Value> {
@@ -145,6 +161,14 @@ impl Drop for Sandbox {
     }
 }
 
+/// Waits until a just-written file passes frust's "file too new" rule, which would otherwise decline to cache a build started right away.
+pub fn settle(path: &Path) {
+    let stamp = frust::cache::hashing::Stamp::read(path).unwrap();
+    while stamp.too_new_for(frust::cache::hashing::now_ns()) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -164,7 +188,102 @@ pub fn assert_success(out: &Output) {
 }
 
 pub fn run_binary(target: &Path, profile: &str, name: &str) -> Output {
-    Command::new(target.join(profile).join(name)).output().unwrap()
+    Command::new(target.join(profile).join(exe(name))).output().unwrap()
+}
+
+/// A binary's file name on this platform.
+pub fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Creates a directory symlink; on Windows this needs developer mode or elevation, so callers skip on `Err`.
+pub fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+}
+
+/// Puts the child in its own process group (unix) or console process group (Windows) so `kill_tree` and `interrupt` reach only it.
+pub fn own_group(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP)
+    }
+}
+
+/// Kills the process and everything it started.
+pub fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: signalling the process group created by `own_group` for this child.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+}
+
+/// Sends the child an interrupt; the child exits 130 on both platforms.
+pub fn interrupt(child: &Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: signalling only the given child process.
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+        // CTRL_BREAK reaches a child started with `own_group` (frust treats it as Ctrl-C); without a shared console, taskkill without /F is the nearest graceful request.
+        // SAFETY: plain FFI call with a process group id and no pointers.
+        let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+        if sent == 0 {
+            let _ = Command::new("taskkill").args(["/PID", &child.id().to_string()]).output();
+        }
+    }
+}
+
+/// A child that has already exited or exits at once, for tests that need a reaped process id.
+pub fn spawn_exiting() -> Child {
+    #[cfg(unix)]
+    {
+        Command::new("true").spawn().unwrap()
+    }
+    #[cfg(windows)]
+    {
+        Command::new("cmd").args(["/c", "exit", "0"]).spawn().unwrap()
+    }
+}
+
+/// Writes an executable fake tool: the shell script on unix, the batch file on Windows (`path` gets a `.cmd` extension unless it has one); returns the written path.
+pub fn write_fake_tool(path: &Path, unix_script: &str, windows_cmd: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = windows_cmd;
+        fs::write(path, unix_script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        let _ = unix_script;
+        let path = if path.extension().is_some_and(|e| e == "cmd") { path.to_path_buf() } else { path.with_extension("cmd") };
+        fs::write(&path, windows_cmd).unwrap();
+        path
+    }
 }
 
 impl Sandbox {

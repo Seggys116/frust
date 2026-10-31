@@ -19,10 +19,11 @@ use crate::stats;
 use crate::style::{Styler, duration_ms, row};
 use crate::toolchain::{Probe, resolve_tool};
 use crate::ui::{self, Style};
+use crate::update;
 use crate::workspace;
 
 /// Commands owned by frust. Chosen to avoid every cargo built-in name.
-const META: &[&str] = &["stats", "gc", "compact", "doctor", "locks", "env", "where", "bench", "ui-demo", "link", "tool", "help"];
+const META: &[&str] = &["stats", "gc", "compact", "doctor", "locks", "env", "where", "bench", "ui-demo", "link", "tool", "self-update", "help"];
 
 pub fn frust_main(args: Vec<OsString>) -> i32 {
     let first = args.first().and_then(|a| a.to_str()).map(str::to_owned);
@@ -63,6 +64,7 @@ fn meta(cmd: &str, rest: Vec<OsString>) -> i32 {
         "bench" => bench::run(&dirs, &flags),
         "ui-demo" => ui_demo(&flags),
         "link" => link_cmd(&flags),
+        "self-update" => update::run(&dirs, &flags),
         "tool" => match flags.split_first() {
             Some((tool, _)) => run::tool_main(tool, rest[1..].to_vec()),
             None => {
@@ -91,15 +93,16 @@ fn print_help() {
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
         ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
-        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick]"),
+        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
         ("tool", "run any toolchain tool unchanged: frust tool rustfmt --version"),
+        ("self-update", "install the latest release in place  [--yes] [--check] [--version vX.Y.Z] [--disable | --enable]"),
     ] {
         println!("  {:<9} {}", s.cyan(name), text);
     }
     println!("\nAnything else is passed to cargo untouched, including +toolchain and future subcommands.");
-    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_GIB");
+    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_GIB FRUST_UPDATE_CHECK");
 }
 
 fn flag_value(flags: &[String], name: &str) -> Option<String> {
@@ -240,6 +243,9 @@ fn idle(duration: Duration) -> String {
 }
 
 fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
+    if flags.iter().any(|f| f == gc::AUTO_CHILD_FLAG) {
+        return gc::run_auto_child(dirs, cfg);
+    }
     let s = Styler::detect();
     let mut opts = GcOptions::new(cfg.cache_max_bytes);
     if let Some(gib) = flag_value(flags, "--max-gib").and_then(|v| v.parse::<f64>().ok()) {
@@ -556,12 +562,12 @@ fn link_cmd(flags: &[String]) -> i32 {
             code = 1;
             continue;
         }
-        let link = dir.join(format!("f{tool}"));
+        let link = dir.join(format!("f{tool}{}", env::consts::EXE_SUFFIX));
         if link.exists() {
             println!("exists   {}", link.display());
             continue;
         }
-        match std::os::unix::fs::symlink(&exe, &link) {
+        match crate::sys::link_tool(&exe, &link) {
             Ok(()) => println!("created  {} -> {}", link.display(), exe.display()),
             Err(err) => {
                 eprintln!("frust: cannot create {}: {err}", link.display());

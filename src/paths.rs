@@ -1,10 +1,13 @@
 //! Everything lives under one root so it can be inspected, moved or deleted as a unit.
 
 use std::env;
-use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use crate::sys;
+
+/// File-name prefix of the slot locks in `Dirs::deferred`; gc keys on it.
+pub const DEFERRED_SLOT_PREFIX: &str = "slot-";
 
 #[derive(Debug, Clone)]
 pub struct Dirs {
@@ -58,6 +61,16 @@ impl Dirs {
         self.root.join("tmp")
     }
 
+    /// Per-prekey compile locks; kept apart from `locks()` because gc treats every entry there as a build-lock directory.
+    pub fn keylocks(&self) -> PathBuf {
+        self.root.join("keylocks")
+    }
+
+    /// Job files and slot locks of deferred stores.
+    pub fn deferred(&self) -> PathBuf {
+        self.tmp().join("deferred")
+    }
+
     pub fn ledger(&self) -> PathBuf {
         self.root.join("ledger.jsonl")
     }
@@ -70,8 +83,22 @@ impl Dirs {
         self.root.join("hashmemo")
     }
 
+    /// Violation log, quarantine markers and the audit counter of stamp-validated direct mode.
+    pub fn stamp_trust(&self) -> PathBuf {
+        self.root.join("stamp-trust")
+    }
+
     pub fn auto_gc_marker(&self) -> PathBuf {
         self.root.join("auto-gc")
+    }
+
+    pub fn compact_memo_dir(&self) -> PathBuf {
+        self.root.join("compact-memo")
+    }
+
+    /// One memo per target directory; the version in the name retires old formats without reading them.
+    pub fn compact_memo(&self, target: &Path) -> PathBuf {
+        self.compact_memo_dir().join(format!("{}-v1.bin", short_hash(target.as_os_str().as_encoded_bytes())))
     }
 }
 
@@ -98,31 +125,13 @@ fn platform_cache_dir() -> Result<PathBuf, String> {
 
 /// The shared temp dir is world-writable: another user could pre-create this directory and plant cache entries, so unverified ones are refused.
 pub fn private_temp_dir(base: &Path) -> Result<PathBuf, String> {
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    let dir = base.join(format!("frust-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+    let dir = base.join(format!("frust-{}", sys::user_id()));
+    match sys::create_dir_with_mode(&dir, 0o700) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(format!("cannot create private state directory {}: {err}", dir.display())),
     }
-    let meta = fs::symlink_metadata(&dir).map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?;
-    let refuse = |why: &str| {
-        Err(format!(
-            "refusing to use {} as frust's state directory: {why}; set FRUST_HOME or HOME to a private location",
-            dir.display()
-        ))
-    };
-    if !meta.file_type().is_dir() {
-        return refuse("it is not a directory");
-    }
-    if meta.uid() != uid {
-        return refuse(&format!("it is owned by uid {}, not {uid}", meta.uid()));
-    }
-    let mode = meta.permissions().mode() & 0o7777;
-    if mode != 0o700 {
-        return refuse(&format!("its mode is {mode:o}, not 700"));
-    }
+    sys::verify_private_dir(&dir)?;
     Ok(dir)
 }
 

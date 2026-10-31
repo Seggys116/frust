@@ -4,10 +4,8 @@
 //! Each queue ticket is flocked by its waiter, so liveness never depends on pid probing (pid reuse, other users).
 //! The lock covers the compile phase only; `run`, `test` and `bench` release it before executing user code.
 
-use std::ffi::CStr;
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -19,12 +17,18 @@ use serde::{Deserialize, Serialize};
 use crate::events::Event;
 use crate::fsx;
 use crate::paths::{Dirs, short_hash};
+use crate::sys::{self, LockKind, signal};
 
 /// The front waiter takes over when the holder finishes, so its poll interval is the hand-over latency.
 const FRONT_POLL: Duration = Duration::from_millis(15);
 const FOLLOW_POLL: Duration = Duration::from_millis(10);
 const FOLLOW_CHECK: Duration = Duration::from_millis(50);
-const MAX_POLL: Duration = Duration::from_millis(250);
+const FIRST_POLL: Duration = Duration::from_millis(20);
+/// Waiters behind the first only need to notice a change in their position, and each poll opens every ticket.
+const MAX_POLL: Duration = Duration::from_millis(40);
+const LOG_FLUSH_EVERY: Duration = Duration::from_millis(25);
+const LOG_FLUSH_BYTES: usize = 64 * 1024;
+const FOLLOWER_SCAN_EVERY: Duration = Duration::from_millis(50);
 const ANNOUNCE_AFTER: Duration = Duration::from_millis(150);
 const NOTIFY_EVERY: Duration = Duration::from_millis(100);
 const PUBLISH_EVERY: Duration = Duration::from_millis(200);
@@ -424,6 +428,13 @@ impl BuildLock {
         }
     }
 
+    /// Writes buffered records once they are old enough; call from the supervision loop so a quiet build still reaches followers.
+    pub fn flush_log(&mut self) {
+        if let Some(log) = self.log.as_mut() {
+            log.flush_if_due();
+        }
+    }
+
     /// Dropping without this records nothing, which followers treat as a holder that died.
     pub fn finish(mut self, result: BuildResult) {
         let record = Finished {
@@ -449,7 +460,8 @@ impl BuildLock {
 impl Drop for BuildLock {
     fn drop(&mut self) {
         // Followers keep the log open, so removing it does not cut them off.
-        if let Some(log) = self.log.take() {
+        if let Some(mut log) = self.log.take() {
+            log.flush();
             let _ = fs::remove_file(&log.path);
         }
         let _ = fs::remove_file(self.records_dir().join("progress.json"));
@@ -463,20 +475,39 @@ impl Drop for BuildLock {
 struct LogWriter {
     file: File,
     path: PathBuf,
+    /// Bytes accepted so far, written or still pending.
     written: u64,
     truncated: bool,
+    /// Whole records waiting for the next flush.
+    pending: Vec<u8>,
+    last_flush: Option<Instant>,
+    queue: PathBuf,
+    last_scan: Option<Instant>,
+    /// Sticky: once someone follows this build every record is written at once.
+    follower: bool,
 }
 
 impl LogWriter {
-    fn create(dir: &Path, name: &str, mode: Option<Mode>) -> io::Result<LogWriter> {
+    fn create(dir: &Path, queue: PathBuf, name: &str, mode: Option<Mode>) -> io::Result<LogWriter> {
         let path = dir.join(name);
         let mut options = File::options();
-        options.append(true).create_new(true).mode(mode.map_or(0o644, |m| m.file));
+        options.append(true).create_new(true);
+        sys::with_mode(&mut options, mode.map_or(0o644, |m| m.file));
         let file = options.open(&path)?;
         if let Some(m) = mode {
-            let _ = file.set_permissions(Permissions::from_mode(m.file));
+            let _ = sys::set_file_mode(&file, m.file);
         }
-        Ok(LogWriter { file, path, written: 0, truncated: false })
+        Ok(LogWriter {
+            file,
+            path,
+            written: 0,
+            truncated: false,
+            pending: Vec::new(),
+            last_flush: None,
+            queue,
+            last_scan: None,
+            follower: false,
+        })
     }
 
     fn append(&mut self, record: &Record) {
@@ -488,25 +519,67 @@ impl LogWriter {
         line.push(b'\n');
         if output && self.written + line.len() as u64 > LOG_CAP {
             self.truncated = true;
-            self.write(b"{\"k\":\"trunc\"}\n");
+            self.queue_line(b"{\"k\":\"trunc\"}\n");
+            self.flush();
             return;
         }
-        self.write(&line);
+        self.queue_line(&line);
+        // A follower needs the start record to know whether the log is complete.
+        if matches!(record, Record::Start { .. }) {
+            self.flush();
+        } else {
+            self.flush_if_due();
+        }
     }
 
     fn end(&mut self, code: i32, interrupted: bool) {
         if let Ok(mut line) = serde_json::to_vec(&Record::End { code, interrupted }) {
             line.push(b'\n');
-            self.write(&line);
+            self.queue_line(&line);
+        }
+        self.flush();
+    }
+
+    fn queue_line(&mut self, line: &[u8]) {
+        self.pending.extend_from_slice(line);
+        self.written += line.len() as u64;
+    }
+
+    fn flush_if_due(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.follower && self.last_scan.is_none_or(|t| now.duration_since(t) >= FOLLOWER_SCAN_EVERY) {
+            self.last_scan = Some(now);
+            self.follower = has_follower(&self.queue, std::process::id());
+        }
+        let aged = self.last_flush.is_none_or(|t| now.duration_since(t) >= LOG_FLUSH_EVERY);
+        if self.follower || aged || self.pending.len() >= LOG_FLUSH_BYTES {
+            self.flush();
         }
     }
 
-    /// One `write` per record on an `O_APPEND` file, so a follower never sees half a record followed by another.
-    fn write(&mut self, line: &[u8]) {
-        if self.file.write_all(line).is_ok() {
-            self.written += line.len() as u64;
+    /// Only whole records are ever pending, and they go out in one `write` on an `O_APPEND` file; a follower buffers any partial tail itself.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
         }
+        let _ = self.file.write_all(&self.pending);
+        self.pending.clear();
+        self.last_flush = Some(Instant::now());
     }
+}
+
+/// Reads tickets without their flocks: a stale ticket naming us only keeps the log in write-through mode.
+fn has_follower(queue: &Path, pid: u32) -> bool {
+    let Ok(entries) = fs::read_dir(queue) else { return false };
+    entries.flatten().any(|entry| {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            return false;
+        }
+        fs::read(entry.path()).ok().and_then(|text| serde_json::from_slice::<TicketInfo>(&text).ok()).is_some_and(|t| t.joined == Some(pid))
+    })
 }
 
 fn lock_dir(dirs: &Dirs, target_dir: &Path) -> PathBuf {
@@ -567,7 +640,8 @@ pub fn acquire(
     let started = Instant::now();
     let mut announced = false;
     let mut last_notify: Option<Instant> = None;
-    let mut delay = Duration::from_millis(20);
+    let mut delay = FIRST_POLL;
+    let mut last_ahead = usize::MAX;
     let mut follow: Option<Follow> = None;
     let mut followed: Option<Holder> = None;
     // A build we stopped following; never followed again (it may linger for a moment).
@@ -651,20 +725,27 @@ pub fn acquire(
             delay
         };
         thread::sleep(pause);
-        delay = (delay * 2).min(MAX_POLL);
+        if follow.is_none() && ahead < last_ahead {
+            delay = FIRST_POLL;
+        } else {
+            delay = (delay * 2).min(MAX_POLL);
+        }
+        if follow.is_none() {
+            last_ahead = ahead;
+        }
     }
 }
 
 /// Level one is shared, or exclusive for a whole-directory build; on any refusal everything taken is released.
 fn try_take(level: &File, slots: &[File], exclusive: bool) -> io::Result<bool> {
-    let first = if exclusive { level.try_lock() } else { level.try_lock_shared() };
+    let first = sys::try_lock(level, if exclusive { LockKind::Exclusive } else { LockKind::Shared });
     match first {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Ok(false),
         Err(fs::TryLockError::Error(err)) => return Err(err),
     }
     for (i, slot) in slots.iter().enumerate() {
-        let refused = match slot.try_lock() {
+        let refused = match sys::try_lock(slot, LockKind::Exclusive) {
             Ok(()) => continue,
             Err(fs::TryLockError::WouldBlock) => None,
             Err(fs::TryLockError::Error(err)) => Some(err),
@@ -680,9 +761,9 @@ fn try_take(level: &File, slots: &[File], exclusive: bool) -> io::Result<bool> {
 
 fn release(level: &File, slots: &[File]) {
     for slot in slots {
-        let _ = slot.unlock();
+        let _ = sys::unlock(slot);
     }
-    let _ = level.unlock();
+    let _ = sys::unlock(level);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -705,9 +786,9 @@ fn take_ownership(
     let _ = fs::remove_file(records.join("progress.json"));
     remove_logs(records);
     // Keeps the lock directory recent for `frust gc` while scoped builds hold level one shared, which its probe cannot see.
-    let _ = File::open(dir.join("lock")).and_then(|f| f.set_modified(SystemTime::now()));
+    let _ = sys::set_mtime_now(&dir.join("lock"));
     let log_name = format!("build-{pid}-{started_ns}.log");
-    let log = LogWriter::create(records, &log_name, mode).ok();
+    let log = LogWriter::create(records, dir.join("queue"), &log_name, mode).ok();
     let holder = Holder {
         owner: Owner {
             pid,
@@ -888,30 +969,11 @@ fn observe_holder(slot: &Path, holder: Option<Holder>, ahead: usize, waited: Dur
 pub fn current_user() -> (String, u32) {
     static USER: OnceLock<(String, u32)> = OnceLock::new();
     USER.get_or_init(|| {
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
-        let name = passwd_name(uid)
-            .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
-            .or_else(|| std::env::var("LOGNAME").ok().filter(|u| !u.is_empty()))
-            .unwrap_or_else(|| format!("uid {uid}"));
+        let uid = sys::user_id();
+        let name = sys::user_name().unwrap_or_else(|| format!("uid {uid}"));
         (name, uid)
     })
     .clone()
-}
-
-fn passwd_name(uid: libc::uid_t) -> Option<String> {
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: getpwuid_r writes only into `pwd` and `buf` (sizes passed), and `result` is null or points at `pwd`.
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
-        if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
-            return None;
-        }
-        let name = CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned();
-        (!name.is_empty()).then_some(name)
-    }
 }
 
 fn now_ns() -> u64 {
@@ -955,16 +1017,17 @@ impl Ticket {
         let staging = queue.join(format!(".{name}"));
         let path = queue.join(&name);
         let mut options = File::options();
-        options.write(true).create_new(true).mode(mode.map_or(0o644, |m| m.file));
+        options.write(true).create_new(true);
+        sys::with_mode(&mut options, mode.map_or(0o644, |m| m.file));
         let mut file = options.open(&staging)?;
         // Locked before it becomes visible, so nobody can mistake it for a dead ticket.
         let result = (|| {
-            file.lock()?;
+            sys::lock(&file, LockKind::Exclusive)?;
             if let Some(m) = mode {
-                let _ = file.set_permissions(Permissions::from_mode(m.file));
+                let _ = sys::set_file_mode(&file, m.file);
             }
             file.write_all(&serde_json::to_vec(info).map_err(io::Error::other)?)?;
-            fs::rename(&staging, &path)
+            sys::rename(&staging, &path)
         })();
         if let Err(err) = result {
             let _ = fs::remove_file(&staging);
@@ -981,7 +1044,7 @@ impl Ticket {
         self.info.joined = pid;
         if let Ok(json) = serde_json::to_vec(&self.info) {
             let _ = self.file.set_len(0);
-            let _ = self.file.write_all_at(&json, 0);
+            let _ = sys::write_all_at(&self.file, &json, 0);
         }
     }
 }
@@ -1044,7 +1107,7 @@ fn queue_position(dir: &Path, mine: Option<&str>, me: &TicketInfo, since_ns: u64
 
 /// `None` when the ticket is dead (and removed); inner `None` for tickets written by older frust versions.
 fn live_ticket(path: &Path, name: &str) -> Option<Option<TicketInfo>> {
-    let legacy_alive = || name.rsplit('-').next().and_then(ticket_pid).is_some_and(fsx::pid_alive);
+    let legacy_alive = || name.rsplit('-').next().and_then(ticket_pid).is_some_and(sys::pid_alive);
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
@@ -1054,7 +1117,7 @@ fn live_ticket(path: &Path, name: &str) -> Option<Option<TicketInfo>> {
     let mut text = Vec::new();
     let parsed = file.read_to_end(&mut text).ok().and_then(|_| serde_json::from_slice::<TicketInfo>(&text).ok());
     let alive = match &parsed {
-        Some(_) => match file.try_lock_shared() {
+        Some(_) => match sys::try_lock(&file, LockKind::Shared) {
             Ok(()) => false,
             Err(fs::TryLockError::WouldBlock) => true,
             Err(fs::TryLockError::Error(_)) => legacy_alive(),
@@ -1081,7 +1144,7 @@ fn prune_staging(path: &Path) {
         return;
     }
     if let Ok(file) = File::open(path)
-        && file.try_lock_shared().is_ok() {
+        && sys::try_lock(&file, LockKind::Shared).is_ok() {
             drop(file);
             let _ = fs::remove_file(path);
         }
@@ -1089,7 +1152,7 @@ fn prune_staging(path: &Path) {
 
 fn read_holder(dir: &Path) -> Option<Holder> {
     let holder: Holder = serde_json::from_slice(&fs::read(dir.join("owner.json")).ok()?).ok()?;
-    fsx::pid_alive(holder.owner.pid).then_some(holder)
+    sys::pid_alive(holder.owner.pid).then_some(holder)
 }
 
 fn read_progress(dir: &Path) -> Option<Progress> {
@@ -1103,7 +1166,7 @@ fn read_last(dir: &Path) -> Option<Finished> {
 /// Probed by briefly taking the lock; a waiter that loses that race simply retries on its next poll.
 fn lock_held(dir: &Path) -> Option<bool> {
     let file = File::open(dir.join("lock")).ok()?;
-    match file.try_lock_shared() {
+    match sys::try_lock(&file, LockKind::Shared) {
         Ok(()) => Some(false),
         Err(fs::TryLockError::WouldBlock) => Some(true),
         Err(fs::TryLockError::Error(_)) => None,
@@ -1118,7 +1181,7 @@ pub(crate) struct Mode {
 
 /// Used when several OS users share the root; `None` keeps the umask defaults.
 pub(crate) fn shared_mode(dirs: &Dirs) -> Option<Mode> {
-    let mode = fs::metadata(dirs.root()).ok()?.mode();
+    let mode = sys::stat(dirs.root()).ok()?.mode();
     if mode & 0o022 == 0 {
         return None;
     }
@@ -1135,31 +1198,34 @@ pub(crate) fn ensure_dir(path: &Path, mode: Option<Mode>) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         ensure_dir(parent, Some(mode))?;
     }
-    match fs::DirBuilder::new().mode(mode.dir).create(path) {
-        Ok(()) => {
-            let _ = fs::set_permissions(path, Permissions::from_mode(mode.dir));
-            Ok(())
-        }
+    match sys::create_dir_with_mode(path, mode.dir) {
+        Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(err) => Err(err),
     }
 }
 
 pub(crate) fn write_shared(path: &Path, contents: &[u8], mode: Option<Mode>) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent, mode)?;
-    }
     let tmp = fsx::temp_sibling(path);
     let result = (|| {
         let mut options = File::options();
-        options.write(true).create_new(true).mode(mode.map_or(0o666, |m| m.file));
-        let mut file = options.open(&tmp)?;
+        options.write(true).create_new(true);
+        sys::with_mode(&mut options, mode.map_or(0o666, |m| m.file));
+        let mut file = match options.open(&tmp) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    ensure_dir(parent, mode)?;
+                }
+                options.open(&tmp)?
+            }
+            other => other?,
+        };
         if let Some(m) = mode {
-            let _ = file.set_permissions(Permissions::from_mode(m.file));
+            let _ = sys::set_file_mode(&file, m.file);
         }
         file.write_all(contents)?;
         file.flush()?;
-        fs::rename(&tmp, path)
+        sys::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -1168,17 +1234,16 @@ pub(crate) fn write_shared(path: &Path, contents: &[u8], mode: Option<Mode>) -> 
 }
 
 /// A file another user created without group write is opened read-only, which is all `flock` needs.
-fn open_lock_file(path: &Path, mode: Option<Mode>) -> io::Result<File> {
+pub(crate) fn open_lock_file(path: &Path, mode: Option<Mode>) -> io::Result<File> {
     let mut options = File::options();
-    options.read(true).write(true).create(true).truncate(false).mode(mode.map_or(0o666, |m| m.file));
+    options.read(true).write(true).create(true).truncate(false);
+    sys::with_mode(&mut options, mode.map_or(0o666, |m| m.file));
     match options.open(path) {
         Ok(file) => {
-            if let Some(m) = mode {
-                // SAFETY: geteuid has no preconditions.
-                let mine = file.metadata().is_ok_and(|md| md.uid() == unsafe { libc::geteuid() });
-                if mine {
-                    let _ = file.set_permissions(Permissions::from_mode(m.file));
-                }
+            if let Some(m) = mode
+                && sys::owned_by_me(path)
+            {
+                let _ = sys::set_file_mode(&file, m.file);
             }
             Ok(file)
         }
@@ -1191,15 +1256,12 @@ static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
 
 struct WatchState {
     count: usize,
-    saved: Vec<(libc::c_int, libc::sigaction)>,
+    saved: Vec<signal::Saved>,
 }
-
-// SAFETY: `sigaction` is plain data (handler address, mask, flags).
-unsafe impl Send for WatchState {}
 
 static WATCH: Mutex<WatchState> = Mutex::new(WatchState { count: 0, saved: Vec::new() });
 
-extern "C" fn note_signal(signal: libc::c_int) {
+extern "C" fn note_signal(signal: signal::Signal) {
     INTERRUPTED.store(signal, Ordering::Relaxed);
 }
 
@@ -1211,20 +1273,12 @@ impl SignalWatch {
         let mut state = WATCH.lock().unwrap_or_else(|e| e.into_inner());
         if state.count == 0 {
             INTERRUPTED.store(0, Ordering::Relaxed);
-            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                // SAFETY: querying and installing dispositions with initialised structs.
-                unsafe {
-                    let mut old: libc::sigaction = std::mem::zeroed();
-                    if libc::sigaction(signal, std::ptr::null(), &mut old) != 0 || old.sa_sigaction == libc::SIG_IGN {
-                        continue;
-                    }
-                    let mut action: libc::sigaction = std::mem::zeroed();
-                    action.sa_sigaction = note_signal as *const () as usize;
-                    libc::sigemptyset(&mut action.sa_mask);
-                    action.sa_flags = libc::SA_RESTART;
-                    if libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 {
-                        state.saved.push((signal, old));
-                    }
+            for sig in [signal::SIGINT, signal::SIGTERM, signal::SIGHUP] {
+                if signal::disposition(sig) == signal::Disposition::Ignore {
+                    continue;
+                }
+                if let Some(old) = signal::install(sig, note_signal) {
+                    state.saved.push(old);
                 }
             }
         }
@@ -1243,9 +1297,8 @@ impl Drop for SignalWatch {
         let mut state = WATCH.lock().unwrap_or_else(|e| e.into_inner());
         state.count -= 1;
         if state.count == 0 {
-            for (signal, old) in state.saved.drain(..) {
-                // SAFETY: restoring a disposition previously returned by sigaction.
-                unsafe { libc::sigaction(signal, &old, std::ptr::null_mut()) };
+            for old in state.saved.drain(..) {
+                signal::restore(old);
             }
         }
     }
@@ -1728,6 +1781,7 @@ mod tests {
             saved_ms: 1,
             bytes: 1,
         });
+        holder.log.as_mut().unwrap().flush();
         let path = slot_dir_for(&dirs, &target, "debug@host").join(&holder.holder().log);
         let size = fs::metadata(&path).unwrap().len();
         assert!(size <= LOG_CAP + 4096, "log stays bounded: {size}");
@@ -1736,6 +1790,31 @@ mod tests {
         assert!(text.trim_end().ends_with("}}"), "cache events are still logged after the cap");
         drop(holder);
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn buffered_log_keeps_record_order_and_end_flushes_everything() {
+        let (_dirs, root) = temp_dirs("logbuf");
+        let queue = root.join("queue");
+        fs::create_dir_all(&queue).unwrap();
+        let mut log = LogWriter::create(&root, queue, "build-test.log", None).unwrap();
+        log.append(&Record::Start { json: true, complete: true });
+        let on_disk = || fs::read_to_string(root.join("build-test.log")).unwrap();
+        assert_eq!(on_disk().lines().count(), 1, "the start record is written at once");
+        for i in 0..50 {
+            log.append(&Record::Out { l: format!("line {i}") });
+        }
+        log.append(&Record::Err { l: "oops".into() });
+        log.end(0, false);
+        let text = on_disk();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 53);
+        for (i, line) in lines[1..51].iter().enumerate() {
+            assert_eq!(*line, format!("{{\"k\":\"out\",\"l\":\"line {i}\"}}"));
+        }
+        assert_eq!(lines[51], "{\"k\":\"err\",\"l\":\"oops\"}");
+        assert!(lines[52].contains("\"k\":\"end\""));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1784,32 +1863,30 @@ mod tests {
         let err = acquire(&dirs, &target, req("waiter", ""), &mut |e| {
             if matches!(e, LockEvent::Waiting(_)) && !raised {
                 raised = true;
-                // SAFETY: raising a signal whose handler only stores an atomic.
-                unsafe { libc::raise(libc::SIGTERM) };
+                signal::raise(signal::SIGTERM);
             }
         })
         .unwrap_err();
-        assert!(matches!(err, LockError::Interrupted(libc::SIGTERM)), "{err}");
-        assert_eq!(err.exit_code(), 128 + libc::SIGTERM);
+        assert!(matches!(err, LockError::Interrupted(s) if s == signal::SIGTERM), "{err}");
+        assert_eq!(err.exit_code(), 128 + signal::SIGTERM);
         assert_eq!(queue_len(&dirs, &target), 0);
         // The default disposition is back once nobody is queued.
-        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
-        unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut current) };
-        assert_eq!(current.sa_sigaction, libc::SIG_DFL);
+        assert_eq!(signal::disposition(signal::SIGTERM), signal::Disposition::Default);
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_root_gets_group_writable_state() {
         let _serial = serial();
         let (dirs, root) = temp_dirs("shared");
-        fs::set_permissions(&root, Permissions::from_mode(0o775)).unwrap();
+        sys::set_path_mode(&root, 0o775).unwrap();
         let target = root.join("target");
         let guard = take(&dirs, &target, req("cargo build", ""));
         let dir = lock_dir(&dirs, &target);
         let slot = dir.join("slots").join(ALL);
         // The setgid bit is dropped by the kernel when we are not in the directory's group.
-        let mode = |p: &Path| fs::metadata(p).unwrap().mode() & 0o777;
+        let mode = |p: &Path| sys::stat(p).unwrap().mode() & 0o777;
         assert_eq!(mode(&dirs.locks()), 0o775);
         assert_eq!(mode(&dir.join("queue")), 0o775);
         assert_eq!(mode(&dir.join("lock")), 0o664);

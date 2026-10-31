@@ -21,6 +21,8 @@ fn eager() -> AutoOptions {
     opts.uncached_dead_grace = Duration::ZERO;
     opts.dead_incremental_grace = Duration::ZERO;
     opts.max_target_bytes = u64::MAX;
+    opts.pass_budget = Duration::from_secs(3600);
+    opts.pass_bytes = u64::MAX;
     opts
 }
 

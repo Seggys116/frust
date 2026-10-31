@@ -4,7 +4,6 @@ mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -62,8 +61,8 @@ impl Scene {
             .env("FRUST_RENDER", render)
             .env("FRUST_TEST_STARTED", &self.started)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        common::own_group(&mut cmd);
         // The build script reads this variable but cargo does not track it, so omitting it only stops the wait.
         if gated {
             cmd.env("FRUST_TEST_GATE", &self.gate);
@@ -160,14 +159,12 @@ impl Running {
         self.child.try_wait().unwrap().is_none()
     }
 
-    fn signal(&self, signal: i32) {
-        // SAFETY: signalling only the fcargo process we spawned.
-        unsafe { libc::kill(self.pid() as i32, signal) };
+    fn interrupt(&self) {
+        common::interrupt(&self.child);
     }
 
-    fn signal_group(&self, signal: i32) {
-        // SAFETY: signalling the process group we created for this child.
-        unsafe { libc::kill(-(self.pid() as i32), signal) };
+    fn kill_group(&self) {
+        common::kill_tree(self.pid());
     }
 
     fn into_done(mut self, status: ExitStatus, at: Instant) -> Done {
@@ -187,7 +184,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            self.signal_group(libc::SIGKILL);
+            self.kill_group();
             let _ = self.child.wait();
         }
     }
@@ -315,7 +312,7 @@ fn killing_the_holder_lets_the_joiner_finish_the_build() {
     let joiner = scene.build("plain");
     joiner.wait_stderr("the joiner to follow", |e| e.contains("joined    running build of") && e.contains("compiled  early"));
 
-    holder.signal_group(libc::SIGKILL);
+    holder.kill_group();
     let killed = holder.finish();
     assert!(!killed.status.success());
     joiner.wait_stderr("the takeover", |e| e.contains("takeover  build of") && e.contains("building here"));
@@ -386,9 +383,9 @@ fn interrupting_a_joiner_leaves_the_holder_alone() {
     joiner.wait_stderr("the joiner to follow", |e| e.contains("joined    running build of"));
     assert_eq!(scene.tickets().len(), 1);
 
-    joiner.signal(libc::SIGINT);
+    joiner.interrupt();
     let stopped = joiner.finish();
-    assert_eq!(stopped.status.code(), Some(128 + libc::SIGINT), "{}", stopped.stderr);
+    assert_eq!(stopped.status.code(), Some(130), "{}", stopped.stderr);
     assert!(stopped.stderr.contains("interrupted"), "{}", stopped.stderr);
     assert!(scene.tickets().is_empty(), "ticket withdrawn: {:?}", scene.tickets());
     assert!(holder.running(), "the holder carries on");

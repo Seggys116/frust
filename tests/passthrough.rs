@@ -87,7 +87,7 @@ fn frustc_compiles_standalone_files() {
     let sb = Sandbox::new("frustc");
     let src = sb.root.join("hello.rs");
     std::fs::write(&src, "fn main() { println!(\"hi\"); }\n").unwrap();
-    let exe = sb.root.join("hello");
+    let exe = sb.root.join(common::exe("hello"));
     assert_success(&sb.bin("frustc").arg(&src).arg("-o").arg(&exe).output().unwrap());
     let out = std::process::Command::new(&exe).output().unwrap();
     assert_eq!(stdout(&out).trim(), "hi");

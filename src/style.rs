@@ -10,8 +10,7 @@ impl Styler {
         let disabled = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
             || std::env::var("TERM").is_ok_and(|t| t == "dumb");
         let forced = std::env::var("CLICOLOR_FORCE").is_ok_and(|v| !v.is_empty() && v != "0");
-        // SAFETY: isatty only inspects the descriptor.
-        let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+        let tty = crate::sys::ansi_terminal(crate::sys::StdStream::Stdout);
         Styler { on: !disabled && (forced || tty) }
     }
 

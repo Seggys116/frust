@@ -1,15 +1,14 @@
 //! Filesystem helpers: copy-on-write clones, atomic writes, sizes and disk guards.
 //! Artifacts are cloned or copied, never hard-linked: rustc and linkers may rewrite a file in place and would corrupt the cache.
 
-use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::sys::{self, signal};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,7 +53,7 @@ struct TempGuard(Option<usize>);
 
 impl TempGuard {
     fn new(path: &Path) -> TempGuard {
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.len() >= PATH_CAP || bytes.contains(&0) {
             return TempGuard(None);
         }
@@ -81,34 +80,22 @@ impl Drop for TempGuard {
     }
 }
 
-extern "C" fn clean_temps_and_reraise(signal: libc::c_int) {
+extern "C" fn clean_temps_and_reraise(sig: signal::Signal) {
     for slot in &TEMPS {
         if slot.state.compare_exchange(ARMED, HANDLER, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             // SAFETY: the handler owns the slot; the buffer holds a NUL-terminated path.
-            unsafe { libc::unlink((*slot.path.get()).as_ptr().cast()) };
+            unsafe { signal::unlink_from_handler(&*slot.path.get()) };
         }
     }
-    // SAFETY: restore the default action and re-raise, so the process ends as it would have without the handler.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = libc::SIG_DFL;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(signal, &action, std::ptr::null_mut());
-        libc::raise(signal);
-    }
+    // Restore the default action and re-raise, so the process ends as it would have without the handler.
+    signal::set_default(sig);
+    signal::raise(sig);
 }
 
 /// Handlers are reset across `exec`, so a passed-through compiler is unaffected.
 pub fn install_temp_cleanup() {
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: installing a plain handler through sigaction with an initialised struct.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = clean_temps_and_reraise as extern "C" fn(libc::c_int) as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigaction(signal, &action, std::ptr::null_mut());
-        }
+    for sig in [signal::SIGINT, signal::SIGTERM, signal::SIGHUP] {
+        let _ = signal::install(sig, clean_temps_and_reraise);
     }
 }
 
@@ -119,50 +106,10 @@ pub fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}{TEMP_MARKER}{}-{n}-{nanos}", std::process::id()))
 }
 
-fn cstr(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
-}
-
-#[cfg(target_os = "macos")]
-fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
-    let (s, d) = (cstr(src)?, cstr(dst)?);
-    // SAFETY: both pointers are valid NUL-terminated strings for the call duration.
-    let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
-    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-}
-
-#[cfg(target_os = "linux")]
-fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    if fs::symlink_metadata(src)?.is_dir() {
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
-    }
-    let input = File::open(src)?;
-    let output = File::options().write(true).create_new(true).open(dst)?;
-    const FICLONE: libc::c_ulong = 0x4004_9409;
-    // SAFETY: both descriptors are open for the duration of the call.
-    let rc = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) };
-    if rc == 0 {
-        let _ = output.set_permissions(input.metadata()?.permissions());
-        Ok(())
-    } else {
-        let err = io::Error::last_os_error();
-        drop(output);
-        let _ = fs::remove_file(dst);
-        Err(err)
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn try_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}
-
 pub fn clone_replace(src: &Path, dst: &Path) -> io::Result<()> {
     let tmp = temp_sibling(dst);
     let _guard = TempGuard::new(&tmp);
-    let built = match try_reflink(src, &tmp) {
+    let built = match sys::reflink(src, &tmp) {
         Ok(()) => Ok(()),
         Err(_) => {
             let _ = remove_any(&tmp);
@@ -178,14 +125,14 @@ pub fn clone_replace(src: &Path, dst: &Path) -> io::Result<()> {
     {
         fs::remove_dir_all(dst)?;
     }
-    fs::rename(&tmp, dst).inspect_err(|_| {
+    sys::rename(&tmp, dst).inspect_err(|_| {
         let _ = remove_any(&tmp);
     })
 }
 
 /// For paths nobody else can see yet (a private staging directory), so no temp name and rename per file.
 pub fn clone_new(src: &Path, dst: &Path) -> io::Result<()> {
-    if try_reflink(src, dst).is_ok() {
+    if sys::reflink(src, dst).is_ok() {
         return Ok(());
     }
     let _ = remove_any(dst);
@@ -200,7 +147,7 @@ pub fn reflink_supported(dir: &Path) -> bool {
     }
     let source = temp_sibling(&dir.join("probe"));
     let clone = temp_sibling(&dir.join("probe-clone"));
-    let supported = fs::write(&source, b"frust reflink probe").is_ok() && try_reflink(&source, &clone).is_ok();
+    let supported = fs::write(&source, b"frust reflink probe").is_ok() && sys::reflink(&source, &clone).is_ok();
     let _ = fs::remove_file(&source);
     let _ = fs::remove_file(&clone);
     supported
@@ -217,7 +164,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         fs::set_permissions(dst, meta.permissions())?;
         Ok(())
     } else if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+        sys::copy_symlink(src, dst)
     } else {
         fs::copy(src, dst).map(|_| ())
     }
@@ -233,16 +180,23 @@ pub fn remove_any(path: &Path) -> io::Result<()> {
 }
 
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let tmp = temp_sibling(path);
     let _guard = TempGuard::new(&tmp);
     let result = (|| {
-        let mut file = File::create(&tmp)?;
+        // The parent exists almost always, so it is created only after the first attempt finds it missing.
+        let mut file = match File::create(&tmp) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => match path.parent() {
+                Some(parent) => {
+                    fs::create_dir_all(parent)?;
+                    File::create(&tmp)?
+                }
+                None => return Err(err),
+            },
+            other => other?,
+        };
         file.write_all(contents)?;
         file.flush()?;
-        fs::rename(&tmp, path)
+        sys::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -250,17 +204,16 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Sets the modification (and access) time of a file or directory to now with one syscall; failures are ignored.
 pub fn touch(path: &Path) {
-    if let Ok(file) = File::options().write(true).open(path) {
-        let _ = file.set_modified(SystemTime::now());
-    }
+    let _ = sys::set_mtime_now(path);
 }
 
 pub fn allocated_size(path: &Path) -> u64 {
     fn walk(path: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
-        let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+        let Ok(meta) = sys::lstat(path) else { return 0 };
         if meta.is_dir() {
-            let mut total = meta.blocks() * 512;
+            let mut total = meta.allocated();
             if let Ok(entries) = fs::read_dir(path) {
                 for entry in entries.flatten() {
                     total += walk(&entry.path(), seen);
@@ -270,7 +223,7 @@ pub fn allocated_size(path: &Path) -> u64 {
         } else if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
             0
         } else {
-            meta.blocks() * 512
+            meta.allocated()
         }
     }
     walk(path, &mut std::collections::HashSet::new())
@@ -288,9 +241,9 @@ fn physical_walk(
     extents: &mut std::collections::HashSet<(u64, u64)>,
     inodes: &mut std::collections::HashSet<(u64, u64)>,
 ) -> u64 {
-    let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+    let Ok(meta) = sys::lstat(path) else { return 0 };
     if meta.is_dir() {
-        let mut total = meta.blocks() * 512;
+        let mut total = meta.allocated();
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
                 total += physical_walk(&entry.path(), extents, inodes);
@@ -304,26 +257,11 @@ fn physical_walk(
     if !inodes.insert((meta.dev(), meta.ino())) {
         return 0;
     }
-    let bytes = meta.blocks() * 512;
-    match first_extent(path) {
+    let bytes = meta.allocated();
+    match sys::first_extent(path) {
         Some(offset) if !extents.insert((offset, meta.len())) => 0,
         _ => bytes,
     }
-}
-
-#[cfg(target_os = "macos")]
-fn first_extent(path: &Path) -> Option<u64> {
-    use std::os::fd::AsRawFd;
-    let file = File::open(path).ok()?;
-    let mut info = libc::log2phys { l2p_flags: 0, l2p_contigbytes: 1, l2p_devoffset: 0 };
-    // SAFETY: `info` is a valid log2phys struct and the descriptor is open.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_LOG2PHYS_EXT, &mut info) };
-    (rc == 0 && info.l2p_devoffset > 0).then_some(info.l2p_devoffset as u64)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn first_extent(_path: &Path) -> Option<u64> {
-    None
 }
 
 pub fn free_space(path: &Path) -> io::Result<u64> {
@@ -331,14 +269,7 @@ pub fn free_space(path: &Path) -> io::Result<u64> {
     while !probe.exists() {
         probe = probe.parent().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
     }
-    let c = cstr(probe)?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid C string and `stat` is a valid out pointer.
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    sys::free_space(probe)
 }
 
 pub fn require_free_space(path: &Path, min_free: u64) -> Result<(), String> {
@@ -369,8 +300,55 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn pid_alive(pid: u32) -> bool {
-    // SAFETY: kill with signal 0 only checks for existence.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("frust-fsx-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomic_creates_missing_parents_only_when_needed_and_replaces_contents() {
+        let dir = scratch("atomic");
+        let nested = dir.join("a").join("b").join("file");
+        write_atomic(&nested, b"one").unwrap();
+        assert_eq!(fs::read(&nested).unwrap(), b"one");
+        write_atomic(&nested, b"two").unwrap();
+        assert_eq!(fs::read(&nested).unwrap(), b"two");
+        let leftovers: Vec<_> = fs::read_dir(nested.parent().unwrap()).unwrap().flatten().collect();
+        assert_eq!(leftovers.len(), 1, "no temp file is left beside the target");
+        let blocked = dir.join("a").join("b").join("file").join("child");
+        assert!(write_atomic(&blocked, b"x").is_err(), "a file in the way of the parent is an error");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_moves_modification_time_to_now_for_files_and_directories() {
+        let dir = scratch("touch");
+        let file = dir.join("f");
+        fs::write(&file, b"x").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let mut targets = vec![file.clone()];
+        // Windows cannot open a directory for writing through std, so only unix can age one here.
+        if cfg!(unix) {
+            File::open(&sub).unwrap().set_modified(old).unwrap();
+            targets.push(sub);
+        }
+        for path in &targets {
+            touch(path);
+            let age = fs::metadata(path).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+            assert!(age < Duration::from_secs(600), "{}", path.display());
+        }
+        touch(&dir.join("absent"));
+        assert!(!dir.join("absent").exists(), "touching a missing path creates nothing");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
