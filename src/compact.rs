@@ -1893,19 +1893,33 @@ impl AutoOptions {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AutoMarker {
     allocated_after: u64,
+    /// Time of the last actual pass; cheap skips only refresh the marker's mtime.
+    #[serde(default)]
     at_unix: u64,
     #[serde(default)]
     store_entries: u64,
     /// Zero when unknown; otherwise the change signature of the state this marker describes.
     #[serde(default)]
     signature: u64,
-    /// False after a pass that stopped on its budget, so the next due pass continues instead of being skipped.
+    /// False after a partial or failed pass, so the next due pass retries instead of being skipped.
     #[serde(default = "complete_by_default")]
     complete: bool,
 }
 
+impl AutoMarker {
+    fn age_reassessment_due(&self, now: u64) -> bool {
+        self.at_unix == 0 || now.checked_sub(self.at_unix).is_none_or(|age| age >= AUTO_REASSESS_EVERY.as_secs())
+    }
+}
+
+const AUTO_REASSESS_EVERY: Duration = Duration::from_secs(3600);
+
 fn complete_by_default() -> bool {
     true
+}
+
+fn auto_pass_complete(report: &Report) -> bool {
+    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty()
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
@@ -2031,10 +2045,12 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     }
     let options_key = format!("{opts:?}");
     let signature = change_signature(dirs, target, &options_key);
+    let reassess_age = previous.as_ref().is_none_or(|prev| prev.age_reassessment_due(fsx::unix_now()));
     // Mirrors the growth check below without walking the target: an unchanged tree cannot have grown.
     if let (Some(prev), Some(sig)) = (&previous, signature)
         && opts.min_growth > 0
         && prev.complete
+        && !reassess_age
         && prev.signature == sig
         && prev.allocated_after <= opts.max_target_bytes
     {
@@ -2049,6 +2065,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     report.allocated_before = allocated(target);
     if let Some(prev) = &previous
         && prev.complete
+        && !reassess_age
         && report.allocated_before < prev.allocated_after.saturating_add(opts.min_growth)
         && report.allocated_before <= opts.max_target_bytes
     {
@@ -2062,6 +2079,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
             record.store_entries = store_entries(dirs);
         }
         record.signature = change_signature(dirs, target, &options_key).unwrap_or(0);
+        record.complete = auto_pass_complete(&report);
         write_marker(&file, &record);
         let _ = file.set_modified(SystemTime::now());
         report.skipped = Some("grew too little since the last pass");
@@ -2256,7 +2274,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         at_unix: fsx::unix_now(),
         store_entries: store_entries(dirs),
         signature: signature.unwrap_or(0),
-        complete: !report.budget_stopped,
+        complete: auto_pass_complete(&report),
     };
     write_marker(&file, &record);
     let _ = file.set_modified(SystemTime::now());
@@ -3051,6 +3069,32 @@ mod tests {
         let marker: AutoMarker = serde_json::from_str("{\"allocated_after\":5,\"at_unix\":7}").unwrap();
         assert!(marker.complete);
         assert_eq!((marker.signature, marker.store_entries), (0, 0));
+    }
+
+    #[test]
+    fn marker_age_reassessment_uses_the_last_actual_pass() {
+        let marker = AutoMarker { at_unix: 10_000, ..AutoMarker::default() };
+        assert!(!marker.age_reassessment_due(10_000));
+        assert!(!marker.age_reassessment_due(13_599));
+        assert!(marker.age_reassessment_due(13_600));
+        assert!(marker.age_reassessment_due(9_999), "a backwards clock forces reassessment");
+        let unknown: AutoMarker = serde_json::from_str("{\"allocated_after\":5}").unwrap();
+        assert!(unknown.age_reassessment_due(10_000), "a missing timestamp forces reassessment");
+        assert!(unknown.age_reassessment_due(0), "zero never represents a known pass time");
+    }
+
+    #[test]
+    fn incomplete_auto_passes_are_retried() {
+        let mut report = Report::default();
+        assert!(auto_pass_complete(&report));
+        report.budget_stopped = true;
+        assert!(!auto_pass_complete(&report));
+        report.budget_stopped = false;
+        report.busy.push(PathBuf::from("debug"));
+        assert!(!auto_pass_complete(&report));
+        report.busy.clear();
+        report.errors.push((PathBuf::from("artifact"), "cannot remove".into()));
+        assert!(!auto_pass_complete(&report));
     }
 
     #[test]

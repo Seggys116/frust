@@ -93,7 +93,7 @@ fn print_help() {
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
         ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
-        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N]"),
+        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--linking]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
         ("tool", "run any toolchain tool unchanged: frust tool rustfmt --version"),
@@ -102,7 +102,7 @@ fn print_help() {
         println!("  {:<9} {}", s.cyan(name), text);
     }
     println!("\nAnything else is passed to cargo untouched, including +toolchain and future subcommands.");
-    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_GIB FRUST_UPDATE_CHECK");
+    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_LINK FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_GIB FRUST_UPDATE_CHECK");
 }
 
 fn flag_value(flags: &[String], name: &str) -> Option<String> {

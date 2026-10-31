@@ -2,6 +2,8 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -12,6 +14,145 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::{LockKind, StdStream};
 
 pub type Owned = std::os::fd::OwnedFd;
+
+#[cfg(target_os = "linux")]
+pub struct DirectoryWatcher {
+    file: File,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectoryWatcher {
+    pub fn new(paths: &[&Path]) -> io::Result<DirectoryWatcher> {
+        // SAFETY: inotify_init1 has no pointer arguments and returns a new descriptor on success.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: this is the newly created descriptor, now owned only by `file`.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO
+            | libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
+        for path in paths {
+            let path = cstr(path)?;
+            // SAFETY: the descriptor is open and `path` is a valid NUL-terminated path.
+            if unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(DirectoryWatcher { file })
+    }
+
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<bool> {
+        let mut fd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let millis = timeout.as_millis().saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0));
+        // SAFETY: `fd` is one live pollfd and the timeout is clamped to poll's range.
+        let rc = unsafe { libc::poll(&mut fd, 1, millis.min(libc::c_int::MAX as u128) as libc::c_int) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("directory watcher is unavailable"));
+        }
+        // Overflow is a wakeup hint; bounded draining keeps signal checks responsive.
+        let mut buf = [0u8; 8192];
+        for _ in 0..16 {
+            match self.file.read(&mut buf) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub struct DirectoryWatcher {
+    queue: Owned,
+    _directories: Vec<File>,
+}
+
+#[cfg(target_os = "macos")]
+impl DirectoryWatcher {
+    pub fn new(paths: &[&Path]) -> io::Result<DirectoryWatcher> {
+        // SAFETY: kqueue has no arguments and returns a new descriptor on success.
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: this descriptor was just created and has no other owner.
+        let queue = unsafe { Owned::from_raw_fd(fd) };
+        // SAFETY: fcntl sets descriptor flags on the open kqueue descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut directories = Vec::with_capacity(paths.len());
+        for path in paths {
+            let file = File::open(path)?;
+            let change = libc::kevent {
+                ident: file.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_ATTRIB | libc::NOTE_REVOKE,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: `change` is initialized, both descriptors are open, and no output buffer is requested.
+            if unsafe { libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            directories.push(file);
+        }
+        Ok(DirectoryWatcher { queue, _directories: directories })
+    }
+
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<bool> {
+        // SAFETY: kevent is plain data and zero initializes valid output buffers.
+        let mut events: [libc::kevent; 32] = unsafe { std::mem::zeroed() };
+        let mut timeout = libc::timespec {
+            tv_sec: timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as _,
+        };
+        let mut changed = false;
+        for _ in 0..16 {
+            // SAFETY: the kqueue is open, events is a writable array, and timeout is initialized.
+            let rc = unsafe {
+                libc::kevent(self.queue.as_raw_fd(), std::ptr::null(), 0, events.as_mut_ptr(), events.len() as _, &timeout)
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if events[..rc as usize].iter().any(|event| event.flags & libc::EV_ERROR != 0) {
+                return Err(io::Error::other("directory watcher is unavailable"));
+            }
+            if rc == 0 {
+                break;
+            }
+            changed = true;
+            // EV_CLEAR coalesces changes per directory; drain other ready directories without waiting again.
+            timeout = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        }
+        Ok(changed)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub struct DirectoryWatcher;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl DirectoryWatcher {
+    pub fn new(_paths: &[&Path]) -> io::Result<DirectoryWatcher> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub fn wait(&mut self, _timeout: Duration) -> io::Result<bool> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
 
 pub const HOME_VARS: &[&str] = &["HOME"];
 pub const SYSROOT_DYLIB_DIR: &str = "lib";
@@ -461,6 +602,48 @@ mod tests {
         dir
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn directory_watcher_keeps_pending_changes_and_drains_them() {
+        let dir = scratch("watch-pending");
+        let mut watcher = DirectoryWatcher::new(&[&dir]).unwrap();
+        fs::write(dir.join("first"), b"one").unwrap();
+        fs::write(dir.join("second"), b"two").unwrap();
+        assert!(watcher.wait(Duration::ZERO).unwrap(), "a change before waiting must stay pending");
+        assert!(!watcher.wait(Duration::ZERO).unwrap(), "one wait coalesces the pending changes");
+        drop(watcher);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn directory_watcher_times_out_without_changes() {
+        let dir = scratch("watch-timeout");
+        let mut watcher = DirectoryWatcher::new(&[&dir]).unwrap();
+        let timeout = Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        assert!(!watcher.wait(timeout).unwrap());
+        assert!(started.elapsed() >= timeout);
+        drop(watcher);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn directory_watcher_wakes_when_another_thread_changes_the_directory() {
+        let dir = scratch("watch-wakeup");
+        let mut watcher = DirectoryWatcher::new(&[&dir]).unwrap();
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            fs::write(writer_dir.join("changed"), b"ready").unwrap();
+        });
+        assert!(watcher.wait(Duration::from_secs(2)).unwrap(), "a change must wake the blocked wait");
+        writer.join().unwrap();
+        drop(watcher);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
@@ -679,12 +862,10 @@ mod tests {
     }
 }
 
-// wrapper
 pub fn inheritable_clear_of_stdio(files: &[&File]) -> bool {
     files.iter().all(|f| f.as_raw_fd() > 2)
 }
 
-// compact and hashing
 #[cfg(target_os = "macos")]
 pub fn lower_thread_priority() {
     const QOS_CLASS_BACKGROUND: u32 = 0x09;
@@ -743,13 +924,11 @@ pub fn fs_type_name(path: &Path) -> Option<String> {
     Some(linux_fs_name(st.f_type as u64 & 0xFFFF_FFFF))
 }
 
-// Any other platform cannot say what it is looking at, so nothing there is trusted.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn fs_type_name(_path: &Path) -> Option<String> {
     None
 }
 
-/// Maps a statfs magic number to a lowercase filesystem name; unfamiliar magics keep a neutral name.
 #[cfg(target_os = "linux")]
 fn linux_fs_name(magic: u64) -> String {
     let name = match magic {

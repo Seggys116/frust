@@ -51,6 +51,11 @@ const ENV_AFFECTS_OUTPUT: &[&str] = &[
     "XROS_DEPLOYMENT_TARGET",
     "SDKROOT",
     "DEVELOPER_DIR",
+    "COMPILER_PATH",
+    "GCC_EXEC_PREFIX",
+    "CCC_OVERRIDE_OPTIONS",
+    "TOOLCHAINS",
+    "LDFLAGS",
     "LIBRARY_PATH",
     "ZERO_AR_DATE",
 ];
@@ -71,6 +76,7 @@ pub fn run(args: Vec<OsString>) -> i32 {
     }
     let started = Instant::now();
     let cfg = Config::from_env();
+    let args = crate::linking::prepare(&args, cfg.debug).unwrap_or(args);
     if cfg.cache
         && let Some(plan) = Plan::build(&cfg, &args)
     {
@@ -505,9 +511,9 @@ impl Plan {
         preexisting: &HashMap<String, Stamp>,
         key_lock: Option<&File>,
     ) -> io::Result<bool> {
-        let Some(frozen) = self.freeze(captured, preexisting) else { return Ok(false) };
         let deferred = self.dirs.deferred();
         let Some((slot, slot_path)) = acquire_slot(&deferred, slot_count()) else { return Ok(false) };
+        let Some(frozen) = self.freeze(captured, preexisting) else { return Ok(false) };
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
         let mut keep: Vec<&File> = vec![&slot];
         keep.extend(key_lock);
@@ -885,7 +891,16 @@ fn parallel<T: Sync, R: Send>(items: &[T], job: impl Fn(usize, &T) -> io::Result
     const PER_THREAD: usize = 8;
     const MAX_THREADS: usize = 4;
     let threads = items.len().div_ceil(PER_THREAD).clamp(1, MAX_THREADS);
-    if threads == 1 {
+    parallel_with_threads(items, threads, job)
+}
+
+fn parallel_with_threads<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    job: impl Fn(usize, &T) -> io::Result<R> + Sync,
+) -> io::Result<Vec<R>> {
+    let threads = threads.min(items.len());
+    if threads <= 1 {
         return items.iter().enumerate().map(|(i, item)| job(i, item)).collect();
     }
     let chunk = items.len().div_ceil(threads);
@@ -1447,14 +1462,56 @@ struct KeyContext<'a> {
     profile_abs: &'a Path,
 }
 
+fn extern_hash_threads(inputs: usize, cpus: usize) -> usize {
+    // Up to eight externs stay inline to avoid thread startup for small units; leave half the CPUs for cargo's other jobs.
+    inputs.div_ceil(8).clamp(1, 4).min((cpus / 2).clamp(1, 4))
+}
+
 impl KeyContext<'_> {
     fn prekey(&self, tool: &OsString, rest: &[OsString], parsed: &RustcArgs) -> Result<PreKey, String> {
+        let inputs = parsed.paths.iter().filter(|(_, path)| matches!(path, PathArg::Extern { .. })).count();
+        let threads = extern_hash_threads(inputs, thread::available_parallelism().map_or(1, |n| n.get()));
+        self.prekey_with_threads(tool, rest, parsed, threads)
+    }
+
+    fn prekey_with_threads(
+        &self,
+        tool: &OsString,
+        rest: &[OsString],
+        parsed: &RustcArgs,
+        threads: usize,
+    ) -> Result<PreKey, String> {
         let mut watched = Vec::new();
         let mut extern_hashes = HashMap::new();
+        let mut tools = Vec::new();
         let mut hasher = Both(blake3::Hasher::new(), blake3::Hasher::new());
         hasher.update(b"frust-prekey-v2\0");
         hasher.update(toolchain_id(tool, self.cwd).ok_or("cannot identify the compiler")?.as_bytes());
         hasher.update(self.cwd.to_string_lossy().as_bytes());
+
+        let mut externs = if threads > 1 {
+            let paths: Vec<_> = rest
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !parsed.out_dir_args.contains(i) && !parsed.incremental_args.contains(i))
+                .filter_map(|(i, _)| {
+                    parsed.paths.iter().find_map(|(idx, arg)| match arg {
+                        PathArg::Extern { path, .. } if *idx == i => Some(self.cwd.join(path)),
+                        _ => None,
+                    })
+                })
+                .collect();
+            // Keep errors with their argument so an earlier native input failure still takes precedence.
+            Some(
+                parallel_with_threads(&paths, threads, |_, path| {
+                    Ok(self.hasher.hash(path, path.starts_with(self.profile_abs)))
+                })
+                .map_err(|e| format!("cannot hash --extern inputs: {e}"))?
+                .into_iter(),
+            )
+        } else {
+            None
+        };
 
         let mut native_dirs = Vec::new();
         // Incremental outputs are not byte-identical with non-incremental ones (different codegen unit split), so they never share entries.
@@ -1471,10 +1528,11 @@ impl KeyContext<'_> {
             if let Some(PathArg::Extern { name, path }) = specials.iter().find(|p| matches!(p, PathArg::Extern { .. }))
             {
                 let path = self.cwd.join(path);
-                let hashed = self
-                    .hasher
-                    .hash(&path, path.starts_with(self.profile_abs))
-                    .map_err(|e| format!("cannot read --extern {}: {e}", path.display()))?;
+                let hashed = match &mut externs {
+                    Some(externs) => externs.next().expect("one hash per extern argument"),
+                    None => self.hasher.hash(&path, path.starts_with(self.profile_abs)),
+                }
+                .map_err(|e| format!("cannot read --extern {}: {e}", path.display()))?;
                 hasher.update(name.as_bytes());
                 hasher.content(hashed.hash.as_bytes());
                 hasher.unit_only(path.to_string_lossy().replace(self.profile, PROFILE_TOKEN).as_bytes());
@@ -1484,10 +1542,29 @@ impl KeyContext<'_> {
                 watched.push((path, hashed.stamp));
                 continue;
             }
-            hasher.update(text.replace(self.profile, PROFILE_TOKEN).as_bytes());
+            if specials.iter().any(|path| matches!(path, PathArg::Tool(_))) {
+                hasher.update(text.as_bytes());
+            } else {
+                hasher.update(text.replace(self.profile, PROFILE_TOKEN).as_bytes());
+            }
             for special in specials {
                 match special {
                     PathArg::Extern { .. } => {}
+                    PathArg::Tool(program) => {
+                        let path = self.linker_tool(program)?;
+                        let hashed = self
+                            .hasher
+                            .hash(&path, true)
+                            .map_err(|e| format!("cannot read linker {}: {e}", path.display()))?;
+                        if !hashed.stable {
+                            return Err(format!("linker {} changed while being hashed", path.display()));
+                        }
+                        hasher.update(b"\0tool");
+                        hasher.update(path.as_os_str().as_encoded_bytes());
+                        hasher.content(hashed.hash.as_bytes());
+                        tools.push(path.clone());
+                        watched.push((path, hashed.stamp));
+                    }
                     PathArg::NativeDir(dir) => {
                         let dir = self.cwd.join(dir);
                         hasher.update(b"\0d");
@@ -1513,6 +1590,10 @@ impl KeyContext<'_> {
                     }
                 }
             }
+        }
+
+        for path in tools {
+            extern_hashes.remove(&path);
         }
 
         // A bundled static library outside every -L directory comes from a system location the key does not cover.
@@ -1544,6 +1625,18 @@ impl KeyContext<'_> {
         let hashed = self.hasher.hash(path, false).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         watched.push((path.to_path_buf(), hashed.stamp));
         Ok(hashed.hash)
+    }
+
+    fn linker_tool(&self, program: &Path) -> Result<PathBuf, String> {
+        if program.is_absolute() || program.parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+            return Ok(self.cwd.join(program));
+        }
+        program
+            .to_str()
+            .filter(|name| !name.is_empty())
+            .and_then(crate::toolchain::find_on_path)
+            .map(|path| self.cwd.join(path))
+            .ok_or_else(|| format!("cannot resolve linker {} on PATH", program.display()))
     }
 
     fn dir_hash(&self, dir: &Path, watched: &mut Vec<(PathBuf, Stamp)>) -> Result<String, String> {
@@ -1608,6 +1701,10 @@ mod tests {
     }
 
     fn key(cwd: &Path, extra: &[&str]) -> Result<String, String> {
+        keyed(cwd, extra).map(|p| p.key)
+    }
+
+    fn keyed(cwd: &Path, extra: &[&str]) -> Result<PreKey, String> {
         let out_dir = cwd.join("target").join("debug").join("deps");
         let mut args: Vec<OsString> =
             ["--crate-name", "k", "--emit=dep-info,link", "--out-dir"].iter().map(OsString::from).collect();
@@ -1617,7 +1714,81 @@ mod tests {
         let profile = rustc_args::profile_root(&out_dir).to_string_lossy().into_owned();
         let hasher = Hasher::ephemeral();
         let ctx = KeyContext { hasher: &hasher, cwd, profile: &profile, profile_abs: Path::new(&profile) };
-        ctx.prekey(&OsString::from("rustc"), &args, &parsed).map(|p| p.key)
+        ctx.prekey(&OsString::from("rustc"), &args, &parsed)
+    }
+
+    #[test]
+    fn explicit_linker_bytes_change_the_key_but_keep_the_unit_in_every_spelling() {
+        let s = Scratch::new("linker-content");
+        let driver = s.0.join("target").join("debug").join("driver");
+        fs::write(&driver, b"driver one").unwrap();
+        let option = format!("linker={}", driver.display());
+        let short = format!("-C{option}");
+        let long = format!("--codegen={option}");
+        let spellings = [
+            vec!["-C", option.as_str()],
+            vec![short.as_str()],
+            vec!["--codegen", option.as_str()],
+            vec![long.as_str()],
+        ];
+        let before: Vec<_> = spellings.iter().map(|flags| keyed(&s.0, flags).unwrap()).collect();
+        fs::write(&driver, b"driver two").unwrap();
+        for (flags, before) in spellings.iter().zip(&before) {
+            let after = keyed(&s.0, flags).unwrap();
+            assert_ne!(before.key, after.key, "{flags:?}");
+            assert_eq!(before.unit, after.unit, "content edits retain the unit's version group");
+            assert_eq!(before.watched.len(), 1);
+            assert_eq!(before.watched[0].0, driver);
+            assert_ne!(before.watched[0].1, after.watched[0].1);
+            assert!(after.extern_hashes.is_empty(), "a linker never receives extern replacement tolerance");
+        }
+        for pair in before.windows(2) {
+            assert_ne!(pair[0].key, pair[1].key, "original argument spelling stays opaque");
+            assert_ne!(pair[0].unit, pair[1].unit);
+        }
+        let other = s.0.join("other-driver");
+        fs::write(&other, b"driver one").unwrap();
+        let other = keyed(&s.0, &[&format!("-Clinker={}", other.display())]).unwrap();
+        assert_ne!(before[1].key, other.key, "equal bytes at different tool paths are distinct");
+        assert_ne!(before[1].unit, other.unit);
+    }
+
+    #[test]
+    fn explicit_linkers_resolve_relative_paths_and_refuse_missing_tools() {
+        let s = Scratch::new("linker-resolve");
+        let tools = s.0.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let driver = tools.join("driver");
+        fs::write(&driver, b"driver one").unwrap();
+        let before = keyed(&s.0, &["-Clinker=tools/driver"]).unwrap();
+        assert_eq!(before.watched[0].0, driver);
+        fs::write(&driver, b"driver two").unwrap();
+        assert_ne!(before.key, key(&s.0, &["-Clinker=tools/driver"]).unwrap());
+        assert!(key(&s.0, &["-Clinker=tools/missing-driver"]).unwrap_err().contains("cannot read linker"));
+        assert!(key(&s.0, &["-Clinker=frust-missing-linker-91e2c054"]).unwrap_err().contains("cannot resolve linker"));
+        assert!(key(&s.0, &["-Clinker="]).is_err());
+        assert!(key(&s.0, &["-Clinker=./tools"]).is_err(), "directories cannot stand in for executable content");
+    }
+
+    #[test]
+    fn bare_linkers_use_the_actual_path() {
+        let cwd = env::current_dir().unwrap();
+        let driver = crate::toolchain::find_on_path("rustc").expect("the test toolchain is on PATH");
+        let keyed = keyed(&cwd, &["-Clinker=rustc"]).unwrap();
+        assert_eq!(keyed.watched[0].0, cwd.join(driver));
+        assert!(keyed.extern_hashes.is_empty());
+    }
+
+    #[test]
+    fn a_linker_also_named_as_an_extern_never_gets_replacement_tolerance() {
+        let s = Scratch::new("linker-extern");
+        let driver = s.0.join("target").join("debug").join("deps").join("driver.rlib");
+        fs::write(&driver, b"driver").unwrap();
+        let linker = format!("-Clinker={}", driver.display());
+        let dependency = format!("--extern=driver={}", driver.display());
+        for flags in [[linker.as_str(), dependency.as_str()], [dependency.as_str(), linker.as_str()]] {
+            assert!(keyed(&s.0, &flags).unwrap().extern_hashes.is_empty());
+        }
     }
 
     #[test]
@@ -1654,6 +1825,71 @@ mod tests {
         let before = key(&s.0, &[&arg]).unwrap();
         fs::write(&rlib, b"v2").unwrap();
         assert_ne!(before, key(&s.0, &[&arg]).unwrap());
+    }
+
+    #[test]
+    fn extern_hash_workers_are_bounded_and_small_units_stay_inline() {
+        assert_eq!(extern_hash_threads(0, 64), 1);
+        assert_eq!(extern_hash_threads(8, 64), 1);
+        assert_eq!(extern_hash_threads(9, 64), 2);
+        assert_eq!(extern_hash_threads(32, 64), 4);
+        assert_eq!(extern_hash_threads(100, 1), 1);
+        assert_eq!(extern_hash_threads(100, 2), 1);
+        assert_eq!(extern_hash_threads(100, 4), 2);
+        assert_eq!(extern_hash_threads(100, 6), 3);
+        assert_eq!(extern_hash_threads(100, 8), 4);
+    }
+
+    #[test]
+    fn parallel_extern_hashes_preserve_serial_keys_watches_and_errors() {
+        let s = Scratch::new("extern-parallel");
+        let deps = s.0.join("target").join("debug").join("deps");
+        let profile = rustc_args::profile_root(&deps).to_string_lossy().into_owned();
+        let mut args = vec![
+            OsString::from("--crate-name=k"),
+            OsString::from("--emit=dep-info,link"),
+            OsString::from(format!("--out-dir={}", deps.display())),
+            OsString::from("-C"),
+            OsString::from("link-arg=extra.o"),
+        ];
+        fs::write(s.0.join("extra.o"), b"object").unwrap();
+        for i in [7, 2, 11, 5, 0, 9, 1, 10, 6, 3, 8, 4] {
+            let path = if i < 9 { deps.join(format!("libdep{i}.rlib")) } else { s.0.join(format!("libdep{i}.rlib")) };
+            fs::write(&path, vec![i as u8; (i + 1) * 1024]).unwrap();
+            if i % 2 == 0 {
+                args.push(OsString::from(format!("--extern=dep{i}={}", path.display())));
+            } else {
+                args.push(OsString::from("--extern"));
+                args.push(OsString::from(format!("dep{i}={}", path.display())));
+            }
+        }
+        fs::write(s.0.join("custom.json"), b"{}").unwrap();
+        args.extend([OsString::from("--target=custom.json"), OsString::from("-Cincremental=session")]);
+        let prekey = |args: &[OsString], threads| {
+            let parsed = rustc_args::parse(args).unwrap();
+            let hasher = Hasher::ephemeral();
+            let ctx = KeyContext { hasher: &hasher, cwd: &s.0, profile: &profile, profile_abs: Path::new(&profile) };
+            ctx.prekey_with_threads(&OsString::from("rustc"), args, &parsed, threads)
+        };
+        let serial = prekey(&args, 1).unwrap();
+        let parallel = prekey(&args, 4).unwrap();
+        assert_eq!(parallel.key, serial.key);
+        assert_eq!(parallel.unit, serial.unit);
+        assert_eq!(parallel.watched, serial.watched);
+        assert_eq!(parallel.extern_hashes, serial.extern_hashes);
+        assert_eq!(parallel.watched.len(), 14, "twelve externs, an object and a target specification");
+        assert_eq!(parallel.extern_hashes.len(), 9, "only externs under the profile are tracked for replacement");
+
+        args[4] = OsString::from("link-arg=missing.o");
+        args.push(OsString::from("--extern=first=missing-first.rlib"));
+        args.push(OsString::from("--extern=second=missing-second.rlib"));
+        let serial_error = prekey(&args, 1).err().unwrap();
+        assert_eq!(prekey(&args, 4).err().unwrap(), serial_error);
+        assert!(serial_error.contains("linker input") && serial_error.contains("missing.o"));
+        args[4] = OsString::from("link-arg=extra.o");
+        let serial_error = prekey(&args, 1).err().unwrap();
+        assert_eq!(prekey(&args, 4).err().unwrap(), serial_error);
+        assert!(serial_error.contains("cannot read --extern") && serial_error.contains("missing-first.rlib"));
     }
 
     #[test]
@@ -1993,6 +2229,25 @@ mod tests {
     }
 
     #[test]
+    fn an_identically_replaced_linker_refuses_a_deferred_store() {
+        let s = Scratch::new("deferred-linker");
+        let (mut job, _, _) = fixture(&s);
+        let driver = s.0.join("target").join("debug").join("deps").join("driver.rlib");
+        fs::write(&driver, b"linker").unwrap();
+        let linker = format!("-Clinker={}", driver.display());
+        let dependency = format!("--extern=driver={}", driver.display());
+        let keyed = keyed(&s.0, &[&linker, &dependency]).unwrap();
+        job.args.extend([linker, dependency]);
+        job.watched = keyed.watched.iter().map(|(path, stamp)| (path.clone(), StampWire::of(stamp))).collect();
+        job.extern_hashes = keyed.extern_hashes.into_iter().collect();
+        let replacement = driver.with_file_name("replacement-driver");
+        fs::write(&replacement, b"linker").unwrap();
+        sys::rename(&replacement, &driver).unwrap();
+        run_deferred(&job);
+        assert_eq!(rows(&job), 0, "even equal bytes cannot excuse a changed linker stamp");
+    }
+
+    #[test]
     fn a_source_modified_during_the_compile_is_still_refused_by_a_deferred_store() {
         let s = Scratch::new("deferred-new");
         let (mut job, _, _) = fixture(&s);
@@ -2022,6 +2277,31 @@ mod tests {
         let names: Vec<(&str, &str)> = kept.iter().map(|(n, v)| (n.to_str().unwrap(), v.to_str().unwrap())).collect();
         assert_eq!(names, [("CARGO_PKG_NAME", "a"), ("CARGO_PKG_NAME", "k"), ("RUSTC_BOOTSTRAP", "1"), ("SDKROOT", "/sdk")]);
         assert!(keyed_env(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn linker_driver_environment_is_keyed_without_opaque_path_or_display_settings() {
+        let kept = keyed_env([
+            pair("COMPILER_PATH", "/compiler/tools"),
+            pair("GCC_EXEC_PREFIX", "/gcc/prefix"),
+            pair("CCC_OVERRIDE_OPTIONS", "+-custom-option"),
+            pair("TOOLCHAINS", "custom.toolchain"),
+            pair("LDFLAGS", "-L/custom/libs"),
+            pair("LIBRARY_PATH", "/custom/libs"),
+            pair("PATH", "/ordinary/tools"),
+            pair("NO_COLOR", "1"),
+        ]);
+        assert_eq!(
+            kept,
+            [
+                pair("CCC_OVERRIDE_OPTIONS", "+-custom-option"),
+                pair("COMPILER_PATH", "/compiler/tools"),
+                pair("GCC_EXEC_PREFIX", "/gcc/prefix"),
+                pair("LDFLAGS", "-L/custom/libs"),
+                pair("LIBRARY_PATH", "/custom/libs"),
+                pair("TOOLCHAINS", "custom.toolchain"),
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -2102,6 +2382,21 @@ mod tests {
         assert!(acquire_slot(&dir, 0).is_none());
         drop(second);
         assert!((1..=4).contains(&slot_count()));
+    }
+
+    #[test]
+    fn a_store_reserves_a_slot_before_freezing_and_releases_it_when_freezing_declines() {
+        let s = Scratch::new("freeze-slot");
+        let (mut job, _, _) = fixture(&s);
+        job.trust = "off".to_string();
+        let plan = Plan::from_job(&job).unwrap();
+        assert!(!plan.spawn_deferred(&[], 0, 0, &HashMap::new(), None).unwrap());
+        let dir = plan.dirs.deferred();
+        assert!(dir.join("slot-0").exists(), "capacity is reserved before the untrusted profile declines freezing");
+        let released = (0..100).find_map(|_| {
+            acquire_slot(&dir, 1).or_else(|| (thread::sleep(Duration::from_millis(20)), None).1)
+        });
+        assert!(released.is_some(), "the early return releases its slot");
     }
 
     #[test]

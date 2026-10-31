@@ -1,6 +1,6 @@
-//! The cargo front end: builds the accelerator environment, takes the build lock for compile phases, supervises cargo.
-//! `Exec` commands (run, test, bench) build under the lock, release it, then exec cargo untouched.
+//! Cargo supervision releases build locks before executing user programs.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -60,7 +60,8 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
     let (root, located) = workspace::locate_cached(&dirs, &cwd, parsed.toolchain.as_deref(), manifest.as_deref(), &probe.id);
     trace(&cfg, started, &format!("workspace located (locate cache {})", located.label()));
 
-    let mut target = pick_target_dir(&cfg, &dirs, &parsed, root.as_deref(), &probe, &cwd);
+    let configs = ConfigInputs::new(root.as_deref(), &cwd);
+    let mut target = pick_target_dir(&cfg, &dirs, &parsed, root.as_deref(), &probe, &cwd, &configs);
     if class == Class::CacheOnly {
         target.central = None;
     }
@@ -75,7 +76,7 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
             }
         }
     }
-    let tuning = tuning_args(&cfg, &probe, &parsed, root.as_deref(), &cwd, class);
+    let tuning = tuning_args(&cfg, &probe, &parsed, root.as_deref(), &cwd, class, &configs);
 
     let session = Session {
         cfg,
@@ -88,6 +89,7 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
         env_vars,
         tuning,
         parsed,
+        configs,
     };
     match class {
         Class::Compile | Class::Exec(_) => session.build_and_maybe_exec(class),
@@ -124,6 +126,7 @@ fn pick_target_dir(
     root: Option<&Path>,
     probe: &Probe,
     cwd: &Path,
+    configs: &ConfigInputs,
 ) -> TargetChoice {
     let fallback = root.map(|r| r.join("target")).unwrap_or_else(|| cwd.join("target"));
     if let Some(explicit) = parsed.value_of("--target-dir") {
@@ -135,7 +138,7 @@ fn pick_target_dir(
             return TargetChoice { central: None, lock_key: cwd.join(explicit) };
         }
     }
-    if let Some(configured) = configured_target_dir(parsed, root, cwd) {
+    if let Some(configured) = configured_target_dir(parsed, cwd, configs) {
         return TargetChoice { central: None, lock_key: configured.unwrap_or(fallback) };
     }
     if cfg.target == TargetMode::Local {
@@ -146,12 +149,12 @@ fn pick_target_dir(
 }
 
 /// The outer `Some` means a `target-dir` is configured; the inner path is where, when it can be read.
-fn configured_target_dir(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path) -> Option<Option<PathBuf>> {
+fn configured_target_dir(parsed: &CargoArgs, cwd: &Path, configs: &ConfigInputs) -> Option<Option<PathBuf>> {
     for value in cli_configs(parsed) {
         let text = value.to_string_lossy();
         match cli_config_file(&text, cwd) {
             Some(file) => {
-                if let Some(body) = fs::read_to_string(&file).ok().filter(|b| b.contains("target-dir")) {
+                if let Some(body) = Some(configs.read(&file)).filter(|b| b.contains("target-dir")) {
                     return Some(target_dir_setting(&body).map(|dir| config_relative(&file, &dir)));
                 }
             }
@@ -159,9 +162,10 @@ fn configured_target_dir(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path) ->
             None => {}
         }
     }
-    for file in config_files(root, cwd) {
-        if let Some(body) = fs::read_to_string(&file).ok().filter(|b| b.contains("target-dir")) {
-            return Some(target_dir_setting(&body).map(|dir| config_relative(&file, &dir)));
+    for file in &configs.files {
+        let body = configs.read(file);
+        if body.contains("target-dir") {
+            return Some(target_dir_setting(&body).map(|dir| config_relative(file, &dir)));
         }
     }
     None
@@ -247,6 +251,23 @@ fn config_files(root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Shares one config snapshot across target selection, tuning and lock scoping.
+struct ConfigInputs {
+    files: Vec<PathBuf>,
+    contents: RefCell<HashMap<PathBuf, String>>,
+}
+
+impl ConfigInputs {
+    fn new(root: Option<&Path>, cwd: &Path) -> Self {
+        Self { files: config_files(root, cwd), contents: RefCell::new(HashMap::new()) }
+    }
+
+    fn read(&self, path: &Path) -> String {
+        self.contents.borrow_mut().entry(path.to_path_buf())
+            .or_insert_with(|| fs::read_to_string(path).unwrap_or_default()).clone()
+    }
 }
 
 fn defines_profile(text: &str) -> bool {
@@ -384,7 +405,7 @@ fn moves_outputs(text: &str) -> bool {
 
 fn accelerator_env(cfg: &Config, probe: &Probe) -> Vec<(OsString, OsString)> {
     let mut vars = vec![(os("FRUST_RUSTC_ID"), os(&probe.id))];
-    if !cfg.cache {
+    if !cfg.cache && !(crate::linking::requested() && crate::linking::supported()) {
         return vars;
     }
     let foreign = env::var_os("RUSTC_WRAPPER").filter(|w| !w.is_empty());
@@ -407,19 +428,19 @@ fn wrapper_path() -> Option<PathBuf> {
 }
 
 /// `line-tables-only` was measured slower and larger than `debug=0`; never applied over user-written profiles from any source.
-fn tuning_args(cfg: &Config, probe: &Probe, parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, class: Class) -> Vec<OsString> {
+fn tuning_args(cfg: &Config, probe: &Probe, parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, class: Class, configs: &ConfigInputs) -> Vec<OsString> {
     let builds = matches!(class, Class::Compile | Class::Exec(_));
     if !cfg.tune || !builds || probe.cargo_version < TUNING_MIN_CARGO || parsed.subcommand.as_deref() == Some("doc") {
         return Vec::new();
     }
-    if user_profiles(parsed, root, cwd) {
+    if user_profiles(parsed, root, cwd, configs) {
         return Vec::new();
     }
     vec![os("--config"), os("profile.dev.package.\"*\".debug=0")]
 }
 
-fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path) -> bool {
-    let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, configs: &ConfigInputs) -> bool {
+    let read = |p: &Path| configs.read(p);
     let cli = cli_configs(parsed).iter().any(|value| {
         let text = value.to_string_lossy();
         match cli_config_file(&text, cwd) {
@@ -427,7 +448,7 @@ fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path) -> bool {
             None => defines_profile(&text),
         }
     });
-    cli || config_files(root, cwd).iter().any(|p| defines_profile(&read(p)))
+    cli || configs.files.iter().any(|p| defines_profile(&read(p)))
         || root.is_some_and(|r| defines_profile(&read(&r.join("Cargo.toml"))))
 }
 
@@ -463,6 +484,7 @@ fn affects_build(key: &str) -> bool {
                 | "FRUST_CACHE_PRIMARY"
                 | "FRUST_TUNE"
                 | "FRUST_TARGET"
+                | "FRUST_LINK"
                 | "CC"
                 | "CXX"
                 | "AR"
@@ -520,6 +542,7 @@ struct Session {
     env_vars: Vec<(OsString, OsString)>,
     tuning: Vec<OsString>,
     parsed: CargoArgs,
+    configs: ConfigInputs,
 }
 
 impl Session {
@@ -603,11 +626,11 @@ impl Session {
         let own = rest.iter().position(|a| a == "--").map_or(rest, |i| &rest[..i]);
         let args: Vec<&OsStr> = self.parsed.globals.iter().chain(own.iter()).map(OsString::as_os_str).collect();
         let Some((dir, triples)) = profile_and_targets(default_dir, &args) else { return Scope::All };
-        let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+        let read = |p: &Path| self.configs.read(p);
         let cli_file_moves = cli_configs(&self.parsed)
             .iter()
             .any(|value| cli_config_file(&value.to_string_lossy(), &self.cwd).is_some_and(|file| moves_outputs(&read(&file))));
-        if cli_file_moves || config_files(self.root.as_deref(), &self.cwd).iter().any(|file| moves_outputs(&read(file))) {
+        if cli_file_moves || self.configs.files.iter().any(|file| moves_outputs(&read(file))) {
             return Scope::All;
         }
         let mut slots = vec![format!("{dir}@host")];
@@ -629,7 +652,7 @@ impl Session {
         let workspace_name = workspace::display_name(self.root.as_deref());
         let key = self.root.as_deref().map(workspace::workspace_key).unwrap_or_else(|| "_loose".into());
         let history_keys = self.history_keys(&key, sub, rest);
-        let mut expected = history::expected_units(&self.dirs, &history_keys);
+        let expected = history::expected_units(&self.dirs, &history_keys);
 
         let feed_path = self.dirs.tmp().join(format!("feed-{}.jsonl", std::process::id()));
         let mut feed = Feed::new(feed_path.clone());
@@ -689,14 +712,6 @@ impl Session {
             cmd.env("FRUST_EVENTS", &feed_path);
         }
 
-        // Planned under the build lock so it never races a concurrent resolve; failing or timing out keeps the history estimate.
-        if let Some(ui) = ui.as_mut()
-            && crate::unit_graph::supported(sub)
-            && let Some(exact) = crate::unit_graph::count(&self.cargo, &command, rest, &self.env_vars)
-        {
-            expected = Some(exact);
-            ui.set_expected_units(exact);
-        }
         let mut progress = Progress { expected, ..Progress::default() };
         trace(&self.cfg, started, "lock acquired, starting cargo");
         let code = match (style, ui.as_mut()) {
@@ -830,6 +845,10 @@ impl Session {
         mut lock: Option<&mut BuildLock>,
         shown: &mut Shown,
     ) -> i32 {
+        let planning_args: Vec<OsString> = cmd.get_args()
+            .filter(|arg| *arg != "--message-format=json-render-diagnostics")
+            .map(OsStr::to_os_string)
+            .collect();
         cmd.stdin(Stdio::inherit()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -838,7 +857,11 @@ impl Session {
                 return 127;
             }
         };
+        let child_started = Instant::now();
         signals::supervise(child.id());
+        let sub = self.parsed.subcommand.as_deref().unwrap_or("");
+        let mut planning_due = crate::unit_graph::supported(sub);
+        let mut planning = None;
         if let Some(lock) = lock.as_deref_mut() {
             lock.log_start(true, true);
         }
@@ -859,12 +882,22 @@ impl Session {
             if exited_at.is_some_and(|t| t.elapsed() >= LINGER) {
                 break;
             }
+            // Only a still-running build needs planning after the first display tick.
+            if planning_due && status.is_none() && child_started.elapsed() >= TICK {
+                planning_due = false;
+                planning = crate::unit_graph::Pending::start(&self.cargo, &planning_args, &[], &self.env_vars);
+            }
             let ready = wait_readable(&streams, TICK);
             let mut lines: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
             for (i, stream) in streams.iter_mut().enumerate() {
                 if ready[i] {
                     stream.read_lines(&mut chunk, &mut lines[i]);
                 }
+            }
+            if let Some(exact) = planning.as_mut().and_then(crate::unit_graph::Pending::poll) {
+                progress.expected = Some(exact);
+                ui.set_expected_units(exact);
+                planning = None;
             }
             let now = Instant::now();
             // Cache events lag the JSON stream by a poll interval; drain them first.

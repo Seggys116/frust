@@ -7,7 +7,7 @@ Details behind the README: cache correctness, disk usage, locking, platforms and
 The cache uses a two-step key, the same idea as ccache's direct mode.
 
 1. A *pre-key* is derived from the toolchain, the normalised command line, `CARGO_*` environment, the
-   working directory, and the **contents** of every `--extern` library and native library directory.
+   working directory, and the **contents** of every `--extern` library, native library directory and explicitly selected linker executable. Explicit linker names are resolved through the current path; a missing or unreadable executable bypasses caching.
 2. Earlier real compiles record, per pre-key, the exact source files they read (from rustc's own dep-info,
    with content hashes) and every environment variable the compile observed (`env!`, `option_env!`,
    tracked env in proc macros). A candidate matches only if every file still has its recorded content hash
@@ -70,6 +70,7 @@ Related lookup behaviour:
   more with rayon's thread pool. Every other file is read, because truncating a mapped file faults the reader.
   Windows always reads, because a mapped file cannot be replaced or deleted there and cargo does both to its
   outputs.
+* Pre-key hashing of more than eight `--extern` inputs runs in parallel, with ordered key assembly. Workers are capped at four and half the available CPU count; smaller sets stay sequential.
 * A manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
   format number (currently 3); one in another format is ignored and rewritten.
 * Evicting an entry is one rename into `tmp/evicted` under `FRUST_HOME`, so a concurrent restore fails cleanly
@@ -92,6 +93,7 @@ dependency), only one should compile it.
   match, prints nothing, always exits 0, and holds the key lock until it finishes. It does not record a second
   cache event; the wrapper already recorded the miss. A bounded pool of slot locks (half the CPU count, between 1
   and 4) limits how many helpers run at once.
+* Capacity is reserved before preparing a deferred job, so a saturated helper pool does not discover and freeze the same outputs twice.
 * The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
   result cannot be handed over (for example a directory output, or an incremental compile that printed an
   incremental-compilation warning) or when the helper cannot be started.
@@ -109,9 +111,12 @@ misses or waits on the key lock.
 * Automatic compaction (after successful builds, `FRUST_AUTO_COMPACT`) removes artifacts no current fingerprint references, keeps the newest incremental session of every crate (so edit builds stay incremental) and keeps the other profile warm for `FRUST_COMPACT_KEEP_DAYS`. Cargo sees every unit as fresh afterwards, and anything removed that the compile cache holds comes back as a restore. On macOS it also compresses idle files with APFS transparent compression (verified byte-for-byte on write) and deduplicates identical files as clones; those two steps exist only on macOS.
 * Automatic compaction is synchronous but cheap when there is nothing to do. It runs after the build's summary and
   lock hand-off, on a thread at background CPU and I/O priority, and at most once every 10 minutes per target
-  directory. It is skipped when a change signature (modification times and entry names of a few directories per
-  profile, plus the number of cache entries) matches the last complete pass, or when the target grew by less
-  than 64 MiB since then. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files
+  directory. Between hourly reassessments, it is skipped when a change signature (modification times and entry
+  names of a few directories per profile, plus the number of cache entries) matches the last complete pass, or
+  when the target grew by less than 64 MiB since then. Once an hour has elapsed since the last actual pass,
+  the next due check reassesses idle sessions, expired profiles and settled files even without further growth.
+  A pass that skipped a busy profile, hit its budget or encountered an error stays incomplete and is retried
+  when next due. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files
   that did not compress; compressibility is judged from a sample of two 64 KiB blocks, and a file that would save
   less than 5 percent is left alone. The dedupe and compression stage stops after 2 seconds or 512 MiB of work per
   pass, and the next due pass continues. Explicit `frust compact` has no budget.
@@ -141,9 +146,15 @@ misses or waits on the key lock.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
   busy, so running them during builds cannot break a build. `tests/stress.rs` runs eight builds against
   continuous compaction and gc.
-* The hand-over from one build to the next is kept short: waiters poll every 15 ms at the front of the queue, the
-  holder's build log is written in batches (every 25 ms), live redraws are limited to about 40 per second, and a
-  follower reads the event feed only when the file has grown.
+* Queued builds subscribe to directory changes through kqueue on macOS and inotify on Linux, waking promptly when
+  ownership or queue state changes. Notifications are hints: FIFO checks and OS locks still decide ownership.
+  Timed polling remains as a fallback (15 ms at the front, 10 ms for followers, up to 40 ms behind the front).
+  Uncontended builds create no watcher. Logs are batched every 25 ms, or 10 ms once a follower appears, with
+  immediate start/end records and a 64 KiB flush threshold. A follower reads the event feed only when it grows.
+* Display-enabled builds request a unit graph only after Cargo survives one 60 ms display tick. Short builds keep their history estimate and avoid the additional Cargo process. Planning is polled alongside compiler
+  output, updates the progress estimate when ready, and is cancelled before the build lock is released. It has a
+  five-second deadline and never waits for completion after the build. Target selection, tuning and lock scoping
+  share an invocation-local snapshot of Cargo configuration files.
 
 ## Incremental data and compaction
 
@@ -217,3 +228,22 @@ and on). An install downloads the release archive for the platform, checks its S
 checksum, extracts it, runs the staged `frust --version` to confirm the version, backs up the eight installed
 binaries and replaces each atomically, restoring the backups if any replacement fails. A copy installed with
 `cargo` or Homebrew (and Scoop or the Windows store) prints the matching update command instead of replacing files.
+
+
+## Smart native links
+
+`FRUST_LINK=smart` selects rustc’s supported raw Darwin linker path for unoptimised incremental macOS binaries.
+It invokes the current Apple `ld` directly, avoiding the compiler-driver process on each real relink. Rustc still
+supplies the target, SDK, library and platform arguments. The standard library remains statically linked, and
+executables run directly without a toolchain library search path. This accelerates full native relinks; it does
+not claim that Apple’s linker incrementally patches the previous executable.
+
+The policy is opt-in. Explicit linker/flavor/link arguments, non-system compiler drivers, driver customization
+environments, custom targets/sysroots, test harnesses and build scripts retain their existing path. A failed
+native-linker discovery leaves the original invocation intact; a selected link that fails reports the compiler’s
+failure. Effective arguments are prepared before both cache planning and uncached execution, so native and
+original link requests have distinct cache keys. Selected linker bytes and identity are validated just like other
+inputs, including changes made during a compile.
+
+Smart links use the existing target and rustc incremental directories. Automatic compaction and cache budgets
+continue to apply, and no additional persistent linker state accumulates.

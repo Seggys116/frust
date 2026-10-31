@@ -11,6 +11,7 @@ pub mod events;
 pub mod fsx;
 pub mod gc;
 pub mod history;
+pub mod linking;
 pub mod lock;
 pub mod paths;
 pub mod run;

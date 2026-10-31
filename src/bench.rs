@@ -39,6 +39,8 @@ const L_CARGO_NOOP: &str = "cargo      no-op build";
 const L_FRUST_NOOP: &str = "frust      no-op build";
 const L_CARGO_INC: &str = "cargo      incremental edit";
 const L_FRUST_INC: &str = "frust      incremental edit";
+const L_CARGO_INC_WARM: &str = "cargo      incremental edit, warm session";
+const L_FRUST_INC_WARM: &str = "frust      incremental edit, warm session";
 const L_REL_CARGO_A: &str = "cargo      release A, cold";
 const L_REL_CARGO_B: &str = "cargo      release B, cold";
 const L_REL_FRUST_A: &str = "frust      release A, cold cache";
@@ -175,6 +177,24 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
         return 1;
     }
     let guard = Scratch(scratch.clone());
+    if flags.iter().any(|f| f == "--linking") {
+        let result = linking_bench(&scratch, quick, runs);
+        drop(guard);
+        return match result {
+            Ok(report) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                } else {
+                    print_linking(&report, &s);
+                }
+                0
+            }
+            Err(msg) => {
+                eprintln!("frust bench: {msg}");
+                1
+            }
+        };
+    }
     if flags.iter().any(|f| f == "--latency") {
         let result = latency_bench(&scratch, flags, quick, &s, json);
         drop(guard);
@@ -297,6 +317,282 @@ fn runs_from_flags(flags: &[String], quick: bool) -> Result<usize, String> {
         None => Ok(if quick { MIN_RUNS } else { DEFAULT_RUNS }),
         Some(v) => v.trim().parse::<usize>().ok().filter(|n| *n >= MIN_RUNS).ok_or_else(|| format!("--runs needs an integer of at least {MIN_RUNS}, got `{v}`")),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct LinkStats {
+    median_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+}
+
+impl LinkStats {
+    fn from_values(mut values: Vec<f64>) -> Self {
+        values.sort_by(f64::total_cmp);
+        let n = values.len();
+        let median_ms = if n.is_multiple_of(2) { (values[n / 2 - 1] + values[n / 2]) / 2.0 } else { values[n / 2] };
+        Self { median_ms, min_ms: values[0], max_ms: values[n - 1] }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LinkSample {
+    edit: usize,
+    order_in_pair: usize,
+    total_build_ms: u64,
+    native_link_ms: f64,
+    compiled_units: usize,
+    main_bin_compiled_units: usize,
+    binary_bytes: u64,
+    smart_policy_applied: bool,
+    expected_output_present: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkMode {
+    mode: &'static str,
+    total_build: LinkStats,
+    native_link: LinkStats,
+    binary_bytes: u64,
+    samples: Vec<LinkSample>,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkSources {
+    local_crates: usize,
+    registry_deps: bool,
+    edited_source: &'static str,
+    original_source_bytes: usize,
+    original_source_blake3: String,
+    shared_source_path: bool,
+    separate_target_directories: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkReport {
+    description: &'static str,
+    policy: &'static str,
+    timing: &'static str,
+    rustc: String,
+    machine: Machine,
+    runs: usize,
+    sources: LinkSources,
+    artifact_cache: &'static str,
+    build_lock: bool,
+    runtime_outputs_equal: bool,
+    expected_edit_outputs_present: bool,
+    modes: Vec<LinkMode>,
+}
+
+// Always derive the next body from the original, retaining the workload without accumulating edits.
+fn link_edit_source(original: &str, edit: usize) -> Result<String, String> {
+    let signature = "fn main() {";
+    let at = original.find(signature).ok_or("link fixture has no main body")? + signature.len();
+    Ok(format!(
+        "{}\n    println!(\"frust-link-edit {{}}\", std::hint::black_box({edit}usize));{}",
+        &original[..at], &original[at..]
+    ))
+}
+
+// Primary-only profiling avoids replayed dependency timings; reject ambiguous phases.
+fn native_link_millis(stderr: &str) -> Result<f64, String> {
+    let mut phases = stderr.lines()
+        .filter(|line| line.split_whitespace().last() == Some("link_binary"));
+    let line = phases.next()
+        .ok_or("rustc did not report a link_binary phase with -Ztime-passes")?;
+    if phases.next().is_some() {
+        return Err("rustc reported multiple link_binary phases; the current main binary timing is ambiguous".into());
+    }
+    let seconds = line.trim_start().strip_prefix("time:")
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or("invalid rustc link_binary timing")?;
+    Ok(seconds * 1000.0)
+}
+
+fn validate_measured_link(compiled_units: usize, main_bin_compiled_units: usize, native_link_ms: f64, total_build_ms: u64) -> Result<(), String> {
+    if compiled_units != 1 || main_bin_compiled_units != 1 {
+        return Err(format!("linking benchmark measured edit compiled {compiled_units} units ({main_bin_compiled_units} main binaries); timing attribution requires only the main binary to compile"));
+    }
+    // rustc rounds seconds to three decimals and the wall clock truncates milliseconds.
+    if native_link_ms > total_build_ms as f64 + 1.0 {
+        return Err(format!("linking benchmark main link timing {native_link_ms:.3}ms exceeds total build wall time {total_build_ms}ms"));
+    }
+    Ok(())
+}
+
+fn link_profile_script(wrapper: &Path) -> Result<String, String> {
+    let path = wrapper.to_str().ok_or("linking benchmark wrapper path is not UTF-8")?;
+    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+    Ok(format!(
+        "#!/bin/sh\nif [ \"${{CARGO_PRIMARY_PACKAGE:-}}\" = 1 ]; then\n    exec {quoted} \"$@\" -Ztime-passes\nfi\nexec {quoted} \"$@\"\n"
+    ))
+}
+
+fn linking_build(ctx: &Ctx, wrapper: &Path, project: &Path, target: &Path, smart: bool, edit: usize, order: usize) -> Result<(LinkSample, Vec<u8>), String> {
+    fs::create_dir_all(&ctx.home).map_err(|e| e.to_string())?;
+    fs::write(Dirs::at(&ctx.home).auto_gc_marker(), b"").map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(&ctx.fcargo);
+    cmd.args(["build", "--offline", "--message-format=json", "--config", "profile.dev.opt-level=0", "--config", "profile.dev.incremental=true"])
+        .current_dir(project)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_INCREMENTAL", "1")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("RUSTC_WRAPPER", wrapper)
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env("RUSTFLAGS", "")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("FRUST_HOME", &ctx.home)
+        .env("FRUST_LINK", if smart { "smart" } else { "off" })
+        .env("FRUST_CACHE", "off")
+        .env("FRUST_LOCK", "on")
+        .env("FRUST_RENDER", "off")
+        .env("FRUST_TUNE", "off")
+        .env("FRUST_AUTO_COMPACT", "off")
+        .env("FRUST_DEBUG", "1")
+        .env("FRUST_UPDATE_CHECK", "off")
+        .env_remove("FRUST_BYPASS")
+        .stdin(Stdio::null());
+    let started = Instant::now();
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    let total_build_ms = started.elapsed().as_millis() as u64;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("linking benchmark {} build failed:\n{}", if smart { "smart" } else { "off" }, failure_tail(&stderr)));
+    }
+    let smart_policy_applied = stderr.lines().any(|l| l.starts_with("frust-wrap: smart link:"));
+    if smart != smart_policy_applied {
+        return Err(format!("linking benchmark policy evidence missing or unexpected (FRUST_LINK={}); native macOS host linking must be eligible", if smart { "smart" } else { "off" }));
+    }
+    let mut compiled_units = 0;
+    let mut main_bin_compiled_units = 0;
+    let mut binary = None;
+    for line in output.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let message: serde_json::Value = serde_json::from_slice(line).map_err(|e| format!("invalid Cargo JSON in linking benchmark: {e}"))?;
+        if message["reason"] != "compiler-artifact" || message["fresh"] != false {
+            continue;
+        }
+        compiled_units += 1;
+        let main = message["target"]["name"] == "app"
+            && message["target"]["kind"].as_array().is_some_and(|k| k.iter().any(|v| v == "bin"))
+            && message["profile"]["test"] == false;
+        if main {
+            main_bin_compiled_units += 1;
+            binary = message["executable"].as_str().map(PathBuf::from);
+        }
+    }
+    if main_bin_compiled_units == 0 {
+        return Err("linking benchmark edit compiled no main binary; refusing a fresh/no-op sample".into());
+    }
+    let binary = binary.ok_or("Cargo did not report the compiled main executable")?;
+    let native_link_ms = native_link_millis(&stderr)?;
+    let stdout = run_output(&binary)?;
+    let marker = format!("frust-link-edit {edit}");
+    let expected_output_present = stdout.split(|b| *b == b'\n').any(|line| line == marker.as_bytes());
+    if !expected_output_present {
+        return Err(format!("linking benchmark binary did not print expected edit {edit}"));
+    }
+    let binary_bytes = fs::metadata(&binary).map_err(|e| e.to_string())?.len();
+    Ok((LinkSample { edit, order_in_pair: order, total_build_ms, native_link_ms, compiled_units, main_bin_compiled_units, binary_bytes, smart_policy_applied, expected_output_present }, stdout))
+}
+
+fn linking_bench(scratch: &Path, quick: bool, runs: usize) -> Result<LinkReport, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("--linking requires macOS with Apple's native linker; smart linking is unsupported on this platform".into());
+    }
+    let load_before = load_average();
+    fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let fcargo = fcargo_beside(&exe);
+    let actual_wrapper = exe.with_file_name(format!("frust-wrap{}", std::env::consts::EXE_SUFFIX));
+    if !fcargo.exists() || !actual_wrapper.exists() {
+        return Err("fcargo and frust-wrap must be installed next to frust for --linking".into());
+    }
+    // A shared wrapper keeps Cargo's compiler-information cache stable between arms.
+    let wrapper = scratch.join("link-profile-wrapper");
+    fs::write(&wrapper, link_profile_script(&actual_wrapper)?).map_err(|e| e.to_string())?;
+    sys::set_path_mode(&wrapper, 0o755).map_err(|e| e.to_string())?;
+    let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
+    if !probe.host.ends_with("-apple-darwin") {
+        return Err("--linking requires a native Apple Darwin rustc host".into());
+    }
+    let ctx = Ctx { cargo, fcargo, home: scratch.join("link-home"), probe_id: probe.id };
+    let project = scratch.join("linking").join("app");
+    let libs = if quick { 4 } else { 12 };
+    let registry = write_growth_project(&project, libs, true).and_then(|_| resolve_offline(&ctx, &project)).is_ok();
+    if !registry {
+        write_growth_project(&project, libs, false)?;
+    }
+    let source = project.join("src").join("main.rs");
+    let original = fs::read_to_string(&source).map_err(|e| e.to_string())?;
+    let targets = [scratch.join("link-off-target"), scratch.join("link-smart-target")];
+    let mut samples: [Vec<LinkSample>; 2] = [Vec::new(), Vec::new()];
+    // Cold build and a nonzero body edit settle both incremental states before measurement.
+    for step in 0..runs + 2 {
+        fs::write(&source, link_edit_source(&original, step)?).map_err(|e| e.to_string())?;
+        let order = if step % 2 == 0 { [0, 1] } else { [1, 0] };
+        let mut outputs: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        for (position, mode) in order.into_iter().enumerate() {
+            let (sample, output) = linking_build(&ctx, &wrapper, &project, &targets[mode], mode == 1, step, position + 1)?;
+            outputs[mode] = output;
+            if step >= 2 {
+                validate_measured_link(sample.compiled_units, sample.main_bin_compiled_units, sample.native_link_ms, sample.total_build_ms)?;
+                samples[mode].push(sample);
+            }
+        }
+        if outputs[0] != outputs[1] {
+            return Err(format!("linking benchmark binaries produced different output for edit {step}"));
+        }
+        guard_scratch(scratch, max_scratch_bytes())?;
+    }
+    let modes = samples.into_iter().enumerate().map(|(mode, samples)| LinkMode {
+        mode: if mode == 0 { "off" } else { "smart" },
+        total_build: LinkStats::from_values(samples.iter().map(|s| s.total_build_ms as f64).collect()),
+        native_link: LinkStats::from_values(samples.iter().map(|s| s.native_link_ms).collect()),
+        binary_bytes: samples.last().map_or(0, |s| s.binary_bytes),
+        samples,
+    }).collect();
+    Ok(LinkReport {
+        description: "Paired real main-function body edits of one application graph; identical source path, separate warmed incremental targets, alternating build order, direct binary execution after every build.",
+        policy: "FRUST_LINK=smart selects Apple's native ld directly for eligible host debug binaries. The standard library remains statically linked; this is not native incremental linking.",
+        timing: "Total build wall time includes the frust frontend and Cargo; native_link_ms is the single current main-binary link_binary phase, with exactly one main-binary unit compiled per measured edit. Both arms use the same wrapper script, which profiles only the primary application using benchmark-only RUSTC_BOOTSTRAP=1 and -Ztime-passes; dependencies receive no profiling flags. Load and instrumentation can affect results.",
+        rustc: probe.release,
+        machine: machine_context(load_before),
+        runs,
+        sources: LinkSources {
+            local_crates: libs,
+            registry_deps: registry,
+            edited_source: "app/src/main.rs",
+            original_source_bytes: original.len(),
+            original_source_blake3: blake3::hash(original.as_bytes()).to_hex().to_string(),
+            shared_source_path: true,
+            separate_target_directories: true,
+        },
+        artifact_cache: "off",
+        build_lock: true,
+        runtime_outputs_equal: true,
+        expected_edit_outputs_present: true,
+        modes,
+    })
+}
+
+fn print_linking(report: &LinkReport, s: &Styler) {
+    println!("{}", s.bold(&format!("Native linking: {} paired body edits, {} local crates{}", report.runs, report.sources.local_crates, if report.sources.registry_deps { " + registry dependencies" } else { "" })));
+    println!("  {:<8} {:>22} {:>22} {:>10}", "mode", "build ms med [min,max]", "link ms med [min,max]", "binary");
+    for mode in &report.modes {
+        let stats = |v: &LinkStats| format!("{:.1} [{:.1},{:.1}]", v.median_ms, v.min_ms, v.max_ms);
+        println!("  {:<8} {:>22} {:>22} {:>10}", mode.mode, stats(&mode.total_build), stats(&mode.native_link), human_bytes(mode.binary_bytes));
+    }
+    let m = &report.machine;
+    let load = |v: Option<f64>| v.map_or("unavailable".to_string(), |l| format!("{l:.2}"));
+    println!("  {}, {} ({} cores), rustc {}; load before {}, after {}", m.os, m.cpu, m.cores, report.rustc, load(m.load_before), load(m.load_after));
+    println!("  Outputs match for every edit; main binaries recompiled in every sample.");
+    println!("  {}", report.policy);
+    println!("  {}", report.timing);
 }
 
 // An untimed build of a trivial project per tool and profile, so first-launch costs of rustc, std, the linker and fcargo are not charged to whichever row runs first.
@@ -489,6 +785,16 @@ fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool) -> R
                 t.add(L_CARGO_INC, plain_build(&ctx, &proj_a, &ta)?, None);
             } else {
                 t.add(L_FRUST_INC, frust_build(&ctx, &proj_a)?, None);
+            }
+        }
+
+        // Measure warm-session edits separately from the first edit after artifact restoration.
+        touch_app(&proj_a, rep as u32 + 10_000)?;
+        for is_cargo in order {
+            if is_cargo {
+                t.add(L_CARGO_INC_WARM, plain_build(&ctx, &proj_a, &ta)?, None);
+            } else {
+                t.add(L_FRUST_INC_WARM, frust_build(&ctx, &proj_a)?, None);
             }
         }
 
@@ -2069,6 +2375,56 @@ fn yes_no(v: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_link_timing_requires_one_current_phase() {
+        let stderr = "time:   0.500; rss: 100MB -> 110MB (10MB) codegen_to_LLVM_IR\n\
+                      time:   0.012; rss: 110MB -> 111MB (1MB) run_linker\n\
+                      time:   0.250; rss: 112MB -> 113MB (1MB) link_binary\n";
+        assert_eq!(native_link_millis(stderr), Ok(250.0));
+        let replayed = format!("time: 1.200; rss: 0MB link_binary\n{stderr}");
+        assert!(native_link_millis(&replayed).is_err());
+        assert_eq!(native_link_millis("time: 0.000; rss: 0MB link_binary"), Ok(0.0));
+        assert!(native_link_millis("time: 1.0; rss: 0MB link_binary_extra").is_err());
+        assert!(native_link_millis("time: NaN; rss: 0MB link_binary").is_err());
+        assert!(native_link_millis("time: -1; rss: 0MB link_binary").is_err());
+        assert!(native_link_millis("link_binary").is_err());
+    }
+
+    #[test]
+    fn link_profile_script_quotes_the_shared_wrapper_path() {
+        let script = link_profile_script(Path::new("/tools/it's a wrapper/frust-wrap")).unwrap();
+        assert!(script.contains("exec '/tools/it'\\''s a wrapper/frust-wrap' \"$@\" -Ztime-passes"));
+        assert!(script.ends_with("exec '/tools/it'\\''s a wrapper/frust-wrap' \"$@\"\n"));
+        assert_eq!(script.matches("-Ztime-passes").count(), 1);
+        assert!(script.contains("\"${CARGO_PRIMARY_PACKAGE:-}\" = 1"));
+    }
+
+    #[test]
+    fn measured_link_requires_only_current_main_and_plausible_wall_time() {
+        assert!(validate_measured_link(1, 1, 250.0, 303).is_ok());
+        assert!(validate_measured_link(1, 1, 303.9, 303).is_ok());
+        assert!(validate_measured_link(2, 1, 250.0, 303).is_err());
+        assert!(validate_measured_link(1, 0, 250.0, 303).is_err());
+        assert!(validate_measured_link(0, 0, 0.0, 303).is_err());
+        assert!(validate_measured_link(1, 1, 1444.0, 303).is_err());
+        assert!(validate_measured_link(1, 1, 304.1, 303).is_err());
+    }
+
+    #[test]
+    fn linking_edits_preserve_workload_and_replace_body_input() {
+        let original = "use lib0::checksum;\nfn main() {\n    println!(\"{}\", checksum(7));\n}\n";
+        let first = link_edit_source(original, 17).unwrap();
+        let second = link_edit_source(original, 18).unwrap();
+        assert!(first.contains("std::hint::black_box(17usize)"));
+        assert!(second.contains("std::hint::black_box(18usize)"));
+        assert!(!second.contains("17usize"));
+        assert!(first.starts_with("use lib0::checksum;\nfn main() {\n"));
+        assert!(first.ends_with("\n    println!(\"{}\", checksum(7));\n}\n"));
+        assert!(second.ends_with("\n    println!(\"{}\", checksum(7));\n}\n"));
+        assert_ne!(first, second);
+        assert!(link_edit_source("pub fn helper() {}", 1).is_err());
+    }
 
     /// A minimal 64-bit Mach-O: LC_UUID at 32, LC_CODE_SIGNATURE at 56 pointing at a 32-byte blob at 96.
     fn image() -> Vec<u8> {

@@ -232,6 +232,94 @@ fn allocated(dir: &Path) -> u64 {
     compact::breakdown(dir).total().allocated
 }
 
+fn auto_marker(target: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(target.join(compact::AUTO_MARKER)).unwrap()).unwrap()
+}
+
+fn write_auto_marker(target: &Path, marker: &serde_json::Value) {
+    fs::write(target.join(compact::AUTO_MARKER), serde_json::to_vec(marker).unwrap()).unwrap();
+}
+
+fn age_reassessment_cleans_unchanged_target(signature_matches: bool) {
+    let sb = Sandbox::new(if signature_matches { "auto-age-signature" } else { "auto-age-growth" });
+    let dirs = Dirs::at(sb.home());
+    let target = dirs.targets().join("age-reassessment");
+    let profile = target.join("debug");
+    let deps = profile.join("deps");
+    let session = profile.join("incremental").join("app-1abc").join("s-current");
+    fs::create_dir_all(&deps).unwrap();
+    fs::create_dir_all(&session).unwrap();
+    fs::write(session.join("dep-graph.bin"), b"current session").unwrap();
+    let fingerprints = profile.join(".fingerprint");
+    let old_unit = fingerprints.join("app-0000000000000001");
+    let current_unit = fingerprints.join("app-0000000000000002");
+    for unit in [&old_unit, &current_unit] {
+        fs::create_dir_all(unit).unwrap();
+        fs::write(unit.join("bin-app.json"), r#"{"rustc":1,"profile":1,"compile_kind":0,"deps":[]}"#).unwrap();
+        fs::write(unit.join("bin-app"), "1111111111111111").unwrap();
+    }
+    let old_output = deps.join("app-0000000000000001");
+    let current_output = deps.join("app-0000000000000002");
+    fs::write(&old_output, b"superseded output").unwrap();
+    fs::write(&current_output, b"current output").unwrap();
+
+    let mut opts = eager();
+    opts.min_growth = u64::MAX;
+    opts.compress = false;
+    opts.cache_enabled = false;
+    opts.uncached_dead_grace = Duration::from_secs(3600);
+    let first = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(first.skipped.is_none() && first.errors.is_empty(), "{first:?}");
+    assert!(old_output.exists(), "a recent uncached variant stays warm for its grace period");
+    let mut marker = auto_marker(&target);
+    let last_pass = marker["at_unix"].as_u64().unwrap();
+    assert!(last_pass > 7200);
+    assert_ne!(marker["signature"], 0);
+
+    // Fingerprint leaf mtimes determine retention without changing the shallow directory signature or target size.
+    age(&old_unit.join("bin-app.json"), Duration::from_secs(7200));
+    age(&old_unit.join("bin-app"), Duration::from_secs(7200));
+    if !signature_matches {
+        marker["signature"] = 0.into();
+        write_auto_marker(&target, &marker);
+    }
+    let skipped = compact::auto_compact_with(&dirs, &target, &opts);
+    assert_eq!(
+        skipped.skipped,
+        Some(if signature_matches { "nothing changed since the last pass" } else { "grew too little since the last pass" }),
+        "{skipped:?}"
+    );
+    assert_eq!(auto_marker(&target)["at_unix"], last_pass, "cheap skips preserve the actual pass time");
+    assert!(old_output.exists());
+
+    let mut marker = auto_marker(&target);
+    marker["at_unix"] = (last_pass - 7200).into();
+    if !signature_matches {
+        marker["signature"] = 0.into();
+    }
+    write_auto_marker(&target, &marker);
+    let cleaned = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(cleaned.skipped.is_none() && cleaned.errors.is_empty(), "{cleaned:?}");
+    assert_eq!(cleaned.dead_units, 1, "{cleaned:?}");
+    assert!(cleaned.removed.iter().any(|(p, _)| p == &old_output), "{cleaned:?}");
+    assert!(!old_output.exists() && !old_unit.exists(), "age-based cleanup runs despite an unchanged or barely grown target");
+    assert!(current_unit.exists());
+    assert_eq!(fs::read(current_output).unwrap(), b"current output");
+    assert_eq!(fs::read(session.join("dep-graph.bin")).unwrap(), b"current session");
+    assert!(auto_marker(&target)["at_unix"].as_u64().unwrap() >= last_pass);
+    assert_eq!(auto_marker(&target)["complete"], true);
+}
+
+#[test]
+fn auto_compaction_reassesses_age_despite_an_unchanged_signature() {
+    age_reassessment_cleans_unchanged_target(true);
+}
+
+#[test]
+fn auto_compaction_reassesses_age_despite_insufficient_growth() {
+    age_reassessment_cleans_unchanged_target(false);
+}
+
 const MAIN_WITH_TEST: &str = "fn main() { let tag = if cfg!(feature = \"x\") { \"x\" } else { \"plain\" }; println!(\"{} {}\", tag, leaf::all(1)); }\n#[test]\nfn adds() { assert_eq!(leaf::all(1), leaf::all(1)); }\n";
 
 // Windows names a binary without a hash, so feature variants of a bin share one fingerprint directory and none is superseded.
@@ -358,17 +446,42 @@ fn auto_compaction_never_disturbs_a_build_and_is_cheap_when_not_due() {
     let app = project(&sb);
     build(&sb, &app, &[]);
     build(&sb, &app, &["--features", "x"]);
+    build(&sb, &app, &["--release", "--features", "x"]);
     let target = sb.central_target(&app);
     let dirs = Dirs::at(sb.home());
     let debug = target.join("debug");
     let before = hashes_of(&debug.join(".fingerprint"), "app-");
+    let mut opts = eager();
+    opts.min_growth = u64::MAX;
+    opts.compress = false;
 
+    if target.join(compact::AUTO_MARKER).exists() {
+        let mut marker = auto_marker(&target);
+        marker["at_unix"] = 0.into();
+        write_auto_marker(&target, &marker);
+    }
     let lock = File::options().read(true).write(true).open(debug.join(".cargo-lock")).unwrap();
     frust::sys::lock(&lock, frust::sys::LockKind::Exclusive).unwrap();
-    let report = compact::auto_compact_with(&dirs, &target, &eager());
+    let report = compact::auto_compact_with(&dirs, &target, &opts);
     assert!(report.busy.iter().any(|p| p == &debug), "{report:?}");
+    assert_eq!(report.profiles, 1, "the unlocked release profile is still processed: {report:?}");
+    assert_eq!(auto_marker(&target)["complete"], false, "busy profiles leave the pass incomplete");
     assert_eq!(hashes_of(&debug.join(".fingerprint"), "app-"), before);
+    let signature = auto_marker(&target)["signature"].clone();
+    let retry = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(retry.skipped.is_none() && retry.busy.contains(&debug), "an unchanged partial pass must retry: {retry:?}");
+    assert_eq!(auto_marker(&target)["signature"], signature, "the tree did not change between partial passes");
+    assert_eq!(auto_marker(&target)["complete"], false);
     drop(lock);
+
+    let retry = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(retry.skipped.is_none() && retry.busy.is_empty() && retry.errors.is_empty(), "{retry:?}");
+    assert_eq!(retry.profiles, 2, "the previously busy profile is now processed");
+    #[cfg(unix)]
+    assert!(retry.dead_units > 0, "the previously locked profile is cleaned: {retry:?}");
+    assert_eq!(auto_marker(&target)["complete"], true);
+    assert!(compiled(&build(&sb, &app, &["--features", "x"])).is_empty(), "retry preserves cargo freshness");
+    assert!(compiled(&build(&sb, &app, &["--release", "--features", "x"])).is_empty());
 
     // Another pass in progress (holding the marker): this one does nothing.
     let marker = File::options().read(true).write(true).create(true).truncate(false).open(target.join(compact::AUTO_MARKER)).unwrap();

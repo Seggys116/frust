@@ -36,6 +36,18 @@ use super::{LockKind, StdStream};
 
 pub type Owned = OwnedHandle;
 
+pub struct DirectoryWatcher;
+
+impl DirectoryWatcher {
+    pub fn new(_paths: &[&Path]) -> io::Result<DirectoryWatcher> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub fn wait(&mut self, _timeout: Duration) -> io::Result<bool> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 pub const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
 pub const SYSROOT_DYLIB_DIR: &str = "bin";
 
@@ -838,7 +850,6 @@ impl Job {
 
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
-// Windows has no load average, so callers report it as unavailable.
 pub fn load_average() -> Option<f64> {
     None
 }
@@ -957,8 +968,7 @@ fn probe_ansi(stream: StdStream) -> bool {
         // A pty such as mintty is a terminal without being a console.
         return terminal;
     }
-    // 0x4 is ENABLE_VIRTUAL_TERMINAL_PROCESSING and 0x1 is ENABLE_PROCESSED_OUTPUT.
-    // SAFETY: the handle is a console handle.
+    // SAFETY: the console handle is valid; 0x4 and 0x1 enable VT and processed output.
     unsafe { SetConsoleMode(handle, mode | 0x4 | 0x1) != 0 }
 }
 
@@ -1348,13 +1358,11 @@ mod tests {
     }
 }
 
-// wrapper
 // Handles are never renumbered onto the standard streams, and nothing is inherited here anyway.
 pub fn inheritable_clear_of_stdio(_files: &[&File]) -> bool {
     true
 }
 
-// compact and hashing
 pub fn lower_thread_priority() {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
     const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;

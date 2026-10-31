@@ -21,7 +21,10 @@ directory under the system temp directory that it removes afterwards.
 * **Display.** The display pipeline is off in every other frust row. One extra row, `clean rebuild, display on`,
   repeats the clean rebuild with the display enabled (plain rendering) to show what it costs.
 * **Rows.** For debug: project A cold, project B cold (cargo) and cold cache and warm cache (frust), clean rebuild,
-  clean rebuild with display on (frust only), no-op build and an incremental edit. For release: A and B (cargo
+  clean rebuild with display on (frust only), no-op build, the first edit after the clean rebuild, and a second
+  edit with warm incremental sessions. The original `incremental edit` row retains the recovery cost after a cache
+  restore: frust has restored artifacts but has no incremental session yet, whereas cargo's clean compile created
+  one. The `incremental edit, warm session` row measures ongoing edits after both tools have actually compiled. For release: A and B (cargo
   cold; frust cold cache for A and warm cache for B) and a clean rebuild. Then the two maintenance rows. Disk use of the two projects, a configuration-churn
   test and the release-binary comparisons are reported after the timed rows.
 * **Machine context.** The report states the operating system, CPU, core count and the load average before and
@@ -63,3 +66,50 @@ rows run with both switched off.
 What is not faster: an uncached compile. rustc sets that floor, and changing flags to beat it would change the
 executable. A single fresh project's target directory has the same content as cargo's; it is smaller only through
 compression (macOS APFS), removal of superseded variants and clone sharing across projects.
+
+
+## Performance and growth follow-up, 31 October 2026
+
+Compared the release binaries from `06582b4` with the working-tree changes on Darwin 27 arm64, 16 cores.
+The full `frust bench --quick --json` completed all correctness checks, including release byte identity against
+both its cold compile and plain Cargo. Its load average changed from 79 to 17; the earlier baseline changed
+from 33 to 17. Those runs do **not** establish an overall before/after speed-up: both Cargo and frust varied
+substantially with machine load.
+
+Two narrower comparisons alternated the old and new versions:
+
+| Measurement | Before | After | Interpretation |
+|---|---:|---:|---|
+| Content-validated cache hit, 32 extern paths totalling 158 MiB | 104.3 ms | 31.3 ms | 3.3x faster; 9 runs per version |
+| Display-enabled no-op, repository release binaries | 187.8 ms | 136.6 ms | 27% lower median; faster in 9 of 10 pairs |
+| Display-off no-op, same project | 172.2 ms | 196.3 ms | No improvement established under load |
+
+The hashing comparison used 32 copies of a valid `serde_core` rlib, a small library compiled once by each
+wrapper, then nine verified cache hits per wrapper with `FRUST_CACHE_TRUST_STAMPS=off`. Both compiles produced
+identical metadata. This isolates content-hashing throughput; it is not a claim of a 3.3x whole-build speed-up.
+
+The no-op comparison used identical-byte copies of both executables, one warmed `FRUST_HOME`, a shared explicit
+`RUSTC_WRAPPER`, the existing local target, and `build --release --bins --locked`. All 44 warm-up and measured
+invocations succeeded without compilation or startup-cache misses. Switching wrapper paths otherwise invalidates
+Cargo's compiler-information cache. macOS also showed a per-file launch effect: copying the same new executable
+reduced time before its first debug line from 105 ms to 13 ms, without changing its bytes.
+
+No-op ranges remained wide: display off was 111–395 ms before and 132–478 ms after; display enabled was
+130–281 ms before and 74–186 ms after. For display off, Cargo's own reported median rose from 65 to 95 ms;
+wrapper setup was 15.7 versus 17.4 ms and teardown 2.2 versus 1.8 ms. No display-off speed-up is claimed.
+
+The growth portion of the full benchmark retained its disk-space benefit:
+
+| After 30 edits and feature changes | Cargo | frust automatic compaction |
+|---|---:|---:|
+| Target directory | 97.1 MiB | 31.1 MiB |
+| Incremental directory | 51.4 MiB | 12.9 MiB |
+| Units compiled over the edit loop | 85 | 85 |
+| Units compiled by the final unchanged rebuild | 0 | 0 |
+
+The shared frust cache used another 26.9 MiB. Both binaries printed the same output, and no stale incremental
+sessions remained after automatic compaction. Separate regressions verify that unchanged targets are reassessed
+for age-based cleanup and that busy profiles are retried, while current outputs and incremental sessions survive.
+
+Validation: 416 native tests passed; strict Clippy passed. Linux and Windows all-target compile checks passed
+with `blake3/pure` to avoid requiring cross C toolchains; runtime tests were run on macOS.

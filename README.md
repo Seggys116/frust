@@ -87,6 +87,8 @@ fclippy --all-targets
 
 Anything frust does not recognise is passed straight to cargo. Set `FRUST_BYPASS=1` to run cargo completely untouched.
 
+On macOS, `FRUST_LINK=smart fcargo build` opts eligible dev binaries into the direct native-linker path. Measure actual edit builds with `frust bench --linking --runs 7`; see [configuration](docs/configuration.md) for eligibility and controls.
+
 ## Builds that overlap
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/locks.svg" alt="Builds in different profiles run at once, builds in the same profile run in order, and identical builds share one build" width="880"></p>

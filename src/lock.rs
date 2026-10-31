@@ -1,15 +1,10 @@
-//! Build lock in front of cargo's own flock: scoped FIFO queue, progress sharing, and joining identical builds.
-//! Layout per lock dir: `lock` (level one), `target`, `queue/`, `slots/<scope>/{lock,owner.json,progress.json,last.json,build-*.log}`.
-//! Lock order is level one, then slots in name order, all without blocking, so builds cannot deadlock.
-//! Each queue ticket is flocked by its waiter, so liveness never depends on pid probing (pid reuse, other users).
-//! The lock covers the compile phase only; `run`, `test` and `bench` release it before executing user code.
+//! Scoped FIFO build locks with live progress and joins for identical builds.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +14,7 @@ use crate::fsx;
 use crate::paths::{Dirs, short_hash};
 use crate::sys::{self, LockKind, signal};
 
-/// The front waiter takes over when the holder finishes, so its poll interval is the hand-over latency.
+/// Notifications wake waiters early; these limits also cover missed events and signal checks.
 const FRONT_POLL: Duration = Duration::from_millis(15);
 const FOLLOW_POLL: Duration = Duration::from_millis(10);
 const FOLLOW_CHECK: Duration = Duration::from_millis(50);
@@ -27,6 +22,7 @@ const FIRST_POLL: Duration = Duration::from_millis(20);
 /// Waiters behind the first only need to notice a change in their position, and each poll opens every ticket.
 const MAX_POLL: Duration = Duration::from_millis(40);
 const LOG_FLUSH_EVERY: Duration = Duration::from_millis(25);
+const FOLLOWER_FLUSH_EVERY: Duration = Duration::from_millis(10);
 const LOG_FLUSH_BYTES: usize = 64 * 1024;
 const FOLLOWER_SCAN_EVERY: Duration = Duration::from_millis(50);
 const ANNOUNCE_AFTER: Duration = Duration::from_millis(150);
@@ -358,7 +354,7 @@ pub struct Request<'a> {
 
 #[derive(Debug)]
 pub struct BuildLock {
-    /// Closed after `Drop::drop` runs, which releases the flocks.
+    /// Explicitly unlocked by `Drop::drop` before these files close.
     _level: File,
     _slots: Vec<File>,
     slot_dirs: Vec<PathBuf>,
@@ -459,14 +455,19 @@ impl BuildLock {
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
-        // Followers keep the log open, so removing it does not cut them off.
-        if let Some(mut log) = self.log.take() {
+        let mut log = self.log.take();
+        if let Some(log) = log.as_mut() {
             log.flush();
-            let _ = fs::remove_file(&log.path);
         }
         let _ = fs::remove_file(self.records_dir().join("progress.json"));
         for dir in &self.slot_dirs {
             let _ = fs::remove_file(dir.join("owner.json"));
+        }
+        // A concurrent fork can keep cloned descriptors alive until exec; closing ours is not enough.
+        release(&self._level, &self._slots);
+        if let Some(log) = log {
+            // Removing this holder's unique log wakes waiters while followers retain their open handles.
+            let _ = fs::remove_file(&log.path);
         }
     }
 }
@@ -483,7 +484,7 @@ struct LogWriter {
     last_flush: Option<Instant>,
     queue: PathBuf,
     last_scan: Option<Instant>,
-    /// Sticky: once someone follows this build every record is written at once.
+    /// Sticky: once someone follows this build, use the shorter flush interval.
     follower: bool,
 }
 
@@ -546,16 +547,20 @@ impl LogWriter {
     }
 
     fn flush_if_due(&mut self) {
+        self.flush_if_due_at(Instant::now());
+    }
+
+    fn flush_if_due_at(&mut self, now: Instant) {
         if self.pending.is_empty() {
             return;
         }
-        let now = Instant::now();
         if !self.follower && self.last_scan.is_none_or(|t| now.duration_since(t) >= FOLLOWER_SCAN_EVERY) {
             self.last_scan = Some(now);
             self.follower = has_follower(&self.queue, std::process::id());
         }
-        let aged = self.last_flush.is_none_or(|t| now.duration_since(t) >= LOG_FLUSH_EVERY);
-        if self.follower || aged || self.pending.len() >= LOG_FLUSH_BYTES {
+        let interval = if self.follower { FOLLOWER_FLUSH_EVERY } else { LOG_FLUSH_EVERY };
+        let aged = self.last_flush.is_none_or(|t| now.duration_since(t) >= interval);
+        if aged || self.pending.len() >= LOG_FLUSH_BYTES {
             self.flush();
         }
     }
@@ -571,7 +576,7 @@ impl LogWriter {
     }
 }
 
-/// Reads tickets without their flocks: a stale ticket naming us only keeps the log in write-through mode.
+/// Reads tickets without their flocks: a stale ticket naming us only keeps the shorter flush interval.
 fn has_follower(queue: &Path, pid: u32) -> bool {
     let Ok(entries) = fs::read_dir(queue) else { return false };
     entries.flatten().any(|entry| {
@@ -636,6 +641,8 @@ pub fn acquire(
     let since_ns = ticket.as_ref().map(|t| t.info.since_ns).unwrap_or(me.since_ns);
     let watch = SignalWatch::start();
     let can_follow = request.join && !request.fingerprint.is_empty();
+
+    let mut changes: Option<sys::DirectoryWatcher> = None;
 
     let started = Instant::now();
     let mut announced = false;
@@ -724,7 +731,16 @@ pub fn acquire(
         } else {
             delay
         };
-        thread::sleep(pause);
+        match changes.as_mut() {
+            Some(watcher) => {
+                watcher.wait(pause);
+            }
+            None => {
+                changes = Some(watch_lock_dirs(&dir, &queue, &slot_dirs));
+                // Recheck after subscribing: a release before setup must not be lost before our first wait.
+                continue;
+            }
+        }
         if follow.is_none() && ahead < last_ahead {
             delay = FIRST_POLL;
         } else {
@@ -734,6 +750,20 @@ pub fn acquire(
             last_ahead = ahead;
         }
     }
+}
+
+fn watch_lock_dirs(dir: &Path, queue: &Path, slot_dirs: &[PathBuf]) -> sys::DirectoryWatcher {
+    // Include existing sibling slots: whole-directory builds and multi-slot holders may publish there.
+    let slots = dir.join("slots");
+    let mut watched_dirs = vec![dir.to_path_buf(), queue.to_path_buf(), slots.clone()];
+    watched_dirs.extend(slot_dirs.iter().cloned());
+    if let Ok(entries) = fs::read_dir(&slots) {
+        watched_dirs.extend(entries.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())).map(|entry| entry.path()));
+    }
+    watched_dirs.sort();
+    watched_dirs.dedup();
+    let paths: Vec<&Path> = watched_dirs.iter().map(PathBuf::as_path).collect();
+    sys::DirectoryWatcher::new(&paths)
 }
 
 /// Level one is shared, or exclusive for a whole-directory build; on any refusal everything taken is released.
@@ -1405,6 +1435,7 @@ pub fn list(dirs: &Dirs) -> Vec<LockStatus> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread;
 
     /// Tests that install signal watchers or raise signals must not overlap.
     static SERIAL: StdMutex<()> = StdMutex::new(());
@@ -1819,6 +1850,48 @@ mod tests {
     }
 
     #[test]
+    fn follower_log_batches_for_ten_milliseconds() {
+        let (_dirs, root) = temp_dirs("log-follower-batch");
+        let mut log = LogWriter::create(&root, root.join("queue"), "build-test.log", None).unwrap();
+        log.follower = true;
+        log.append(&Record::Start { json: true, complete: true });
+        let now = log.last_flush.unwrap();
+        log.queue_line(b"{\"k\":\"out\",\"l\":\"first\"}\n");
+        log.queue_line(b"{\"k\":\"err\",\"l\":\"second\"}\n");
+        log.flush_if_due_at(now + Duration::from_millis(9));
+        assert_eq!(fs::read_to_string(&log.path).unwrap().lines().count(), 1, "output stays buffered before 10ms");
+        log.flush_if_due_at(now + Duration::from_millis(10));
+        assert_eq!(fs::read_to_string(&log.path).unwrap().lines().count(), 3, "a quiet build flushes at 10ms");
+        log.queue_line(b"{\"k\":\"out\",\"l\":\"last\"}\n");
+        log.end(0, false);
+        let text = fs::read_to_string(&log.path).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        assert!(text.lines().last().unwrap().contains("\"k\":\"end\""));
+        drop(log);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unfollowed_log_keeps_the_twenty_five_millisecond_interval_and_byte_cap() {
+        let (_dirs, root) = temp_dirs("log-normal-batch");
+        let mut log = LogWriter::create(&root, root.join("queue"), "build-test.log", None).unwrap();
+        log.append(&Record::Start { json: true, complete: true });
+        let now = log.last_flush.unwrap();
+        log.queue_line(b"{\"k\":\"out\",\"l\":\"buffered\"}\n");
+        log.flush_if_due_at(now + Duration::from_millis(24));
+        assert_eq!(fs::read_to_string(&log.path).unwrap().lines().count(), 1);
+        log.flush_if_due_at(now + Duration::from_millis(25));
+        assert_eq!(fs::read_to_string(&log.path).unwrap().lines().count(), 2);
+        let now = log.last_flush.unwrap();
+        let line = format!("{{\"k\":\"out\",\"l\":\"{}\"}}\n", "x".repeat(LOG_FLUSH_BYTES));
+        log.queue_line(line.as_bytes());
+        log.flush_if_due_at(now);
+        assert_eq!(fs::read_to_string(&log.path).unwrap().lines().count(), 3, "the byte cap flushes without waiting");
+        drop(log);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn dead_tickets_are_pruned() {
         let _serial = serial();
         let (dirs, root) = temp_dirs("prune");
@@ -1926,6 +1999,36 @@ mod tests {
         assert!(list(&dirs).is_empty());
         assert!(!slot.join("owner.json").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_releases_locks_while_cloned_descriptors_stay_open() {
+        let _serial = serial();
+        for scope in [Scope::All, Scope::slots(["debug@host".to_string(), "release@host".to_string()])] {
+            let (dirs, root) = temp_dirs("drop-cloned");
+            let target = root.join("target");
+            let guard = take(&dirs, &target, Request { scope: &scope, ..req("cargo build", "") });
+            // A concurrent fork keeps the same open file descriptions alive until its exec.
+            let inherited_level = guard._level.try_clone().unwrap();
+            let inherited_slots: Vec<File> = guard._slots.iter().map(|file| file.try_clone().unwrap()).collect();
+            let records = guard.records_dir().to_path_buf();
+            let stale = guard.holder.clone();
+            let mut locks: Vec<PathBuf> = guard.slot_dirs.iter().map(|dir| dir.join("lock")).collect();
+            locks.push(dir_for(&dirs, &target).join("lock"));
+            drop(guard);
+
+            fs::write(records.join("owner.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+            assert!(list(&dirs).is_empty(), "cloned descriptors must not keep the old holder active");
+            assert!(!records.join("owner.json").exists());
+            for path in locks {
+                let next = open_lock_file(&path, None).unwrap();
+                sys::try_lock(&next, LockKind::Exclusive).expect("dropping the guard releases every lock");
+            }
+
+            drop((inherited_level, inherited_slots));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

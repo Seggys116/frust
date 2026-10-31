@@ -34,6 +34,8 @@ pub enum PathArg {
     NativeDir(PathBuf),
     /// Missing ones that look like objects or libraries make the invocation uncacheable.
     MaybeFiles(Vec<PathBuf>),
+    /// An explicit linker program, resolved and keyed by its executable content.
+    Tool(PathBuf),
     Target(String),
 }
 
@@ -74,9 +76,9 @@ pub enum Skip {
 
 const SUPPORTED_EMIT: &[&str] = &["dep-info", "metadata", "link"];
 
-/// `linker` names a program keyed by its text; `incremental` is rustc's session directory, excluded from the key.
+/// `incremental` is rustc's session directory, excluded from the key; the other values are opaque options.
 const CODEGEN_NOT_PATHS: &[&str] =
-    &["extra-filename", "metadata", "opt-level", "debuginfo", "codegen-units", "strip", "linker", "incremental"];
+    &["extra-filename", "metadata", "opt-level", "debuginfo", "codegen-units", "strip", "linker-flavor", "incremental"];
 
 pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
     let strings: Vec<String> =
@@ -246,6 +248,10 @@ fn push_option_paths(index: usize, value: &str, paths: &mut Vec<(usize, PathArg)
     let Some((key, val)) = value.split_once('=') else {
         return;
     };
+    if key == "linker" {
+        paths.push((index, PathArg::Tool(PathBuf::from(val))));
+        return;
+    }
     if CODEGEN_NOT_PATHS.contains(&key) || val.is_empty() {
         return;
     }
@@ -415,6 +421,21 @@ mod tests {
                 (9, PathArg::Target("my.json".into())),
             ]
         );
+    }
+
+    #[test]
+    fn explicit_linkers_are_tools_in_every_codegen_spelling() {
+        for (flags, index) in [
+            (vec!["-C", "linker=tools/driver"], 6),
+            (vec!["-Clinker=tools/driver"], 5),
+            (vec!["--codegen", "linker=tools/driver"], 6),
+            (vec!["--codegen=linker=tools/driver"], 5),
+        ] {
+            let parsed = with(&flags).unwrap();
+            assert_eq!(parsed.paths, vec![(index, PathArg::Tool("tools/driver".into()))], "{flags:?}");
+        }
+        assert!(with(&["-Clinker-flavor=ld"]).unwrap().paths.is_empty());
+        assert_eq!(with(&["-Clinker="]).unwrap().paths, vec![(5, PathArg::Tool(PathBuf::new()))]);
     }
 
     #[test]

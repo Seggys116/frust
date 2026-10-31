@@ -21,6 +21,7 @@ For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` tur
 | `FRUST_TARGET_MAX_GIB` | `8` | Soft per-target-directory budget; over it, least recently used superseded artifacts go first |
 | `FRUST_TARGET` | `central` | `local` leaves `CARGO_TARGET_DIR` alone |
 | `FRUST_TUNE` | `off` | Opt-in dependency debuginfo reduction |
+| `FRUST_LINK` | `off` | `smart` invokes Apple’s native linker directly for eligible macOS host dev binaries, avoiding the default compiler-driver process. Keeps static Rust linkage and current incremental state. Explicit linker options, custom drivers, cross targets, tests and release builds keep their existing link path |
 | `FRUST_LOCK` | `on` | Queued build lock |
 | `FRUST_LOCK_TIMEOUT_SECS` | none | Give up waiting for the lock |
 | `FRUST_RENDER` | `auto` | `auto`, `ansi`, `plain`, `off` |
@@ -36,3 +37,14 @@ An explicit `CARGO_TARGET_DIR`, `--target-dir`, or a `target-dir` in your cargo 
 
 The update check runs only on an interactive terminal, never when `CI` is set or `FRUST_BYPASS` is set, and at most
 once a day. See [how it works](how-it-works.md#updates) for `frust self-update`.
+
+
+`FRUST_LINK=smart fcargo build` enables the native-link policy. It applies when Cargo invokes rustc for an
+unoptimised incremental binary; otherwise fresh artifacts remain fresh. The policy also works with
+`FRUST_CACHE=off`, respects an existing foreign `RUSTC_WRAPPER`, and uses the current `xcrun` linker selection
+rather than persisting an Xcode selection. `FRUST_DEBUG=1` reports applied and skipped decisions.
+
+Measure actual function-body edits with `frust bench --linking --runs 7 --json`. The benchmark keeps both
+incremental targets warm, alternates order, verifies that the binary recompiled and ran with the changed output,
+and records native-link and total-build timing separately. It uses the same wrapper path in both arms to avoid
+invalidating Cargo’s compiler-information cache between samples.
