@@ -956,7 +956,10 @@ fn finalized_expiry_batches_many_sessions_and_preserves_parent_idle_times() {
             fs::hard_link(source, session.join("dep-graph.bin")).unwrap();
         }
         let old = SystemTime::now() - Duration::from_secs(31 * 86400);
-        File::open(session.join("dep-graph.bin"))
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(session.join("dep-graph.bin"))
             .unwrap()
             .set_modified(old)
             .unwrap();
@@ -999,7 +1002,10 @@ fn finalized_expiry_preserves_held_recent_unknown_and_program_outputs() {
     let (recent, _) = finalized(&fixture, 2);
     let ttl = Duration::from_secs(30 * 86400);
     let now = SystemTime::now() + ttl + GRACE;
-    File::open(recent.join("dep-graph.bin"))
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(recent.join("dep-graph.bin"))
         .unwrap()
         .set_modified(now)
         .unwrap();

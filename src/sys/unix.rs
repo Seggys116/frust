@@ -240,6 +240,7 @@ pub fn open_session_lock(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn session_record_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
     // SAFETY: flock is plain data; zero length locks the whole file, including future bytes.
     let mut record: libc::flock = unsafe { std::mem::zeroed() };
@@ -260,6 +261,7 @@ fn session_record_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
 
 pub fn try_lock_session(file: &File) -> io::Result<()> {
     file.try_lock().map_err(io::Error::from)?;
+    #[cfg(not(target_os = "macos"))]
     if let Err(error) = session_record_lock(file, libc::F_WRLCK as _) {
         let _ = file.unlock();
         return Err(error);
@@ -268,6 +270,7 @@ pub fn try_lock_session(file: &File) -> io::Result<()> {
 }
 
 pub fn unlock_session(file: &File) {
+    #[cfg(not(target_os = "macos"))]
     let _ = session_record_lock(file, libc::F_UNLCK as _);
     let _ = file.unlock();
 }
@@ -1000,6 +1003,12 @@ fn linux_fs_name(magic: u64) -> String {
 }
 
 #[cfg(test)]
+pub(super) fn non_utf8_os_string() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![0xff])
+}
+
+#[cfg(test)]
 mod compact_hashing_tests {
     use super::*;
 
@@ -1041,10 +1050,4 @@ mod compact_hashing_tests {
         }
         assert_eq!(linux_fs_name(0xdead), "magic-dead");
     }
-}
-
-#[cfg(test)]
-pub(super) fn non_utf8_os_string() -> std::ffi::OsString {
-    use std::os::unix::ffi::OsStringExt;
-    std::ffi::OsString::from_vec(vec![0xff])
 }

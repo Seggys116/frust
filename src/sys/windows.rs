@@ -1417,6 +1417,12 @@ pub fn fs_type_name(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(super) fn non_utf8_os_string() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    OsString::from_wide(&[0xd800])
+}
+
+#[cfg(test)]
 mod compact_hashing_tests {
     use super::*;
 
@@ -1433,10 +1439,4 @@ mod compact_hashing_tests {
         }
         assert_eq!(fs_type_name(&dir.join("frust-sys-no-such-path").join("x")), None);
     }
-}
-
-#[cfg(test)]
-pub(super) fn non_utf8_os_string() -> OsString {
-    use std::os::windows::ffi::OsStringExt;
-    OsString::from_wide(&[0xd800])
 }

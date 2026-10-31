@@ -476,6 +476,11 @@ pub fn fs_type_name(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn non_utf8_os_string() -> OsString {
+    imp::non_utf8_os_string()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -615,9 +620,4 @@ mod tests {
         assert_eq!(wait_readable([Some(&pipe), None], Duration::from_secs(5)), [true, false]);
         assert_eq!(pipe.read(&mut buf).unwrap(), 0);
     }
-}
-
-#[cfg(test)]
-pub(crate) fn non_utf8_os_string() -> OsString {
-    imp::non_utf8_os_string()
 }
