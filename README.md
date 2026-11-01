@@ -101,13 +101,13 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 20.3x faster; isolated cold paired differences reported separately" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 20.3x faster; isolated cold paired differences reported separately" width="760"></p>
 
 Warm debug restores were **20.3× faster**; managed storage was **39.2% smaller** after 200 edits. Cold builds still have overhead. [Method and results](docs/benchmarks.md).
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.8x faster, ThinLTO 34.5x, full/fat LTO 34.3x; median and observed range of seven runs" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.8x faster, ThinLTO 34.5x, full/fat LTO 34.3x; median and observed range of seven runs" width="760"></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 immediate edits: Cargo 371.1 MiB versus frust 225.5 MiB, including target, cache and other managed bytes; automatic compression" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 immediate edits: Cargo 371.1 MiB versus frust 225.5 MiB, including target, cache and other managed bytes; automatic compression" width="760"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 
