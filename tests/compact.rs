@@ -487,13 +487,16 @@ fn auto_compaction_never_disturbs_a_build_and_is_cheap_when_not_due() {
     // Another pass in progress (holding the marker): this one does nothing.
     let marker = File::options().read(true).write(true).create(true).truncate(false).open(target.join(compact::AUTO_MARKER)).unwrap();
     frust::sys::lock(&marker, frust::sys::LockKind::Exclusive).unwrap();
+    let inherited_marker = marker.try_clone().unwrap();
     let report = compact::auto_compact_with(&dirs, &target, &eager());
     assert_eq!(report.skipped, Some("another compaction is running"));
+    frust::sys::unlock(&marker).unwrap();
     drop(marker);
 
     // Default interval: right after a pass, the next is not due.
     let report = compact::auto_compact_with(&dirs, &target, &eager());
     assert!(report.skipped.is_none(), "{report:?}");
+    drop(inherited_marker);
     let mut defaults = eager();
     defaults.every = Duration::from_secs(600);
     assert_eq!(compact::auto_compact_with(&dirs, &target, &defaults).skipped, Some("not due"));

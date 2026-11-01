@@ -67,7 +67,7 @@ fn settled_inputs_are_recorded_with_stamps_and_serve_the_next_build() {
     assert_eq!(sb.count_cache("miss", "leaf"), 1);
     assert!(recorded_stamps(&sb) > 0, "settled inputs carry stamps: {:#?}", manifest_values(&sb));
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 4, "manifests are written in the current format");
+        assert_eq!(manifest["format"], 5, "manifests are written in the current format");
     }
 
     clean(&sb, &a);
@@ -134,7 +134,7 @@ fn manifests_in_an_older_format_are_ignored_and_rewritten() {
     assert_eq!(sb.count_cache("hit", "leaf"), 0, "a manifest without the current format serves nothing");
     assert_eq!(app_output(&sb, &a), "41");
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 4, "the manifest is rewritten in the current format");
+        assert_eq!(manifest["format"], 5, "the manifest is rewritten in the current format");
     }
 
     clean(&sb, &a);
@@ -335,6 +335,107 @@ fn with_stamp_trust_off_a_forged_record_is_just_a_miss_and_no_violation_is_recor
     assert!(violations(&sb).is_empty());
     assert!(quarantine_markers(&sb).is_empty());
     assert_eq!(audits_passed(&sb), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn default_deferred_mode_publishes_reused_metadata_probe_outputs_before_returning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct HelperGate {
+        gate: PathBuf,
+        jobs: PathBuf,
+    }
+    impl Drop for HelperGate {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.gate, b"open");
+            let begun = std::time::Instant::now();
+            while fs::read_dir(&self.jobs).is_ok_and(|mut entries| {
+                entries.any(|entry| entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("job-")))
+            }) && begun.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let sb = Sandbox::new("default-deferred-metadata-probes");
+    let bin = sb.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let persona = bin.join("frustc");
+    fs::copy(env!("CARGO_BIN_EXE_frustc"), &persona).unwrap();
+    let helper = bin.join("frust-wrap");
+    fs::write(&helper, r#"#!/bin/sh
+printf 'helper\n' >> "$FRUST_PROBE_HELPER_CALLS"
+attempts=0
+while [ ! -f "$FRUST_PROBE_HELPER_GATE" ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -gt 3000 ]; then exit 2; fi
+    sleep 0.01
+done
+exec "$FRUST_PROBE_REAL_HELPER" "$@"
+"#).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let helper_calls = sb.root.join("helper-calls");
+    let gate = HelperGate { gate: sb.root.join("helper-gate"), jobs: frust::paths::Dirs::at(sb.home()).deferred() };
+    let compiler = sb.root.join("counted-rustc");
+    let calls = sb.root.join("compiler-calls");
+    fs::write(&compiler, r#"#!/bin/sh
+for arg do
+    case "$arg" in
+        --emit|--emit=*) printf 'compile\n' >> "$FRUST_PROBE_CALLS"; break ;;
+    esac
+done
+exec rustc "$@"
+"#).unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+    let sources = [sb.root.join("location.rs"), sb.root.join("file.rs")];
+    fs::write(&sources[0], "pub fn location() -> u32 { 11 }\n").unwrap();
+    fs::write(&sources[1], "pub fn file() -> u64 { 22 }\n").unwrap();
+    let failed = sb.root.join("failed.rs");
+    fs::write(&failed, "compile_error!(\"intentional capability probe failure\");\n").unwrap();
+    settle(&failed);
+    let out_dir = sb.root.join("probe");
+    let command = |source: &Path| {
+        let mut command = sb.bin_path(persona.to_str().unwrap());
+        command.args(["--cfg=procmacro2_build_probe", "--edition=2021", "--crate-type=lib", "--emit=dep-info,metadata", "--crate-name=proc_macro2"])
+            .arg("--out-dir").arg(&out_dir).arg(source).current_dir(&sb.root)
+            .env("FRUST_RUSTC", &compiler).env("FRUST_PROBE_CALLS", &calls)
+            .env("FRUST_PROBE_HELPER_CALLS", &helper_calls).env("FRUST_PROBE_HELPER_GATE", &gate.gate)
+            .env("FRUST_PROBE_REAL_HELPER", env!("CARGO_BIN_EXE_frust-wrap"))
+            .env("FRUST_CACHE", "on").env("FRUST_CACHE_TRUST_STAMPS", "on").env("FRUST_DEBUG", "1")
+            .env_remove("FRUST_STORE_SYNC").env_remove("FRUST_RUSTC_ID").env_remove("RUSTC_BOOTSTRAP");
+        command
+    };
+    let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
+    let mut artifacts = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        fs::create_dir(&out_dir).unwrap();
+        let output = command(source).output().unwrap();
+        assert_success(&output);
+        artifacts.push((fs::read(out_dir.join("proc_macro2.d")).unwrap(), fs::read(out_dir.join("libproc_macro2.rmeta")).unwrap()));
+        assert_eq!(manifest_values(&sb).len(), index + 1, "each probe must be published while helpers are gated: {}", common::stderr(&output));
+        fs::remove_dir_all(&out_dir).unwrap();
+    }
+    assert_eq!(count(), 2);
+    assert_ne!(artifacts[0].1, artifacts[1].1);
+    // Build scripts may delete the probe directory after every call, including cache hits.
+    for (source, expected) in sources.iter().zip(&artifacts) {
+        fs::create_dir(&out_dir).unwrap();
+        assert_success(&command(source).output().unwrap());
+        assert_eq!(&(fs::read(out_dir.join("proc_macro2.d")).unwrap(), fs::read(out_dir.join("libproc_macro2.rmeta")).unwrap()), expected);
+        fs::remove_dir_all(&out_dir).unwrap();
+    }
+    assert_eq!(count(), 2, "both successful probes restore without real compiler calls");
+    for expected in [3, 4] {
+        fs::create_dir(&out_dir).unwrap();
+        let output = command(&failed).output().unwrap();
+        assert!(!output.status.success());
+        assert!(common::stderr(&output).contains("intentional capability probe failure"));
+        assert_eq!(count(), expected);
+        fs::remove_dir_all(&out_dir).unwrap();
+    }
+    assert!(!helper_calls.exists(), "metadata-only unhashed outputs are stored inline");
+    assert_eq!(sb.count_cache("hit", "proc_macro2"), 2);
 }
 
 #[cfg(unix)]

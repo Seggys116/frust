@@ -1,6 +1,8 @@
 // Backends own the raw std calls banned elsewhere by clippy.toml.
 #![allow(clippy::disallowed_methods)]
 
+pub(crate) mod jobserver_loan;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -230,6 +232,19 @@ impl DirectoryWatcher {
     /// Register before checking the state to avoid missing changes before a wait.
     pub fn new(paths: &[&Path]) -> DirectoryWatcher {
         DirectoryWatcher { inner: imp::DirectoryWatcher::new(paths).ok() }
+    }
+
+    /// Only Linux supplies close hints for the ordinary lifetime of an open lock file.
+    pub fn for_key_lock(parent: &Path) -> Option<DirectoryWatcher> {
+        #[cfg(target_os = "linux")]
+        {
+            imp::DirectoryWatcher::for_key_lock(parent).ok().map(|inner| DirectoryWatcher { inner: Some(inner) })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parent;
+            None
+        }
     }
 
     /// An interrupted wait returns promptly so the caller can check its signal state.

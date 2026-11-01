@@ -2,79 +2,130 @@
 
 ## Method
 
-The benchmark compares plain Cargo with release-built frust binaries using generated projects and isolated temporary caches and targets. It runs offline and alternates which tool goes first. Cold means an empty target and frust cache; it does not mean the operating system page cache was cleared.
+Times are milliseconds, median [minimum, maximum] across seven repetitions unless stated otherwise. Observed ranges describe these runs; no confidence interval or runtime-throughput claim is inferred. Cold means an empty build target and frust cache, with the toolchain and registry dependencies already installed; the OS page cache was not cleared. The general graph has four local crates plus registry dependencies; the release-profile graph has two local crates plus registry dependencies.
 
-Every reported build-timing row has 7 samples after untimed tool/profile warm-ups. Tables show median [minimum, maximum] milliseconds; figure whiskers show the same range, not confidence intervals. Ratios divide the Cargo median by the frust median. Display and inline maintenance are off in the speed rows; synchronous cache storage is included.
+Build latency uses production deferred stores and automatic compression. Foreground wall time includes the frontend, Cargo and compiler audit. Store completion is measured separately: after child exit, the observer waits for no job files and holds every existing slot lock exclusively together. Settled time runs from child start through that proof; drain is the observed interval outside foreground. These observations establish completion coverage, not helper counts or fallback frequency. Growth uses synchronous stores and assesses automatic compaction after every build. Source-stamp settling and allocation inspection are outside growth build latency.
 
-The debug fixture uses 4 local crates plus serde 1.0.229 and serde_json 1.0.154. The release-profile fixture uses 2 local crates plus serde 1.0.229 and serde_json 1.0.154. Edits change an observable main-function body value. The first edit after restoration includes rebuilding incremental state; the warm-session edit measures the next real edit.
+Latency-suite edits change executable function bodies and check program output. Growth replays body/signature edits, feature changes and reverts across bottom, middle and application crates. A clean restore and the first subsequent edit are separate from an edit in a warm incremental session. Release comparisons keep each profile’s Cargo/rustc flags identical between tools: defaults use LTO=false, 16 codegen units, unwind; ThinLTO uses LTO=thin, 16 codegen units, unwind; full/fat LTO uses LTO=fat, one codegen unit, abort. All three have incremental=false. Cargo’s lto=false permits thin local LTO; it differs from lto="off". Same-path binaries match exactly between tools and across clean restores; measured binaries are executed.
 
-A stable compiler audit records actual rustc compilation calls, excluding version and `--print` queries, separately from Cargo’s `Compiling` package notices and cache hit/miss events. Warm restores must execute zero declared Cargo-unit compilations and zero unknown compiler calls. Build-script capability probes remain explicitly counted. Build wall times include audit shim startup and logging. Every no-op and final unchanged growth rebuild must emit zero Cargo compile notices, execute zero compiler calls in every classification, and record zero cache hits or misses. Every release-profile build runs its executable, verifies the changed output, and checks Cargo/frust byte identity at the same source and target paths.
+The audit retains every backend rustc call. Known inspection-only print requests and version/help calls are counted separately from Cargo unit compilations and build-script capability probes. An allowlist with option-operand parsing identifies queries; compilation-bearing, malformed and unknown --print requests remain outside that query class. Queries and probes contribute to measured wall time. No-op checks require zero backend calls of every class, zero Cargo compilation notices and zero cache hits/misses.
 
-The growth experiment replays 200 body/signature edits, feature changes and reverts across 12 local crates plus serde and serde_json. This workload assesses automatic compaction after every build, rather than the ordinary ten-minute interval, with a 2-second / 512-MiB limit on deduplication and compression work and fixed retention policy. Structural analysis and guarded cleanup are additional work. Storage includes the target and cache, with shared extents counted once; the toolchain and shared Cargo registry are excluded. Growth-loop timings are not a latency comparison.
+Concurrent cold groups are a separate workload: two equivalent dev-inherited profiles (`coldone`, `coldtwo`) build the same two-local-library plus registry graph concurrently into separate targets. At each group start, both targets and the shared cache are empty except independently warmed compiler-info memos for each tool/profile cell. Groups alternate Cargo/frust order and profile spawn order; there is no artificial compiler gate. The group clock starts before the first spawn and stops after both direct foreground processes exit; actual spawn skew is recorded. One shared-home drain precedes settled completion. This proves store completion, without asserting that every descendant exited. Intra-group peer cache hits are expected; a concurrent-group improvement does not establish an isolated cold-build improvement. Compiler instrumentation is shared between arms and can affect scheduling. Raw source/tool hashes and fresh-cohort provenance bind the reports to the recorded binaries and original toolchain.
 
-The link collector measures the configured-linker baseline, with artifact caching off and only the primary application profiled using benchmark-only `RUSTC_BOOTSTRAP=1` and `-Ztime-passes`. Instrumentation and system load can affect the timings.
+The fresh measurement cohort records each command, capture interval, report digest, frozen frontend/wrapper identities, original compiler and Cargo versions, native compiler identity, sysroot identity and hardware/filesystem context. Missing in-report metadata, including growth hardware/store policy, comes from this contemporaneous runner provenance; it is not inferred from earlier results. Raw reports and the cohort manifest remain outside the repository.
 
-Reproduce with release-built binaries and at least 12 GiB free. Set `TMPDIR` to a scratch directory on the filesystem being measured; these results use ext4 rather than the system tmpfs:
+Reproduce with the same release-built frust binary and at least 12 GiB free. Set TMPDIR to an existing scratch directory on the filesystem being measured; these results use ext4 rather than the system tmpfs. The general command includes the release-profile matrix. The standalone --profiles command below is an optional separate rerun. Raw JSON reports can remain under /tmp independently of the fixture TMPDIR; keep them outside the repository:
 
-```sh
+```bash
 export TMPDIR=/path/to/scratch-on-measured-filesystem
-frust bench --quick --runs 7 --json
-frust bench --growth --edits=200 --every=20 --libs=12 --variants=cargo,auto --json
-frust bench --growth --edits=200 --every=20 --libs=12 --variants=cargo,auto --compression=off --json
-frust bench --linking --quick --runs 7 --json
+frust bench --quick --runs 7 --store=deferred --compression=auto --json > /tmp/frust-builds.json
+# Optional: rerun only the profile matrix already included above.
+frust bench --profiles --quick --runs 7 --store=deferred --compression=auto --json > /tmp/frust-profiles.json
+frust bench --growth --edits=200 --every=20 --libs=12 --variants=cargo,auto --compression=auto --json > /tmp/frust-growth.json
+frust bench --growth --settle-edits --edits=200 --every=20 --libs=12 --variants=cargo,auto --compression=auto --json > /tmp/frust-growth-settled.json
+frust bench --linking --quick --runs 7 --json > /tmp/frust-linking.json
+frust bench --concurrent --quick --runs 7 --store=deferred --compression=auto --json > /tmp/frust-concurrent.json
 ```
 
 ## Results
 
-Measured 2026-10-31 on Intel(R) Core(TM) Ultra 7 255H, 16 cores, Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. Load average for the general build rows was 3.25 before and 3.04 after; for the profile matrix it was 3.96 before and 2.61 after. Results describe these generated workloads on this machine.
+Measured 2026-10-31–2026-11-01 UTC using Intel(R) Core(TM) Ultra 7 255H (16 logical CPUs), Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. General-suite load before/after: 2.59/2.60; profile-suite load: 2.47/2.80; linker-suite load: 2.74/2.68. Concurrent-suite load: 2.68/2.68; Cargo 1.97.1 (c980f4866 2026-06-30); concurrent compiler identity matches the profile suite. Reflinks supported: false.
 
-![Debug cold builds, warm restores, no-op builds and real warm-session edits](../.github/assets/results.svg)
+### Debug builds
 
-| Debug build | Cargo ms [min, max] | frust ms [min, max] | Result |
-|---|---:|---:|---:|
-| Cold build | 4773 [3156, 5123] | 5184 [3373, 5275] | +411 ms |
-| Warm restore | 5066 [3197, 5086] | 175 [170, 182] | 28.9x faster |
-| No-op build | 20 [19, 21] | 21 [21, 23] | +1 ms |
-| First edit after restore | 95 [89, 100] | 121 [107, 130] | +26 ms |
-| Warm-session edit | 93 [86, 100] | 113 [99, 176] | +20 ms |
+![Debug build timings](../.github/assets/results.svg)
 
-The uncached, no-op and edit rows expose overhead alongside the cache gains.
+| Operation | Cargo ms | frust ms |
+| --- | --- | --- |
+| Cold | 3301 [2853, 3525] | 3572 [2946, 3793] |
+| Second project | 3478 [2829, 3544] | 820 [710, 876] |
+| Clean rebuild / restore | 3483 [2867, 3592] | 162 [157, 186] |
+| No-op | 18 [17, 19] | 19 [19, 21] |
+| First edit after restore | 91 [82, 101] | 99 [91, 113] |
+| Warm-session edit | 87 [85, 105] | 105 [93, 114] |
 
-![Release warm-cache rebuilds for default release, ThinLTO and full/fat LTO](../.github/assets/release-profiles.svg)
+### Concurrent cold groups
 
-| Release profile | Build | Cargo ms [min, max] | frust ms [min, max] | Result |
-|---|---|---:|---:|---:|
-| Release defaults | Cold build | 5071 [5042, 5093] | 5174 [5147, 5214] | +103 ms |
-| Release defaults | Warm restore | 5086 [5044, 5117] | 161 [149, 180] | 31.6x faster |
-| Release defaults | No-op | 20 [18, 21] | 21 [20, 22] | +1 ms |
-| Release defaults | Body edit | 76 [67, 80] | 79 [73, 83] | +3 ms |
-| ThinLTO | Cold build | 7263 [6963, 7496] | 7296 [7244, 7708] | +33 ms |
-| ThinLTO | Warm restore | 7181 [7092, 7397] | 159 [156, 165] | 45.2x faster |
-| ThinLTO | No-op | 20 [19, 22] | 22 [21, 23] | +2 ms |
-| ThinLTO | Body edit | 2407 [2364, 2519] | 2389 [2360, 2583] | -18 ms |
-| Full / fat LTO | Cold build | 6832 [6590, 7388] | 7093 [6760, 7436] | +261 ms |
-| Full / fat LTO | Warm restore | 6725 [6524, 7379] | 158 [154, 168] | 42.6x faster |
-| Full / fat LTO | No-op | 19 [19, 22] | 21 [20, 23] | +2 ms |
-| Full / fat LTO | Body edit | 2216 [2136, 2279] | 2204 [2131, 2217] | -12 ms |
+Each sample completes **two concurrent builds**, with intra-group peer reuse starting from an empty shared cache. These group totals are distinct from the single-build cold rows above. Differences below use matching repetition pairs (frust minus Cargo); their median need not equal the difference between tool medians.
 
-Release defaults use `lto=false`, 16 codegen units and unwinding; ThinLTO uses `lto="thin"` with the same codegen/panic settings; full/fat LTO uses `lto="fat"`, one codegen unit and `panic="abort"`. Cargo’s `lto=false` permits thin local LTO; it is not the same setting as `lto="off"`.
+| Measurement | Cargo ms | frust ms | Paired difference ms | frust faster pairs |
+| --- | --- | --- | --- | --- |
+| Foreground group | 5089.434 [4768.562, 5213.963] | 3697.148 [3651.074, 3878.379] | -1312.618 [-1505.045, -1018.238] | 7/7 |
+| Settled group | 5089.667 [4768.636, 5214.087] | 3697.243 [3651.150, 3878.459] | -1312.708 [-1505.090, -1018.226] | 7/7 |
 
-Median paired cold-build differences (frust minus Cargo) were Release defaults +114 ms (7/7 positive pairs); ThinLTO +307 ms (6/7 positive pairs); Full / fat LTO +184 ms (5/7 positive pairs). These are medians of paired differences; the cold-build table result cells subtract the separately computed tool medians.
+Observed Cargo-unit compilation totals across the seven Cargo/frust pairs were 40→20, 40→20, 40→20, 40→20, 40→20, 40→20, 40→20. Each pair proved 14 uniquely identified shared units compiled once with positive-byte store and peer-hit evidence. Those counts exclude separately retained inspection queries and build-script capability probes. Same-path executable bytes and runtime output matched across tools and profiles. All final unchanged groups executed zero compiler calls (including queries), zero Cargo compilation notices and zero cache events.
 
-All paired release executables were byte-identical, including cold versus restored outputs. Each warm restore executed zero declared Cargo-unit or unknown compiler calls and 1 build-script capability probe. The separate release runtime check also matched output on every one of its 10 measured launches per binary; process-launch timing is not a program-throughput result.
+### Release profiles
 
-![Combined target and cache storage after 200 edits](../.github/assets/growth.svg)
+![Release-profile restore timings](../.github/assets/release-profiles.svg)
 
-| After 200 edits | Target MiB | Cache MiB | Combined physical MiB |
-|---|---:|---:|---:|
-| Cargo | 371.1 | 0.0 | 371.1 |
-| frust compression off | 174.4 | 164.1 | 338.5 |
-| frust compression auto | 174.4 | 64.5 | 238.8 |
+| Profile | Operation | Cargo ms | frust ms |
+| --- | --- | --- | --- |
+| Defaults | Cold | 3684 [3556, 3773] | 3936 [3845, 4026] |
+| Defaults | Clean rebuild / restore | 3698 [3618, 3820] | 146 [141, 169] |
+| Defaults | No-op | 20 [17, 20] | 21 [19, 24] |
+| Defaults | Body edit | 67 [65, 77] | 74 [68, 81] |
+| ThinLTO | Cold | 5129 [4956, 5209] | 5316 [5236, 5483] |
+| ThinLTO | Clean rebuild / restore | 5018 [4991, 5267] | 146 [142, 161] |
+| ThinLTO | No-op | 19 [19, 20] | 21 [19, 28] |
+| ThinLTO | Body edit | 1767 [1710, 1890] | 1785 [1736, 1863] |
+| Full/fat LTO | Cold | 4957 [4839, 4998] | 5242 [5039, 5416] |
+| Full/fat LTO | Clean rebuild / restore | 4960 [4832, 5088] | 143 [140, 145] |
+| Full/fat LTO | No-op | 19 [19, 20] | 21 [21, 21] |
+| Full/fat LTO | Body edit | 1712 [1641, 1760] | 1710 [1639, 1796] |
 
-With automatic cache compression, combined storage was 35.6% smaller than Cargo. Both variants executed 1,542 actual compiler invocations during the automatic-compression edit loop and executed zero compiler calls on the final unchanged rebuild, with zero Cargo compile notices or cache events; every edit’s runtime output matched. Compression-off and compression-auto are separate full replays of the same workload.
+Frust retained a positive paired median isolated-cold overhead for debug, ordinary release, ThinLTO, full/fat LTO. The concurrent-group result does not remove those regressions. Cold rows above contain each tool’s own median. The following differences use matching repetition pairs (frust minus Cargo); their median need not equal the difference between tool medians. Cold pairs alternate tool order.
 
-Automatic compression used 60.7% less cache allocation and 29.4% less combined allocation than disabled compression.
+| Cold comparison | Paired difference ms | Paired difference % | Positive differences |
+| --- | --- | --- | --- |
+| Debug general graph | 112 [-167, 492] | 3.3% [-5.2%, 14.9%] | 6/7 |
+| Defaults | 289 [96, 384] | 8.1% [2.5%, 10.6%] | 7/7 |
+| ThinLTO | 237 [27, 445] | 4.6% [0.5%, 8.8%] | 7/7 |
+| Full/fat LTO | 279 [82, 513] | 5.6% [1.7%, 10.6%] | 7/7 |
 
-After the initial two-project debug builds, combined allocation was 221.1 MiB for Cargo and 260.2 MiB for frust including its cache: 17.7% larger. Cache storage has an initial cost; total savings depend on the workload and accumulated build history.
+Each debug cold sample compiled 22 Cargo units and ran 3 build-script capability probes with either tool. Cargo issued 8 queries and frust 10: two extra frust cold queries, retained in total latency. Warm restores require zero Cargo-unit and unknown compilations, positive cache hits and zero misses; any inspection queries or capability probes remain visible. Debug and release no-op samples made zero compiler calls, including queries.
 
-The configured-linker baseline took 36 [30, 42] ms within the 92 [82, 99] ms build. Each of the 7 real body edits compiled exactly one current main binary and executed the expected changed output. The configured linker was retained.
+### Deferred store completion
+
+All listed frust samples include the completion proof. Foreground values are in the build tables; these columns report the separate observed drain and total settled time.
+
+| frust operation | Drain ms | Settled total ms |
+| --- | --- | --- |
+| Debug: cold | 20 [10, 20] | 3592 [2966, 3803] |
+| Debug: second project | 10 [10, 20] | 831 [720, 897] |
+| Debug: clean rebuild / restore | 0 [0, 0] | 162 [157, 186] |
+| Debug: no-op | 0 [0, 0] | 19 [19, 21] |
+| Debug: first edit after restore | 20 [0, 20] | 115 [91, 131] |
+| Debug: warm-session edit | 20 [0, 20] | 121 [93, 134] |
+| Defaults: cold | 0 [0, 0] | 3936 [3845, 4026] |
+| Defaults: clean rebuild / restore | 0 [0, 0] | 146 [141, 169] |
+| ThinLTO: cold | 0 [0, 0] | 5316 [5236, 5483] |
+| ThinLTO: clean rebuild / restore | 0 [0, 0] | 146 [142, 161] |
+| Full/fat LTO: cold | 0 [0, 0] | 5242 [5039, 5416] |
+| Full/fat LTO: clean rebuild / restore | 0 [0, 0] | 144 [140, 145] |
+
+### Managed allocation after 200 edits
+
+![Managed allocation after 200 edits](../.github/assets/growth.svg)
+
+Both sequences use 12 local libraries, one application and registry dependencies. Each tool completed 200 steps of body/signature edits, feature changes and reverts, produced matching output throughout, recorded 1,542 compilations including the initial build, and made zero compiler calls on the final unchanged rebuild. These are single completed growth sequences, not seven-run latency distributions. Allocation counts unique device/inode blocks across managed roots. Toolchain and Cargo registry storage are excluded. Target plus store is a subset of full managed allocation. The cache column is the additional store allocation beyond the target; other managed allocation includes controls and other managed roots. Standalone retired payload may share inodes or extents with target/store and is annotated separately, never added to a stack.
+
+| Sequence | Tool | Target MiB | Cache (additional) MiB | Other managed MiB | Full managed MiB |
+| --- | --- | --- | --- | --- | --- |
+| Immediate edits | Cargo | 371.1 | 0.0 | 0.0 | 371.1 |
+| Immediate edits | frust | 174.4 | 48.1 | 3.0 | 225.5 |
+| Settled source stamps | Cargo | 371.1 | 0.0 | 0.0 | 371.1 |
+| Settled source stamps | frust | 174.4 | 48.6 | 3.1 | 226.0 |
+
+Settled source checks waited 20.155 seconds for Cargo, 20.233 seconds for frust outside build latency. Neither frust replay retained queued payload allocation at its endpoint; this cache-home measure is not applicable to Cargo.
+
+At the final settled snapshot, the maximum retained keys per unit was 3, within the configured bound of 4; the retired queue contained 0 payload entries. The final unchanged build made zero compiler calls. Retention observations check descriptors and backing presence rather than full restore integrity.
+
+### Native linking baseline
+
+With FRUST_LINK=off, the configured linker is preserved and the artifact cache is off. Seven real main-function edits each compiled exactly one main binary and produced the expected edit output. Benchmark-only RUSTC_BOOTSTRAP=1 and -Ztime-passes instrument the primary application; dependencies receive no profiling flags. Total build time includes frontend and Cargo; native link time is the single current main-binary link_binary phase. This instrumentation is separate from the production build tables. Only the baseline mode was measured; no native-link reuse or transformed-linker speedup is claimed.
+
+| Measurement | ms median [min, max] |
+| --- | --- |
+| Total build | 85 [78, 90] |
+| Native link phase | 31 [27, 37] |

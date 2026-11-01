@@ -80,9 +80,10 @@ Related lookup behaviour:
   without waiting. If none is available, work stays on the caller. Without a jobserver, CPU and worker-count caps
   still apply. Detached stores run serially and do not borrow Cargo tokens.
 * A current-format manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
-  format number: new writes use 4, legacy format 3 remains readable, and other formats are ignored and rewritten.
+  format number: new writes use 5, legacy formats 3 and 4 remain readable, and other formats are ignored and rewritten.
 * Evicting an entry is one rename into `tmp/evicted` under `FRUST_HOME`, so a concurrent restore fails cleanly
-  and recompiles; `frust gc` and the daily maintenance delete such entries once they are an hour old.
+  and recompiles. The remover immediately deletes only its unique retired child. Failed deletions remain queued;
+  `frust gc` and daily maintenance retry individual children without an age delay and preserve the queue directory.
 
 ## Single-flight and the deferred store
 
@@ -90,10 +91,28 @@ When several processes miss on the same pre-key at once (parallel builds of one 
 dependency), only one should compile it.
 
 * **Single-flight.** After a miss, the wrapper takes an exclusive lock on a file named by the pre-key under
-  `keylocks/` in `FRUST_HOME`. A process that finds the lock held polls it (5 ms, doubling to 40 ms) for up to
+  `keylocks/` in `FRUST_HOME`. A process that finds the lock held waits for up to
   `FRUST_KEYLOCK_WAIT_SECS` (default 300), then looks the entry up again and restores it instead of recompiling.
+  On Linux, a watcher is created only after contention and wakes on lock-file closure. Every wakeup rechecks
+  the OS lock; notifications never grant ownership. Timed retries start at 5 ms and double to 40 ms, providing
+  the fallback on unsupported platforms, watcher errors and missed notifications.
   This is fail-open: if the lock file cannot be opened or locked, or the wait runs out, the wrapper compiles
-  anyway. The lock is held until the entry is published.
+  anyway. Every acquired key lock triggers another lookup, including an immediate acquisition. The lock is
+  held until the entry is published. Matching compiler units can share results across profile and target
+  directories; different compiler flags keep separate identities.
+* Publication, manifest updates, usage refreshes, version-record updates and retirement renames share a short
+  cache-wide metadata lock. Compilation, hashing and payload deletion happen outside it. Retirement prunes
+  proven-missing candidates from the entry's recorded manifest and removes an empty manifest immediately.
+  Live candidates keep their order; legacy or uncertain metadata remains for conservative GC. GC keeps a unit
+  record while any referenced cache entry remains and rechecks orphaned records under the same lock before
+  removing them. Busy automatic retirements keep the pass incomplete so maintenance retries them.
+* On Linux and macOS, a waiting wrapper can lend its implicit slot so independent units compile. This requires
+  a verified direct child of frust's supervised Cargo, currently versions 1.89–1.99. A short-lived guardian holds
+  Cargo's captured stderr open until it has repaid the loan, including when the wrapper is terminated. Cargo
+  therefore retains its accounting for that compiler until repayment. The wrapper releases the key lock before
+  reclaiming its slot, then retries the key without blocking. Other callers retain their slots while waiting.
+  The guardian starts only on contention and exits after repayment or jobserver EOF; killing the guardian itself
+  during a loan is outside this recovery guarantee. Uncertain repayment fails the build before further compilation.
 * **Deferred store.** Storing a result means hashing inputs, copying outputs and writing a manifest, none of which
   cargo needs to wait for. After rustc succeeds, the wrapper records the identity of the outputs and inputs,
   writes a job file under `tmp/deferred` and starts a detached helper (`frust-wrap --deferred-store <job>`, a
@@ -104,7 +123,8 @@ dependency), only one should compile it.
 * Capacity is reserved before preparing a deferred job, so a saturated helper pool does not discover and freeze the same outputs twice.
 * The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
   result cannot be handed over (for example a directory output, or an incremental compile that printed an
-  incremental-compilation warning) or when the helper cannot be started.
+  incremental-compilation warning), for unhashed metadata probes whose outputs may be deleted immediately,
+  or when the helper cannot be started.
 
 So the entry for a crate can appear a moment after cargo has moved on. A build started in that moment simply
 misses or waits on the key lock.
@@ -121,8 +141,10 @@ Restores decode bounded 1 MiB blocks and check the exact decoded length, content
 before replacing the destination. Original file permissions, including executable bits, are preserved. Damaged
 or truncated payloads fail the restore, allowing another candidate or the compiler to supply the outputs.
 
+When compression is enabled on a supported filesystem, a `.rmeta` payload can share its matching cached `.rlib` archive. Frust requires an exact byte match inside a checked archive member and records the complete archive and metadata hashes, bounds and permissions. A restore decodes the archive once into separate original outputs and verifies both before publishing them. Unsupported or nonmatching layouts keep ordinary payload storage; compaction requires the same complete proof before treating either output as recoverable.
+
 `FRUST_CACHE_COMPRESSION=off` changes new writes only; existing compressed entries can still be restored. Legacy
-raw entries remain readable without conversion. New manifests use format 4 so older readers ignore them, and
+raw entries remain readable without conversion. New manifests use format 5 so older readers ignore them, and
 encoded entries use a separate key domain from the keys older writers compute.
 
 ## Smaller build directories
@@ -171,6 +193,9 @@ encoded entries use a separate key domain from the keys older writers compute.
   cache budget, scratch and temporary files, metadata and central-target retirement. It sizes cache entries from
   recorded stored allocations (legacy entries use their existing byte counts), measuring them only when the
   cache is over its budget. An explicit `frust gc` measures every entry.
+* A manifest expires only when it and its surviving entries have been idle past the retention period.
+  Manifest identity, contents and entry usage are checked again before removal, so activity after planning
+  preserves the lookup route to a reused entry.
 * A central target becomes eligible for payload retirement after 30 days without activity. If the detached
   collector cannot start, foreground fallback examines at most eight candidates and retires at most two targets,
   with bounded activity scans. The daily detached collector drains eligible targets using a

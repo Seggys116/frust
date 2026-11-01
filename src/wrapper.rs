@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::hashing::{self, DirHash, Hasher, Stamp, StampRecord, StampTrust};
 use crate::cache::rustc_args::{self, PathArg, RustcArgs};
-use crate::cache::{self, Cache, Candidate, EntryMeta, Input, PROFILE_TOKEN, StoredFile, TrustMode};
+use crate::cache::{
+    self, Cache, Candidate, EntryMeta, Input, PROFILE_TOKEN, StoredFile, TrustMode,
+};
 use crate::compact;
 use crate::config::Config;
 use crate::events::{self, CacheResult, Event};
@@ -25,10 +27,23 @@ use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::sys::{self, LockKind};
 
-const ENV_DENY_PREFIXES: &[&str] =
-    &["CARGO_TERM_", "CARGO_BUILD_", "CARGO_NET_", "CARGO_HTTP_", "CARGO_REGISTRIES_", "CARGO_PROFILE_", "CARGO_LOG"];
-const ENV_DENY_EXACT: &[&str] =
-    &["CARGO", "CARGO_MAKEFLAGS", "CARGO_TARGET_DIR", "CARGO_HOME", "CARGO_INCREMENTAL", "CARGO_PRIMARY_PACKAGE"];
+const ENV_DENY_PREFIXES: &[&str] = &[
+    "CARGO_TERM_",
+    "CARGO_BUILD_",
+    "CARGO_NET_",
+    "CARGO_HTTP_",
+    "CARGO_REGISTRIES_",
+    "CARGO_PROFILE_",
+    "CARGO_LOG",
+];
+const ENV_DENY_EXACT: &[&str] = &[
+    "CARGO",
+    "CARGO_MAKEFLAGS",
+    "CARGO_TARGET_DIR",
+    "CARGO_HOME",
+    "CARGO_INCREMENTAL",
+    "CARGO_PRIMARY_PACKAGE",
+];
 
 /// Enough for an undo, a switch between two branches and one more state, while bounding edit-loop growth.
 pub const UNIT_VERSIONS: usize = 4;
@@ -67,13 +82,17 @@ const DEFERRED_ARG: &str = "--deferred-store";
 const KEY_POLL_START: Duration = Duration::from_millis(5);
 const KEY_POLL_MAX: Duration = Duration::from_millis(40);
 
-/// Bumped whenever `StoreJob` changes shape; a helper meeting another format stores nothing.
+/// Bumped whenever `StoreJob` changes incompatibly; a helper meeting another format stores nothing.
 const JOB_FORMAT: u32 = 2;
 
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
 static DETACHED_STORE: AtomicBool = AtomicBool::new(false);
+pub(crate) const SLOT_SUPERVISOR_ENV: &str = "FRUST_JOBSERVER_SUPERVISOR";
 
 pub fn run(args: Vec<OsString>) -> i32 {
+    if let Some(code) = sys::jobserver_loan::helper_entry(&args) {
+        return code;
+    }
     if let Some(job) = deferred_entry(&args) {
         DETACHED_STORE.store(true, Ordering::Relaxed);
         return deferred_main(job);
@@ -87,7 +106,11 @@ pub fn run(args: Vec<OsString>) -> i32 {
         && let Some(plan) = Plan::build(&cfg, &args)
     {
         let code = plan.execute();
-        plan.debug(&format!("{} done in {}ms", plan.parsed.crate_name, started.elapsed().as_millis()));
+        plan.debug(&format!(
+            "{} done in {}ms",
+            plan.parsed.crate_name,
+            started.elapsed().as_millis()
+        ));
         return code;
     }
     passthrough(&args)
@@ -99,7 +122,10 @@ fn passthrough(args: &[OsString]) -> i32 {
         return 2;
     };
     let err = sys::exec_replace(compiler_command(tool).args(rest));
-    eprintln!("frust-wrap: cannot run {}: {err}", Path::new(tool).display());
+    eprintln!(
+        "frust-wrap: cannot run {}: {err}",
+        Path::new(tool).display()
+    );
     127
 }
 
@@ -164,7 +190,9 @@ impl Plan {
             } else if !incremental_units_enabled() {
                 Some("incremental compile (FRUST_CACHE_INCREMENTAL=off)")
             } else if primary && !primary_incremental_enabled() {
-                Some("incremental compile of a primary package (FRUST_CACHE_PRIMARY_INCREMENTAL=off)")
+                Some(
+                    "incremental compile of a primary package (FRUST_CACHE_PRIMARY_INCREMENTAL=off)",
+                )
             } else {
                 None
             };
@@ -181,20 +209,37 @@ impl Plan {
             }
         };
         let cwd = env::current_dir().ok()?;
-        let profile = rustc_args::profile_root(&parsed.out_dir).to_string_lossy().into_owned();
+        let profile = rustc_args::profile_root(&parsed.out_dir)
+            .to_string_lossy()
+            .into_owned();
         let profile_abs = cwd.join(&profile);
         let trust = Arc::new(TrustGate::new(TrustMode::from_env(), &dirs, cfg.debug));
-        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots()).with_stamp_trust(stamp_policy(&trust));
-        let key = KeyContext { hasher: &hasher, cwd: &cwd, profile: &profile, profile_abs: &profile_abs };
+        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots())
+            .with_stamp_trust(stamp_policy(&trust));
+        let key = KeyContext {
+            hasher: &hasher,
+            cwd: &cwd,
+            profile: &profile,
+            profile_abs: &profile_abs,
+        };
         let keyed = Instant::now();
-        let PreKey { key: prekey, unit, watched, extern_hashes } = match key.prekey(&args[0], &args[1..], &parsed) {
+        let PreKey {
+            key: prekey,
+            unit,
+            watched,
+            extern_hashes,
+        } = match key.prekey(&args[0], &args[1..], &parsed) {
             Ok(found) => found,
             Err(reason) => {
                 debug(format!("not cacheable: {} ({reason})", parsed.crate_name));
                 return None;
             }
         };
-        debug(format!("pre-key for {} in {}ms", parsed.crate_name, keyed.elapsed().as_millis()));
+        debug(format!(
+            "pre-key for {} in {}ms",
+            parsed.crate_name,
+            keyed.elapsed().as_millis()
+        ));
         // Registry and git crates never change, so they accumulate no versions and need no bookkeeping.
         let unit = env::var_os("CARGO_MANIFEST_DIR")
             .filter(|dir| !dir.is_empty() && !hasher.in_immutable_root(Path::new(dir)))
@@ -230,12 +275,23 @@ impl Plan {
         // The helper is detached and silent.
         cfg.debug = false;
         let dirs = Dirs::at(&job.home);
-        let profile = rustc_args::profile_root(&parsed.out_dir).to_string_lossy().into_owned();
+        let profile = rustc_args::profile_root(&parsed.out_dir)
+            .to_string_lossy()
+            .into_owned();
         let profile_abs = job.cwd.join(&profile);
-        let watched = job.watched.iter().map(|(path, wire)| Some((path.clone(), wire.stamp()?))).collect::<Option<Vec<_>>>()?;
+        let watched = job
+            .watched
+            .iter()
+            .map(|(path, wire)| Some((path.clone(), wire.stamp()?)))
+            .collect::<Option<Vec<_>>>()?;
         let extern_hashes = job.extern_hashes.iter().cloned().collect();
-        let trust = Arc::new(TrustGate::new(TrustMode::parse(Some(job.trust.as_str())), &dirs, false));
-        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots()).with_stamp_trust(stamp_policy(&trust));
+        let trust = Arc::new(TrustGate::new(
+            TrustMode::parse(Some(job.trust.as_str())),
+            &dirs,
+            false,
+        ));
+        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots())
+            .with_stamp_trust(stamp_policy(&trust));
         let cache = Cache::new(&dirs);
         Some(Plan {
             cfg,
@@ -258,48 +314,97 @@ impl Plan {
     }
 
     fn execute(&self) -> i32 {
+        self.execute_after_miss(|| {})
+    }
+
+    fn execute_after_miss(&self, after_miss: impl FnOnce()) -> i32 {
         fsx::install_temp_cleanup();
         let started = Instant::now();
         if self.try_hit(started) {
-            self.debug(&format!("hit {} in {}ms", self.parsed.crate_name, started.elapsed().as_millis()));
+            self.debug(&format!(
+                "hit {} in {}ms",
+                self.parsed.crate_name,
+                started.elapsed().as_millis()
+            ));
             return 0;
         }
-        self.debug(&format!("lookup {} missed after {}ms", self.parsed.crate_name, started.elapsed().as_millis()));
-        let (key_lock, waited) = self.lock_key();
+        self.debug(&format!(
+            "lookup {} missed after {}ms",
+            self.parsed.crate_name,
+            started.elapsed().as_millis()
+        ));
+        after_miss();
+        let (key_lock, waited) = match self.lock_key() {
+            Ok(locked) => locked,
+            Err(error) => {
+                eprintln!("frust-wrap: cannot settle compiler slot: {error}");
+                return 1;
+            }
+        };
         // The process that held the lock has published its entry by now if it stored one.
-        if waited && self.try_hit(started) {
-            self.debug(&format!("hit {} after waiting, in {}ms", self.parsed.crate_name, started.elapsed().as_millis()));
+        if (key_lock.is_some() || waited) && self.try_hit(started) {
+            self.debug(&format!(
+                "hit {} after key lock, in {}ms",
+                self.parsed.crate_name,
+                started.elapsed().as_millis()
+            ));
             return 0;
         }
         self.compile_and_store(key_lock)
     }
 
-    /// The lock file for this pre-key, exclusive while a process compiles the unit. Returns the held lock (if any) and whether it had to wait; every failure means "compile without the lock".
-    fn lock_key(&self) -> (Option<File>, bool) {
+    /// Returns the key lock and wait state; lock failures allow compilation, while unsettled slot loans fail the build.
+    fn lock_key(&self) -> io::Result<(Option<File>, bool)> {
         let path = keylock_path(&self.dirs, &self.prekey);
         let file = match open_key_lock(&self.dirs, &path) {
             Ok(file) => file,
             Err(err) => {
-                self.debug(&format!("no key lock for {}: {err}", self.parsed.crate_name));
-                return (None, false);
+                self.debug(&format!(
+                    "no key lock for {}: {err}",
+                    self.parsed.crate_name
+                ));
+                return Ok((None, false));
             }
         };
         match try_key_lock(&file) {
-            Ok(true) => (Some(file), false),
+            Ok(true) => Ok((Some(file), false)),
             Ok(false) => {
+                self.debug(&format!(
+                    "waiting for key lock for {}",
+                    self.parsed.crate_name
+                ));
                 let begun = Instant::now();
-                let got = wait_key_lock(&file, self.cfg.keylock_wait);
+                let client = if DETACHED_STORE.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    JOBSERVER.get().and_then(Option::as_ref)
+                };
+                let mut watcher = path.parent().and_then(sys::DirectoryWatcher::for_key_lock);
+                let got = wait_key_with_slot(
+                    file,
+                    self.cfg.keylock_wait,
+                    || lend_cargo_slot(client),
+                    |file, cap| match watcher.as_mut() {
+                        Some(watcher) => wait_key_lock_hints(file, cap, |pause| watcher.wait(pause)),
+                        None => wait_key_lock(file, cap),
+                    },
+                    || open_key_lock(&self.dirs, &path),
+                );
                 let waited_ms = (begun.elapsed().as_millis() as u64).max(1);
                 self.waited_ms.store(waited_ms, Ordering::Relaxed);
-                self.debug(&format!("waited {waited_ms}ms for {}", self.parsed.crate_name));
+                self.debug(&format!(
+                    "waited {waited_ms}ms for {}",
+                    self.parsed.crate_name
+                ));
                 match got {
-                    Ok(true) => (Some(file), true),
-                    _ => (None, true),
+                    Ok(Some(file)) => Ok((Some(file), true)),
+                    Err(KeyWaitError::Loan(error)) => Err(error),
+                    _ => Ok((None, true)),
                 }
             }
             Err(err) => {
                 self.debug(&format!("cannot lock {}: {err}", path.display()));
-                (None, false)
+                Ok((None, false))
             }
         }
     }
@@ -313,7 +418,8 @@ impl Plan {
     }
 
     fn resolve(&self, normalised: &str) -> PathBuf {
-        self.cwd.join(normalised.replace(PROFILE_TOKEN, &self.profile))
+        self.cwd
+            .join(normalised.replace(PROFILE_TOKEN, &self.profile))
     }
 
     fn version(&self) -> String {
@@ -349,7 +455,10 @@ impl Plan {
                     );
                     return true;
                 }
-                Err(err) => self.debug(&format!("restore failed for {}: {err}", self.parsed.crate_name)),
+                Err(err) => self.debug(&format!(
+                    "restore failed for {}: {err}",
+                    self.parsed.crate_name
+                )),
             }
         }
         false
@@ -371,13 +480,23 @@ impl Plan {
                 (i, path, persist, input)
             })
             .collect();
-        let (hasher, gate, now, krate) = (&self.hasher, &self.trust, hashing::now_ns(), self.parsed.crate_name.as_str());
+        let (hasher, gate, now, krate) = (
+            &self.hasher,
+            &self.trust,
+            hashing::now_ns(),
+            self.parsed.crate_name.as_str(),
+        );
         let skipped = Mutex::new(Vec::new());
         let confirmed = AtomicUsize::new(0);
-        let check = |(i, path, persist, input): &(usize, PathBuf, bool, &Input)| match input_matches(hasher, path, *persist, input, gate, now) {
+        let check = |(i, path, persist, input): &(usize, PathBuf, bool, &Input)| match input_matches(
+            hasher, path, *persist, input, gate, now,
+        ) {
             Verdict::Match => true,
             Verdict::Trusted => {
-                skipped.lock().unwrap_or_else(PoisonError::into_inner).push(*i);
+                skipped
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(*i);
                 true
             }
             Verdict::Confirmed => {
@@ -390,7 +509,11 @@ impl Plan {
                 false
             }
         };
-        let all = if checks.len() > PARALLEL_VERIFY_MIN_INPUTS { all_parallel(&checks, check) } else { checks.iter().all(check) };
+        let all = if checks.len() > PARALLEL_VERIFY_MIN_INPUTS {
+            all_parallel(&checks, check)
+        } else {
+            checks.iter().all(check)
+        };
         if !all {
             return false;
         }
@@ -418,7 +541,10 @@ impl Plan {
     }
 
     fn restore(&self, entry: &Path, meta: &EntryMeta) -> io::Result<u64> {
-        let names_ok = meta.files.iter().all(|f| cache::safe_file_name(&f.name) && cache::safe_file_name(&f.stored))
+        let names_ok = meta
+            .files
+            .iter()
+            .all(|f| cache::safe_file_name(&f.name) && cache::safe_file_name(&f.stored))
             && cache::safe_file_name(&meta.stderr);
         if !names_ok {
             return Err(io::Error::new(
@@ -426,18 +552,36 @@ impl Plan {
                 "entry metadata names a file outside its directory",
             ));
         }
-        if meta.files.iter().any(|file| !file.encoding.is_raw() && (file.text || file.dir)) {
+        if meta
+            .files
+            .iter()
+            .any(|file| !file.encoding.is_raw() && (file.text || file.dir))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "encoded entry metadata marks an artifact as text or a directory",
             ));
         }
+        let groups = cache::metadata_slice::validate_groups(&meta.files)?;
         if !self.parsed.out_dir.is_dir() {
             fs::create_dir_all(&self.parsed.out_dir)?;
         }
         // A temp name plus rename per file lets them be restored concurrently.
         let (out_dir, profile) = (&self.parsed.out_dir, &self.profile);
-        let restored = parallel(&meta.files, |_, file| {
+        let restored = parallel(&groups, |_, group| {
+            let file = &meta.files[group.base_index];
+            if !group.slice_indices.is_empty() {
+                cache::metadata_slice::restore_group(entry, out_dir, &meta.files, group)?;
+                let mut bytes = 0;
+                for index in
+                    std::iter::once(group.base_index).chain(group.slice_indices.iter().copied())
+                {
+                    let output = &meta.files[index];
+                    fsx::touch(&out_dir.join(&output.name));
+                    bytes += output.bytes;
+                }
+                return Ok(bytes);
+            }
             let src = entry.join(&file.stored);
             let dst = out_dir.join(&file.name);
             if file.text {
@@ -453,7 +597,8 @@ impl Plan {
             Ok(file.bytes)
         })?;
         let bytes = restored.iter().sum();
-        let stderr = fs::read_to_string(entry.join(&meta.stderr))?.replace(PROFILE_TOKEN, &self.profile);
+        let stderr =
+            fs::read_to_string(entry.join(&meta.stderr))?.replace(PROFILE_TOKEN, &self.profile);
         let mut out = io::stderr().lock();
         out.write_all(stderr.as_bytes())?;
         out.flush()?;
@@ -465,13 +610,27 @@ impl Plan {
         let started = Instant::now();
         // Taken after any wait and before rustc starts: an input changed after this may have been read in its old state.
         let spawned_ns = hashing::now_ns();
-        let preexisting: HashMap<String, Stamp> =
-            self.prefixed_outputs(|_| true).into_iter().filter_map(|(name, stamp)| Some((name, stamp?))).collect();
-        self.debug(&format!("{} earlier outputs scanned in {}ms", preexisting.len(), started.elapsed().as_millis()));
-        let mut child = match compiler_command(&self.args[0]).args(&self.args[1..]).stderr(Stdio::piped()).spawn() {
+        let preexisting: HashMap<String, Stamp> = self
+            .prefixed_outputs(|_| true)
+            .into_iter()
+            .filter_map(|(name, stamp)| Some((name, stamp?)))
+            .collect();
+        self.debug(&format!(
+            "{} earlier outputs scanned in {}ms",
+            preexisting.len(),
+            started.elapsed().as_millis()
+        ));
+        let mut child = match compiler_command(&self.args[0])
+            .args(&self.args[1..])
+            .stderr(Stdio::piped())
+            .spawn()
+        {
             Ok(child) => child,
             Err(err) => {
-                eprintln!("frust-wrap: cannot run {}: {err}", Path::new(&self.args[0]).display());
+                eprintln!(
+                    "frust-wrap: cannot run {}: {err}",
+                    Path::new(&self.args[0]).display()
+                );
                 return 127;
             }
         };
@@ -484,11 +643,23 @@ impl Plan {
         if status.success() {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
-            if self.defer_store(&captured, compile_ms, spawned_ns, &preexisting, key_lock.as_ref()) {
-                self.debug(&format!("compiled {} in {compile_ms}ms, store deferred", self.parsed.crate_name));
+            if self.defer_store(
+                &captured,
+                compile_ms,
+                spawned_ns,
+                &preexisting,
+                key_lock.as_ref(),
+            ) {
+                self.debug(&format!(
+                    "compiled {} in {compile_ms}ms, store deferred",
+                    self.parsed.crate_name
+                ));
             } else {
                 if let Err(err) = self.store(&captured, compile_ms, spawned_ns, &preexisting) {
-                    self.debug(&format!("store failed for {}: {err}", self.parsed.crate_name));
+                    self.debug(&format!(
+                        "store failed for {}: {err}",
+                        self.parsed.crate_name
+                    ));
                 }
                 self.debug(&format!(
                     "compiled {} in {compile_ms}ms, stored in {}ms",
@@ -511,13 +682,19 @@ impl Plan {
         preexisting: &HashMap<String, Stamp>,
         key_lock: Option<&File>,
     ) -> bool {
-        if self.cfg.store_sync {
+        // Capability probes reuse or delete these exact output names immediately after the wrapper returns.
+        if self.cfg.store_sync
+            || (self.parsed.metadata_only_library && self.parsed.extra_filename.is_empty())
+        {
             return false;
         }
         match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock) {
             Ok(handed_over) => handed_over,
             Err(err) => {
-                self.debug(&format!("store of {} not deferred: {err}", self.parsed.crate_name));
+                self.debug(&format!(
+                    "store of {} not deferred: {err}",
+                    self.parsed.crate_name
+                ));
                 false
             }
         }
@@ -533,10 +710,15 @@ impl Plan {
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
         let Some((slot, slot_path)) = acquire_slot(&deferred, slot_count()) else {
-            self.debug(&format!("deferred store slots busy or unavailable for {}; storing inline", self.parsed.crate_name));
+            self.debug(&format!(
+                "deferred store slots busy or unavailable for {}; storing inline",
+                self.parsed.crate_name
+            ));
             return Ok(false);
         };
-        let Some(frozen) = self.freeze(captured, preexisting) else { return Ok(false) };
+        let Some(frozen) = self.freeze(captured, spawned_ns, preexisting) else {
+            return Ok(false);
+        };
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
         let mut keep: Vec<&File> = vec![&slot];
         keep.extend(key_lock);
@@ -545,7 +727,12 @@ impl Plan {
         }
         // Where handles are not inherited the helper takes both locks again by path.
         let helper_relocks = !sys::INHERITS_DESCRIPTORS;
-        let Some(args) = self.args.iter().map(|a| a.to_str().map(str::to_owned)).collect::<Option<Vec<_>>>() else {
+        let Some(args) = self
+            .args
+            .iter()
+            .map(|a| a.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(false);
         };
         let job = StoreJob {
@@ -559,15 +746,34 @@ impl Plan {
             compile_ms,
             spawned_ns: spawned_ns.to_string(),
             captured: String::from_utf8_lossy(captured).into_owned(),
-            watched: self.watched.iter().map(|(path, stamp)| (path.clone(), StampWire::of(stamp))).collect(),
-            extern_hashes: self.extern_hashes.iter().map(|(path, hash)| (path.clone(), hash.clone())).collect(),
+            watched: self
+                .watched
+                .iter()
+                .map(|(path, stamp)| (path.clone(), StampWire::of(stamp)))
+                .collect(),
+            extern_hashes: self
+                .extern_hashes
+                .iter()
+                .map(|(path, hash)| (path.clone(), hash.clone()))
+                .collect(),
             names: frozen.names,
             dep_name: frozen.dep_name,
             dep_text: frozen.dep_text,
-            outputs: frozen.outputs.iter().map(|(name, stamp)| (name.clone(), StampWire::of(stamp))).collect(),
-            inputs: frozen.inputs.iter().map(|(path, stamp)| (path.clone(), StampWire::of(stamp))).collect(),
+            outputs: frozen
+                .outputs
+                .iter()
+                .map(|(name, stamp)| (name.clone(), StampWire::of(stamp)))
+                .collect(),
+            commitments: frozen.commitments,
+            inputs: frozen
+                .inputs
+                .iter()
+                .map(|(path, stamp)| (path.clone(), StampWire::of(stamp)))
+                .collect(),
             slot_lock: helper_relocks.then_some(slot_path),
-            key_lock: key_lock.filter(|_| helper_relocks).map(|_| keylock_path(&self.dirs, &self.prekey)),
+            key_lock: key_lock
+                .filter(|_| helper_relocks)
+                .map(|_| keylock_path(&self.dirs, &self.prekey)),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         let job_path = write_job(&deferred, &job)?;
@@ -597,7 +803,22 @@ impl Plan {
     }
 
     /// Records, before the wrapper returns, what a later store must still find: the output set and the identity of every output and input. `None` where a store must stay inline.
-    fn freeze(&self, captured: &[u8], preexisting: &HashMap<String, Stamp>) -> Option<Frozen> {
+    fn freeze(
+        &self,
+        captured: &[u8],
+        spawned_ns: i128,
+        preexisting: &HashMap<String, Stamp>,
+    ) -> Option<Frozen> {
+        self.freeze_with_capture(captured, spawned_ns, preexisting, cache::payload::capture)
+    }
+
+    fn freeze_with_capture(
+        &self,
+        captured: &[u8],
+        spawned_ns: i128,
+        preexisting: &HashMap<String, Stamp>,
+        mut capture: impl FnMut(&Path) -> io::Result<(sys::Meta, cache::payload::Commitment)>,
+    ) -> Option<Frozen> {
         if self.declines_session(captured) {
             return None;
         }
@@ -609,16 +830,6 @@ impl Plan {
         let names = self.output_files(captured, preexisting);
         let dep_name = names.iter().find(|n| n.ends_with(".d"))?.clone();
         let dep_text = fs::read_to_string(self.parsed.out_dir.join(&dep_name)).ok()?;
-        let mut outputs = Vec::with_capacity(names.len());
-        for name in &names {
-            let path = self.parsed.out_dir.join(name);
-            // A bundle's inner files can change without its own stamp moving.
-            let meta = sys::stat(&path).ok()?;
-            if meta.is_dir() {
-                return None;
-            }
-            outputs.push((name.clone(), Stamp::of(&meta)));
-        }
         let mut inputs = HashMap::new();
         for file in &cache::depinfo::parse(&dep_text).files {
             let path = self.resolve(&self.norm(file));
@@ -626,15 +837,55 @@ impl Plan {
             if meta.is_dir() {
                 continue;
             }
-            inputs.insert(path, Stamp::of(&meta));
+            let stamp = Stamp::of(&meta);
+            // Reject inputs that cannot settle for this compile before reading output commitments.
+            if !path.starts_with(&self.profile_abs) && stamp.too_new_for(spawned_ns) {
+                return None;
+            }
+            inputs.insert(path, stamp);
         }
-        let frozen = Frozen { names, dep_name, dep_text, outputs, inputs };
+        let mut outputs = Vec::with_capacity(names.len());
+        let mut commitments = HashMap::new();
+        let compress = cache_compression_requested()
+            && cache::payload::compression_supported(&self.dirs.tmp());
+        for name in &names {
+            let path = self.parsed.out_dir.join(name);
+            // A bundle's inner files can change without its own stamp moving.
+            let mut meta = sys::stat(&path).ok()?;
+            if meta.is_dir() {
+                return None;
+            }
+            if compress
+                && !name.ends_with(".d")
+                && meta.is_file()
+                && meta.len() >= cache::payload::MIN_BYTES
+            {
+                let (committed_meta, commitment) = capture(&path).ok()?;
+                if Stamp::of(&meta) != Stamp::of(&committed_meta)
+                    || meta.mode() != committed_meta.mode()
+                {
+                    return None;
+                }
+                meta = committed_meta;
+                commitments.insert(name.clone(), commitment);
+            }
+            outputs.push((name.clone(), Stamp::of(&meta)));
+        }
+        let frozen = Frozen {
+            names,
+            dep_name,
+            dep_text,
+            outputs,
+            inputs,
+            commitments,
+        };
         (!frozen.has_coarse_stamp()).then_some(frozen)
     }
 
     /// Session-directory warnings describe this target directory, not the crate, so hits elsewhere must not replay them.
     fn declines_session(&self, captured: &[u8]) -> bool {
-        self.parsed.incremental() && String::from_utf8_lossy(captured).contains("incremental compilation")
+        self.parsed.incremental()
+            && String::from_utf8_lossy(captured).contains("incremental compilation")
     }
 
     /// Catches outputs rustc writes without an artifact notification, such as split debuginfo objects; only names accepted by `wants_stamp` are stat'd.
@@ -642,7 +893,10 @@ impl Plan {
         let mut found = Vec::new();
         if self.parsed.extra_filename.is_empty() {
             if self.parsed.metadata_only_library {
-                for name in [format!("{}.d", self.parsed.crate_name), format!("lib{}.rmeta", self.parsed.crate_name)] {
+                for name in [
+                    format!("{}.d", self.parsed.crate_name),
+                    format!("lib{}.rmeta", self.parsed.crate_name),
+                ] {
                     let path = self.parsed.out_dir.join(&name);
                     if let Ok(meta) = sys::lstat(&path)
                         && meta.is_file()
@@ -656,14 +910,21 @@ impl Plan {
         }
         let prefixes = [
             format!("{}{}", self.parsed.crate_name, self.parsed.extra_filename),
-            format!("lib{}{}", self.parsed.crate_name, self.parsed.extra_filename),
+            format!(
+                "lib{}{}",
+                self.parsed.crate_name, self.parsed.extra_filename
+            ),
         ];
         if let Ok(entries) = fs::read_dir(&self.parsed.out_dir) {
             for entry in entries.flatten() {
                 let filename = entry.file_name();
                 let name = filename.to_string_lossy();
                 if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
-                    let stamp = if wants_stamp(&name) { Stamp::read(&entry.path()).ok() } else { None };
+                    let stamp = if wants_stamp(&name) {
+                        Stamp::read(&entry.path()).ok()
+                    } else {
+                        None
+                    };
                     found.push((name.into_owned(), stamp));
                 }
             }
@@ -676,8 +937,11 @@ impl Plan {
         let mut names = BTreeSet::new();
         // A file that did not exist before the compile cannot be a leftover, so only earlier names need a stamp.
         for (name, stamp) in self.prefixed_outputs(|name| preexisting.contains_key(name)) {
-            let leftover =
-                stamp.as_ref().is_some_and(|now| preexisting.get(&name).is_some_and(|before| same_file(before, now)));
+            let leftover = stamp.as_ref().is_some_and(|now| {
+                preexisting
+                    .get(&name)
+                    .is_some_and(|before| same_file(before, now))
+            });
             if !leftover {
                 names.insert(name);
             }
@@ -698,9 +962,14 @@ impl Plan {
             }
         }
         // An unhashed metadata entry is useful only when both of its mandatory outputs belong to this compile.
-        if self.parsed.extra_filename.is_empty() && self.parsed.metadata_only_library
-            && ![format!("{}.d", self.parsed.crate_name), format!("lib{}.rmeta", self.parsed.crate_name)]
-                .iter().all(|name| names.contains(name))
+        if self.parsed.extra_filename.is_empty()
+            && self.parsed.metadata_only_library
+            && ![
+                format!("{}.d", self.parsed.crate_name),
+                format!("lib{}.rmeta", self.parsed.crate_name),
+            ]
+            .iter()
+            .all(|name| names.contains(name))
         {
             return Vec::new();
         }
@@ -715,13 +984,25 @@ impl Plan {
         preexisting: &HashMap<String, Stamp>,
     ) -> io::Result<()> {
         if self.declines_session(captured) {
-            return self.skip_store("rustc reported a problem with its incremental session", compile_ms);
+            return self.skip_store(
+                "rustc reported a problem with its incremental session",
+                compile_ms,
+            );
         }
         let names = self.output_files(captured, preexisting);
-        let dep_name =
-            names.iter().find(|n| n.ends_with(".d")).ok_or_else(|| io::Error::other("no dep-info among outputs"))?;
+        let dep_name = names
+            .iter()
+            .find(|n| n.ends_with(".d"))
+            .ok_or_else(|| io::Error::other("no dep-info among outputs"))?;
         let dep_text = fs::read_to_string(self.parsed.out_dir.join(dep_name))?;
-        self.store_outputs(captured, compile_ms, spawned_ns, &names, (dep_name.as_str(), dep_text.as_str()), None)
+        self.store_outputs(
+            captured,
+            compile_ms,
+            spawned_ns,
+            &names,
+            (dep_name.as_str(), dep_text.as_str()),
+            None,
+        )
     }
 
     /// With `frozen` (a deferred store) every input and output must still be the file that existed when the wrapper returned, because the build that owned the target directory has since moved on.
@@ -740,38 +1021,76 @@ impl Plan {
 
         for (path, stamp) in &self.watched {
             if Stamp::read(path).ok().as_ref() != Some(stamp) && !self.extern_unchanged(path) {
-                return self.skip_store(&format!("{} changed during the compile", path.display()), compile_ms);
+                return self.skip_store(
+                    &format!("{} changed during the compile", path.display()),
+                    compile_ms,
+                );
             }
         }
-        let paths: Vec<_> = info.files.iter().map(|file| self.resolve(&self.norm(file))).collect();
-        let threads = extern_hash_threads(paths.len(), thread::available_parallelism().map_or(1, |n| n.get()));
+        let paths: Vec<_> = info
+            .files
+            .iter()
+            .map(|file| self.resolve(&self.norm(file)))
+            .collect();
+        let threads = extern_hash_threads(
+            paths.len(),
+            thread::available_parallelism().map_or(1, |n| n.get()),
+        );
         // Keep failures beside their input so validation and entry keys retain dep-info order.
         let hashed = parallel_with_threads(&paths, threads, |_, path| {
-            Ok(if path.is_dir() { None } else { Some(self.hasher.hash(path, self.persistable_source(path))) })
+            Ok(if path.is_dir() {
+                None
+            } else {
+                Some(self.hasher.hash(path, self.persistable_source(path)))
+            })
         })?;
         let mut inputs = Vec::with_capacity(paths.len());
         for ((file, path), hashed) in info.files.iter().zip(&paths).zip(hashed) {
             let Some(hashed) = hashed else { continue };
             let hashed = hashed?;
             if !hashed.stable {
-                return self.skip_store(&format!("{} changed while being hashed", path.display()), compile_ms);
+                return self.skip_store(
+                    &format!("{} changed while being hashed", path.display()),
+                    compile_ms,
+                );
             }
             // Other units' outputs gain hard links as cargo uplifts them, which moves ctime without touching content.
-            if frozen.is_some_and(|f| !f.input_unchanged(path, &hashed.stamp, !path.starts_with(&self.profile_abs))) {
-                return self.skip_store(&format!("{} changed after the compile", path.display()), compile_ms);
+            if frozen.is_some_and(|f| {
+                !f.input_unchanged(path, &hashed.stamp, !path.starts_with(&self.profile_abs))
+            }) {
+                return self.skip_store(
+                    &format!("{} changed after the compile", path.display()),
+                    compile_ms,
+                );
             }
             // Target-profile files come from units that finished under cargo's lock; the rest get the "file too new" check.
             if !path.starts_with(&self.profile_abs) && hashed.stamp.too_new_for(spawned_ns) {
-                return self.skip_store(&format!("{} was modified during the compile", path.display()), compile_ms);
+                return self.skip_store(
+                    &format!("{} was modified during the compile", path.display()),
+                    compile_ms,
+                );
             }
             // Recorded only for a file that had settled when hashed, and not on a volume whose stamps are distrusted.
-            let stamp = if self.trust.records_stamps(hashed.stamp.dev, path) { StampRecord::of(&hashed) } else { None };
-            inputs.push(Input { path: self.norm(file), stamp, hash: hashed.hash });
+            let stamp = if self.trust.records_stamps(hashed.stamp.dev, path) {
+                StampRecord::of(&hashed)
+            } else {
+                None
+            };
+            inputs.push(Input {
+                path: self.norm(file),
+                stamp,
+                hash: hashed.hash,
+            });
         }
         let envs: Vec<(String, Option<String>)> = info
             .env
             .iter()
-            .map(|(name, value)| (name.clone(), value.as_ref().map(|v| cache::hash_str(&self.norm(v)))))
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value.as_ref().map(|v| cache::hash_str(&self.norm(v))),
+                )
+            })
             .collect();
         let key = entry_key(&self.prekey, &inputs, &envs);
         let hashed_ms = started.elapsed().as_millis();
@@ -781,7 +1100,14 @@ impl Plan {
                 return self.skip_store("an output changed after the compile", compile_ms);
             }
             let staged = self.cache.stage()?;
-            let built = self.stage_entry(&staged, names, (dep_name, dep_text), captured, compile_ms);
+            let built = self.stage_entry(
+                &staged,
+                names,
+                (dep_name, dep_text),
+                captured,
+                compile_ms,
+                frozen.map(|f| &f.commitments),
+            );
             match built {
                 // Checked again once cloned: an output replaced while being cloned must not be published.
                 Ok(_) if frozen.is_some_and(|f| !f.outputs_unchanged(&self.parsed.out_dir)) => {
@@ -793,7 +1119,11 @@ impl Plan {
                         let _ = fsx::remove_any(&staged);
                         return Err(err);
                     }
-                    self.record_miss(&meta.version, compile_ms, meta.files.iter().map(|f| f.bytes).sum());
+                    self.record_miss(
+                        &meta.version,
+                        compile_ms,
+                        meta.files.iter().map(|f| f.bytes).sum(),
+                    );
                 }
                 Err(err) => {
                     let _ = fsx::remove_any(&staged);
@@ -803,7 +1133,8 @@ impl Plan {
         }
         let entry_ms = started.elapsed().as_millis();
         self.note_unit(&key);
-        self.cache.add_candidate(&self.prekey, Candidate { inputs, envs, key });
+        self.cache
+            .add_candidate(&self.prekey, Candidate { inputs, envs, key });
         self.debug(&format!(
             "store {}: {} inputs hashed in {hashed_ms}ms, entry at {entry_ms}ms, manifest at {}ms",
             self.parsed.crate_name,
@@ -847,16 +1178,37 @@ impl Plan {
         dep_info: (&str, &str),
         captured: &[u8],
         compile_ms: u64,
+        commitments: Option<&HashMap<String, cache::payload::Commitment>>,
     ) -> io::Result<EntryMeta> {
         // The staging directory is private until one rename publishes it, so files are cloned straight to final names.
         let (out_dir, profile) = (&self.parsed.out_dir, &self.profile);
-        let compress = cache_compression_requested() && cache::payload::compression_supported(staged);
-        let files = parallel(names, |i, name| {
+        let compress =
+            cache_compression_requested() && cache::payload::compression_supported(staged);
+        let indices: HashMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        let paired: Vec<Option<usize>> = names
+            .iter()
+            .map(|name| {
+                if !compress {
+                    return None;
+                }
+                name.strip_suffix(".rmeta")
+                    .and_then(|stem| indices.get(format!("{stem}.rlib").as_str()).copied())
+            })
+            .collect();
+        let store_file = |i: usize, name: &String| -> io::Result<StoredFile> {
             let src = out_dir.join(name);
             let stored = format!("f{i}");
             let text = name.ends_with(".d");
             let payload = if text {
-                let raw = if name == dep_info.0 { dep_info.1.to_string() } else { fs::read_to_string(&src)? };
+                let raw = if name == dep_info.0 {
+                    dep_info.1.to_string()
+                } else {
+                    fs::read_to_string(&src)?
+                };
                 let body = dep_info_tokenised(&raw, profile);
                 let bytes = body.len() as u64;
                 fs::write(staged.join(&stored), body)?;
@@ -868,7 +1220,12 @@ impl Plan {
                     content_hash: None,
                 }
             } else {
-                cache::payload::store(&src, &staged.join(&stored), compress)?
+                cache::payload::store_committed(
+                    &src,
+                    &staged.join(&stored),
+                    compress,
+                    commitments.and_then(|c| c.get(name)),
+                )?
             };
             let dir = !text && src.is_dir();
             Ok(StoredFile {
@@ -881,8 +1238,47 @@ impl Plan {
                 stored_bytes: payload.stored_bytes,
                 decoded_bytes: payload.decoded_bytes,
                 content_hash: payload.content_hash,
+                metadata_slice: None,
             })
+        };
+        let normal = parallel(names, |i, name| {
+            if paired[i].is_some() {
+                Ok(None)
+            } else {
+                store_file(i, name).map(Some)
+            }
         })?;
+        // Range proofs read the completed staged backing, including its compression and integrity checks.
+        let files = parallel(names, |i, name| {
+            let Some(base_index) = paired[i] else {
+                return Ok(normal[i].as_ref().unwrap().clone());
+            };
+            let base = normal[base_index].as_ref().unwrap();
+            let src = out_dir.join(name);
+            let target = StoredFile {
+                name: name.clone(),
+                stored: format!("f{i}"),
+                text: false,
+                bytes: fsx::allocated_size(&src),
+                dir: src.is_dir(),
+                encoding: cache::payload::Encoding::Raw,
+                stored_bytes: None,
+                decoded_bytes: None,
+                content_hash: None,
+                metadata_slice: None,
+            };
+            match cache::metadata_slice::build(
+                &staged.join(&base.stored),
+                base,
+                &src,
+                &target,
+                commitments.and_then(|c| c.get(name)),
+            )? {
+                Some(file) => Ok(file),
+                None => store_file(i, name),
+            }
+        })?;
+        cache::metadata_slice::validate_groups(&files)?;
         let stderr_text = String::from_utf8_lossy(captured).replace(&self.profile, PROFILE_TOKEN);
         fs::write(staged.join("stderr"), stderr_text)?;
         let meta = EntryMeta {
@@ -890,11 +1286,19 @@ impl Plan {
             version: self.version(),
             compile_ms,
             created_unix: fsx::unix_now(),
-            incremental_unit: if self.parsed.incremental() { self.unit.clone() } else { None },
+            prekey: Some(self.prekey.clone()),
+            incremental_unit: if self.parsed.incremental() {
+                self.unit.clone()
+            } else {
+                None
+            },
             files,
             stderr: "stderr".to_string(),
         };
-        fs::write(staged.join("meta.json"), serde_json::to_vec(&meta).map_err(io::Error::other)?)?;
+        fs::write(
+            staged.join("meta.json"),
+            serde_json::to_vec(&meta).map_err(io::Error::other)?,
+        )?;
         Ok(meta)
     }
 
@@ -912,8 +1316,10 @@ impl Plan {
     fn note_unit(&self, key: &str) {
         let Some(unit) = &self.unit else { return };
         for old in self.cache.note_unit_entry(unit, key, UNIT_VERSIONS) {
-            self.debug(&format!("removing superseded entry {old} of {}", self.parsed.crate_name));
-            self.cache.remove_entry(&old);
+            self.debug(&format!(
+                "retired superseded entry {old} of {}",
+                self.parsed.crate_name
+            ));
         }
     }
 
@@ -928,7 +1334,11 @@ impl Plan {
 fn rewrite_dep_info(text: &str, plain: (&str, &str), spaced: (&str, &str)) -> String {
     text.split_inclusive('\n')
         .map(|line| {
-            let (from, to) = if line.starts_with("# env-dep:") { plain } else { spaced };
+            let (from, to) = if line.starts_with("# env-dep:") {
+                plain
+            } else {
+                spaced
+            };
             line.replace(from, to)
         })
         .collect()
@@ -939,11 +1349,19 @@ fn escape_spaces(path: &str) -> String {
 }
 
 fn dep_info_tokenised(raw: &str, profile: &str) -> String {
-    rewrite_dep_info(raw, (profile, PROFILE_TOKEN), (escape_spaces(profile).as_str(), PROFILE_TOKEN))
+    rewrite_dep_info(
+        raw,
+        (profile, PROFILE_TOKEN),
+        (escape_spaces(profile).as_str(), PROFILE_TOKEN),
+    )
 }
 
 fn dep_info_resolved(stored: &str, profile: &str) -> String {
-    rewrite_dep_info(stored, (PROFILE_TOKEN, profile), (PROFILE_TOKEN, escape_spaces(profile).as_str()))
+    rewrite_dep_info(
+        stored,
+        (PROFILE_TOKEN, profile),
+        (PROFILE_TOKEN, escape_spaces(profile).as_str()),
+    )
 }
 
 /// ctime is left out: it moves whenever another hard link to the inode comes or goes.
@@ -952,7 +1370,10 @@ fn same_file(a: &Stamp, b: &Stamp) -> bool {
 }
 
 fn cache_compression_requested() -> bool {
-    !matches!(env::var("FRUST_CACHE_COMPRESSION").as_deref(), Ok("off" | "0" | "false" | "no"))
+    !matches!(
+        env::var("FRUST_CACHE_COMPRESSION").as_deref(),
+        Ok("off" | "0" | "false" | "no")
+    )
 }
 
 fn parallel<T: Sync, R: Send>(
@@ -1131,6 +1552,8 @@ struct StoreJob {
     dep_text: String,
     outputs: Vec<(String, StampWire)>,
     inputs: Vec<(PathBuf, StampWire)>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    commitments: HashMap<String, cache::payload::Commitment>,
     /// Lock files the helper takes again itself when handles cannot be inherited.
     slot_lock: Option<PathBuf>,
     key_lock: Option<PathBuf>,
@@ -1144,34 +1567,66 @@ struct Frozen {
     dep_text: String,
     outputs: Vec<(String, Stamp)>,
     inputs: HashMap<PathBuf, Stamp>,
+    commitments: HashMap<String, cache::payload::Commitment>,
 }
 
 impl Frozen {
     fn from_job(job: &StoreJob) -> Option<Frozen> {
+        for (name, commitment) in &job.commitments {
+            let stamp = job
+                .outputs
+                .iter()
+                .find(|(output, _)| output == name)?
+                .1
+                .stamp()?;
+            if !cache::safe_file_name(name)
+                || name.ends_with(".d")
+                || !job.names.contains(name)
+                || !commitment.valid()
+                || !commitment.matches_identity(stamp.dev, stamp.ino, stamp.size, stamp.mtime_ns)
+            {
+                return None;
+            }
+        }
         Some(Frozen {
+            commitments: job.commitments.clone(),
             names: job.names.clone(),
             dep_name: job.dep_name.clone(),
             dep_text: job.dep_text.clone(),
-            outputs: job.outputs.iter().map(|(name, wire)| Some((name.clone(), wire.stamp()?))).collect::<Option<Vec<_>>>()?,
-            inputs: job.inputs.iter().map(|(path, wire)| Some((path.clone(), wire.stamp()?))).collect::<Option<HashMap<_, _>>>()?,
+            outputs: job
+                .outputs
+                .iter()
+                .map(|(name, wire)| Some((name.clone(), wire.stamp()?)))
+                .collect::<Option<Vec<_>>>()?,
+            inputs: job
+                .inputs
+                .iter()
+                .map(|(path, wire)| Some((path.clone(), wire.stamp()?)))
+                .collect::<Option<HashMap<_, _>>>()?,
         })
     }
 
     /// Whole-second stamps cannot show a rewrite within the same second.
     fn has_coarse_stamp(&self) -> bool {
-        self.outputs.iter().map(|(_, stamp)| stamp).chain(self.inputs.values()).any(Stamp::coarse)
+        self.outputs
+            .iter()
+            .map(|(_, stamp)| stamp)
+            .chain(self.inputs.values())
+            .any(Stamp::coarse)
     }
 
     /// `ctime_matters` is false for files cargo hard-links after the fact, where only the content identity counts.
     fn input_unchanged(&self, path: &Path, now: &Stamp, ctime_matters: bool) -> bool {
-        self.inputs
-            .get(path)
-            .is_some_and(|then| same_file(then, now) && (!ctime_matters || then.ctime_ns == now.ctime_ns))
+        self.inputs.get(path).is_some_and(|then| {
+            same_file(then, now) && (!ctime_matters || then.ctime_ns == now.ctime_ns)
+        })
     }
 
     /// Cargo hard-links outputs into place after the wrapper returns, so ctime is left out of the comparison.
     fn outputs_unchanged(&self, out_dir: &Path) -> bool {
-        self.outputs.iter().all(|(name, then)| Stamp::read(&out_dir.join(name)).is_ok_and(|now| same_file(then, &now)))
+        self.outputs.iter().all(|(name, then)| {
+            Stamp::read(&out_dir.join(name)).is_ok_and(|now| same_file(then, &now))
+        })
     }
 }
 
@@ -1181,9 +1636,14 @@ struct JobFile(PathBuf);
 impl JobFile {
     /// Only `job-*.json` directly inside the deferred directory is claimed, so the argument can never name another file to read or delete.
     fn claim(path: PathBuf, deferred: &Path) -> Option<JobFile> {
-        let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("job-") && n.ends_with(".json"));
+        let named = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("job-") && n.ends_with(".json"));
         let cwd = env::current_dir().ok()?;
-        let inside = path.parent().is_some_and(|parent| cwd.join(parent) == cwd.join(deferred));
+        let inside = path
+            .parent()
+            .is_some_and(|parent| cwd.join(parent) == cwd.join(deferred));
         // Lazy on purpose: building a JobFile for a refused path would delete it on drop.
         (named && inside).then(|| JobFile(path))
     }
@@ -1196,7 +1656,9 @@ impl Drop for JobFile {
 }
 
 fn keylock_path(dirs: &Dirs, prekey: &str) -> PathBuf {
-    dirs.keylocks().join(prekey.get(..2).unwrap_or("00")).join(prekey)
+    dirs.keylocks()
+        .join(prekey.get(..2).unwrap_or("00"))
+        .join(prekey)
 }
 
 /// The parent directory is created only when the first open finds it missing.
@@ -1239,6 +1701,123 @@ fn wait_key_lock(file: &File, cap: Duration) -> io::Result<bool> {
     }
 }
 
+fn wait_key_lock_hints(
+    file: &File,
+    cap: Duration,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> io::Result<bool> {
+    let begun = Instant::now();
+    // Subscription precedes this recheck; close notifications never authorize admission.
+    if !cap.is_zero() && try_key_lock(file)? {
+        return Ok(true);
+    }
+    let mut pause = KEY_POLL_START;
+    loop {
+        let remaining = cap.saturating_sub(begun.elapsed());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let changed = wait(pause.min(remaining));
+        if try_key_lock(file)? {
+            return Ok(true);
+        }
+        // Linux may report close before releasing flock, so every retry remains bounded.
+        pause = if changed { KEY_POLL_START } else { (pause * 2).min(KEY_POLL_MAX) };
+    }
+}
+
+fn lend_cargo_slot(
+    client: Option<&jobserver::Client>,
+) -> io::Result<Option<sys::jobserver_loan::Loan>> {
+    let supervisor = env::var(SLOT_SUPERVISOR_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let cargo = env::var_os("CARGO").map(PathBuf::from);
+    if client.is_none()
+        || !supervisor
+            .zip(cargo)
+            .is_some_and(|(pid, cargo)| sys::jobserver_loan::direct_cargo_parent(pid, &cargo))
+    {
+        return Ok(None);
+    }
+    let Ok(helper) = helper_exe() else {
+        return Ok(None);
+    };
+    match sys::jobserver_loan::lend(&helper) {
+        Ok(loan) => Ok(Some(loan)),
+        Err(sys::jobserver_loan::LendError::Unavailable(_)) => Ok(None),
+        #[cfg(unix)]
+        Err(sys::jobserver_loan::LendError::Uncertain(error)) => Err(error),
+    }
+}
+
+trait SlotLoan {
+    fn resume(&mut self) -> io::Result<()>;
+}
+
+impl SlotLoan for sys::jobserver_loan::Loan {
+    fn resume(&mut self) -> io::Result<()> {
+        sys::jobserver_loan::Loan::resume(self)
+    }
+}
+
+#[derive(Debug)]
+enum KeyWaitError {
+    Lock(io::Error),
+    Loan(io::Error),
+}
+
+impl std::fmt::Display for KeyWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(error) | Self::Loan(error) => error.fmt(formatter),
+        }
+    }
+}
+
+struct WaitingKey(File);
+
+impl Drop for WaitingKey {
+    fn drop(&mut self) {
+        let _ = sys::unlock(&self.0);
+    }
+}
+
+/// An idle wrapper lends its implicit Cargo slot, then regains it without holding the key lock.
+fn wait_key_with_slot<L: SlotLoan>(
+    mut file: File,
+    cap: Duration,
+    mut lend: impl FnMut() -> io::Result<Option<L>>,
+    mut wait: impl FnMut(&File, Duration) -> io::Result<bool>,
+    mut reopen: impl FnMut() -> io::Result<File>,
+) -> Result<Option<File>, KeyWaitError> {
+    let begun = Instant::now();
+    loop {
+        let remaining = cap.saturating_sub(begun.elapsed());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let Some(mut slot) = lend().map_err(KeyWaitError::Loan)? else {
+            return wait(&file, remaining)
+                .map(|acquired| acquired.then_some(file))
+                .map_err(KeyWaitError::Lock);
+        };
+        let acquired = {
+            // Explicit unlocking also releases duplicated or inherited handles before slot repayment.
+            let waiting = WaitingKey(file);
+            wait(&waiting.0, remaining)
+        };
+        slot.resume().map_err(KeyWaitError::Loan)?;
+        if !acquired.map_err(KeyWaitError::Lock)? {
+            return Ok(None);
+        }
+        file = reopen().map_err(KeyWaitError::Lock)?;
+        if try_key_lock(&file).map_err(KeyWaitError::Lock)? {
+            return Ok(Some(file));
+        }
+    }
+}
+
 /// How many deferred stores may run at once across all processes.
 fn slot_count() -> usize {
     (thread::available_parallelism().map_or(2, |n| n.get()) / 2).clamp(1, 4)
@@ -1255,7 +1834,11 @@ fn acquire_slot(dir: &Path, count: usize) -> Option<(File, PathBuf)> {
 }
 
 fn write_job(dir: &Path, job: &StoreJob) -> io::Result<PathBuf> {
-    let path = dir.join(format!("job-{}-{}.json", std::process::id(), hashing::now_ns()));
+    let path = dir.join(format!(
+        "job-{}-{}.json",
+        std::process::id(),
+        hashing::now_ns()
+    ));
     let bytes = serde_json::to_vec(job).map_err(io::Error::other)?;
     fsx::write_atomic(&path, &bytes)?;
     Ok(path)
@@ -1277,7 +1860,10 @@ fn helper_beside(exe: &Path) -> io::Result<PathBuf> {
     }
     match exe.parent().map(|dir| dir.join(&name)) {
         Some(sibling) if sibling.is_file() => Ok(sibling),
-        _ => Err(io::Error::new(io::ErrorKind::NotFound, "no frust-wrap binary beside the running one")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no frust-wrap binary beside the running one",
+        )),
     }
 }
 
@@ -1296,7 +1882,10 @@ fn relock(job: &StoreJob) -> Vec<File> {
         return Vec::new();
     }
     let dirs = Dirs::at(&job.home);
-    let wanted = [(&job.slot_lock, None), (&job.key_lock, lock::shared_mode(&dirs))];
+    let wanted = [
+        (&job.slot_lock, None),
+        (&job.key_lock, lock::shared_mode(&dirs)),
+    ];
     let mut held = Vec::new();
     for (path, mode) in wanted {
         if let Some(path) = path
@@ -1326,7 +1915,9 @@ fn deferred_main(path: PathBuf) -> i32 {
 }
 
 fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
-    let Some(file) = JobFile::claim(path, deferred) else { return 0 };
+    let Some(file) = JobFile::claim(path, deferred) else {
+        return 0;
+    };
     if let Some(job) = read_job(&file.0) {
         let _held = relock(&job);
         compact::at_background_priority(|| run_deferred(&job));
@@ -1336,13 +1927,22 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
 
 /// The key lock and slot lock were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
 fn run_deferred(job: &StoreJob) {
-    let (Some(plan), Some(frozen), Ok(spawned_ns)) =
-        (Plan::from_job(job), Frozen::from_job(job), job.spawned_ns.parse::<i128>())
-    else {
+    let (Some(plan), Some(frozen), Ok(spawned_ns)) = (
+        Plan::from_job(job),
+        Frozen::from_job(job),
+        job.spawned_ns.parse::<i128>(),
+    ) else {
         return;
     };
     let dep_info = (frozen.dep_name.as_str(), frozen.dep_text.as_str());
-    let _ = plan.store_outputs(job.captured.as_bytes(), job.compile_ms, spawned_ns, &frozen.names, dep_info, Some(&frozen));
+    let _ = plan.store_outputs(
+        job.captured.as_bytes(),
+        job.compile_ms,
+        spawned_ns,
+        &frozen.names,
+        dep_info,
+        Some(&frozen),
+    );
 }
 
 /// Lines are forwarded as they arrive because cargo needs artifact notifications in real time.
@@ -1401,7 +2001,10 @@ enum Verdict {
     Confirmed,
     Mismatch,
     /// The stamp matched but the fresh content hash differs from the recorded one: the stamp lied.
-    Violation { fresh: String, dev: u64 },
+    Violation {
+        fresh: String,
+        dev: u64,
+    },
 }
 
 /// Decides per volume whether recorded stamps are believed, and files the evidence when one proved wrong.
@@ -1415,7 +2018,12 @@ struct TrustGate {
 
 impl TrustGate {
     fn new(mode: TrustMode, dirs: &Dirs, debug: bool) -> TrustGate {
-        TrustGate { mode, dirs: dirs.clone(), debug, volumes: Mutex::new(HashMap::new()) }
+        TrustGate {
+            mode,
+            dirs: dirs.clone(),
+            debug,
+            volumes: Mutex::new(HashMap::new()),
+        }
     }
 
     fn volumes(&self) -> MutexGuard<'_, HashMap<u64, bool>> {
@@ -1442,7 +2050,10 @@ impl TrustGate {
 
     fn violation(&self, krate: &str, dev: u64, input: &Input, fresh: &str) {
         if self.debug {
-            eprintln!("frust-wrap: stamp violation in {krate}: {} matched its stamp but its content changed", input.path);
+            eprintln!(
+                "frust-wrap: stamp violation in {krate}: {} matched its stamp but its content changed",
+                input.path
+            );
         }
         cache::report_violation(&self.dirs, krate, &input.path, &input.hash, fresh, dev);
         self.volumes().insert(dev, false);
@@ -1456,14 +2067,25 @@ fn stamp_policy(gate: &Arc<TrustGate>) -> StampTrust {
 }
 
 /// A recorded stamp that still matches proves the file unchanged since its hash was taken; anything else is decided by content.
-fn input_matches(hasher: &Hasher, path: &Path, persist: bool, input: &Input, gate: &TrustGate, now_ns: i128) -> Verdict {
+fn input_matches(
+    hasher: &Hasher,
+    path: &Path,
+    persist: bool,
+    input: &Input,
+    gate: &TrustGate,
+    now_ns: i128,
+) -> Verdict {
     if gate.mode != TrustMode::Off
         && let Some(record) = &input.stamp
         && let Ok((current, birth)) = Stamp::read_with_birth(path)
         && record.trusts(&current, birth, now_ns)
         && gate.volume_trusted(current.dev, path)
     {
-        return if gate.mode == TrustMode::Audit { audit_input(path, input, &current) } else { Verdict::Trusted };
+        return if gate.mode == TrustMode::Audit {
+            audit_input(path, input, &current)
+        } else {
+            Verdict::Trusted
+        };
     }
     match hasher.hash(path, persist) {
         Ok(hashed) if hashed.hash == input.hash => Verdict::Match,
@@ -1478,7 +2100,10 @@ fn audit_input(path: &Path, input: &Input, current: &Stamp) -> Verdict {
             if hashed.hash == input.hash {
                 Verdict::Confirmed
             } else {
-                Verdict::Violation { fresh: hashed.hash, dev: current.dev }
+                Verdict::Violation {
+                    fresh: hashed.hash,
+                    dev: current.dev,
+                }
             }
         }
         _ => Verdict::Mismatch,
@@ -1488,7 +2113,9 @@ fn audit_input(path: &Path, input: &Input, current: &Stamp) -> Verdict {
 /// The stamp is checked again first, so a file edited since the lookup is a mismatch rather than a violation.
 fn audit_trusted(path: &Path, input: &Input, now_ns: i128) -> Verdict {
     match (&input.stamp, Stamp::read_with_birth(path)) {
-        (Some(record), Ok((current, birth))) if record.trusts(&current, birth, now_ns) => audit_input(path, input, &current),
+        (Some(record), Ok((current, birth))) if record.trusts(&current, birth, now_ns) => {
+            audit_input(path, input, &current)
+        }
         _ => Verdict::Mismatch,
     }
 }
@@ -1506,7 +2133,10 @@ fn mix(seed: u64, bytes: &[u8]) -> u64 {
 }
 
 fn audit_seed() -> u64 {
-    mix(u64::from(std::process::id()), &hashing::now_ns().to_le_bytes())
+    mix(
+        u64::from(std::process::id()),
+        &hashing::now_ns().to_le_bytes(),
+    )
 }
 
 /// Positions in `trusted` to re-hash: all of them for a small candidate, otherwise the one whose seeded path hash is lowest.
@@ -1527,7 +2157,8 @@ fn all_parallel<T: Sync>(items: &[T], check: impl Fn(&T) -> bool + Sync) -> bool
     let budget = worker_budget(VERIFY_THREADS.min(items.len()));
     let threads = budget.threads;
     if threads <= 1 {
-        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| items.iter().all(check))).unwrap_or(false);
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| items.iter().all(check)))
+            .unwrap_or(false);
     }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -1557,12 +2188,18 @@ fn all_parallel<T: Sync>(items: &[T], check: impl Fn(&T) -> bool + Sync) -> bool
 
 /// `FRUST_CACHE_INCREMENTAL=off` (or `0`, `false`, `no`) keeps incremental units uncached.
 fn incremental_units_enabled() -> bool {
-    !matches!(env::var("FRUST_CACHE_INCREMENTAL").as_deref(), Ok("0" | "off" | "false" | "no"))
+    !matches!(
+        env::var("FRUST_CACHE_INCREMENTAL").as_deref(),
+        Ok("0" | "off" | "false" | "no")
+    )
 }
 
 /// `FRUST_CACHE_PRIMARY_INCREMENTAL=off` (or `0`, `false`, `no`) leaves primary-package incremental compiles to rustc.
 fn primary_incremental_enabled() -> bool {
-    !matches!(env::var("FRUST_CACHE_PRIMARY_INCREMENTAL").as_deref(), Ok("0" | "off" | "false" | "no"))
+    !matches!(
+        env::var("FRUST_CACHE_PRIMARY_INCREMENTAL").as_deref(),
+        Ok("0" | "off" | "false" | "no")
+    )
 }
 
 /// The pre-key hasher and the unit identity hasher, fed together.
@@ -1596,9 +2233,16 @@ fn immutable_source_roots() -> Vec<PathBuf> {
     let home = env::var_os("CARGO_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| sys::home_var().filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".cargo")));
+        .or_else(|| {
+            sys::home_var()
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".cargo"))
+        });
     match home {
-        Some(home) => vec![home.join("registry").join("src"), home.join("git").join("checkouts")],
+        Some(home) => vec![
+            home.join("registry").join("src"),
+            home.join("git").join("checkouts"),
+        ],
         None => Vec::new(),
     }
 }
@@ -1613,11 +2257,14 @@ fn keyed_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(OsStr
             (starts("CARGO_")
                 && !ENV_DENY_EXACT.iter().any(|exact| exact.as_bytes() == name)
                 && !ENV_DENY_PREFIXES.iter().any(|prefix| starts(prefix)))
-                || ENV_AFFECTS_OUTPUT.iter().any(|exact| exact.as_bytes() == name)
+                || ENV_AFFECTS_OUTPUT
+                    .iter()
+                    .any(|exact| exact.as_bytes() == name)
         })
         .collect();
     kept.sort_by(|a, b| {
-        (a.0.as_encoded_bytes(), a.1.as_encoded_bytes()).cmp(&(b.0.as_encoded_bytes(), b.1.as_encoded_bytes()))
+        (a.0.as_encoded_bytes(), a.1.as_encoded_bytes())
+            .cmp(&(b.0.as_encoded_bytes(), b.1.as_encoded_bytes()))
     });
     kept
 }
@@ -1635,9 +2282,21 @@ fn extern_hash_threads(inputs: usize, cpus: usize) -> usize {
 }
 
 impl KeyContext<'_> {
-    fn prekey(&self, tool: &OsString, rest: &[OsString], parsed: &RustcArgs) -> Result<PreKey, String> {
-        let inputs = parsed.paths.iter().filter(|(_, path)| matches!(path, PathArg::Extern { .. })).count();
-        let threads = extern_hash_threads(inputs, thread::available_parallelism().map_or(1, |n| n.get()));
+    fn prekey(
+        &self,
+        tool: &OsString,
+        rest: &[OsString],
+        parsed: &RustcArgs,
+    ) -> Result<PreKey, String> {
+        let inputs = parsed
+            .paths
+            .iter()
+            .filter(|(_, path)| matches!(path, PathArg::Extern { .. }))
+            .count();
+        let threads = extern_hash_threads(
+            inputs,
+            thread::available_parallelism().map_or(1, |n| n.get()),
+        );
         self.prekey_with_threads(tool, rest, parsed, threads)
     }
 
@@ -1653,14 +2312,20 @@ impl KeyContext<'_> {
         let mut tools = Vec::new();
         let mut hasher = Both(blake3::Hasher::new(), blake3::Hasher::new());
         hasher.update(b"frust-prekey-v2\0");
-        hasher.update(toolchain_id(tool, self.cwd).ok_or("cannot identify the compiler")?.as_bytes());
+        hasher.update(
+            toolchain_id(tool, self.cwd)
+                .ok_or("cannot identify the compiler")?
+                .as_bytes(),
+        );
         hasher.update(self.cwd.to_string_lossy().as_bytes());
 
         let mut externs = if threads > 1 {
             let paths: Vec<_> = rest
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !parsed.out_dir_args.contains(i) && !parsed.incremental_args.contains(i))
+                .filter(|(i, _)| {
+                    !parsed.out_dir_args.contains(i) && !parsed.incremental_args.contains(i)
+                })
                 .filter_map(|(i, _)| {
                     parsed.paths.iter().find_map(|(idx, arg)| match arg {
                         PathArg::Extern { path, .. } if *idx == i => Some(self.cwd.join(path)),
@@ -1691,8 +2356,15 @@ impl KeyContext<'_> {
             }
             let text = arg.to_str().ok_or("non-UTF-8 argument")?;
             hasher.update(b"\0a");
-            let specials: Vec<&PathArg> = parsed.paths.iter().filter(|(idx, _)| *idx == i).map(|(_, p)| p).collect();
-            if let Some(PathArg::Extern { name, path }) = specials.iter().find(|p| matches!(p, PathArg::Extern { .. }))
+            let specials: Vec<&PathArg> = parsed
+                .paths
+                .iter()
+                .filter(|(idx, _)| *idx == i)
+                .map(|(_, p)| p)
+                .collect();
+            if let Some(PathArg::Extern { name, path }) = specials
+                .iter()
+                .find(|p| matches!(p, PathArg::Extern { .. }))
             {
                 let path = self.cwd.join(path);
                 let hashed = match &mut externs {
@@ -1702,7 +2374,11 @@ impl KeyContext<'_> {
                 .map_err(|e| format!("cannot read --extern {}: {e}", path.display()))?;
                 hasher.update(name.as_bytes());
                 hasher.content(hashed.hash.as_bytes());
-                hasher.unit_only(path.to_string_lossy().replace(self.profile, PROFILE_TOKEN).as_bytes());
+                hasher.unit_only(
+                    path.to_string_lossy()
+                        .replace(self.profile, PROFILE_TOKEN)
+                        .as_bytes(),
+                );
                 if path.starts_with(self.profile_abs) {
                     extern_hashes.insert(path.clone(), hashed.hash.clone());
                 }
@@ -1724,7 +2400,10 @@ impl KeyContext<'_> {
                             .hash(&path, true)
                             .map_err(|e| format!("cannot read linker {}: {e}", path.display()))?;
                         if !hashed.stable {
-                            return Err(format!("linker {} changed while being hashed", path.display()));
+                            return Err(format!(
+                                "linker {} changed while being hashed",
+                                path.display()
+                            ));
                         }
                         hasher.update(b"\0tool");
                         hasher.update(path.as_os_str().as_encoded_bytes());
@@ -1745,7 +2424,10 @@ impl KeyContext<'_> {
                                 hasher.update(b"\0f");
                                 hasher.content(self.file_hash(&path, &mut watched)?.as_bytes());
                             } else if rustc_args::looks_like_link_input(&path) {
-                                return Err(format!("linker input {} cannot be read", path.display()));
+                                return Err(format!(
+                                    "linker input {} cannot be read",
+                                    path.display()
+                                ));
                             }
                         }
                     }
@@ -1766,8 +2448,14 @@ impl KeyContext<'_> {
         // A bundled static library outside every -L directory comes from a system location the key does not cover.
         for lib in parsed.libs.iter().filter(|l| l.bundled()) {
             let names = lib.file_names();
-            if !native_dirs.iter().any(|dir| names.iter().any(|n| dir.join(n).is_file())) {
-                return Err(format!("static library `{}` is not in any -L directory", lib.name));
+            if !native_dirs
+                .iter()
+                .any(|dir| names.iter().any(|n| dir.join(n).is_file()))
+            {
+                return Err(format!(
+                    "static library `{}` is not in any -L directory",
+                    lib.name
+                ));
             }
         }
 
@@ -1788,14 +2476,25 @@ impl KeyContext<'_> {
         })
     }
 
-    fn file_hash(&self, path: &Path, watched: &mut Vec<(PathBuf, Stamp)>) -> Result<String, String> {
-        let hashed = self.hasher.hash(path, false).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    fn file_hash(
+        &self,
+        path: &Path,
+        watched: &mut Vec<(PathBuf, Stamp)>,
+    ) -> Result<String, String> {
+        let hashed = self
+            .hasher
+            .hash(path, false)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         watched.push((path.to_path_buf(), hashed.stamp));
         Ok(hashed.hash)
     }
 
     fn linker_tool(&self, program: &Path) -> Result<PathBuf, String> {
-        if program.is_absolute() || program.parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+        if program.is_absolute()
+            || program
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
             return Ok(self.cwd.join(program));
         }
         program
@@ -1810,7 +2509,10 @@ impl KeyContext<'_> {
         if let Ok(stamp) = Stamp::read(dir) {
             watched.push((dir.to_path_buf(), stamp));
         }
-        match self.hasher.hash_dir(dir, dir.starts_with(self.profile_abs), watched) {
+        match self
+            .hasher
+            .hash_dir(dir, dir.starts_with(self.profile_abs), watched)
+        {
             DirHash::Hash(hash) => Ok(hash),
             DirHash::Unverifiable(reason) => Err(reason),
         }
@@ -1822,7 +2524,10 @@ impl KeyContext<'_> {
             return if direct.is_file() {
                 Ok(Some(direct))
             } else {
-                Err(format!("target specification {} cannot be read", direct.display()))
+                Err(format!(
+                    "target specification {} cannot be read",
+                    direct.display()
+                ))
             };
         }
         if let Some(search) = env::var_os("RUST_TARGET_PATH") {
@@ -1842,8 +2547,16 @@ fn toolchain_id(tool: &OsString, cwd: &Path) -> Option<String> {
     if let Some(id) = env::var("FRUST_RUSTC_ID").ok().filter(|v| !v.is_empty()) {
         return Some(id);
     }
-    let output = compiler_command(tool).arg("-vV").current_dir(cwd).stdin(Stdio::null()).output().ok()?;
-    output.status.success().then(|| crate::paths::short_hash(&output.stdout))
+    let output = compiler_command(tool)
+        .arg("-vV")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| crate::paths::short_hash(&output.stdout))
 }
 
 #[cfg(test)]
@@ -1873,14 +2586,23 @@ mod tests {
 
     fn keyed(cwd: &Path, extra: &[&str]) -> Result<PreKey, String> {
         let out_dir = cwd.join("target").join("debug").join("deps");
-        let mut args: Vec<OsString> =
-            ["--crate-name", "k", "--emit=dep-info,link", "--out-dir"].iter().map(OsString::from).collect();
+        let mut args: Vec<OsString> = ["--crate-name", "k", "--emit=dep-info,link", "--out-dir"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         args.push(out_dir.clone().into_os_string());
         args.extend(extra.iter().map(OsString::from));
         let parsed = rustc_args::parse(&args).map_err(|e| format!("{e:?}"))?;
-        let profile = rustc_args::profile_root(&out_dir).to_string_lossy().into_owned();
+        let profile = rustc_args::profile_root(&out_dir)
+            .to_string_lossy()
+            .into_owned();
         let hasher = Hasher::ephemeral();
-        let ctx = KeyContext { hasher: &hasher, cwd, profile: &profile, profile_abs: Path::new(&profile) };
+        let ctx = KeyContext {
+            hasher: &hasher,
+            cwd,
+            profile: &profile,
+            profile_abs: Path::new(&profile),
+        };
         ctx.prekey(&OsString::from("rustc"), &args, &parsed)
     }
 
@@ -1898,25 +2620,40 @@ mod tests {
             vec!["--codegen", option.as_str()],
             vec![long.as_str()],
         ];
-        let before: Vec<_> = spellings.iter().map(|flags| keyed(&s.0, flags).unwrap()).collect();
+        let before: Vec<_> = spellings
+            .iter()
+            .map(|flags| keyed(&s.0, flags).unwrap())
+            .collect();
         fs::write(&driver, b"driver two").unwrap();
         for (flags, before) in spellings.iter().zip(&before) {
             let after = keyed(&s.0, flags).unwrap();
             assert_ne!(before.key, after.key, "{flags:?}");
-            assert_eq!(before.unit, after.unit, "content edits retain the unit's version group");
+            assert_eq!(
+                before.unit, after.unit,
+                "content edits retain the unit's version group"
+            );
             assert_eq!(before.watched.len(), 1);
             assert_eq!(before.watched[0].0, driver);
             assert_ne!(before.watched[0].1, after.watched[0].1);
-            assert!(after.extern_hashes.is_empty(), "a linker never receives extern replacement tolerance");
+            assert!(
+                after.extern_hashes.is_empty(),
+                "a linker never receives extern replacement tolerance"
+            );
         }
         for pair in before.windows(2) {
-            assert_ne!(pair[0].key, pair[1].key, "original argument spelling stays opaque");
+            assert_ne!(
+                pair[0].key, pair[1].key,
+                "original argument spelling stays opaque"
+            );
             assert_ne!(pair[0].unit, pair[1].unit);
         }
         let other = s.0.join("other-driver");
         fs::write(&other, b"driver one").unwrap();
         let other = keyed(&s.0, &[&format!("-Clinker={}", other.display())]).unwrap();
-        assert_ne!(before[1].key, other.key, "equal bytes at different tool paths are distinct");
+        assert_ne!(
+            before[1].key, other.key,
+            "equal bytes at different tool paths are distinct"
+        );
         assert_ne!(before[1].unit, other.unit);
     }
 
@@ -1931,16 +2668,28 @@ mod tests {
         assert_eq!(before.watched[0].0, driver);
         fs::write(&driver, b"driver two").unwrap();
         assert_ne!(before.key, key(&s.0, &["-Clinker=tools/driver"]).unwrap());
-        assert!(key(&s.0, &["-Clinker=tools/missing-driver"]).unwrap_err().contains("cannot read linker"));
-        assert!(key(&s.0, &["-Clinker=frust-missing-linker-91e2c054"]).unwrap_err().contains("cannot resolve linker"));
+        assert!(
+            key(&s.0, &["-Clinker=tools/missing-driver"])
+                .unwrap_err()
+                .contains("cannot read linker")
+        );
+        assert!(
+            key(&s.0, &["-Clinker=frust-missing-linker-91e2c054"])
+                .unwrap_err()
+                .contains("cannot resolve linker")
+        );
         assert!(key(&s.0, &["-Clinker="]).is_err());
-        assert!(key(&s.0, &["-Clinker=./tools"]).is_err(), "directories cannot stand in for executable content");
+        assert!(
+            key(&s.0, &["-Clinker=./tools"]).is_err(),
+            "directories cannot stand in for executable content"
+        );
     }
 
     #[test]
     fn bare_linkers_use_the_actual_path() {
         let cwd = env::current_dir().unwrap();
-        let driver = crate::toolchain::find_on_path("rustc").expect("the test toolchain is on PATH");
+        let driver =
+            crate::toolchain::find_on_path("rustc").expect("the test toolchain is on PATH");
         let keyed = keyed(&cwd, &["-Clinker=rustc"]).unwrap();
         assert_eq!(keyed.watched[0].0, cwd.join(driver));
         assert!(keyed.extern_hashes.is_empty());
@@ -1949,11 +2698,18 @@ mod tests {
     #[test]
     fn a_linker_also_named_as_an_extern_never_gets_replacement_tolerance() {
         let s = Scratch::new("linker-extern");
-        let driver = s.0.join("target").join("debug").join("deps").join("driver.rlib");
+        let driver =
+            s.0.join("target")
+                .join("debug")
+                .join("deps")
+                .join("driver.rlib");
         fs::write(&driver, b"driver").unwrap();
         let linker = format!("-Clinker={}", driver.display());
         let dependency = format!("--extern=driver={}", driver.display());
-        for flags in [[linker.as_str(), dependency.as_str()], [dependency.as_str(), linker.as_str()]] {
+        for flags in [
+            [linker.as_str(), dependency.as_str()],
+            [dependency.as_str(), linker.as_str()],
+        ] {
             assert!(keyed(&s.0, &flags).unwrap().extern_hashes.is_empty());
         }
     }
@@ -2079,6 +2835,352 @@ mod tests {
         assert_eq!(client.available().unwrap(), 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lent_jobserver_slot_child() {
+        if env::var_os("FRUST_TEST_LENT_SLOT_CHILD").is_none() {
+            return;
+        }
+        sys::signal::set_default(sys::signal::SIGTERM);
+        // SAFETY: this isolated child inherits the parent's configured, still-open jobserver pipes.
+        let client = JOBSERVER
+            .get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() })
+            .as_ref()
+            .expect("inherited jobserver");
+        assert_eq!(client.available().unwrap(), 0);
+        let lent = lend_cargo_slot(Some(client)).unwrap();
+        assert!(
+            lent.is_none(),
+            "an arbitrary parent cannot supply Cargo's completion barrier"
+        );
+        assert_eq!(client.available().unwrap(), 0);
+        println!("frust-lent-slot-ready");
+        io::stdout().flush().unwrap();
+        let mut command = [0];
+        assert_eq!(io::Read::read(&mut io::stdin(), &mut command).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_key_waiter_does_not_inflate_its_surviving_jobserver() {
+        struct ReapChild {
+            child: std::process::Child,
+            reaped: bool,
+        }
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+        }
+        let mut capacities = Vec::new();
+        for signal in ["SIGTERM", "SIGKILL"] {
+            let client = jobserver::Client::new(1).unwrap();
+            assert_eq!(client.available().unwrap(), 1);
+            // Cargo owns this assigned slot and returns it when its child terminates.
+            let assigned = client.acquire().unwrap();
+            assert_eq!(client.available().unwrap(), 0);
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "wrapper::tests::lent_jobserver_slot_child",
+                    "--nocapture",
+                ])
+                .env("FRUST_TEST_LENT_SLOT_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            client.configure(&mut command);
+            let mut child = ReapChild {
+                child: command.spawn().unwrap(),
+                reaped: false,
+            };
+            let output = child.child.stdout.take().unwrap();
+            let (send, ready) = std::sync::mpsc::channel();
+            let reader = thread::spawn(move || {
+                let mut observed = String::new();
+                for line in BufReader::new(output).lines() {
+                    match line {
+                        Ok(line) if line.contains("frust-lent-slot-ready") => {
+                            let _ = send.send(Ok(()));
+                            return;
+                        }
+                        Ok(line) => {
+                            observed.push_str(&line);
+                            observed.push('\n');
+                        }
+                        Err(error) => {
+                            let _ = send.send(Err(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+                let _ = send.send(Err(format!(
+                    "child exited before lending its slot: {observed}"
+                )));
+            });
+            ready
+                .recv_timeout(Duration::from_secs(10))
+                .expect("child did not report its slot handoff")
+                .unwrap();
+            reader.join().unwrap();
+            assert_eq!(
+                client.available().unwrap(),
+                0,
+                "an unguarded child must retain its assigned slot"
+            );
+            if signal == "SIGTERM" {
+                sys::signal::forward(child.child.id(), sys::signal::SIGTERM);
+            } else {
+                child.child.kill().unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.child.try_wait().unwrap() {
+                    child.reaped = true;
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{signal} did not terminate the child"
+                );
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert!(
+                !status.success(),
+                "{signal} must bypass the child's normal return"
+            );
+            if signal == "SIGTERM" {
+                assert_eq!(sys::exit_code(status), 128 + sys::signal::SIGTERM);
+            }
+            drop(assigned);
+            capacities.push((signal, client.available().unwrap()));
+        }
+        assert_eq!(
+            capacities,
+            [("SIGTERM", 1), ("SIGKILL", 1)],
+            "termination must not mint jobserver capacity"
+        );
+    }
+
+    struct TestSlot<'a> {
+        client: &'a jobserver::Client,
+        released: bool,
+    }
+
+    impl<'a> TestSlot<'a> {
+        fn release(client: &'a jobserver::Client) -> io::Result<Option<Self>> {
+            client.release_raw()?;
+            Ok(Some(Self {
+                client,
+                released: true,
+            }))
+        }
+    }
+
+    impl SlotLoan for TestSlot<'_> {
+        fn resume(&mut self) -> io::Result<()> {
+            while self.released {
+                match self.client.acquire_raw() {
+                    Ok(()) => self.released = false,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for TestSlot<'_> {
+        fn drop(&mut self) {
+            let _ = self.resume();
+        }
+    }
+
+    #[test]
+    fn uncertain_slot_accounting_stops_key_waiting_before_work_can_resume() {
+        struct FailedSlot;
+        impl SlotLoan for FailedSlot {
+            fn resume(&mut self) -> io::Result<()> {
+                Err(io::Error::other("repayment failed"))
+            }
+        }
+        let s = Scratch::new("key-slot-fatal");
+        let path = s.0.join("key");
+        let open = || {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        };
+        let authorized = wait_key_with_slot::<FailedSlot>(
+            open().unwrap(),
+            Duration::from_secs(1),
+            || Err(io::Error::other("authorization uncertain")),
+            |_, _| panic!("uncertain authorization must not start waiting"),
+            || panic!("uncertain authorization must not reopen the key"),
+        );
+        assert!(matches!(authorized, Err(KeyWaitError::Loan(_))));
+        let repaid = wait_key_with_slot(
+            open().unwrap(),
+            Duration::from_secs(1),
+            || Ok(Some(FailedSlot)),
+            |file, _| {
+                assert!(try_key_lock(file).unwrap());
+                Ok(true)
+            },
+            || panic!("failed repayment must not reopen the key"),
+        );
+        assert!(matches!(repaid, Err(KeyWaitError::Loan(_))));
+        assert!(
+            try_key_lock(&open().unwrap()).unwrap(),
+            "repayment must not retain the key"
+        );
+    }
+
+    #[test]
+    fn key_wait_lends_capacity_and_drops_its_lock_before_reclaiming_the_slot() {
+        let s = Scratch::new("key-slot-progress");
+        let path = s.0.join("key");
+        let open = || {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        };
+        let client = jobserver::Client::new(0).unwrap();
+        let mut worker = None;
+        let acquired = wait_key_with_slot(
+            open().unwrap(),
+            Duration::from_secs(5),
+            || TestSlot::release(&client),
+            |file, _| {
+                assert_eq!(client.available().unwrap(), 1);
+                let token = client.acquire().unwrap();
+                assert!(try_key_lock(file).unwrap());
+                let inherited = file.try_clone().unwrap();
+                let path = path.clone();
+                worker = Some(thread::spawn(move || {
+                    let _inherited = inherited;
+                    let other = File::options().read(true).write(true).open(path).unwrap();
+                    assert!(
+                        wait_key_lock(&other, Duration::from_secs(2)).unwrap(),
+                        "token reacquisition held the key lock"
+                    );
+                    sys::unlock(&other).unwrap();
+                    drop(other);
+                    drop(token);
+                }));
+                Ok(true)
+            },
+            open,
+        )
+        .unwrap()
+        .expect("key acquired after regaining the slot");
+        worker.unwrap().join().unwrap();
+        assert_eq!(client.available().unwrap(), 0);
+        assert!(!try_key_lock(&open().unwrap()).unwrap());
+        drop(acquired);
+    }
+
+    #[test]
+    fn key_wait_balances_slots_and_unlocks_on_timeout_error_and_unwind() {
+        for outcome in ["timeout", "error", "panic"] {
+            let s = Scratch::new(&format!("key-slot-{outcome}"));
+            let path = s.0.join("key");
+            let open = || {
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            };
+            let client = jobserver::Client::new(0).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_key_with_slot(
+                    open().unwrap(),
+                    Duration::from_secs(5),
+                    || TestSlot::release(&client),
+                    |file, _| {
+                        assert_eq!(client.available().unwrap(), 1);
+                        assert!(try_key_lock(file).unwrap());
+                        match outcome {
+                            "timeout" => Ok(false),
+                            "error" => Err(io::Error::other("wait failed")),
+                            _ => panic!("wait panicked"),
+                        }
+                    },
+                    open,
+                )
+            }));
+            match outcome {
+                "timeout" => assert!(result.unwrap().unwrap().is_none()),
+                "error" => assert_eq!(result.unwrap().unwrap_err().to_string(), "wait failed"),
+                _ => assert!(result.is_err()),
+            }
+            assert_eq!(client.available().unwrap(), 0, "{outcome}");
+            assert!(try_key_lock(&open().unwrap()).unwrap(), "{outcome}");
+        }
+    }
+
+    #[test]
+    fn key_wait_retries_when_a_peer_wins_during_token_reacquisition() {
+        let s = Scratch::new("key-slot-retry");
+        let path = s.0.join("key");
+        let open = || {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        };
+        let client = jobserver::Client::new(0).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut released = Some(released);
+        let mut worker = None;
+        let mut calls = 0;
+        let acquired = wait_key_with_slot(
+            open().unwrap(),
+            Duration::from_secs(5),
+            || TestSlot::release(&client),
+            |file, cap| {
+                calls += 1;
+                assert_eq!(client.available().unwrap(), 1);
+                if calls == 1 {
+                    let token = client.acquire().unwrap();
+                    assert!(try_key_lock(file).unwrap());
+                    let path = path.clone();
+                    let released = released.take().unwrap();
+                    worker = Some(thread::spawn(move || {
+                        let other = File::options().read(true).write(true).open(path).unwrap();
+                        assert!(wait_key_lock(&other, Duration::from_secs(2)).unwrap());
+                        drop(token);
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                        drop(other);
+                    }));
+                    return Ok(true);
+                }
+                release.send(()).unwrap();
+                wait_key_lock(file, cap)
+            },
+            open,
+        )
+        .unwrap()
+        .expect("peer released the key");
+        worker.unwrap().join().unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(client.available().unwrap(), 0);
+        drop(acquired);
+    }
+
     #[test]
     fn dynamic_workers_finish_other_inputs_while_one_is_slow_and_preserve_order() {
         let items: Vec<_> = (0..32).collect();
@@ -2135,7 +3237,8 @@ mod tests {
                     panic!("hashing failed");
                 }
                 Ok(i)
-            }).unwrap_err();
+            })
+            .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Other);
             assert_eq!(error.to_string(), "worker thread panicked");
         }
@@ -2184,7 +3287,9 @@ mod tests {
     fn parallel_extern_hashes_preserve_serial_keys_watches_and_errors() {
         let s = Scratch::new("extern-parallel");
         let deps = s.0.join("target").join("debug").join("deps");
-        let profile = rustc_args::profile_root(&deps).to_string_lossy().into_owned();
+        let profile = rustc_args::profile_root(&deps)
+            .to_string_lossy()
+            .into_owned();
         let mut args = vec![
             OsString::from("--crate-name=k"),
             OsString::from("--emit=dep-info,link"),
@@ -2194,21 +3299,36 @@ mod tests {
         ];
         fs::write(s.0.join("extra.o"), b"object").unwrap();
         for i in [7, 2, 11, 5, 0, 9, 1, 10, 6, 3, 8, 4] {
-            let path = if i < 9 { deps.join(format!("libdep{i}.rlib")) } else { s.0.join(format!("libdep{i}.rlib")) };
+            let path = if i < 9 {
+                deps.join(format!("libdep{i}.rlib"))
+            } else {
+                s.0.join(format!("libdep{i}.rlib"))
+            };
             fs::write(&path, vec![i as u8; (i + 1) * 1024]).unwrap();
             if i % 2 == 0 {
-                args.push(OsString::from(format!("--extern=dep{i}={}", path.display())));
+                args.push(OsString::from(format!(
+                    "--extern=dep{i}={}",
+                    path.display()
+                )));
             } else {
                 args.push(OsString::from("--extern"));
                 args.push(OsString::from(format!("dep{i}={}", path.display())));
             }
         }
         fs::write(s.0.join("custom.json"), b"{}").unwrap();
-        args.extend([OsString::from("--target=custom.json"), OsString::from("-Cincremental=session")]);
+        args.extend([
+            OsString::from("--target=custom.json"),
+            OsString::from("-Cincremental=session"),
+        ]);
         let prekey = |args: &[OsString], threads| {
             let parsed = rustc_args::parse(args).unwrap();
             let hasher = Hasher::ephemeral();
-            let ctx = KeyContext { hasher: &hasher, cwd: &s.0, profile: &profile, profile_abs: Path::new(&profile) };
+            let ctx = KeyContext {
+                hasher: &hasher,
+                cwd: &s.0,
+                profile: &profile,
+                profile_abs: Path::new(&profile),
+            };
             ctx.prekey_with_threads(&OsString::from("rustc"), args, &parsed, threads)
         };
         let serial = prekey(&args, 1).unwrap();
@@ -2217,8 +3337,16 @@ mod tests {
         assert_eq!(parallel.unit, serial.unit);
         assert_eq!(parallel.watched, serial.watched);
         assert_eq!(parallel.extern_hashes, serial.extern_hashes);
-        assert_eq!(parallel.watched.len(), 14, "twelve externs, an object and a target specification");
-        assert_eq!(parallel.extern_hashes.len(), 9, "only externs under the profile are tracked for replacement");
+        assert_eq!(
+            parallel.watched.len(),
+            14,
+            "twelve externs, an object and a target specification"
+        );
+        assert_eq!(
+            parallel.extern_hashes.len(),
+            9,
+            "only externs under the profile are tracked for replacement"
+        );
 
         args[4] = OsString::from("link-arg=missing.o");
         args.push(OsString::from("--extern=first=missing-first.rlib"));
@@ -2229,7 +3357,10 @@ mod tests {
         args[4] = OsString::from("link-arg=extra.o");
         let serial_error = prekey(&args, 1).err().unwrap();
         assert_eq!(prekey(&args, 4).err().unwrap(), serial_error);
-        assert!(serial_error.contains("cannot read --extern") && serial_error.contains("missing-first.rlib"));
+        assert!(
+            serial_error.contains("cannot read --extern")
+                && serial_error.contains("missing-first.rlib")
+        );
     }
 
     #[test]
@@ -2241,7 +3372,10 @@ mod tests {
         let before = key(&s.0, &["-C", &arg]).unwrap();
         fs::write(&obj, b"v2").unwrap();
         assert_ne!(before, key(&s.0, &["-C", &arg]).unwrap());
-        assert!(key(&s.0, &["-C", "link-arg=missing.o"]).is_err(), "an unreadable object is not keyed by its name");
+        assert!(
+            key(&s.0, &["-C", "link-arg=missing.o"]).is_err(),
+            "an unreadable object is not keyed by its name"
+        );
 
         fs::write(s.0.join("custom.json"), b"{}").unwrap();
         let spec = key(&s.0, &["--target", "custom.json"]).unwrap();
@@ -2252,13 +3386,18 @@ mod tests {
     }
 
     fn input(path: &Path, hash: &str, stamp: Option<StampRecord>) -> Input {
-        Input { path: path.to_string_lossy().into_owned(), hash: hash.to_string(), stamp }
+        Input {
+            path: path.to_string_lossy().into_owned(),
+            hash: hash.to_string(),
+            stamp,
+        }
     }
 
     /// A hash dated past the settle margin, as one taken seconds after the last write would be.
     fn settled(path: &Path) -> hashing::Hashed {
         let mut hashed = hashing::hash_with_stamp(path).unwrap();
-        hashed.at_ns = hashed.stamp.mtime_ns.max(hashed.stamp.ctime_ns) + hashing::SETTLE_MARGIN_NS + 1;
+        hashed.at_ns =
+            hashed.stamp.mtime_ns.max(hashed.stamp.ctime_ns) + hashing::SETTLE_MARGIN_NS + 1;
         hashed
     }
 
@@ -2275,26 +3414,58 @@ mod tests {
         // A deliberately wrong hash proves the content was not consulted.
         let bogus = "0".repeat(64);
         let (on, off) = (gate(&s, TrustMode::On), gate(&s, TrustMode::Off));
-        let verdict = |path: &Path, hash: &str, stamp: Option<StampRecord>, gate: &TrustGate, at: i128| {
-            input_matches(&hasher, path, false, &input(path, hash, stamp), gate, at)
-        };
-        assert_eq!(verdict(&file, &bogus, Some(record), &on, now), Verdict::Trusted);
-        assert_eq!(verdict(&file, &bogus, Some(record), &off, now), Verdict::Mismatch, "the kill switch forces hashing");
-        assert_eq!(verdict(&file, &bogus, None, &on, now), Verdict::Mismatch, "no record, no trust");
+        let verdict =
+            |path: &Path, hash: &str, stamp: Option<StampRecord>, gate: &TrustGate, at: i128| {
+                input_matches(&hasher, path, false, &input(path, hash, stamp), gate, at)
+            };
+        assert_eq!(
+            verdict(&file, &bogus, Some(record), &on, now),
+            Verdict::Trusted
+        );
+        assert_eq!(
+            verdict(&file, &bogus, Some(record), &off, now),
+            Verdict::Mismatch,
+            "the kill switch forces hashing"
+        );
+        assert_eq!(
+            verdict(&file, &bogus, None, &on, now),
+            Verdict::Mismatch,
+            "no record, no trust"
+        );
         assert_eq!(verdict(&file, &hashed.hash, None, &on, now), Verdict::Match);
 
         fs::write(&file, b"pub fn b() { 1 }").unwrap();
         let edited = blake3::hash(b"pub fn b() { 1 }").to_hex().to_string();
-        assert_eq!(verdict(&file, &hashed.hash, Some(record), &on, now), Verdict::Mismatch, "an edit is never served from the old hash");
-        assert_eq!(verdict(&file, &edited, Some(record), &on, now), Verdict::Match, "a changed stamp falls back to the content");
+        assert_eq!(
+            verdict(&file, &hashed.hash, Some(record), &on, now),
+            Verdict::Mismatch,
+            "an edit is never served from the old hash"
+        );
+        assert_eq!(
+            verdict(&file, &edited, Some(record), &on, now),
+            Verdict::Match,
+            "a changed stamp falls back to the content"
+        );
 
         let copy = s.0.join("copy.rs");
         fs::copy(&file, &copy).unwrap();
         let again = settled(&file);
         let (record, later) = (StampRecord::of(&again).unwrap(), again.at_ns);
-        assert_eq!(verdict(&file, &bogus, Some(record), &on, later), Verdict::Trusted, "the rewritten file is trusted under its new record");
-        assert_eq!(verdict(&copy, &bogus, Some(record), &on, later), Verdict::Mismatch, "another inode never matches a record");
-        assert_eq!(verdict(&s.0.join("gone.rs"), &bogus, Some(record), &on, later), Verdict::Mismatch, "a missing file is a mismatch");
+        assert_eq!(
+            verdict(&file, &bogus, Some(record), &on, later),
+            Verdict::Trusted,
+            "the rewritten file is trusted under its new record"
+        );
+        assert_eq!(
+            verdict(&copy, &bogus, Some(record), &on, later),
+            Verdict::Mismatch,
+            "another inode never matches a record"
+        );
+        assert_eq!(
+            verdict(&s.0.join("gone.rs"), &bogus, Some(record), &on, later),
+            Verdict::Mismatch,
+            "a missing file is a mismatch"
+        );
     }
 
     fn gate(s: &Scratch, mode: TrustMode) -> TrustGate {
@@ -2314,21 +3485,59 @@ mod tests {
         let dirs = Dirs::at(s.0.join("state"));
 
         let audit = gate(&s, TrustMode::Audit);
-        let verdict = |hash: &str, gate: &TrustGate| input_matches(&hasher, &file, false, &input(&file, hash, Some(record)), gate, now);
-        assert_eq!(verdict(&hashed.hash, &audit), Verdict::Confirmed, "audit mode reads every predicted input");
-        assert_eq!(verdict(&bogus, &audit), Verdict::Violation { fresh: hashed.hash.clone(), dev });
-        assert!(!cache::quarantined(&dirs, dev), "detection alone writes nothing");
+        let verdict = |hash: &str, gate: &TrustGate| {
+            input_matches(
+                &hasher,
+                &file,
+                false,
+                &input(&file, hash, Some(record)),
+                gate,
+                now,
+            )
+        };
+        assert_eq!(
+            verdict(&hashed.hash, &audit),
+            Verdict::Confirmed,
+            "audit mode reads every predicted input"
+        );
+        assert_eq!(
+            verdict(&bogus, &audit),
+            Verdict::Violation {
+                fresh: hashed.hash.clone(),
+                dev
+            }
+        );
+        assert!(
+            !cache::quarantined(&dirs, dev),
+            "detection alone writes nothing"
+        );
 
-        audit.violation("lib", dev, &input(&file, &bogus, Some(record)), &hashed.hash);
+        audit.violation(
+            "lib",
+            dev,
+            &input(&file, &bogus, Some(record)),
+            &hashed.hash,
+        );
         assert!(cache::quarantined(&dirs, dev));
-        assert_eq!(verdict(&bogus, &audit), Verdict::Mismatch, "the gate that saw the violation stops predicting");
+        assert_eq!(
+            verdict(&bogus, &audit),
+            Verdict::Mismatch,
+            "the gate that saw the violation stops predicting"
+        );
         assert_eq!(verdict(&hashed.hash, &audit), Verdict::Match);
         for mode in [TrustMode::On, TrustMode::Audit] {
             let later = gate(&s, mode);
-            assert_eq!(verdict(&bogus, &later), Verdict::Mismatch, "a later process also hashes content under {mode:?}");
+            assert_eq!(
+                verdict(&bogus, &later),
+                Verdict::Mismatch,
+                "a later process also hashes content under {mode:?}"
+            );
             assert!(!later.records_stamps(dev, &file), "and records no stamps");
         }
-        assert!(gate(&s, TrustMode::Off).records_stamps(dev, &file), "off records as it always did");
+        assert!(
+            gate(&s, TrustMode::Off).records_stamps(dev, &file),
+            "off records as it always did"
+        );
     }
 
     #[test]
@@ -2340,19 +3549,42 @@ mod tests {
         let record = StampRecord::of(&hashed).unwrap();
         let (now, dev) = (hashed.at_ns, hashed.stamp.dev);
         let bogus = "0".repeat(64);
-        assert_eq!(audit_trusted(&file, &input(&file, &hashed.hash, Some(record)), now), Verdict::Confirmed);
-        assert_eq!(audit_trusted(&file, &input(&file, &bogus, Some(record)), now), Verdict::Violation { fresh: hashed.hash.clone(), dev });
-        assert_eq!(audit_trusted(&file, &input(&file, &hashed.hash, None), now), Verdict::Mismatch, "an input without a record cannot be audited");
+        assert_eq!(
+            audit_trusted(&file, &input(&file, &hashed.hash, Some(record)), now),
+            Verdict::Confirmed
+        );
+        assert_eq!(
+            audit_trusted(&file, &input(&file, &bogus, Some(record)), now),
+            Verdict::Violation {
+                fresh: hashed.hash.clone(),
+                dev
+            }
+        );
+        assert_eq!(
+            audit_trusted(&file, &input(&file, &hashed.hash, None), now),
+            Verdict::Mismatch,
+            "an input without a record cannot be audited"
+        );
         fs::write(&file, b"pub fn b() { 1 }").unwrap();
-        assert_eq!(audit_trusted(&file, &input(&file, &bogus, Some(record)), now), Verdict::Mismatch, "an edit is a miss, not a violation");
+        assert_eq!(
+            audit_trusted(&file, &input(&file, &bogus, Some(record)), now),
+            Verdict::Mismatch,
+            "an edit is a miss, not a violation"
+        );
     }
 
     #[test]
     fn audits_cover_every_trusted_input_of_a_small_candidate_and_one_of_a_large_one() {
-        let paths: Vec<PathBuf> = (0..12).map(|i| PathBuf::from(format!("/src/file{i}.rs"))).collect();
+        let paths: Vec<PathBuf> = (0..12)
+            .map(|i| PathBuf::from(format!("/src/file{i}.rs")))
+            .collect();
         let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
         for n in 0..=AUDIT_ALL_AT_OR_BELOW {
-            assert_eq!(audit_selection(&refs[..n], 99), (0..n).collect::<Vec<_>>(), "{n} trusted inputs");
+            assert_eq!(
+                audit_selection(&refs[..n], 99),
+                (0..n).collect::<Vec<_>>(),
+                "{n} trusted inputs"
+            );
         }
         assert!(audit_selection(&[], 1).is_empty());
         let mut seen = BTreeSet::new();
@@ -2360,10 +3592,17 @@ mod tests {
             let picked = audit_selection(&refs, seed);
             assert_eq!(picked.len(), 1, "seed {seed}");
             assert!(picked[0] < refs.len(), "only a trusted input can be chosen");
-            assert_eq!(picked, audit_selection(&refs, seed), "a seed always picks the same input");
+            assert_eq!(
+                picked,
+                audit_selection(&refs, seed),
+                "a seed always picks the same input"
+            );
             seen.insert(picked[0]);
         }
-        assert!(seen.len() > 3, "different seeds spread over the inputs: {seen:?}");
+        assert!(
+            seen.len() > 3,
+            "different seeds spread over the inputs: {seen:?}"
+        );
         let five = &refs[..AUDIT_ALL_AT_OR_BELOW + 1];
         assert_eq!(audit_selection(five, 7).len(), 1);
     }
@@ -2386,7 +3625,10 @@ mod tests {
             input(path, "new", Some(record(9_000_000_000_123))),
             input(path, "mid", Some(record(5_000_000_000_123))),
         ];
-        let order: Vec<&str> = newest_first(&inputs).iter().map(|i| i.hash.as_str()).collect();
+        let order: Vec<&str> = newest_first(&inputs)
+            .iter()
+            .map(|i| i.hash.as_str())
+            .collect();
         assert_eq!(order, ["unrecorded", "new", "mid", "old"]);
     }
 
@@ -2418,8 +3660,14 @@ mod tests {
             n != 3
         }));
         assert!(seen.load(Ordering::Relaxed) <= items.len());
-        assert!(all_parallel(&[] as &[u32], |_| false), "nothing to check is a match");
-        assert!(!all_parallel(&items, |&n| n < 199), "the last item decides too");
+        assert!(
+            all_parallel(&[] as &[u32], |_| false),
+            "nothing to check is a match"
+        );
+        assert!(
+            !all_parallel(&items, |&n| n < 199),
+            "the last item decides too"
+        );
     }
 
     #[test]
@@ -2429,8 +3677,17 @@ mod tests {
         let lib = s.0.join("ext");
         fs::create_dir_all(&lib).unwrap();
         fs::write(lib.join("libnowhere.a"), b"x").unwrap();
-        assert!(key(&s.0, &["-l", "static=nowhere", &format!("-L{}", lib.display())]).is_ok());
-        assert!(key(&s.0, &["-l", "dylib=system"]).is_ok(), "dynamic libraries are only named in the output");
+        assert!(
+            key(
+                &s.0,
+                &["-l", "static=nowhere", &format!("-L{}", lib.display())]
+            )
+            .is_ok()
+        );
+        assert!(
+            key(&s.0, &["-l", "dylib=system"]).is_ok(),
+            "dynamic libraries are only named in the output"
+        );
     }
 
     fn wire(path: &Path) -> StampWire {
@@ -2444,11 +3701,24 @@ mod tests {
         fs::write(&src, b"pub fn a() {}").unwrap();
         let rlib = deps.join("libk.rlib");
         fs::write(&rlib, b"object").unwrap();
-        let dep_text = format!("{}: {}\n\n{}:\n", deps.join("k.d").display(), src.display(), src.display());
+        let dep_text = format!(
+            "{}: {}\n\n{}:\n",
+            deps.join("k.d").display(),
+            src.display(),
+            src.display()
+        );
         fs::write(deps.join("k.d"), &dep_text).unwrap();
         let names = vec!["k.d".to_string(), "libk.rlib".to_string()];
-        let mut args: Vec<String> =
-            ["rustc", "--crate-name", "k", "--emit=dep-info,link", "--out-dir"].iter().map(|a| a.to_string()).collect();
+        let mut args: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "k",
+            "--emit=dep-info,link",
+            "--out-dir",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
         args.push(deps.display().to_string());
         let job = StoreJob {
             format: JOB_FORMAT,
@@ -2464,11 +3734,15 @@ mod tests {
             captured: String::new(),
             watched: Vec::new(),
             extern_hashes: Vec::new(),
-            outputs: names.iter().map(|n| (n.clone(), wire(&deps.join(n)))).collect(),
+            outputs: names
+                .iter()
+                .map(|n| (n.clone(), wire(&deps.join(n))))
+                .collect(),
             names,
             dep_name: "k.d".to_string(),
             dep_text,
             inputs: vec![(src.clone(), wire(&src))],
+            commitments: HashMap::new(),
             slot_lock: None,
             key_lock: None,
         };
@@ -2476,7 +3750,55 @@ mod tests {
     }
 
     fn rows(job: &StoreJob) -> usize {
-        Cache::new(&Dirs::at(&job.home)).candidates(&job.prekey).len()
+        Cache::new(&Dirs::at(&job.home))
+            .candidates(&job.prekey)
+            .len()
+    }
+
+    #[test]
+    fn a_peer_publishing_between_lookup_and_uncontended_lock_prevents_compiler_launch() {
+        let s = Scratch::new("published-before-lock");
+        let (job, _, _) = fixture(&s);
+        let counter = s.0.join("compiler-launches");
+        let mut plan = Plan::from_job(&job).unwrap();
+        #[cfg(unix)]
+        {
+            plan.args = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf launch >> \"$1\"; exit 1".into(),
+                "compiler".into(),
+                counter.clone().into_os_string(),
+            ];
+        }
+        #[cfg(windows)]
+        {
+            plan.args = vec![
+                "cmd.exe".into(),
+                "/C".into(),
+                format!("echo launch>>\"{}\" & exit /B 1", counter.display()).into(),
+            ];
+        }
+        assert_eq!(plan.compile_and_store(None), 1);
+        assert!(fs::metadata(&counter).unwrap().len() > 0);
+        fs::remove_file(&counter).unwrap();
+        assert_eq!(
+            plan.execute_after_miss(|| {
+                assert_eq!(rows(&job), 0);
+                run_deferred(&job);
+                assert_eq!(rows(&job), 1);
+            }),
+            0
+        );
+        assert!(
+            !counter.exists(),
+            "the follower must never launch its compiler"
+        );
+        assert_eq!(
+            plan.waited(),
+            0,
+            "the key lock was acquired without contention"
+        );
     }
 
     #[test]
@@ -2495,8 +3817,14 @@ mod tests {
         assert_eq!(stored.matches(PROFILE_TOKEN).count(), 4);
 
         let restored = dep_info_resolved(&stored, new);
-        assert!(restored.contains("/other/new\\ place/target/debug/deps/k.d: src/lib.rs"), "{restored}");
-        assert!(restored.contains("# env-dep:OUT=/other/new place/target/debug/build\n"), "{restored}");
+        assert!(
+            restored.contains("/other/new\\ place/target/debug/deps/k.d: src/lib.rs"),
+            "{restored}"
+        );
+        assert!(
+            restored.contains("# env-dep:OUT=/other/new place/target/debug/build\n"),
+            "{restored}"
+        );
         assert_eq!(dep_info_tokenised(&restored, new), stored);
     }
 
@@ -2504,18 +3832,37 @@ mod tests {
     fn a_profile_path_without_spaces_is_replaced_exactly_as_before() {
         let profile = "/work/target/debug";
         let raw = format!("{profile}/deps/k.d: {profile}/deps/a.rs\n# env-dep:X={profile}\n");
-        assert_eq!(dep_info_tokenised(&raw, profile), raw.replace(profile, PROFILE_TOKEN));
+        assert_eq!(
+            dep_info_tokenised(&raw, profile),
+            raw.replace(profile, PROFILE_TOKEN)
+        );
         let stored = dep_info_tokenised(&raw, profile);
-        assert_eq!(dep_info_resolved(&stored, "/else/target/debug"), raw.replace(profile, "/else/target/debug"));
+        assert_eq!(
+            dep_info_resolved(&stored, "/else/target/debug"),
+            raw.replace(profile, "/else/target/debug")
+        );
     }
 
     #[test]
     fn a_stamp_survives_the_wire_with_its_nanoseconds() {
-        let stamp = Stamp { dev: 3, ino: 4, size: 5, mtime_ns: 1_700_000_000_123_456_789, ctime_ns: -42 };
+        let stamp = Stamp {
+            dev: 3,
+            ino: 4,
+            size: 5,
+            mtime_ns: 1_700_000_000_123_456_789,
+            ctime_ns: -42,
+        };
         let wire = StampWire::of(&stamp);
         let again: StampWire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
         assert_eq!(again.stamp(), Some(stamp));
-        assert!(StampWire { mtime_ns: "soon".to_string(), ..wire }.stamp().is_none());
+        assert!(
+            StampWire {
+                mtime_ns: "soon".to_string(),
+                ..wire
+            }
+            .stamp()
+            .is_none()
+        );
     }
 
     #[test]
@@ -2533,13 +3880,31 @@ mod tests {
         assert_eq!(plan.dirs.root(), job.home.as_path());
         assert!(Frozen::from_job(&again).is_some());
 
-        let other_format = StoreJob { format: JOB_FORMAT + 1, ..job.clone() };
-        assert!(Plan::from_job(&other_format).is_none(), "a job of another format stores nothing");
-        let no_args = StoreJob { args: vec!["rustc".to_string()], ..job.clone() };
+        let other_format = StoreJob {
+            format: JOB_FORMAT + 1,
+            ..job.clone()
+        };
+        assert!(
+            Plan::from_job(&other_format).is_none(),
+            "a job of another format stores nothing"
+        );
+        let no_args = StoreJob {
+            args: vec!["rustc".to_string()],
+            ..job.clone()
+        };
         assert!(Plan::from_job(&no_args).is_none());
         let mut bad = job.clone();
-        bad.watched.push((s.0.join("lib.rs"), StampWire { ctime_ns: "x".to_string(), ..bad.inputs[0].1.clone() }));
-        assert!(Plan::from_job(&bad).is_none(), "an unreadable stamp is never guessed");
+        bad.watched.push((
+            s.0.join("lib.rs"),
+            StampWire {
+                ctime_ns: "x".to_string(),
+                ..bad.inputs[0].1.clone()
+            },
+        ));
+        assert!(
+            Plan::from_job(&bad).is_none(),
+            "an unreadable stamp is never guessed"
+        );
         bad.inputs[0].1.mtime_ns = "x".to_string();
         assert!(Frozen::from_job(&bad).is_none());
     }
@@ -2553,13 +3918,20 @@ mod tests {
         run_deferred(&job);
         assert_eq!(rows(&job), 1);
         let events = fs::read_to_string(Dirs::at(&job.home).ledger()).unwrap_or_default();
-        assert!(events.is_empty(), "the wrapper records the event of a deferred store, not the helper");
+        assert!(
+            events.is_empty(),
+            "the wrapper records the event of a deferred store, not the helper"
+        );
     }
 
     #[test]
     fn encoded_entry_keys_cannot_alias_legacy_raw_entry_keys() {
         let prekey = "ab".repeat(20);
-        let inputs = vec![Input { path: "src/lib.rs".to_string(), hash: "cd".repeat(32), stamp: None }];
+        let inputs = vec![Input {
+            path: "src/lib.rs".to_string(),
+            hash: "cd".repeat(32),
+            stamp: None,
+        }];
         let envs = vec![("WATCHED".to_string(), Some("value".to_string()))];
         let mut legacy = blake3::Hasher::new();
         legacy.update(prekey.as_bytes());
@@ -2588,7 +3960,14 @@ mod tests {
         let plan = Plan::from_job(&job).unwrap();
         let staged = plan.cache.stage().unwrap();
         let meta = plan
-            .stage_entry(&staged, &job.names, (&job.dep_name, &job.dep_text), b"", 7)
+            .stage_entry(
+                &staged,
+                &job.names,
+                (&job.dep_name, &job.dep_text),
+                b"",
+                7,
+                None,
+            )
             .unwrap();
         let binary = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
         let dep = meta.files.iter().find(|f| f.name == "k.d").unwrap();
@@ -2613,21 +3992,41 @@ mod tests {
         let (job, _, rlib) = fixture(&s);
         let mut plan = Plan::from_job(&job).unwrap();
         let staged = plan.cache.stage().unwrap();
-        let mut meta = plan.stage_entry(&staged, &job.names, (&job.dep_name, &job.dep_text), b"", 7).unwrap();
-        let binary = meta.files.iter().position(|file| file.name == "libk.rlib").unwrap();
+        let mut meta = plan
+            .stage_entry(
+                &staged,
+                &job.names,
+                (&job.dep_name, &job.dep_text),
+                b"",
+                7,
+                None,
+            )
+            .unwrap();
+        let binary = meta
+            .files
+            .iter()
+            .position(|file| file.name == "libk.rlib")
+            .unwrap();
         let dep_info = rlib.parent().unwrap().join("k.d");
         let sibling = rlib.parent().unwrap().join("unrelated-output");
         fs::write(&rlib, b"existing artifact").unwrap();
         fs::write(&dep_info, b"existing dep-info").unwrap();
         fs::write(&sibling, b"existing sibling").unwrap();
-        fs::write(staged.join(&meta.files[binary].stored), b"UTF-8 text that is not an encoded payload").unwrap();
+        fs::write(
+            staged.join(&meta.files[binary].stored),
+            b"UTF-8 text that is not an encoded payload",
+        )
+        .unwrap();
         meta.files[binary].encoding = cache::payload::Encoding::Lz4BlocksV1;
         meta.files[binary].decoded_bytes = Some(1);
         meta.files[binary].content_hash = Some("0".repeat(64));
         for (text, dir) in [(true, false), (false, true), (true, true)] {
             meta.files[binary].text = text;
             meta.files[binary].dir = dir;
-            assert_eq!(plan.restore(&staged, &meta).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                plan.restore(&staged, &meta).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
             assert_eq!(fs::read(&rlib).unwrap(), b"existing artifact");
             assert_eq!(fs::read(&dep_info).unwrap(), b"existing dep-info");
             assert_eq!(fs::read(&sibling).unwrap(), b"existing sibling");
@@ -2716,19 +4115,31 @@ mod tests {
     fn an_identically_replaced_linker_refuses_a_deferred_store() {
         let s = Scratch::new("deferred-linker");
         let (mut job, _, _) = fixture(&s);
-        let driver = s.0.join("target").join("debug").join("deps").join("driver.rlib");
+        let driver =
+            s.0.join("target")
+                .join("debug")
+                .join("deps")
+                .join("driver.rlib");
         fs::write(&driver, b"linker").unwrap();
         let linker = format!("-Clinker={}", driver.display());
         let dependency = format!("--extern=driver={}", driver.display());
         let keyed = keyed(&s.0, &[&linker, &dependency]).unwrap();
         job.args.extend([linker, dependency]);
-        job.watched = keyed.watched.iter().map(|(path, stamp)| (path.clone(), StampWire::of(stamp))).collect();
+        job.watched = keyed
+            .watched
+            .iter()
+            .map(|(path, stamp)| (path.clone(), StampWire::of(stamp)))
+            .collect();
         job.extern_hashes = keyed.extern_hashes.into_iter().collect();
         let replacement = driver.with_file_name("replacement-driver");
         fs::write(&replacement, b"linker").unwrap();
         sys::rename(&replacement, &driver).unwrap();
         run_deferred(&job);
-        assert_eq!(rows(&job), 0, "even equal bytes cannot excuse a changed linker stamp");
+        assert_eq!(
+            rows(&job),
+            0,
+            "even equal bytes cannot excuse a changed linker stamp"
+        );
     }
 
     #[test]
@@ -2758,8 +4169,19 @@ mod tests {
             pair("CARGO_PKG_NAME", "a"),
             pair("SDKROOT", "/sdk"),
         ]);
-        let names: Vec<(&str, &str)> = kept.iter().map(|(n, v)| (n.to_str().unwrap(), v.to_str().unwrap())).collect();
-        assert_eq!(names, [("CARGO_PKG_NAME", "a"), ("CARGO_PKG_NAME", "k"), ("RUSTC_BOOTSTRAP", "1"), ("SDKROOT", "/sdk")]);
+        let names: Vec<(&str, &str)> = kept
+            .iter()
+            .map(|(n, v)| (n.to_str().unwrap(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("CARGO_PKG_NAME", "a"),
+                ("CARGO_PKG_NAME", "k"),
+                ("RUSTC_BOOTSTRAP", "1"),
+                ("SDKROOT", "/sdk")
+            ]
+        );
         assert!(keyed_env(Vec::new()).is_empty());
     }
 
@@ -2790,7 +4212,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn variables_that_are_not_unicode_are_kept_by_their_bytes_when_filtered_in_and_dropped_otherwise() {
+    fn variables_that_are_not_unicode_are_kept_by_their_bytes_when_filtered_in_and_dropped_otherwise()
+     {
         // SAFETY: on unix the encoded form of an OsString is its raw bytes, so any byte string is valid.
         let bad = |bytes: &[u8]| unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) };
         let kept = keyed_env([
@@ -2814,13 +4237,56 @@ mod tests {
     }
 
     #[test]
+    fn deferred_output_commitments_validate_names_identity_and_legacy_jobs() {
+        let s = Scratch::new("commitment-job");
+        let (mut job, _, rlib) = fixture(&s);
+        let (_, commitment) = cache::payload::capture(&rlib).unwrap();
+        job.commitments
+            .insert("libk.rlib".into(), commitment.clone());
+        let frozen = Frozen::from_job(&job).unwrap();
+        assert_eq!(frozen.commitments.len(), 1);
+        let encoded = serde_json::to_value(&job).unwrap();
+        let decoded: StoreJob = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, job);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("commitments");
+        let legacy: StoreJob = serde_json::from_value(legacy).unwrap();
+        assert!(Frozen::from_job(&legacy).unwrap().commitments.is_empty());
+        job.commitments.insert("../outside".into(), commitment);
+        assert!(Frozen::from_job(&job).is_none());
+        job.commitments.remove("../outside");
+        job.outputs
+            .iter_mut()
+            .find(|(name, _)| name == "libk.rlib")
+            .unwrap()
+            .1
+            .ino += 1;
+        assert!(Frozen::from_job(&job).is_none());
+        let replacement = rlib.with_extension("replacement");
+        fs::write(&replacement, b"object").unwrap();
+        sys::rename(&replacement, &rlib).unwrap();
+        assert!(!frozen.outputs_unchanged(rlib.parent().unwrap()));
+    }
+
+    #[test]
     fn a_coarse_stamp_in_a_frozen_state_is_detected() {
-        let fine = Stamp { dev: 1, ino: 2, size: 3, mtime_ns: 5_000_000_001, ctime_ns: 5_000_000_002 };
-        let coarse = Stamp { mtime_ns: 5_000_000_000, ctime_ns: 6_000_000_000, ..fine };
+        let fine = Stamp {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 5_000_000_001,
+            ctime_ns: 5_000_000_002,
+        };
+        let coarse = Stamp {
+            mtime_ns: 5_000_000_000,
+            ctime_ns: 6_000_000_000,
+            ..fine
+        };
         let frozen = |output: Stamp, input: Stamp| Frozen {
             names: Vec::new(),
             dep_name: String::new(),
             dep_text: String::new(),
+            commitments: HashMap::new(),
             outputs: vec![("o".to_string(), output)],
             inputs: HashMap::from([(PathBuf::from("i"), input)]),
         };
@@ -2842,30 +4308,67 @@ mod tests {
         let plan = Plan::from_job(&job).unwrap();
         let deps = rlib.parent().unwrap();
         fs::write(deps.join("libk.rmeta"), b"old metadata").unwrap();
-        let before: HashMap<_, _> = plan.prefixed_outputs(|_| true).into_iter()
-            .map(|(name, stamp)| (name, stamp.unwrap())).collect();
+        let before: HashMap<_, _> = plan
+            .prefixed_outputs(|_| true)
+            .into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap()))
+            .collect();
         assert_eq!(before.len(), 2);
         fs::write(deps.join("k.d"), b"new dependency information").unwrap();
-        fs::write(deps.join("libk.rmeta"), b"new metadata with a different size").unwrap();
-        for name in ["libk.d", "liblibk.rmeta", "libk", "k_extra.d", "k-other.d", "k.notes", "libk.notes", "k.d.other"] {
+        fs::write(
+            deps.join("libk.rmeta"),
+            b"new metadata with a different size",
+        )
+        .unwrap();
+        for name in [
+            "libk.d",
+            "liblibk.rmeta",
+            "libk",
+            "k_extra.d",
+            "k-other.d",
+            "k.notes",
+            "libk.notes",
+            "k.d.other",
+        ] {
             fs::write(deps.join(name), b"another compile wrote this sibling").unwrap();
         }
         fs::create_dir(deps.join("k.dSYM")).unwrap();
         assert_eq!(plan.output_files(&[], &before), ["k.d", "libk.rmeta"]);
-        let now: HashMap<_, _> = plan.prefixed_outputs(|_| true).into_iter()
-            .map(|(name, stamp)| (name, stamp.unwrap())).collect();
-        assert!(plan.output_files(&[], &now).is_empty(), "unchanged outputs do not belong to a new compile");
+        let now: HashMap<_, _> = plan
+            .prefixed_outputs(|_| true)
+            .into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap()))
+            .collect();
+        assert!(
+            plan.output_files(&[], &now).is_empty(),
+            "unchanged outputs do not belong to a new compile"
+        );
         let captured = serde_json::json!({ "artifact": deps.join("k.notes") }).to_string();
-        assert_eq!(plan.output_files(captured.as_bytes(), &before), ["k.d", "k.notes", "libk.rmeta"]);
+        assert_eq!(
+            plan.output_files(captured.as_bytes(), &before),
+            ["k.d", "k.notes", "libk.rmeta"]
+        );
         sys::rename(&deps.join("libk.rmeta"), &deps.join("previous-rmeta")).unwrap();
         fs::create_dir(deps.join("libk.rmeta")).unwrap();
-        assert!(plan.output_files(&[], &before).is_empty(), "a missing regular metadata output prevents storage");
+        assert!(
+            plan.output_files(&[], &before).is_empty(),
+            "a missing regular metadata output prevents storage"
+        );
         #[cfg(unix)]
         {
             sys::rename(&deps.join("libk.rmeta"), &deps.join("unrelated-directory")).unwrap();
             sys::link_tool(&deps.join("previous-rmeta"), &deps.join("libk.rmeta")).unwrap();
-            assert_eq!(plan.prefixed_outputs(|_| true).iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["k.d"]);
-            assert!(plan.output_files(&[], &before).is_empty(), "a symlink is not owned by metadata discovery");
+            assert_eq!(
+                plan.prefixed_outputs(|_| true)
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                ["k.d"]
+            );
+            assert!(
+                plan.output_files(&[], &before).is_empty(),
+                "a symlink is not owned by metadata discovery"
+            );
         }
     }
 
@@ -2876,8 +4379,12 @@ mod tests {
         let plan = Plan::from_job(&job).unwrap();
         assert!(plan.prefixed_outputs(|_| true).is_empty());
         assert!(plan.output_files(&[], &HashMap::new()).is_empty());
-        let captured = serde_json::json!({ "artifact": plan.parsed.out_dir.join("libk.rlib") }).to_string();
-        assert_eq!(plan.output_files(captured.as_bytes(), &HashMap::new()), ["libk.rlib"]);
+        let captured =
+            serde_json::json!({ "artifact": plan.parsed.out_dir.join("libk.rlib") }).to_string();
+        assert_eq!(
+            plan.output_files(captured.as_bytes(), &HashMap::new()),
+            ["libk.rlib"]
+        );
     }
 
     #[test]
@@ -2895,9 +4402,11 @@ mod tests {
             })
             .collect();
         let freeze = |job: &StoreJob| {
-            Plan::from_job(job)
-                .expect("plan")
-                .freeze(captured.as_bytes(), &HashMap::new())
+            Plan::from_job(job).expect("plan").freeze(
+                captured.as_bytes(),
+                job.spawned_ns.parse().unwrap(),
+                &HashMap::new(),
+            )
         };
 
         let off = StoreJob {
@@ -2942,6 +4451,94 @@ mod tests {
     }
 
     #[test]
+    fn fresh_external_inputs_decline_freezing_before_output_commitments() {
+        let s = Scratch::new("freeze-fresh-input");
+        let (job, src, rlib) = fixture(&s);
+        fs::write(&rlib, vec![b'o'; cache::payload::MIN_BYTES as usize]).unwrap();
+        let plan = Plan::from_job(&job).unwrap();
+        fs::create_dir_all(plan.dirs.tmp()).unwrap();
+        let deps = rlib.parent().unwrap();
+        let captured = ["k.d", "libk.rlib"]
+            .iter()
+            .map(|name| format!("{}\n", serde_json::json!({ "artifact": deps.join(name) })))
+            .collect::<String>();
+        let stamp = Stamp::read(&src).unwrap();
+        let newest = stamp.mtime_ns.max(stamp.ctime_ns);
+        let inside = newest + 100_000_000 - 1;
+        let boundary = newest + 100_000_000;
+        let outside = boundary + 1;
+        for spawned_ns in [inside, boundary] {
+            assert!(
+                plan.freeze_with_capture(captured.as_bytes(), spawned_ns, &HashMap::new(), |_| {
+                    panic!("a fresh external input must decline before output capture")
+                })
+                .is_none()
+            );
+        }
+        let fine = [&src, &rlib, &deps.join("k.d")]
+            .iter()
+            .all(|path| !Stamp::read(path).unwrap().coarse());
+        if !hashing::fs_trusted(&s.0) || !fine {
+            return;
+        }
+        let compress = cache_compression_requested()
+            && cache::payload::compression_supported(&plan.dirs.tmp());
+        let mut captures = Vec::new();
+        let frozen = plan
+            .freeze_with_capture(captured.as_bytes(), outside, &HashMap::new(), |path| {
+                captures.push(path.to_path_buf());
+                cache::payload::capture(path)
+            })
+            .expect("a settled external input remains eligible for deferral");
+        assert_eq!(frozen.inputs.get(&src), Some(&stamp));
+        assert_eq!(
+            captures,
+            if compress {
+                vec![rlib.clone()]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(frozen.commitments.len(), usize::from(compress));
+
+        let generated = plan.profile_abs.join("generated.rs");
+        fs::write(&generated, b"pub fn generated() {}").unwrap();
+        fs::write(
+            deps.join("k.d"),
+            format!("{}: {}\n", deps.join("k.d").display(), generated.display()),
+        )
+        .unwrap();
+        let generated_stamp = Stamp::read(&generated).unwrap();
+        if !generated_stamp.coarse() && !Stamp::read(&deps.join("k.d")).unwrap().coarse() {
+            let spawned_ns = generated_stamp.mtime_ns.max(generated_stamp.ctime_ns);
+            assert!(generated_stamp.too_new_for(spawned_ns));
+            let frozen = plan
+                .freeze(captured.as_bytes(), spawned_ns, &HashMap::new())
+                .expect("fresh profile inputs retain their exemption");
+            assert_eq!(frozen.inputs, HashMap::from([(generated, generated_stamp)]));
+        }
+    }
+
+    #[test]
+    fn fine_input_freshness_checks_both_mtime_and_ctime_at_the_settle_boundary() {
+        let old = 10_000_000_001;
+        let recent = 10_500_000_001;
+        for (mtime_ns, ctime_ns) in [(recent, old), (old, recent)] {
+            let stamp = Stamp {
+                dev: 1,
+                ino: 2,
+                size: 3,
+                mtime_ns,
+                ctime_ns,
+            };
+            assert!(!stamp.coarse());
+            assert!(stamp.too_new_for(recent + 100_000_000 - 1));
+            assert!(stamp.too_new_for(recent + 100_000_000));
+            assert!(!stamp.too_new_for(recent + 100_000_000 + 1));
+        }
+    }
+
+    #[test]
     fn slots_are_exclusive_bounded_and_reusable() {
         let s = Scratch::new("slots");
         let dir = s.0.join("deferred");
@@ -2950,7 +4547,10 @@ mod tests {
         assert!(acquire_slot(&dir, 2).is_none(), "the pool is exhausted");
         drop(first);
         // A child forked by another test thread keeps a copy of the descriptor until it execs, so the release can lag briefly.
-        let again = (0..100).find_map(|_| acquire_slot(&dir, 2).or_else(|| (std::thread::sleep(Duration::from_millis(20)), None).1));
+        let again = (0..100).find_map(|_| {
+            acquire_slot(&dir, 2)
+                .or_else(|| (std::thread::sleep(Duration::from_millis(20)), None).1)
+        });
         assert!(again.is_some(), "a released slot is free again");
         drop(again);
         assert!(acquire_slot(&dir, 0).is_none());
@@ -2964,9 +4564,16 @@ mod tests {
         let (mut job, _, _) = fixture(&s);
         job.trust = "off".to_string();
         let plan = Plan::from_job(&job).unwrap();
-        assert!(!plan.spawn_deferred(&[], 0, 0, &HashMap::new(), None).unwrap());
+        assert!(
+            !plan
+                .spawn_deferred(&[], 0, 0, &HashMap::new(), None)
+                .unwrap()
+        );
         let dir = plan.dirs.deferred();
-        assert!(dir.join("slot-0").exists(), "capacity is reserved before the untrusted profile declines freezing");
+        assert!(
+            dir.join("slot-0").exists(),
+            "capacity is reserved before the untrusted profile declines freezing"
+        );
         let released = (0..100).find_map(|_| {
             acquire_slot(&dir, 1).or_else(|| (thread::sleep(Duration::from_millis(20)), None).1)
         });
@@ -2976,11 +4583,21 @@ mod tests {
     #[test]
     fn the_hidden_argument_selects_the_helper_only_in_its_exact_forms() {
         let os = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(deferred_entry(&os(&[DEFERRED_ARG, "/j"])), Some(PathBuf::from("/j")));
-        assert_eq!(deferred_entry(&os(&["rustc", DEFERRED_ARG, "/j"])), None, "the persona form is a compiler command line");
+        assert_eq!(
+            deferred_entry(&os(&[DEFERRED_ARG, "/j"])),
+            Some(PathBuf::from("/j"))
+        );
+        assert_eq!(
+            deferred_entry(&os(&["rustc", DEFERRED_ARG, "/j"])),
+            None,
+            "the persona form is a compiler command line"
+        );
         assert_eq!(deferred_entry(&os(&["rustc", "--crate-name", "k"])), None);
         assert_eq!(deferred_entry(&os(&[DEFERRED_ARG, "/j", "extra"])), None);
-        assert_eq!(deferred_entry(&os(&["rustc", "--crate-name", DEFERRED_ARG, "/j"])), None);
+        assert_eq!(
+            deferred_entry(&os(&["rustc", "--crate-name", DEFERRED_ARG, "/j"])),
+            None
+        );
         assert_eq!(deferred_entry(&os(&[DEFERRED_ARG])), None);
         assert_eq!(deferred_entry(&os(&[])), None);
     }
@@ -2994,7 +4611,10 @@ mod tests {
         fs::write(&job, b"{ not a job").unwrap();
         assert_eq!(deferred_main_in(job.clone(), &deferred), 0);
         assert!(!job.exists());
-        assert_eq!(deferred_main_in(deferred.join("job-2-2.json"), &deferred), 0);
+        assert_eq!(
+            deferred_main_in(deferred.join("job-2-2.json"), &deferred),
+            0
+        );
     }
 
     #[test]
@@ -3026,7 +4646,11 @@ mod tests {
         let dotted = deferred.join("..").join("deferred").join("job-1-1.json");
         for path in [&outside, &misnamed, &wrong_suffix, &nested] {
             fs::write(path, &bytes).unwrap();
-            assert!(JobFile::claim(path.clone(), &deferred).is_none(), "{}", path.display());
+            assert!(
+                JobFile::claim(path.clone(), &deferred).is_none(),
+                "{}",
+                path.display()
+            );
             assert_eq!(deferred_main_in(path.clone(), &deferred), 0);
             assert!(path.exists(), "{} was deleted", path.display());
         }
@@ -3034,8 +4658,14 @@ mod tests {
 
         let valid = deferred.join("job-1-1.json");
         fs::write(&valid, &bytes).unwrap();
-        assert!(JobFile::claim(dotted, &deferred).is_none(), "a path that only resolves into the directory is refused");
-        assert!(JobFile::claim(valid, &deferred).is_some(), "the exact form is accepted");
+        assert!(
+            JobFile::claim(dotted, &deferred).is_none(),
+            "a path that only resolves into the directory is refused"
+        );
+        assert!(
+            JobFile::claim(valid, &deferred).is_some(),
+            "the exact form is accepted"
+        );
     }
 
     #[test]
@@ -3070,21 +4700,199 @@ mod tests {
         let prekey = "cd".repeat(20);
         let path = keylock_path(&dirs, &prekey);
         assert_eq!(path, dirs.keylocks().join("cd").join(&prekey));
-        assert!(!path.starts_with(dirs.locks()), "gc treats everything under locks as a build lock directory");
+        assert!(
+            !path.starts_with(dirs.locks()),
+            "gc treats everything under locks as a build lock directory"
+        );
 
         let held = open_key_lock(&dirs, &path).unwrap();
         assert!(try_key_lock(&held).unwrap());
         let other = open_key_lock(&dirs, &path).unwrap();
         assert!(!try_key_lock(&other).unwrap());
-        assert!(!wait_key_lock(&other, Duration::from_millis(30)).unwrap(), "gives up at the cap");
+        assert!(
+            !wait_key_lock(&other, Duration::from_millis(30)).unwrap(),
+            "gives up at the cap"
+        );
         assert!(!wait_key_lock(&other, Duration::ZERO).unwrap());
 
         let releaser = thread::spawn(move || {
             thread::sleep(Duration::from_millis(60));
             drop(held);
         });
-        assert!(wait_key_lock(&other, Duration::from_secs(60)).unwrap(), "takes the lock once it is released");
+        assert!(
+            wait_key_lock(&other, Duration::from_secs(60)).unwrap(),
+            "takes the lock once it is released"
+        );
         releaser.join().unwrap();
-        assert!(!try_key_lock(&open_key_lock(&dirs, &path).unwrap()).unwrap(), "now held by `other`");
+        assert!(
+            !try_key_lock(&open_key_lock(&dirs, &path).unwrap()).unwrap(),
+            "now held by `other`"
+        );
+    }
+
+    #[test]
+    fn key_lock_hint_wait_rechecks_before_waiting() {
+        let s = Scratch::new("key-hint-recheck");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let owner = open_key_lock(&dirs, &path).unwrap();
+        let follower = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&owner).unwrap());
+        assert!(!try_key_lock(&follower).unwrap());
+        sys::unlock(&owner).unwrap();
+        assert!(wait_key_lock_hints(&follower, Duration::from_secs(2), |_| {
+            panic!("release during subscription must be found before waiting")
+        }).unwrap());
+        assert!(!try_key_lock(&owner).unwrap());
+    }
+
+    #[test]
+    fn key_lock_hint_retries_reset_backoff_and_keep_authoritative_locking() {
+        let s = Scratch::new("key-hint-retry");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let owner = open_key_lock(&dirs, &path).unwrap();
+        let follower = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&owner).unwrap());
+        let mut pauses = Vec::new();
+        assert!(wait_key_lock_hints(&follower, Duration::from_secs(2), |pause| {
+            pauses.push(pause);
+            match pauses.len() {
+                1 => false,
+                2 => true,
+                3 => {
+                    sys::unlock(&owner).unwrap();
+                    false
+                }
+                _ => panic!("unlock must admit on the next authoritative retry"),
+            }
+        }).unwrap());
+        assert_eq!(pauses, [KEY_POLL_START, KEY_POLL_START * 2, KEY_POLL_START]);
+        assert!(!try_key_lock(&owner).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_lock_watcher_rechecks_release_during_subscription() {
+        let s = Scratch::new("key-watch-subscribe");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let owner = open_key_lock(&dirs, &path).unwrap();
+        let follower = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&owner).unwrap());
+        assert!(!try_key_lock(&follower).unwrap());
+        sys::unlock(&owner).unwrap();
+        let mut watcher = sys::DirectoryWatcher::for_key_lock(path.parent().unwrap()).unwrap();
+        assert!(!watcher.wait(Duration::ZERO));
+        assert!(wait_key_lock_hints(&follower, Duration::from_secs(2), |_| {
+            panic!("a release before subscription has no event and requires an immediate recheck")
+        }).unwrap());
+        assert!(!try_key_lock(&owner).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_lock_watcher_bounds_retry_after_unlock_with_open_owner() {
+        let s = Scratch::new("key-watch-unlock");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let owner = open_key_lock(&dirs, &path).unwrap();
+        let follower = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&owner).unwrap());
+        let mut watcher = sys::DirectoryWatcher::for_key_lock(path.parent().unwrap()).unwrap();
+        let mut waits = 0;
+        assert!(wait_key_lock_hints(&follower, Duration::from_secs(2), |pause| {
+            waits += 1;
+            assert!(pause <= KEY_POLL_MAX);
+            sys::unlock(&owner).unwrap();
+            let changed = watcher.wait(pause);
+            assert!(!changed, "unlock while the owner stays open produces no close event");
+            changed
+        }).unwrap());
+        assert_eq!(waits, 1);
+        assert!(!try_key_lock(&owner).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_lock_watcher_ignores_close_of_an_unlocked_carrier() {
+        let s = Scratch::new("key-watch-carrier");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let owner = open_key_lock(&dirs, &path).unwrap();
+        let follower = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&owner).unwrap());
+        let mut watcher = sys::DirectoryWatcher::for_key_lock(path.parent().unwrap()).unwrap();
+        let carrier = open_key_lock(&dirs, &path).unwrap();
+        let duplicate = carrier.try_clone().unwrap();
+        drop(carrier);
+        drop(duplicate);
+        let mut waits = 0;
+        assert!(wait_key_lock_hints(&follower, Duration::from_secs(2), |pause| {
+            waits += 1;
+            match waits {
+                1 => assert!(watcher.wait(Duration::ZERO), "the duplicate carrier's final close is pending"),
+                2 => {
+                    assert_eq!(pause, KEY_POLL_START);
+                    sys::unlock(&owner).unwrap();
+                }
+                _ => panic!("owner release must admit the follower"),
+            }
+            true
+        }).unwrap());
+        assert_eq!(waits, 2, "the close event alone cannot admit the follower");
+        assert!(!try_key_lock(&owner).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual real-lock handoff timing; run with --release --nocapture"]
+    fn key_lock_handoff_measurements() {
+        let s = Scratch::new("key-handoff-measure");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let mut samples = Vec::new();
+        for pair in 0..31 {
+            for watched in if pair % 2 == 0 { [false, true] } else { [true, false] } {
+                let owner = open_key_lock(&dirs, &path).unwrap();
+                let follower = open_key_lock(&dirs, &path).unwrap();
+                assert!(try_key_lock(&owner).unwrap());
+                assert!(!try_key_lock(&follower).unwrap());
+                let mut watcher = watched.then(|| {
+                    sys::DirectoryWatcher::for_key_lock(path.parent().unwrap()).unwrap()
+                });
+                let (ready_send, ready) = std::sync::mpsc::channel();
+                let (result_send, result) = std::sync::mpsc::channel();
+                let (finish, finished) = std::sync::mpsc::channel();
+                let waiter = thread::spawn(move || {
+                    ready_send.send(()).unwrap();
+                    let acquired = match watcher.as_mut() {
+                        Some(watcher) => wait_key_lock_hints(&follower, Duration::from_secs(2), |pause| watcher.wait(pause)),
+                        None => wait_key_lock(&follower, Duration::from_secs(2)),
+                    }.unwrap();
+                    result_send.send((acquired, Instant::now())).unwrap();
+                    finished.recv_timeout(Duration::from_secs(2)).unwrap();
+                    drop(follower);
+                });
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                let release_delay = Duration::from_millis([7, 19, 37, 61][pair % 4]);
+                thread::sleep(release_delay);
+                let released = Instant::now();
+                drop(owner);
+                let (acquired, admitted) = result.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert!(acquired);
+                let probe = open_key_lock(&dirs, &path).unwrap();
+                assert!(!try_key_lock(&probe).unwrap(), "the timed follower must still hold the real lock");
+                finish.send(()).unwrap();
+                waiter.join().unwrap();
+                samples.push(serde_json::json!({
+                    "pair": pair,
+                    "watched": watched,
+                    "release_delay_ns": release_delay.as_nanos() as u64,
+                    "release_to_admission_ns": admitted.checked_duration_since(released).expect("admission precedes owner release").as_nanos() as u64,
+                }));
+            }
+        }
+        println!("{}", serde_json::json!({ "samples": samples }));
     }
 }

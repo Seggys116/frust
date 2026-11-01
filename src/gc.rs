@@ -18,8 +18,6 @@ use crate::sys::{self, LockKind, Meta};
 /// Younger manifests and lock directories are left alone even if they look orphaned: a build may be writing them.
 const METADATA_GRACE: Duration = Duration::from_secs(3600);
 const AUTO_GC_EVERY: Duration = Duration::from_secs(86_400);
-/// Evicted cache entries are renamed aside before deletion; one that old was left by a process that died mid-delete.
-const EVICTED_MIN_AGE: Duration = Duration::from_secs(3600);
 /// Per-prekey locks, deferred-store jobs and their slot locks older than this are removed when nothing holds them.
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(86_400);
 /// Hidden flag of `frust gc` that runs one daily collection and prints nothing.
@@ -113,6 +111,10 @@ pub struct Plan {
     /// Lock directories are rechecked just before removal: a build may have started using one since planning.
     pub lock_max_idle: Duration,
     target_retirements: HashMap<PathBuf, TargetRetirement>,
+    manifest_retirements: HashMap<PathBuf, ManifestRetirement>,
+    retired_entries: HashMap<PathBuf, cache::RetiredChildProof>,
+    unit_retirements: HashMap<PathBuf, UnitRetirement>,
+    cache_retirements: HashMap<PathBuf, cache::EntryRetirementSnapshot>,
 }
 
 impl Plan {
@@ -140,6 +142,7 @@ pub fn plan(dirs: &Dirs, opts: &GcOptions) -> Plan {
     let evicted = plan_cache(dirs, opts, &mut plan, true);
     plan_targets(dirs, opts, &mut plan);
     plan_scratch(dirs, &mut plan);
+    plan_retired_entries(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
     plan_metadata(dirs, opts, &evicted, &mut plan);
     plan
@@ -153,6 +156,7 @@ pub fn plan_maintenance(dirs: &Dirs, opts: &GcOptions) -> Plan {
     let evicted = plan_cache(dirs, opts, &mut plan, false);
     plan_idle_targets(dirs, opts, &mut plan, AUTO_TARGET_RETIREMENTS);
     plan_scratch(dirs, &mut plan);
+    plan_retired_entries(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
     plan_target_temps(dirs, opts, &mut plan);
     plan_metadata(dirs, opts, &evicted, &mut plan);
@@ -172,12 +176,22 @@ pub fn superseded_incremental_entries(dirs: &Dirs, keep: usize) -> Vec<(PathBuf,
     superseded_among(&scan_entries(dirs), keep)
 }
 
+pub(crate) fn superseded_cache_retirements(dirs: &Dirs, keep: usize) -> Vec<(PathBuf, u64, cache::EntryRetirementSnapshot)> {
+    let scanned = scan_entries(dirs);
+    let snapshots: HashMap<_, _> = scanned.iter().filter_map(|entry| entry.retirement.as_ref().map(|snapshot| (entry.path.as_path(), snapshot))).collect();
+    superseded_among(&scanned, keep).into_iter().filter_map(|(path, bytes)| {
+        let snapshot = (*snapshots.get(path.as_path())?).clone();
+        Some((path, bytes, snapshot))
+    }).collect()
+}
+
 /// What one read of an entry's `meta.json` yields: its LRU time, its unit identity if incremental, and its size by the recorded byte counts.
 struct ScannedEntry {
     path: PathBuf,
     used: SystemTime,
     unit: Option<IncrementalUnit>,
     estimate: Option<u64>,
+    retirement: Option<cache::EntryRetirementSnapshot>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -220,11 +234,15 @@ fn unit_identity(meta: &cache::EntryMeta) -> Option<IncrementalUnit> {
 
 fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
     let mut out = Vec::new();
+    let store = cache::Cache::new(dirs);
     let Ok(shards) = fs::read_dir(dirs.store()) else { return out };
     for shard in shards.flatten() {
         let Ok(entries) = fs::read_dir(shard.path()) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
+            let Some(key) = path.file_name().and_then(|name| name.to_str()).filter(|key| cache::valid_key(key)) else { continue };
+            if path != store.entry_dir(key) { continue; }
+            let retirement = store.retirement_snapshot(key);
             let (used, meta) = match File::open(path.join("meta.json")) {
                 Ok(mut file) => {
                     let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -236,7 +254,9 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
             };
             let unit = meta.as_ref().and_then(unit_identity);
             let estimate = meta.as_ref().and_then(estimate_entry_bytes);
-            out.push(ScannedEntry { path, used, unit, estimate });
+            let retirement = retirement.filter(|snapshot| snapshot.used() == used
+                && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
+            out.push(ScannedEntry { path, used, unit, estimate, retirement });
         }
     }
     out
@@ -302,6 +322,10 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
             evicted.insert(key.to_string_lossy().into_owned());
         }
         plan.removals.push(Removal { class: Class::CacheEntry, path, bytes });
+    }
+    let selected: HashSet<_> = plan.removals.iter().filter(|removal| removal.class == Class::CacheEntry).map(|removal| removal.path.as_path()).collect();
+    for entry in scanned {
+        if selected.contains(entry.path.as_path()) && let Some(snapshot) = entry.retirement { plan.cache_retirements.insert(entry.path, snapshot); }
     }
     evicted
 }
@@ -742,8 +766,8 @@ fn superseded_incremental(profile: &Path, analysis: Option<&compact::Analysis>) 
 fn plan_scratch(dirs: &Dirs, plan: &mut Plan) {
     if let Ok(entries) = fs::read_dir(dirs.tmp()) {
         for entry in entries.flatten() {
-            // Held slot locks live there, and `plan_deferred` knows which of its files are in use.
-            if entry.path() == dirs.deferred() {
+            // Dedicated planners own held deferred jobs and individual retired children.
+            if entry.path() == dirs.deferred() || entry.path() == cache::evicted_dir(dirs) {
                 continue;
             }
             let old = entry
@@ -758,6 +782,18 @@ fn plan_scratch(dirs: &Dirs, plan: &mut Plan) {
         }
     }
     plan.trim_ledger = fs::metadata(dirs.ledger()).map(|m| m.len() > 8 * 1024 * 1024).unwrap_or(false);
+}
+
+// Plan children separately so later arrivals never fall under a recursive parent removal.
+fn plan_retired_entries(dirs: &Dirs, plan: &mut Plan) {
+    let Some(queue) = cache::QueueProof::capture(dirs) else { return };
+    let Ok(children) = fs::read_dir(cache::evicted_dir(dirs)) else { return };
+    for child in children.flatten() {
+        let path = child.path();
+        let Some(proof) = queue.child(dirs, &path) else { continue };
+        plan.retired_entries.insert(path.clone(), proof);
+        plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&path), path });
+    }
 }
 
 fn plan_store_temps(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
@@ -947,30 +983,146 @@ fn sharded_files(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MetadataIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: SystemTime,
+    changed: (i64, i64),
+}
+
+impl MetadataIdentity {
+    fn read(meta: &Meta) -> io::Result<Self> {
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified()?,
+            changed: meta.ctime(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ManifestRetirement {
+    identity: MetadataIdentity,
+    contents: Vec<u8>,
+    references: Vec<(String, Option<MetadataIdentity>)>,
+    max_idle: Duration,
+}
+
+fn manifest_reference(store: &cache::Cache, key: &str) -> io::Result<Option<MetadataIdentity>> {
+    if !cache::valid_key(key) {
+        return Ok(None);
+    }
+    match sys::stat(&store.entry_dir(key).join("meta.json")) {
+        Ok(meta) if meta.is_file() => MetadataIdentity::read(&meta).map(Some),
+        Ok(_) => Err(io::Error::other("cache metadata is not a file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn manifest_snapshot(
+    store: &cache::Cache,
+    path: &Path,
+    max_idle: Duration,
+) -> io::Result<ManifestRetirement> {
+    #[derive(serde::Deserialize)]
+    struct References {
+        candidates: Vec<cache::Candidate>,
+    }
+    let mut file = File::open(path)?;
+    let before = MetadataIdentity::read(&sys::fstat(&file)?)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    let mut references = Vec::new();
+    if let Ok(manifest) = serde_json::from_slice::<References>(&contents) {
+        for candidate in manifest.candidates {
+            let usage = manifest_reference(store, &candidate.key)?;
+            references.push((candidate.key, usage));
+        }
+    }
+    let after = sys::lstat(path)?;
+    if !after.is_file() || before != MetadataIdentity::read(&after)? {
+        return Err(io::Error::other("manifest changed while reading"));
+    }
+    Ok(ManifestRetirement {
+        identity: before,
+        contents,
+        references,
+        max_idle,
+    })
+}
+
+impl ManifestRetirement {
+    fn eligible(&self, evicted: &HashSet<String>) -> bool {
+        let Some(age) = self.identity.modified.elapsed().ok() else {
+            return false;
+        };
+        if age < METADATA_GRACE {
+            return false;
+        }
+        let orphaned = self
+            .references
+            .iter()
+            .all(|(key, usage)| usage.is_none() || evicted.contains(key));
+        orphaned
+            || (age > self.max_idle
+                && self.references.iter().all(|(_, usage)| {
+                    usage.as_ref().is_none_or(|usage| {
+                        usage
+                            .modified
+                            .elapsed()
+                            .is_ok_and(|age| age > self.max_idle)
+                    })
+                }))
+    }
+
+    fn still_eligible(&self, store: &cache::Cache, path: &Path) -> bool {
+        let Ok(current) = manifest_snapshot(store, path, self.max_idle) else {
+            return false;
+        };
+        if current.identity != self.identity
+            || current.contents != self.contents
+            || current.references.len() != self.references.len()
+        {
+            return false;
+        }
+        // Disappeared entries are safe; replaced or newly used entries invalidate the plan.
+        if current.references.iter().zip(&self.references).any(
+            |((key, usage), (old_key, old_usage))| {
+                key != old_key || (usage.is_some() && usage != old_usage)
+            },
+        ) {
+            return false;
+        }
+        current.eligible(&HashSet::new())
+    }
+}
+
 fn plan_manifests(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan: &mut Plan) {
     let store = cache::Cache::new(dirs);
     for (name, path) in sharded_files(&dirs.manifests()) {
         if fsx::temp_owner(&name).is_some() {
             if stale_temp(&path, &name, opts) {
-                plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&path), path });
+                plan.removals.push(Removal {
+                    class: Class::Scratch,
+                    bytes: fsx::allocated_size(&path),
+                    path,
+                });
             }
             continue;
         }
-        let Some(age) = mtime_age(&path) else { continue };
-        if age > opts.manifest_max_age {
-            push_metadata(plan, path);
+        if !mtime_age(&path).is_some_and(|age| age >= METADATA_GRACE) {
             continue;
         }
-        if age < METADATA_GRACE {
+        let Ok(snapshot) = manifest_snapshot(&store, &path, opts.manifest_max_age) else {
             continue;
-        }
-        let orphaned = match cache::manifest_keys(&path) {
-            None => true,
-            Some(keys) => {
-                keys.iter().all(|k| evicted.contains(k) || !store.entry_dir(k).join("meta.json").is_file())
-            }
         };
-        if orphaned {
+        if snapshot.eligible(evicted) {
+            plan.manifest_retirements.insert(path.clone(), snapshot);
             push_metadata(plan, path);
         }
     }
@@ -1082,9 +1234,81 @@ fn plan_history(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
     }
 }
 
+#[derive(Debug)]
+struct UnitRetirement {
+    identity: MetadataIdentity,
+    contents: Vec<u8>,
+    keys: Vec<String>,
+    max_idle: Duration,
+}
+
+fn unit_snapshot(store: &cache::Cache, path: &Path, max_idle: Duration) -> io::Result<UnitRetirement> {
+    let path_before = sys::lstat(path)?;
+    if !path_before.is_file() || path_before.file_type().is_symlink() { return Err(io::Error::other("unit record is not a regular file")); }
+    let mut file = File::open(path)?;
+    let before = MetadataIdentity::read(&sys::fstat(&file)?)?;
+    if before != MetadataIdentity::read(&path_before)? { return Err(io::Error::other("unit record changed before reading")); }
+    if before.len > 64 * 1024 { return Err(io::Error::other("oversized unit record")); }
+    let mut contents = Vec::new();
+    (&mut file).take(64 * 1024 + 1).read_to_end(&mut contents)?;
+    let text = std::str::from_utf8(&contents).map_err(io::Error::other)?;
+    let keys: Vec<String> = if text == "\n" { Vec::new() } else { text.lines().map(str::to_owned).collect() };
+    if keys.iter().any(|key| !cache::valid_key(key)) || text != format!("{}\n", keys.join("\n")) {
+        return Err(io::Error::other("invalid unit record"));
+    }
+    let after = sys::lstat(path)?;
+    if !after.is_file() || after.file_type().is_symlink() || before != MetadataIdentity::read(&after)? {
+        return Err(io::Error::other("unit record changed while reading"));
+    }
+    let snapshot = UnitRetirement { identity: before, contents, keys, max_idle };
+    if !snapshot.references_absent(store) { return Err(io::Error::other("unit record references present or uncertain entries")); }
+    Ok(snapshot)
+}
+
+fn unit_reference_absent(store: &cache::Cache, key: &str) -> bool {
+    let entry = store.entry_dir(key);
+    let Some(shard) = entry.parent() else { return false };
+    let Some(storage) = shard.parent() else { return false };
+    let Some(home) = storage.parent() else { return false };
+    let Ok(meta) = sys::stat(home) else { return false };
+    if !meta.is_dir() { return false; }
+    let mut parents = vec![(home, true, meta.dev(), meta.ino())];
+    let mut absent = entry.as_path();
+    for path in [storage, shard] {
+        match sys::lstat(path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                parents.push((path, false, meta.dev(), meta.ino()));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
+            _ => return false,
+        }
+    }
+    // Prove component types before interpreting portable NotFound, then recheck parent identities.
+    if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
+    parents.iter().all(|&(path, follow, dev, ino)| {
+        let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
+        meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
+    })
+}
+
+impl UnitRetirement {
+    fn references_absent(&self, store: &cache::Cache) -> bool {
+        // Existing roots, unsafe parent types, and I/O uncertainty retain the record.
+        self.keys.iter().all(|key| unit_reference_absent(store, key))
+    }
+
+    fn eligible(&self, store: &cache::Cache) -> bool {
+        self.identity.modified.elapsed().is_ok_and(|age| age > self.max_idle) && self.references_absent(store)
+    }
+
+    fn still_eligible(&self, store: &cache::Cache, path: &Path) -> bool {
+        let Ok(current) = unit_snapshot(store, path, self.max_idle) else { return false };
+        current.identity == self.identity && current.contents == self.contents && current.keys == self.keys && current.eligible(store)
+    }
+}
+
 fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
-    let units = dirs.root().join(cache::UNITS_DIR);
-    for (name, path) in sharded_files(&dirs.hashmemo()).into_iter().chain(sharded_files(&units)) {
+    for (name, path) in sharded_files(&dirs.hashmemo()) {
         if fsx::temp_owner(&name).is_some() {
             if stale_temp(&path, &name, opts) {
                 plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&path), path });
@@ -1095,22 +1319,83 @@ fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
             push_metadata(plan, path);
         }
     }
+    let store = cache::Cache::new(dirs);
+    for (name, path) in sharded_files(&store.units_dir()) {
+        if !cache::valid_key(&name) || path.parent() != Some(store.units_dir().join(&name[..2]).as_path()) { continue; }
+        if !mtime_age(&path).is_some_and(|age| age > opts.hashmemo_max_age) { continue; }
+        let Ok(snapshot) = unit_snapshot(&store, &path, opts.hashmemo_max_age) else { continue };
+        if snapshot.eligible(&store) {
+            plan.unit_retirements.insert(path.clone(), snapshot);
+            push_metadata(plan, path);
+        }
+    }
+
 }
 
 pub fn execute(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
     let (freed, failures) = execute_removals(dirs, plan);
     prune_empty_workspaces(dirs);
-    let _ = cache::sweep_evicted(dirs, EVICTED_MIN_AGE);
     (freed, failures)
+}
+
+// Count the size estimate only when this attempt actually removes the child root.
+fn remove_retired_child(path: &Path, before_delete: impl FnOnce() -> bool) -> io::Result<u64> {
+    let bytes = fsx::allocated_size(path);
+    if !before_delete() { return Ok(0); }
+    let removal = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) => Err(error),
+    };
+    match removal {
+        Ok(()) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
     let mut freed = 0;
     let mut failures = Vec::new();
     let locks = dirs.locks();
+    let store = cache::Cache::new(dirs);
+    // Finish cache and metadata retirement before acquiring any profile locks.
+    for removal in &plan.removals {
+        if removal.class == Class::CacheEntry {
+            let Some(snapshot) = plan.cache_retirements.get(&removal.path) else { continue };
+            match store.try_retire_entry(snapshot) {
+                Ok(cache::EntryRetirementOutcome::Retired) => freed += removal.bytes,
+                Ok(cache::EntryRetirementOutcome::Busy | cache::EntryRetirementOutcome::Stale) => {}
+                Err(error) => failures.push((removal.path.clone(), error)),
+            }
+            continue;
+        }
+        let unit = plan.unit_retirements.get(&removal.path);
+        let manifest = plan.manifest_retirements.get(&removal.path);
+        if unit.is_none() && manifest.is_none() { continue; }
+        let Ok(Some(_guard)) = cache::UnitRecordsGuard::try_acquire(dirs) else { continue };
+        if unit.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path))
+            || manifest.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path)) { continue; }
+        match fs::remove_file(&removal.path) {
+            Ok(()) => freed += removal.bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push((removal.path.clone(), error)),
+        }
+    }
     // Cargo's locks stay held on each profile for the rest of the run, and variants are rechecked under them.
     let mut profiles: HashMap<PathBuf, Option<ProfileGuard>> = HashMap::new();
     for removal in &plan.removals {
+        if removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
+            || plan.manifest_retirements.contains_key(&removal.path) { continue; }
+        if removal.path.parent() == Some(cache::evicted_dir(dirs).as_path()) {
+            let Some(proof) = plan.retired_entries.get(&removal.path) else { continue };
+            if !proof.valid(dirs, &removal.path) { continue; }
+            match remove_retired_child(&removal.path, || proof.valid(dirs, &removal.path)) {
+                Ok(bytes) => freed += bytes,
+                Err(error) => failures.push((removal.path.clone(), error)),
+            }
+            continue;
+        }
         let mut incremental_root = None;
         if removal.class == Class::TargetDir {
             if let Some(snapshot) = plan.target_retirements.get(&removal.path) {
@@ -1329,7 +1614,6 @@ fn run_maintenance(dirs: &Dirs, cfg: &Config, drain: bool) {
     if drain {
         drain_idle_targets(dirs, &opts);
     }
-    let _ = cache::sweep_evicted(dirs, EVICTED_MIN_AGE);
 }
 
 /// The hidden `frust gc --auto-background` entry: one maintenance run at background priority that never prints.
@@ -1379,6 +1663,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_child_disappearing_after_sizing_is_not_counted_as_removed() {
+        let root = home("retired-size-delete-race");
+        for directory in [false, true] {
+            let child = root.join("retired-child");
+            if directory {
+                fs::create_dir(&child).unwrap();
+                fs::write(child.join("f0"), vec![0x4b; 16384]).unwrap();
+            } else { fs::write(&child, vec![0x4b; 16384]).unwrap(); }
+            assert!(fsx::allocated_size(&child) > 0);
+            let credited = remove_retired_child(&child, || { fsx::remove_any(&child).unwrap(); true }).unwrap();
+            assert_eq!(credited, 0, "another remover owns the post-size deletion");
+            assert!(!child.exists());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn variant_names_parse() {
         assert_eq!(variant_of("libserde-0123456789abcdef.rlib"), Some(("serde".into(), "0123456789abcdef".into())));
         assert_eq!(variant_of("my_bin-0123456789abcdef"), Some(("my_bin".into(), "0123456789abcdef".into())));
@@ -1407,6 +1708,98 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn misplaced_duplicate_keys_cannot_retire_canonical_entries_from_other_units() {
+        let root = home("misplaced-cache-key");
+        let dirs = Dirs::at(&root);
+        let store = cache::Cache::new(&dirs);
+        let key = "aa".repeat(20);
+        let legitimate = store_entry(&root, &key, &[("artifact", 64)], 0);
+        let common_time = SystemTime::now() - Duration::from_secs(20_000);
+        let files = [("libx-0123456789abcdef.rlib", 64), ("x-0123456789abcdef.c1.t1.rcgu.o", 64)];
+        let misplaced = root.join("store/bb").join(&key);
+        fs::create_dir_all(&misplaced).unwrap();
+        let source = store_entry(&root, &"cc".repeat(20), &files, 5000);
+        fs::copy(source.join("meta.json"), misplaced.join("meta.json")).unwrap();
+        store_entry(&root, &"dd".repeat(20), &files, 1000);
+        for path in [&legitimate, &misplaced] {
+            File::options().write(true).open(path.join("meta.json")).unwrap().set_modified(common_time).unwrap();
+        }
+        assert!(superseded_incremental_entries(&dirs, 2).is_empty());
+        assert!(superseded_cache_retirements(&dirs, 2).is_empty());
+        let selected = plan(&dirs, &GcOptions::new(u64::MAX));
+        assert!(cache_removals(&selected).is_empty());
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(store.has_entry(&key));
+        assert!(misplaced.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_gc_retires_selected_states_and_prunes_their_manifest_immediately() {
+        let root = home("cache-manifest-retirement");
+        let dirs = Dirs::at(&root);
+        let store = cache::Cache::new(&dirs);
+        let prekey = "ab".repeat(20);
+        let mut paths = Vec::new();
+        for n in 1..=3 {
+            let key = format!("{n:040x}");
+            let path = store_entry(&root, &key, &[("libx-0123456789abcdef.rlib", 64), ("x-0123456789abcdef.c1.t1.rcgu.o", 64)], 0);
+            let mut meta: cache::EntryMeta = serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
+            meta.prekey = Some(prekey.clone());
+            fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            store.add_candidate(&prekey, cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key });
+            File::options().write(true).open(path.join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs((4 - n) * 5000)).unwrap();
+            paths.push(path);
+        }
+        let opts = GcOptions::new(u64::MAX);
+        let delayed = plan(&dirs, &opts);
+        assert_eq!(cache_removals(&delayed), paths[..1]);
+        store.mark_used(&format!("{:040x}", 1));
+        let (_, failures) = execute_removals(&dirs, &delayed);
+        assert!(failures.is_empty());
+        assert!(paths[0].exists(), "usage after planning invalidates retirement");
+        let current = plan(&dirs, &opts);
+        assert_eq!(cache_removals(&current), paths[1..2]);
+        let (_, failures) = execute_removals(&dirs, &current);
+        assert!(failures.is_empty());
+        assert!(!paths[1].exists());
+        assert_eq!(store.candidates(&prekey).into_iter().map(|row| row.key).collect::<Vec<_>>(), vec![format!("{:040x}", 3), format!("{:040x}", 1)]);
+        assert!(paths[0].exists() && paths[2].exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_gc_skips_busy_guard_and_rechecks_after_unlocked_upsert() {
+        let root = home("manifest-guard-upsert");
+        let dirs = Dirs::at(&root);
+        let store = cache::Cache::new(&dirs);
+        let key = "aa".repeat(20);
+        let prekey = "bb".repeat(20);
+        let entry = store_entry(&root, &key, &[("f0", 64)], 0);
+        let row = cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() };
+        store.add_candidate(&prekey, row.clone());
+        let path = dirs.manifests().join("bb").join(format!("{prekey}.json"));
+        let old = SystemTime::now() - Duration::from_secs(60 * 86_400);
+        for path in [&path, &entry.join("meta.json")] { File::options().write(true).open(path).unwrap().set_modified(old).unwrap(); }
+        let selected = plan(&dirs, &GcOptions::new(u64::MAX));
+        assert!(selected.manifest_retirements.contains_key(&path));
+        let guard = cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap();
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(path.exists(), "validation and unlink require the same guard");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_prekey = prekey.clone();
+        let worker = std::thread::spawn(move || { ready_tx.send(()).unwrap(); writer.add_candidate(&writer_prekey, row); });
+        ready_rx.recv().unwrap();
+        drop(guard);
+        worker.join().unwrap();
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(path.exists());
+        assert_eq!(store.candidates(&prekey).len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn cache_removals(plan: &Plan) -> Vec<PathBuf> {
         plan.removals.iter().filter(|r| r.class == Class::CacheEntry).map(|r| r.path.clone()).collect()
     }
@@ -1424,6 +1817,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(estimate_entry_bytes(&empty), None, "no recorded files means the directory is measured instead");
+    }
+
+    #[test]
+    fn metadata_slice_references_add_no_second_payload_allocation() {
+        let meta: cache::EntryMeta = serde_json::from_value(serde_json::json!({
+            "crate_name":"app", "version":"1", "compile_ms":1, "created_unix":1, "stderr":"stderr",
+            "files":[
+                {"name":"libapp.rlib", "stored":"f0", "text":false, "bytes":8192, "stored_bytes":4096},
+                {"name":"libapp.rmeta", "stored":"f0", "text":false, "bytes":1024, "stored_bytes":0,
+                 "encoding":"inline_metadata_slice_v1", "decoded_bytes":1024, "content_hash":"0".repeat(64),
+                 "metadata_slice":{"offset":128,"source_encoding":"raw","source_decoded_bytes":8192,"source_content_hash":"1".repeat(64),"mode":0o100644}}
+            ]
+        })).unwrap();
+        cache::metadata_slice::validate_groups(&meta.files).unwrap();
+        assert_eq!(estimate_entry_bytes(&meta), Some(ENTRY_OVERHEAD_BYTES + 4096));
     }
 
     #[test]

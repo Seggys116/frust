@@ -7,6 +7,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use common::{Sandbox, age, assert_success, run_binary, stdout};
 use frust::gc::{self, Class, GcOptions};
@@ -153,6 +155,180 @@ fn concurrent_builds_compile_a_shared_dependency_once() {
     assert_success(&run_b);
     assert_eq!(stdout(&run_a), stdout(&run_b));
     assert!(!stdout(&run_a).trim().is_empty());
+}
+
+#[cfg(unix)]
+struct CountedCompiler {
+    tool: PathBuf,
+    count: PathBuf,
+    gate: PathBuf,
+}
+
+#[cfg(unix)]
+impl CountedCompiler {
+    fn new(sb: &Sandbox) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = sb.root.join("counted-rustc");
+        fs::write(&tool, r#"#!/bin/sh
+crate=
+emit=
+previous=
+for arg in "$@"; do
+    if [ "$previous" = '--crate-name' ]; then crate=$arg; fi
+    case "$arg" in
+        --crate-name=*) crate=${arg#--crate-name=} ;;
+        --emit|--emit=*) emit=yes ;;
+    esac
+    previous=$arg
+done
+if [ "$crate" = leaf ] && [ "$emit" = yes ]; then
+    printf 'compile\n' >> "$FRUST_TEST_COMPILER_COUNT"
+    attempts=0
+    while [ ! -f "$FRUST_TEST_COMPILER_GATE" ]; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -gt 12000 ]; then exit 2; fi
+        sleep 0.01
+    done
+fi
+exec rustc "$@"
+"#).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        Self { tool, count: sb.root.join("compiler-count"), gate: sb.root.join("compiler-gate") }
+    }
+
+    fn launches(&self) -> usize {
+        fs::read_to_string(&self.count).unwrap_or_default().lines().count()
+    }
+
+    fn start(&self, sb: &Sandbox, project: &Path, profile: &str, deferred: bool) -> CountedBuild {
+        let target = sb.root.join(format!("target-{profile}"));
+        let stderr = sb.root.join(format!("stderr-{profile}"));
+        let mut command = sb.bin("fcargo");
+        command.args(["build", "--profile", profile]).current_dir(project)
+            .env("CARGO_TARGET_DIR", target)
+            .env("RUSTC", &self.tool)
+            .env("FRUST_DEBUG", "1")
+            .env("FRUST_TEST_COMPILER_COUNT", &self.count)
+            .env("FRUST_TEST_COMPILER_GATE", &self.gate)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(File::create(&stderr).unwrap());
+        if deferred { command.env_remove("FRUST_STORE_SYNC"); }
+        common::own_group(&mut command);
+        CountedBuild { child: Some(command.spawn().unwrap()), stderr }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CountedCompiler {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.gate, b"open");
+    }
+}
+
+#[cfg(unix)]
+struct CountedBuild {
+    child: Option<Child>,
+    stderr: PathBuf,
+}
+
+#[cfg(unix)]
+impl CountedBuild {
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+
+    fn finish(mut self) -> String {
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        let stderr = self.stderr();
+        assert!(output.status.success(), "{stderr}");
+        stderr
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CountedBuild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            common::kill_tree(child.id());
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let begun = Instant::now();
+    while !ready() {
+        assert!(begun.elapsed() < Duration::from_secs(60), "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn counted_profile_pair(tag: &str, deferred: bool, different_flags: bool) {
+    let sb = Sandbox::new(tag);
+    sb.vendor_crate("leaf", "1.0.0", &slow_leaf());
+    let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
+    let manifest = project.join("Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    for profile in ["cooperate-a", "cooperate-b"] {
+        text.push_str(&format!("\n[profile.{profile}]\ninherits = \"dev\"\ndebug = 0\nincremental = false\n"));
+        if different_flags && profile == "cooperate-b" { text.push_str("opt-level = 1\n"); }
+    }
+    fs::write(manifest, text).unwrap();
+    let compiler = CountedCompiler::new(&sb);
+    let first = compiler.start(&sb, &project, "cooperate-a", deferred);
+    until("the first real compiler launch", || compiler.launches() == 1);
+    let second = compiler.start(&sb, &project, "cooperate-b", deferred);
+    if different_flags {
+        until("both distinct compiler invocations before either finishes", || compiler.launches() == 2);
+    } else {
+        until("the follower's cold cache lookup", || second.stderr().contains("lookup leaf missed"));
+    }
+    fs::write(&compiler.gate, b"open").unwrap();
+    let first_stderr = first.finish();
+    let second_stderr = second.finish();
+    assert_eq!(compiler.launches(), if different_flags { 2 } else { 1 }, "{first_stderr}\n{second_stderr}");
+    if !different_flags {
+        assert_eq!(sb.count_cache("miss", "leaf"), 1);
+        assert_eq!(sb.count_cache("hit", "leaf"), 1);
+    } else {
+        assert_eq!(sb.count_cache("miss", "leaf"), 2);
+        assert_eq!(sb.count_cache("hit", "leaf"), 0);
+    }
+    let mut expected = None;
+    for profile in ["cooperate-a", "cooperate-b"] {
+        let output = run_binary(&sb.root.join(format!("target-{profile}")), profile, "app");
+        assert_success(&output);
+        assert!(!output.stdout.is_empty());
+        if let Some(expected) = &expected { assert_eq!(&output.stdout, expected); }
+        expected = Some(output.stdout);
+    }
+    if deferred {
+        assert!(first_stderr.lines().any(|line| line.contains("compiled leaf ") && line.contains("store deferred")), "{first_stderr}");
+        until("deferred stores to finish", || {
+            fs::read_dir(Dirs::at(sb.home()).deferred()).is_ok_and(|mut entries| {
+                entries.all(|entry| entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with("job-")))
+            })
+        });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn identical_custom_profiles_share_one_actual_compiler_launch() {
+    counted_profile_pair("sf-profiles-counted", false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn default_deferred_stores_share_one_actual_compiler_launch() {
+    counted_profile_pair("sf-deferred-counted", true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn different_profile_flags_compile_independently_without_waiting_for_the_shared_gate() {
+    counted_profile_pair("sf-different-flags-counted", false, true);
 }
 
 /// A holder that dies releases its lock with it, so a build waiting on it carries on.

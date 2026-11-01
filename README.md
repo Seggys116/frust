@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: pixel-art wordmark above an animated build progress bar" width="880">
+<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated warm full/fat LTO rebuild, Cargo 4.96 s versus frust 143 ms, 34.7x faster" width="880">
 
 **A thin accelerator that sits on top of the Rust toolchain you already have.**
 
@@ -101,13 +101,13 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured debug build times: cold, warm restore, no-op and real warm-session edit; warm restore 28.9x faster" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 21.5x faster; isolated cold builds retain overhead" width="880"></p>
 
-Measured on Intel(R) Core(TM) Ultra 7 255H, ext4, rustc 1.97.1: median of 7 runs. A warm debug clean rebuild was 28.9x faster. Combined target and cache storage after 200 edits was 35.6% smaller than Cargo, with compaction assessed after every build. Initial two-project combined allocation was 221.1 MiB for Cargo versus 260.2 MiB for frust. The figures include cold-build, no-op and edit overhead; paired release binaries and runtime outputs matched. See the [method and complete results](docs/benchmarks.md).
+Measured on Intel(R) Core(TM) Ultra 7 255H, ext4, rustc 1.97.1: median of 7 runs. A warm debug clean rebuild took 3,483 ms with Cargo and 162 ms with frust (21.5x faster). Isolated cold builds retained overhead in debug and all three release profiles. In the separate two-build concurrent cold workload, foreground group time was 5.089 s for Cargo and 3.697 s for frust, with intra-group peer reuse. Full managed allocation after 200 immediate edits was 371.1 MiB for Cargo versus 225.5 MiB for frust (39.2% smaller), including target, cache and other managed storage with compaction assessed after every build. Paired executable bytes and runtime outputs matched, and final unchanged builds made zero compiler calls. See the [method and complete results](docs/benchmarks.md).
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm-cache release rebuilds with default release, ThinLTO and full/fat LTO settings" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.3x faster, ThinLTO 34.4x, full/fat LTO 34.7x; median and observed range of seven runs" width="880"></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Combined target and cache allocation after 200 edits, including automatic and disabled cache compression" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 immediate edits: Cargo 371.1 MiB versus frust 225.5 MiB, including target, cache and other managed bytes; automatic compression" width="880"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 

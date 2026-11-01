@@ -23,6 +23,17 @@ pub struct DirectoryWatcher {
 #[cfg(target_os = "linux")]
 impl DirectoryWatcher {
     pub fn new(paths: &[&Path]) -> io::Result<DirectoryWatcher> {
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO
+            | libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
+        Self::with_mask(paths, mask)
+    }
+
+    pub fn for_key_lock(parent: &Path) -> io::Result<DirectoryWatcher> {
+        let mask = libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
+        Self::with_mask(&[parent], mask)
+    }
+
+    fn with_mask(paths: &[&Path], mask: u32) -> io::Result<DirectoryWatcher> {
         // SAFETY: inotify_init1 has no pointer arguments and returns a new descriptor on success.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -30,8 +41,6 @@ impl DirectoryWatcher {
         }
         // SAFETY: this is the newly created descriptor, now owned only by `file`.
         let file = unsafe { File::from_raw_fd(fd) };
-        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO
-            | libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_ONLYDIR;
         for path in paths {
             let path = cstr(path)?;
             // SAFETY: the descriptor is open and `path` is a valid NUL-terminated path.
@@ -641,6 +650,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_lock_watcher_keeps_close_pending_without_waking_for_writes() {
+        let dir = scratch("watch-key-close");
+        let mut file = OpenOptions::new().write(true).create_new(true).open(dir.join("key")).unwrap();
+        let mut watcher = DirectoryWatcher::for_key_lock(&dir).unwrap();
+        file.write_all(b"changed").unwrap();
+        assert!(!watcher.wait(Duration::ZERO).unwrap());
+        drop(file);
+        assert!(watcher.wait(Duration::ZERO).unwrap());
+        assert!(!watcher.wait(Duration::ZERO).unwrap());
+        drop(watcher);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

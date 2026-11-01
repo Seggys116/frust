@@ -1,0 +1,1351 @@
+//! Same-entry archive ranges with complete backing and output commitments.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    StoredFile,
+    payload::{self, Commitment, Encoding},
+};
+use crate::{fsx, sys};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// Backings cannot themselves reference another artifact.
+pub enum SourceEncoding {
+    Raw,
+    Lz4BlocksV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Offsets address decoded backing bytes.
+pub struct MetadataSlice {
+    pub offset: u64,
+    pub source_encoding: SourceEncoding,
+    pub source_decoded_bytes: u64,
+    pub source_content_hash: String,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreGroup {
+    pub base_index: usize,
+    pub slice_indices: Vec<usize>,
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+fn hash_valid(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['/', '\\', ':'])
+        && Path::new(name).components().count() == 1
+        && matches!(
+            Path::new(name).components().next(),
+            Some(Component::Normal(_))
+        )
+}
+fn mode_valid(mode: u32) -> bool {
+    mode & !0o107777 == 0 && mode & 0o170000 == 0o100000
+}
+fn stem(name: &str, suffix: &str) -> Option<String> {
+    name.strip_suffix(suffix).map(str::to_owned)
+}
+
+// Validate the whole entry before callers create any output.
+pub fn validate_groups(files: &[StoredFile]) -> io::Result<Vec<RestoreGroup>> {
+    let mut names = HashSet::new();
+    let mut backing = HashMap::<&str, usize>::new();
+    let mut groups = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        if !safe(&file.name) || !safe(&file.stored) || !names.insert(&file.name) {
+            return Err(invalid("unsafe or duplicate output name"));
+        }
+        if file.encoding != Encoding::InlineMetadataSliceV1 {
+            if file.metadata_slice.is_some() || backing.insert(&file.stored, i).is_some() {
+                return Err(invalid("invalid or duplicate backing reference"));
+            }
+            if file.encoding == Encoding::Lz4BlocksV1
+                && (file.dir
+                    || file.text
+                    || file.decoded_bytes.is_none()
+                    || !file.content_hash.as_deref().is_some_and(hash_valid))
+            {
+                return Err(invalid("invalid compressed backing metadata"));
+            }
+            if file.encoding == Encoding::Raw
+                && (file.decoded_bytes.is_some() || file.content_hash.is_some())
+            {
+                return Err(invalid("inconsistent raw backing metadata"));
+            }
+            groups.push(RestoreGroup {
+                base_index: i,
+                slice_indices: Vec::new(),
+            });
+        }
+    }
+    for (i, file) in files.iter().enumerate() {
+        if file.encoding != Encoding::InlineMetadataSliceV1 {
+            continue;
+        }
+        let range = file
+            .metadata_slice
+            .as_ref()
+            .ok_or_else(|| invalid("missing metadata range"))?;
+        // Resolve only declared ordinary backing records.
+        let base_index = *backing
+            .get(file.stored.as_str())
+            .ok_or_else(|| invalid("missing range backing"))?;
+        let base = &files[base_index];
+        let len = file
+            .decoded_bytes
+            .ok_or_else(|| invalid("missing slice length"))?;
+        let source_encoding = match base.encoding {
+            Encoding::Raw => SourceEncoding::Raw,
+            Encoding::Lz4BlocksV1 => SourceEncoding::Lz4BlocksV1,
+            _ => return Err(invalid("chained metadata range")),
+        };
+        if base.dir
+            || base.text
+            || file.dir
+            || file.text
+            || base_index == i
+            || stem(&file.name, ".rmeta").is_none()
+            || stem(&file.name, ".rmeta") != stem(&base.name, ".rlib")
+            || file.stored_bytes != Some(0)
+            || len == 0
+            || source_encoding != range.source_encoding
+            || !mode_valid(range.mode)
+            || !hash_valid(&range.source_content_hash)
+            || !file.content_hash.as_deref().is_some_and(hash_valid)
+            || range
+                .offset
+                .checked_add(len)
+                .is_none_or(|end| end > range.source_decoded_bytes)
+        {
+            return Err(invalid("invalid metadata range"));
+        }
+        // Encoded records already commit the complete backing.
+        if source_encoding == SourceEncoding::Lz4BlocksV1
+            && (base.decoded_bytes != Some(range.source_decoded_bytes)
+                || base.content_hash.as_ref() != Some(&range.source_content_hash))
+        {
+            return Err(invalid("inconsistent compressed backing commitment"));
+        }
+        let group = groups
+            .iter_mut()
+            .find(|g| g.base_index == base_index)
+            .unwrap();
+        if group.slice_indices.iter().any(|&j| {
+            let previous = files[j].metadata_slice.as_ref().unwrap();
+            previous.source_decoded_bytes != range.source_decoded_bytes
+                || previous.source_content_hash != range.source_content_hash
+        }) {
+            return Err(invalid("conflicting backing commitments"));
+        }
+        group.slice_indices.push(i);
+    }
+    Ok(groups)
+}
+
+struct Temporary(PathBuf);
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn temporary(path: &Path) -> io::Result<(Temporary, File)> {
+    let path = Temporary(fsx::temp_sibling(path));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path.0)?;
+    Ok((path, file))
+}
+fn stream(source: &File, base: &StoredFile, out: &mut impl Write) -> io::Result<()> {
+    match base.encoding {
+        Encoding::Raw => {
+            io::copy(
+                &mut source.take(source.metadata()?.len().saturating_add(1)),
+                out,
+            )?;
+            Ok(())
+        }
+        Encoding::Lz4BlocksV1 => payload::decode(source, base, out),
+        _ => Err(invalid("invalid range source encoding")),
+    }
+}
+fn decode_staged(
+    source: &File,
+    base: &StoredFile,
+    decoded: &mut File,
+) -> io::Result<(u64, String)> {
+    match base.encoding {
+        Encoding::Lz4BlocksV1 => {
+            // Successful decode already verifies the full backing digest, length, and terminator.
+            payload::decode(source, base, decoded)?;
+            decoded.flush()?;
+            Ok((
+                base.decoded_bytes
+                    .ok_or_else(|| invalid("missing backing length"))?,
+                base.content_hash
+                    .clone()
+                    .ok_or_else(|| invalid("missing backing hash"))?,
+            ))
+        }
+        Encoding::Raw => {
+            let mut output = hashing(decoded);
+            stream(source, base, &mut output)?;
+            output.flush()?;
+            Ok((output.bytes, output.hash.finalize().to_hex().to_string()))
+        }
+        _ => Err(invalid("invalid staged backing encoding")),
+    }
+}
+
+struct HashWriter<W> {
+    output: W,
+    hash: blake3::Hasher,
+    bytes: u64,
+}
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.output.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        self.bytes = self
+            .bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| invalid("payload too large"))?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+fn hashing<W>(output: W) -> HashWriter<W> {
+    HashWriter {
+        output,
+        hash: blake3::Hasher::new(),
+        bytes: 0,
+    }
+}
+
+// Unknown archive layouts are a normal storage fallback.
+fn member_ranges(file: &mut File, total: u64) -> io::Result<Option<Vec<(u64, u64)>>> {
+    let mut magic = [0; 8];
+    if total < 8 {
+        return Ok(None);
+    }
+    file.read_exact(&mut magic)?;
+    if &magic != b"!<arch>\n" {
+        return Ok(None);
+    }
+    let mut at = 8u64;
+    let mut names = Vec::new();
+    let mut found = Vec::new();
+    while at < total {
+        if total - at < 60 {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(at))?;
+        let mut header = [0; 60];
+        file.read_exact(&mut header)?;
+        if &header[58..] != b"`\n" {
+            return Ok(None);
+        }
+        let Some(size) = std::str::from_utf8(&header[48..58])
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        else {
+            return Ok(None);
+        };
+        let Some(end) = at.checked_add(60).and_then(|n| n.checked_add(size)) else {
+            return Ok(None);
+        };
+        if end > total {
+            return Ok(None);
+        }
+        let Ok(name) = std::str::from_utf8(&header[..16]) else {
+            return Ok(None);
+        };
+        let name = name.trim_end();
+        let mut start = at + 60;
+        let resolved;
+        if name == "//" {
+            if size > 1024 * 1024 {
+                return Ok(None);
+            }
+            names.resize(size as usize, 0);
+            file.read_exact(&mut names)?;
+            resolved = "".to_owned();
+        } else if let Some(n) = name.strip_prefix("#1/") {
+            let Some(n) = n.parse::<u64>().ok().filter(|n| *n <= size && *n <= 4096) else {
+                return Ok(None);
+            };
+            let mut bytes = vec![0; n as usize];
+            file.read_exact(&mut bytes)?;
+            let Ok(value) = String::from_utf8(bytes) else {
+                return Ok(None);
+            };
+            resolved = value.trim_end_matches('\0').to_owned();
+            start += n;
+        } else if name.starts_with('/') && name.len() > 1 && name != "/SYM64/" {
+            let Some(index) = name[1..].parse::<usize>().ok().filter(|n| *n < names.len()) else {
+                return Ok(None);
+            };
+            if index != 0 && names[index - 1] != b'\n' {
+                return Ok(None);
+            }
+            let Some(len) = names[index..].iter().position(|b| *b == b'\n') else {
+                return Ok(None);
+            };
+            let Ok(value) = std::str::from_utf8(&names[index..index + len]) else {
+                return Ok(None);
+            };
+            resolved = value.trim_end_matches('/').to_owned();
+        } else {
+            resolved = name.trim_end_matches('/').to_owned();
+        }
+        if resolved == "lib.rmeta" {
+            found.push((start, end - start));
+        }
+        let Some(next) = end.checked_add(size % 2) else {
+            return Ok(None);
+        };
+        if next > total {
+            return Ok(None);
+        }
+        at = next;
+    }
+    Ok(Some(found))
+}
+
+// Compare the entire candidate and hash the bytes actually compared.
+fn equal_range(
+    base: &mut File,
+    target: &mut File,
+    offset: u64,
+    len: u64,
+    expected_hash: &str,
+) -> io::Result<bool> {
+    base.seek(SeekFrom::Start(offset))?;
+    target.seek(SeekFrom::Start(0))?;
+    let mut a = [0; 64 * 1024];
+    let mut b = [0; 64 * 1024];
+    let mut hash = blake3::Hasher::new();
+    let mut left = len;
+    while left != 0 {
+        let n = left.min(a.len() as u64) as usize;
+        base.read_exact(&mut a[..n])?;
+        target.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Ok(false);
+        }
+        hash.update(&b[..n]);
+        left -= n as u64;
+    }
+    Ok(hash.finalize().to_hex().as_str() == expected_hash)
+}
+// Prefix scanning keeps memory bounded even for large metadata files.
+fn unique_range(
+    base: &mut File,
+    target: &mut File,
+    ranges: &[(u64, u64)],
+    len: u64,
+    expected_hash: &str,
+) -> io::Result<Option<u64>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let n = len.min(64) as usize;
+    let mut prefix = [0; 64];
+    target.read_exact(&mut prefix[..n])?;
+    let mut buffer = vec![0; 64 * 1024 + n];
+    let mut found = None;
+    for &(start, size) in ranges {
+        if size < len {
+            continue;
+        }
+        let limit = start + size - len + 1;
+        let mut at = start;
+        while at < limit {
+            let count = (limit - at).min(64 * 1024) as usize;
+            base.seek(SeekFrom::Start(at))?;
+            base.read_exact(&mut buffer[..count + n - 1])?;
+            for i in 0..count {
+                if buffer[i..i + n] == prefix[..n]
+                    && equal_range(base, target, at + i as u64, len, expected_hash)?
+                {
+                    if found.is_some() {
+                        return Ok(None);
+                    }
+                    found = Some(at + i as u64);
+                }
+            }
+            at += count as u64;
+        }
+    }
+    Ok(found)
+}
+
+pub fn build(
+    staged_base: &Path,
+    base: &StoredFile,
+    original: &Path,
+    target: &StoredFile,
+    commitment: Option<&Commitment>,
+) -> io::Result<Option<StoredFile>> {
+    build_inner(staged_base, base, original, target, commitment, || {})
+}
+
+fn build_inner(
+    staged_base: &Path,
+    base: &StoredFile,
+    original: &Path,
+    target: &StoredFile,
+    commitment: Option<&Commitment>,
+    before_proof: impl FnOnce(),
+) -> io::Result<Option<StoredFile>> {
+    if !cfg!(unix)
+        || base.dir
+        || base.text
+        || target.dir
+        || target.text
+        || stem(&target.name, ".rmeta").is_none()
+        || stem(&target.name, ".rmeta") != stem(&base.name, ".rlib")
+        || !matches!(base.encoding, Encoding::Raw | Encoding::Lz4BlocksV1)
+        || base.metadata_slice.is_some()
+    {
+        return Ok(None);
+    }
+    let path_before = sys::lstat(original)?;
+    let mut target_file = File::open(original)?;
+    let before = sys::fstat(&target_file)?;
+    if !payload::stable(&path_before, &before)
+        || !before.is_file()
+        || commitment.is_some_and(|c| !c.valid() || !c.matches(&before))
+    {
+        return Err(invalid("metadata changed before range proof"));
+    }
+    let mut target_hash = hashing(io::sink());
+    io::copy(
+        &mut (&mut target_file).take(before.len().saturating_add(1)),
+        &mut target_hash,
+    )?;
+    let target_digest = target_hash.hash.finalize().to_hex().to_string();
+    if target_hash.bytes != before.len() || commitment.is_some_and(|c| c.hash != target_digest) {
+        return Err(invalid("metadata differs from commitment"));
+    }
+    target_file.seek(SeekFrom::Start(0))?;
+    before_proof();
+    let path_meta = sys::lstat(staged_base)?;
+    let source = File::open(staged_base)?;
+    let source_before = sys::fstat(&source)?;
+    if !payload::stable(&path_meta, &source_before) || !source_before.is_file() {
+        return Err(invalid("invalid staged backing"));
+    }
+    // Private scratch makes archive parsing independent of live build outputs.
+    let (_scratch, mut decoded) = temporary(staged_base)?;
+    let (source_len, source_hash) = decode_staged(&source, base, &mut decoded)?;
+    if !payload::stable(&source_before, &sys::fstat(&source)?)
+        || !payload::stable(&source_before, &sys::lstat(staged_base)?)
+    {
+        return Err(invalid("staged backing changed during proof"));
+    }
+    decoded.seek(SeekFrom::Start(0))?;
+    let offset = match member_ranges(&mut decoded, source_len)? {
+        Some(ranges) => unique_range(
+            &mut decoded,
+            &mut target_file,
+            &ranges,
+            before.len(),
+            &target_digest,
+        )?,
+        None => None,
+    };
+    // Cargo may add a hardlink; committed bytes still must match exactly.
+    let after = sys::fstat(&target_file)?;
+    let path_after = sys::lstat(original)?;
+    let unchanged =
+        commitment.map_or_else(|| payload::stable(&before, &after), |c| c.matches(&after));
+    if !unchanged || !payload::stable(&after, &path_after) {
+        return Err(invalid("metadata changed during range proof"));
+    }
+    let Some(offset) = offset else {
+        return Ok(None);
+    };
+    let mut result = target.clone();
+    result.stored = base.stored.clone();
+    result.bytes = before.allocated();
+    result.encoding = Encoding::InlineMetadataSliceV1;
+    result.stored_bytes = Some(0);
+    result.decoded_bytes = Some(before.len());
+    result.content_hash = Some(target_digest);
+    result.metadata_slice = Some(MetadataSlice {
+        offset,
+        source_encoding: if base.encoding.is_raw() {
+            SourceEncoding::Raw
+        } else {
+            SourceEncoding::Lz4BlocksV1
+        },
+        source_decoded_bytes: source_len,
+        source_content_hash: source_hash,
+        mode: before.mode(),
+    });
+    validate_groups(&[base.clone(), result.clone()])?;
+    Ok(Some(result))
+}
+
+fn checked_group(files: &[StoredFile], group: &RestoreGroup) -> io::Result<()> {
+    if !validate_groups(files)?.contains(group) {
+        return Err(invalid("unvalidated restore group"));
+    }
+    Ok(())
+}
+
+pub fn cost(files: &[StoredFile], group: &RestoreGroup) -> io::Result<u64> {
+    checked_group(files, group)?;
+    let base = &files[group.base_index];
+    Ok(group
+        .slice_indices
+        .first()
+        .map(|i| {
+            files[*i]
+                .metadata_slice
+                .as_ref()
+                .unwrap()
+                .source_decoded_bytes
+        })
+        .or(base.decoded_bytes)
+        .unwrap_or(base.bytes))
+}
+
+pub fn proof_signature(files: &[StoredFile], group: &RestoreGroup) -> io::Result<String> {
+    checked_group(files, group)?;
+    let records: Vec<_> = std::iter::once(group.base_index)
+        .chain(group.slice_indices.iter().copied())
+        .map(|i| &files[i])
+        .collect();
+    let bytes = serde_json::to_vec(&records).map_err(io::Error::other)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub fn restored_mode(entry: &Path, files: &[StoredFile], index: usize) -> io::Result<u32> {
+    validate_groups(files)?;
+    let file = files
+        .get(index)
+        .ok_or_else(|| invalid("invalid output index"))?;
+    if let Some(range) = &file.metadata_slice {
+        return Ok(range.mode);
+    }
+    Ok(sys::lstat(&entry.join(&file.stored))?.mode())
+}
+
+fn apply_mode(path: &Path, mode: u32) -> io::Result<()> {
+    if !mode_valid(mode) || !cfg!(unix) {
+        return Err(invalid("metadata mode is unsupported on this platform"));
+    }
+    sys::set_path_mode(path, mode & 0o7777)?;
+    if sys::lstat(path)?.mode() != mode {
+        return Err(invalid("metadata mode could not be restored"));
+    }
+    Ok(())
+}
+
+struct SliceOutput<W> {
+    offset: u64,
+    len: u64,
+    expected_hash: String,
+    output: HashWriter<W>,
+}
+struct Tee<W> {
+    base_output: W,
+    base_bytes: u64,
+    base_hash: Option<blake3::Hasher>,
+    slices: Vec<SliceOutput<W>>,
+}
+impl<W: Write> Write for Tee<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let start = self.base_bytes;
+        let end = start
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("backing length overflow"))?;
+        self.base_output.write_all(bytes)?;
+        if let Some(hash) = &mut self.base_hash {
+            hash.update(bytes);
+        }
+        self.base_bytes = end;
+        for slice in &mut self.slices {
+            let lo = start.max(slice.offset);
+            let hi = end.min(
+                slice
+                    .offset
+                    .checked_add(slice.len)
+                    .ok_or_else(|| invalid("slice length overflow"))?,
+            );
+            if lo < hi {
+                slice
+                    .output
+                    .write_all(&bytes[(lo - start) as usize..(hi - start) as usize])?;
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.base_output.flush()?;
+        for slice in &mut self.slices {
+            slice.output.flush()?;
+        }
+        Ok(())
+    }
+}
+fn decode_group<W: Write>(
+    entry: &Path,
+    files: &[StoredFile],
+    group: &RestoreGroup,
+    base_output: W,
+    slice_outputs: Vec<W>,
+) -> io::Result<u32> {
+    checked_group(files, group)?;
+    if slice_outputs.len() != group.slice_indices.len() {
+        return Err(invalid("incorrect group output count"));
+    }
+    let base = &files[group.base_index];
+    let source_path = entry.join(&base.stored);
+    let path_meta = sys::lstat(&source_path)?;
+    let source = File::open(&source_path)?;
+    let before = sys::fstat(&source)?;
+    if !before.is_file() || !payload::stable(&path_meta, &before) {
+        return Err(invalid("invalid backing file"));
+    }
+    let mut tee = Tee {
+        base_output,
+        base_bytes: 0,
+        base_hash: match base.encoding {
+            Encoding::Raw => Some(blake3::Hasher::new()),
+            Encoding::Lz4BlocksV1 => None,
+            _ => return Err(invalid("invalid group backing encoding")),
+        },
+        slices: Vec::new(),
+    };
+    for (&index, output) in group.slice_indices.iter().zip(slice_outputs) {
+        let file = &files[index];
+        let range = file.metadata_slice.as_ref().unwrap();
+        tee.slices.push(SliceOutput {
+            offset: range.offset,
+            len: file.decoded_bytes.unwrap(),
+            expected_hash: file.content_hash.clone().unwrap(),
+            output: hashing(output),
+        });
+    }
+    stream(&source, base, &mut tee)?;
+    tee.flush()?;
+    if !payload::stable(&before, &sys::fstat(&source)?)
+        || !payload::stable(&before, &sys::lstat(&source_path)?)
+    {
+        return Err(invalid("backing changed during grouped decode"));
+    }
+    // Validate all outputs before the first destination rename.
+    // Compressed digests are reusable only after complete stream verification.
+    let base_hash = match &tee.base_hash {
+        Some(hash) => hash.finalize().to_hex().to_string(),
+        None => base
+            .content_hash
+            .clone()
+            .ok_or_else(|| invalid("missing verified backing hash"))?,
+    };
+    for (&index, slice) in group.slice_indices.iter().zip(&tee.slices) {
+        let range = files[index].metadata_slice.as_ref().unwrap();
+        if tee.base_bytes != range.source_decoded_bytes
+            || base_hash != range.source_content_hash
+            || slice.output.bytes != slice.len
+            || slice.output.hash.finalize().to_hex().as_str() != slice.expected_hash
+        {
+            return Err(invalid("group payload length or hash mismatch"));
+        }
+    }
+    Ok(before.mode())
+}
+
+pub fn verify_group(entry: &Path, files: &[StoredFile], group: &RestoreGroup) -> io::Result<()> {
+    checked_group(files, group)?;
+    if !cfg!(unix) && !group.slice_indices.is_empty() {
+        return Err(invalid("metadata mode is unsupported on this platform"));
+    }
+    let base = &files[group.base_index];
+    if base.dir || base.text {
+        if group.slice_indices.is_empty() {
+            return Ok(());
+        }
+        return Err(invalid("invalid grouped artifact"));
+    }
+    decode_group(
+        entry,
+        files,
+        group,
+        io::sink(),
+        group.slice_indices.iter().map(|_| io::sink()).collect(),
+    )
+    .map(|_| ())
+}
+
+pub fn restore_group(
+    entry: &Path,
+    dest: &Path,
+    files: &[StoredFile],
+    group: &RestoreGroup,
+) -> io::Result<()> {
+    restore_group_inner(entry, dest, files, group, || {})
+}
+
+fn restore_group_inner(
+    entry: &Path,
+    dest: &Path,
+    files: &[StoredFile],
+    group: &RestoreGroup,
+    after_decode: impl FnOnce(),
+) -> io::Result<()> {
+    checked_group(files, group)?;
+    let base = &files[group.base_index];
+    if group.slice_indices.is_empty() {
+        return payload::restore(&entry.join(&base.stored), &dest.join(&base.name), base);
+    }
+    let indices: Vec<_> = std::iter::once(group.base_index)
+        .chain(group.slice_indices.iter().copied())
+        .collect();
+    let mut temps = Vec::new();
+    let mut outputs = Vec::new();
+    for &index in &indices {
+        let (temp, output) = temporary(&dest.join(&files[index].name))?;
+        temps.push(temp);
+        outputs.push(output);
+    }
+    let base_output = outputs.remove(0);
+    let base_mode = decode_group(entry, files, group, base_output, outputs)?;
+    after_decode();
+    // Verify platform permissions while every output is still private.
+    for (temp, &index) in temps.iter().zip(&indices) {
+        let mode = if index == group.base_index {
+            base_mode
+        } else {
+            files[index].metadata_slice.as_ref().unwrap().mode
+        };
+        apply_mode(&temp.0, mode)?;
+        if fs::symlink_metadata(dest.join(&files[index].name)).is_ok_and(|m| m.is_dir()) {
+            return Err(invalid("group destination is a directory"));
+        }
+    }
+    for (temp, &index) in temps.iter().zip(&indices) {
+        sys::rename(&temp.0, &dest.join(&files[index].name))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let path = fsx::temp_sibling(&std::env::temp_dir().join("frust-slices"));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(name: &str, stored: &str) -> StoredFile {
+        StoredFile {
+            name: name.into(),
+            stored: stored.into(),
+            text: false,
+            bytes: 0,
+            encoding: Encoding::Raw,
+            stored_bytes: None,
+            decoded_bytes: None,
+            content_hash: None,
+            metadata_slice: None,
+            dir: false,
+        }
+    }
+    fn archive_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+        out.extend_from_slice(
+            format!(
+                "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                0,
+                0,
+                0,
+                "100644",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(content);
+        if !content.len().is_multiple_of(2) {
+            out.push(b'\n');
+        }
+    }
+    #[cfg(unix)]
+    fn fixture(scratch: &Scratch, compress: bool) -> (Vec<StoredFile>, Vec<u8>, Vec<u8>) {
+        let metadata: Vec<_> = (0..1024 * 1024 + 211).map(|i| (i % 251) as u8).collect();
+        let mut member = vec![0x7f; 37];
+        member.extend_from_slice(&metadata);
+        member.extend_from_slice(&[0x39; 113]);
+        let mut archive = b"!<arch>\n".to_vec();
+        archive_member(&mut archive, "lib.rmeta/", &member);
+        archive_member(&mut archive, "code.o/", &[0x65; 71]);
+        let source = scratch.0.join("source");
+        fs::write(&source, &archive).unwrap();
+        let target = scratch.0.join("original");
+        fs::write(&target, &metadata).unwrap();
+        #[cfg(unix)]
+        {
+            sys::set_path_mode(&source, 0o640).unwrap();
+            sys::set_path_mode(&target, 0o751).unwrap();
+        }
+        let stored = payload::store(&source, &scratch.0.join("f0"), compress).unwrap();
+        let mut base = record("libdemo-hash.rlib", "f0");
+        base.bytes = stored.bytes;
+        base.encoding = stored.encoding;
+        base.stored_bytes = stored.stored_bytes;
+        base.decoded_bytes = stored.decoded_bytes;
+        base.content_hash = stored.content_hash;
+        let target_meta = record("libdemo-hash.rmeta", "f1");
+        let (_, commitment) = payload::capture(&target).unwrap();
+        let range = build(
+            &scratch.0.join("f0"),
+            &base,
+            &target,
+            &target_meta,
+            Some(&commitment),
+        )
+        .unwrap()
+        .unwrap();
+        (vec![base, range], archive, metadata)
+    }
+
+    #[test]
+    #[ignore = "manual warm-cache decode comparison using FRUST_METADATA_DECODE_ENTRY"]
+    fn profile_verified_staged_decode_against_double_hash() {
+        let entry = PathBuf::from(
+            std::env::var_os("FRUST_METADATA_DECODE_ENTRY")
+                .expect("set retained cache entry directory"),
+        );
+        let meta: super::super::EntryMeta =
+            serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+        validate_groups(&meta.files).unwrap();
+        let requested = std::env::var("FRUST_METADATA_DECODE_NAME").ok();
+        let base = meta
+            .files
+            .iter()
+            .find(|file| {
+                file.encoding == Encoding::Lz4BlocksV1
+                    && file.name.ends_with(".rlib")
+                    && requested.as_ref().is_none_or(|name| &file.name == name)
+            })
+            .expect("entry must contain requested compressed rlib");
+        let source_path = entry.join(&base.stored);
+        let mut source = File::open(&source_path).unwrap();
+        let before = sys::fstat(&source).unwrap();
+        assert!(before.is_file());
+        assert!(payload::stable(&before, &sys::lstat(&source_path).unwrap()));
+        let scratch = Scratch::new();
+        let (_old_temp, old_output) = temporary(&scratch.0.join("double-hash")).unwrap();
+        let (_new_temp, new_output) = temporary(&scratch.0.join("verified-single-hash")).unwrap();
+        let mut outputs = [old_output, new_output];
+        let expected = (
+            base.decoded_bytes.unwrap(),
+            base.content_hash.clone().unwrap(),
+        );
+        let mut timings = [Vec::new(), Vec::new()];
+        for pair in 0..9usize {
+            let order = if pair.is_multiple_of(2) {
+                [0, 1]
+            } else {
+                [1, 0]
+            };
+            for variant in order {
+                source.seek(SeekFrom::Start(0)).unwrap();
+                outputs[variant].set_len(0).unwrap();
+                outputs[variant].seek(SeekFrom::Start(0)).unwrap();
+                let start = std::time::Instant::now();
+                let proof = if variant == 0 {
+                    let mut output = hashing(&mut outputs[variant]);
+                    stream(&source, base, &mut output).unwrap();
+                    output.flush().unwrap();
+                    (output.bytes, output.hash.finalize().to_hex().to_string())
+                } else {
+                    decode_staged(&source, base, &mut outputs[variant]).unwrap()
+                };
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(proof, expected);
+                if pair != 0 {
+                    timings[variant].push(elapsed);
+                }
+            }
+            let [old, new] = &mut outputs;
+            assert!(equal_range(old, new, 0, expected.0, &expected.1).unwrap());
+            assert_eq!(old.metadata().unwrap().len(), expected.0);
+            assert_eq!(new.metadata().unwrap().len(), expected.0);
+        }
+        assert!(payload::stable(&before, &sys::fstat(&source).unwrap()));
+        assert!(payload::stable(&before, &sys::lstat(&source_path).unwrap()));
+        eprintln!(
+            "staged_decode name={} decoded_bytes={} double_hash_ms={:?} verified_single_hash_ms={:?}",
+            base.name, expected.0, timings[0], timings[1]
+        );
+    }
+
+    #[test]
+    fn staged_raw_decode_computes_actual_backing_digest_and_length() {
+        let scratch = Scratch::new();
+        let original: Vec<_> = (0..1024 * 1024 + 137).map(|i| (i % 251) as u8).collect();
+        let source_path = scratch.0.join("f0");
+        fs::write(&source_path, &original).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let (_temp, mut decoded) = temporary(&source_path).unwrap();
+        let actual = decode_staged(&source, &record("libdemo.rlib", "f0"), &mut decoded).unwrap();
+        assert_eq!(
+            actual,
+            (
+                original.len() as u64,
+                blake3::hash(&original).to_hex().to_string()
+            )
+        );
+        decoded.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        decoded.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_compressed_decode_reuses_only_fully_verified_commitments() {
+        let scratch = Scratch::new();
+        let (files, archive, _) = fixture(&scratch, true);
+        let source_path = scratch.0.join("f0");
+        let source = File::open(&source_path).unwrap();
+        let (_temp, mut decoded) = temporary(&source_path).unwrap();
+        let actual = decode_staged(&source, &files[0], &mut decoded).unwrap();
+        assert_eq!(
+            actual,
+            (
+                archive.len() as u64,
+                blake3::hash(&archive).to_hex().to_string()
+            )
+        );
+        decoded.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        decoded.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, archive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_compressed_staging_aborts_before_range_publication() {
+        for corruption in [
+            "hash",
+            "short-length",
+            "long-length",
+            "trailing",
+            "truncated",
+        ] {
+            let scratch = Scratch::new();
+            let (mut files, _, _) = fixture(&scratch, true);
+            match corruption {
+                "hash" => files[0].content_hash = Some("0".repeat(64)),
+                "short-length" => *files[0].decoded_bytes.as_mut().unwrap() -= 1,
+                "long-length" => *files[0].decoded_bytes.as_mut().unwrap() += 1,
+                "trailing" => OpenOptions::new()
+                    .append(true)
+                    .open(scratch.0.join("f0"))
+                    .unwrap()
+                    .write_all(b"unexpected trailing bytes")
+                    .unwrap(),
+                "truncated" => {
+                    let path = scratch.0.join("f0");
+                    let len = fs::metadata(&path).unwrap().len();
+                    OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(len - 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let (_, commitment) = payload::capture(&scratch.0.join("original")).unwrap();
+            assert!(
+                build(
+                    &scratch.0.join("f0"),
+                    &files[0],
+                    &scratch.0.join("original"),
+                    &record("libdemo-hash.rmeta", "f1"),
+                    Some(&commitment)
+                )
+                .is_err(),
+                "{corruption}"
+            );
+            assert_eq!(
+                fs::read_dir(&scratch.0).unwrap().count(),
+                3,
+                "failed proof leaves no scratch payload"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_and_unaligned_multiblock_groups_restore_exact_bytes_and_modes() {
+        for compress in [false, true] {
+            let scratch = Scratch::new();
+            let (files, archive, metadata) = fixture(&scratch, compress);
+            assert_eq!(files[1].metadata_slice.as_ref().unwrap().offset, 105);
+            assert_eq!(files[1].stored_bytes, Some(0));
+            assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 3);
+            let groups = validate_groups(&files).unwrap();
+            assert_eq!(
+                groups,
+                vec![RestoreGroup {
+                    base_index: 0,
+                    slice_indices: vec![1]
+                }]
+            );
+            assert_eq!(cost(&files, &groups[0]).unwrap(), archive.len() as u64);
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|f| f.stored_bytes.unwrap_or(f.bytes))
+                    .sum::<u64>(),
+                fsx::allocated_size(&scratch.0.join("f0"))
+            );
+            verify_group(&scratch.0, &files, &groups[0]).unwrap();
+            let dest = scratch.0.join("dest");
+            fs::create_dir(&dest).unwrap();
+            restore_group(&scratch.0, &dest, &files, &groups[0]).unwrap();
+            assert_eq!(fs::read(dest.join(&files[0].name)).unwrap(), archive);
+            assert_eq!(fs::read(dest.join(&files[1].name)).unwrap(), metadata);
+            assert_eq!(
+                sys::stat(&dest.join(&files[0].name)).unwrap().mode() & 0o7777,
+                0o640
+            );
+            assert_eq!(
+                sys::stat(&dest.join(&files[1].name)).unwrap().mode() & 0o7777,
+                0o751
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backing_replacement_after_decode_preserves_opened_source_mode() {
+        for replace in [false, true] {
+            let scratch = Scratch::new();
+            let (files, archive, _) = fixture(&scratch, true);
+            let group = validate_groups(&files).unwrap().remove(0);
+            let dest = scratch.0.join("dest");
+            fs::create_dir(&dest).unwrap();
+            restore_group_inner(&scratch.0, &dest, &files, &group, || {
+                let backing = scratch.0.join("f0");
+                if replace {
+                    let replacement = scratch.0.join("replacement");
+                    fs::write(&replacement, b"new backing").unwrap();
+                    sys::set_path_mode(&replacement, 0o777).unwrap();
+                    sys::rename(&replacement, &backing).unwrap();
+                } else {
+                    sys::set_path_mode(&backing, 0o777).unwrap();
+                }
+            })
+            .unwrap();
+            let restored = dest.join(&files[0].name);
+            assert_eq!(fs::read(&restored).unwrap(), archive);
+            assert_eq!(sys::stat(&restored).unwrap().mode() & 0o7777, 0o640);
+            assert_eq!(
+                sys::stat(&dest.join(&files[1].name)).unwrap().mode() & 0o7777,
+                0o751
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupted_backing_or_slice_preserves_both_previous_outputs() {
+        for compress in [false, true] {
+            for corrupt_base in [false, true] {
+                let scratch = Scratch::new();
+                let (mut files, _, _) = fixture(&scratch, compress);
+                let dest = scratch.0.join("dest");
+                fs::create_dir(&dest).unwrap();
+                for file in &files {
+                    fs::write(dest.join(&file.name), b"previous output").unwrap();
+                }
+                if corrupt_base {
+                    let mut data = fs::read(scratch.0.join("f0")).unwrap();
+                    data[30] ^= 0x41;
+                    fs::write(scratch.0.join("f0"), data).unwrap();
+                } else {
+                    files[1].content_hash = Some("0".repeat(64));
+                }
+                let groups = validate_groups(&files).unwrap();
+                assert!(restore_group(&scratch.0, &dest, &files, &groups[0]).is_err());
+                for file in &files {
+                    assert_eq!(fs::read(dest.join(&file.name)).unwrap(), b"previous output");
+                }
+                assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_group_commitments_and_framing_must_verify_before_publication() {
+        for corruption in ["hash", "length", "trailing", "truncated"] {
+            let scratch = Scratch::new();
+            let (mut files, _, _) = fixture(&scratch, true);
+            match corruption {
+                "hash" => {
+                    files[0].content_hash = Some("0".repeat(64));
+                    files[1]
+                        .metadata_slice
+                        .as_mut()
+                        .unwrap()
+                        .source_content_hash = "0".repeat(64);
+                }
+                "length" => {
+                    *files[0].decoded_bytes.as_mut().unwrap() += 1;
+                    files[1]
+                        .metadata_slice
+                        .as_mut()
+                        .unwrap()
+                        .source_decoded_bytes += 1;
+                }
+                "trailing" => OpenOptions::new()
+                    .append(true)
+                    .open(scratch.0.join("f0"))
+                    .unwrap()
+                    .write_all(b"unexpected trailing bytes")
+                    .unwrap(),
+                "truncated" => {
+                    let path = scratch.0.join("f0");
+                    let len = fs::metadata(&path).unwrap().len();
+                    OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(len - 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let group = validate_groups(&files).unwrap().remove(0);
+            let dest = scratch.0.join("dest");
+            fs::create_dir(&dest).unwrap();
+            for file in &files {
+                fs::write(dest.join(&file.name), b"previous output").unwrap();
+            }
+            assert!(
+                verify_group(&scratch.0, &files, &group).is_err(),
+                "{corruption}"
+            );
+            assert!(
+                restore_group(&scratch.0, &dest, &files, &group).is_err(),
+                "{corruption}"
+            );
+            for file in &files {
+                assert_eq!(
+                    fs::read(dest.join(&file.name)).unwrap(),
+                    b"previous output",
+                    "{corruption}"
+                );
+            }
+            assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_references_fail_before_any_destination_write() {
+        let scratch = Scratch::new();
+        let (files, _, _) = fixture(&scratch, false);
+        for case in 0..11 {
+            let mut changed = files.clone();
+            match case {
+                0 => changed[1].stored = "missing".into(),
+                1 => changed[1].name = "other.rmeta".into(),
+                2 => changed[1].metadata_slice.as_mut().unwrap().offset = u64::MAX,
+                3 => changed[1].metadata_slice.as_mut().unwrap().mode = 0o120777,
+                4 => {
+                    changed[1]
+                        .metadata_slice
+                        .as_mut()
+                        .unwrap()
+                        .source_content_hash = "bad".into()
+                }
+                5 => changed[1].stored_bytes = Some(4096),
+                6 => changed[0].metadata_slice = changed[1].metadata_slice.clone(),
+                7 => changed[0].name = "../libdemo-hash.rlib".into(),
+                8 => changed[0].encoding = Encoding::InlineMetadataSliceV1,
+                9 => {
+                    let mut extra = changed[0].clone();
+                    extra.name = "duplicate.rlib".into();
+                    changed.push(extra);
+                }
+                _ => {
+                    changed[1].metadata_slice.as_mut().unwrap().source_encoding =
+                        SourceEncoding::Lz4BlocksV1
+                }
+            }
+            assert!(validate_groups(&changed).is_err(), "case {case}");
+            let dest = scratch.0.join("never-created");
+            assert!(
+                restore_group(
+                    &scratch.0,
+                    &dest,
+                    &changed,
+                    &RestoreGroup {
+                        base_index: 0,
+                        slice_indices: vec![1]
+                    }
+                )
+                .is_err()
+            );
+            assert!(!dest.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_target_replacement_and_rewrite_are_rejected() {
+        let scratch = Scratch::new();
+        let (files, _, metadata) = fixture(&scratch, false);
+        let target = scratch.0.join("original");
+        let (_, commitment) = payload::capture(&target).unwrap();
+        let replacement = scratch.0.join("replacement");
+        fs::write(&replacement, &metadata).unwrap();
+        sys::set_path_mode(&replacement, 0o751).unwrap();
+        sys::rename(&replacement, &target).unwrap();
+        assert!(
+            build(
+                &scratch.0.join("f0"),
+                &files[0],
+                &target,
+                &record("libdemo-hash.rmeta", "f1"),
+                Some(&commitment)
+            )
+            .is_err()
+        );
+        let (_, commitment) = payload::capture(&target).unwrap();
+        fs::write(&target, vec![0x37; metadata.len()]).unwrap();
+        assert!(
+            build(
+                &scratch.0.join("f0"),
+                &files[0],
+                &target,
+                &record("libdemo-hash.rmeta", "f1"),
+                Some(&commitment)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thin_unknown_and_nonmatching_archives_fall_back() {
+        let scratch = Scratch::new();
+        let target = scratch.0.join("original");
+        fs::write(&target, b"metadata bytes").unwrap();
+        let base = record("libdemo.rlib", "f0");
+        let output = record("libdemo.rmeta", "f1");
+        for archive in [
+            b"!<thin>\nexternal".as_slice(),
+            b"unknown archive".as_slice(),
+            b"!<arch>\n".as_slice(),
+        ] {
+            fs::write(scratch.0.join("f0"), archive).unwrap();
+            assert!(
+                build(&scratch.0.join("f0"), &base, &target, &output, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_during_range_proof_is_rejected() {
+        let scratch = Scratch::new();
+        let (files, _, metadata) = fixture(&scratch, false);
+        let original = scratch.0.join("original");
+        let (_, commitment) = payload::capture(&original).unwrap();
+        let result = build_inner(
+            &scratch.0.join("f0"),
+            &files[0],
+            &original,
+            &record("libdemo-hash.rmeta", "f1"),
+            Some(&commitment),
+            || {
+                let replacement = scratch.0.join("replacement");
+                fs::write(&replacement, &metadata).unwrap();
+                sys::set_path_mode(&replacement, 0o751).unwrap();
+                sys::rename(&replacement, &original).unwrap();
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gnu_and_bsd_member_names_are_checked() {
+        let scratch = Scratch::new();
+        for bsd in [false, true] {
+            let mut archive = b"!<arch>\n".to_vec();
+            if bsd {
+                archive_member(&mut archive, "#1/12", b"lib.rmeta\0\0\0payload");
+            } else {
+                archive_member(&mut archive, "//", b"lib.rmeta/\n");
+                archive_member(&mut archive, "/0", b"payload");
+            }
+            let path = scratch.0.join("archive");
+            fs::write(&path, &archive).unwrap();
+            let mut input = File::open(path).unwrap();
+            let ranges = member_ranges(&mut input, archive.len() as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].1, 7);
+        }
+    }
+
+    #[test]
+    fn legacy_records_default_and_old_encoding_enum_declines_ranges() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldEncoding {
+            Raw,
+            Lz4BlocksV1,
+        }
+        let old: StoredFile = serde_json::from_str(
+            r#"{"name":"libdemo.rlib","stored":"f0","text":false,"bytes":32}"#,
+        )
+        .unwrap();
+        assert!(old.metadata_slice.is_none());
+        assert_eq!(validate_groups(&[old]).unwrap()[0].slice_indices.len(), 0);
+        let encoded = serde_json::to_string(&Encoding::InlineMetadataSliceV1).unwrap();
+        assert!(serde_json::from_str::<OldEncoding>(&encoded).is_err());
+    }
+}

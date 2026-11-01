@@ -454,6 +454,7 @@ fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, configs: &
 
 fn exec(cargo: &Path, args: &[OsString], env_vars: &[(OsString, OsString)]) -> i32 {
     let mut cmd = Command::new(cargo);
+    cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
     cmd.args(args);
     for (k, v) in env_vars {
         cmd.env(k, v);
@@ -705,6 +706,13 @@ impl Session {
         cmd.args(rest);
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
+        }
+        cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
+        if self.env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER")
+            && (1, 89, 0) <= self.probe.cargo_version
+            && self.probe.cargo_version < (1, 100, 0)
+        {
+            cmd.env(crate::wrapper::SLOT_SUPERVISOR_ENV, std::process::id().to_string());
         }
         let tracked = style.is_some() || guard.is_some();
         if tracked {

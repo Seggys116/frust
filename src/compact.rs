@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -325,6 +326,95 @@ pub fn physical_size(roots: &[&Path]) -> u64 {
         });
     }
     total
+}
+
+struct AllocationNode {
+    meta: sys::Meta,
+    members: u64,
+    children: Vec<PathBuf>,
+    clone_group: Option<(u64, u64)>,
+}
+
+fn allocation_unchanged(before: &sys::Meta, after: &sys::Meta) -> bool {
+    (before.dev(), before.ino(), before.len(), before.nlink(), before.allocated(), before.mtime(), before.ctime(), before.file_type())
+        == (after.dev(), after.ino(), after.len(), after.nlink(), after.allocated(), after.mtime(), after.ctime(), after.file_type())
+}
+
+fn allocation_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+fn allocation_add(total: &mut u64, bytes: u64) -> io::Result<()> {
+    *total = total.checked_add(bytes).ok_or_else(|| io::Error::other("allocated byte count overflowed"))?;
+    Ok(())
+}
+
+/// Checked allocated-block estimate including directories and symlinks; detected APFS sharing is counted once.
+pub fn physical_size_checked(roots: &[&Path]) -> io::Result<u64> {
+    physical_sizes_checked(&[roots]).map(|totals| totals[0])
+}
+
+pub(crate) fn physical_sizes_checked(root_sets: &[&[&Path]]) -> io::Result<Vec<u64>> {
+    if root_sets.len() > 64 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "at most 64 allocation unions are supported")); }
+    let mut nodes: BTreeMap<(u64, u64), AllocationNode> = BTreeMap::new();
+    let mut paths: BTreeMap<PathBuf, (u64, u64)> = BTreeMap::new();
+    let mut pending: Vec<_> = root_sets.iter().enumerate().flat_map(|(index, roots)|
+        roots.iter().map(move |root| (root.to_path_buf(), 1u64 << index))).collect();
+    while let Some((path, membership)) = pending.pop() {
+        let identity = if let Some(identity) = paths.get(&path) { *identity } else {
+            let meta = sys::lstat(&path).map_err(|error| allocation_error(&path, error))?;
+            if meta.ino() == 0 || !(meta.is_file() || meta.is_dir() || meta.file_type().is_symlink()) {
+                return Err(allocation_error(&path, io::Error::new(io::ErrorKind::Unsupported, "unverifiable inode or file type")));
+            }
+            let identity = (meta.dev(), meta.ino());
+            if let Some(existing) = nodes.get(&identity) {
+                if !allocation_unchanged(&existing.meta, &meta) {
+                    return Err(allocation_error(&path, io::Error::other("allocation changed during inventory")));
+                }
+            } else {
+                let children = if meta.is_dir() && !meta.file_type().is_symlink() {
+                    fs::read_dir(&path).map_err(|error| allocation_error(&path, error))?
+                        .map(|entry| entry.map(|entry| entry.path()).map_err(|error| allocation_error(&path, error)))
+                        .collect::<io::Result<Vec<_>>>()?
+                } else { Vec::new() };
+                let clone_group = if meta.is_file() { apfs::clone_info(&path).filter(|(group, _)| *group != 0) } else { None };
+                nodes.insert(identity, AllocationNode { meta, members: 0, children, clone_group });
+            }
+            paths.insert(path.clone(), identity);
+            identity
+        };
+        let node = nodes.get_mut(&identity).unwrap();
+        let added = membership & !node.members;
+        if added == 0 { continue; }
+        node.members |= added;
+        pending.extend(node.children.iter().map(|child| (child.clone(), added)));
+    }
+    // One inventory supplies every union; any observed change invalidates the allocation sample.
+    for (path, identity) in paths {
+        let current = sys::lstat(&path).map_err(|error| allocation_error(&path, error))?;
+        if !allocation_unchanged(&nodes[&identity].meta, &current) {
+            return Err(allocation_error(&path, io::Error::other("allocation changed during inventory")));
+        }
+    }
+    (0..root_sets.len()).map(|index| {
+        let mut total = 0;
+        let mut clones: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+        for node in nodes.values().filter(|node| node.members & (1u64 << index) != 0) {
+            let allocated = node.meta.allocated();
+            if let Some((group, private)) = node.clone_group {
+                let private = private.min(allocated);
+                let (private_total, shared_max) = clones.entry((node.meta.dev(), group)).or_default();
+                allocation_add(private_total, private)?;
+                *shared_max = (*shared_max).max(allocated - private);
+            } else { allocation_add(&mut total, allocated)?; }
+        }
+        // Private blocks sum, while the largest detected shared portion is charged once per clone group.
+        for (private, shared) in clones.into_values() {
+            allocation_add(&mut total, private)?;
+            allocation_add(&mut total, shared)?;
+        }
+        Ok(total)
+    }).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1314,6 +1404,7 @@ pub struct Report {
     pub orphan_session_locks: usize,
     pub retained_session_states: usize,
     pub retained_incremental: usize,
+    pub retained_cache_entries: usize,
     pub empty_incremental_dirs: usize,
     pub stale_objects: usize,
     pub dead_incremental: usize,
@@ -2129,7 +2220,7 @@ fn complete_by_default() -> bool {
 }
 
 fn auto_pass_complete(report: &Report) -> bool {
-    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0
+    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0 && report.retained_cache_entries == 0
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
@@ -2298,9 +2389,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         let entries = store_entries(dirs);
         let mut record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries, signature: 0, complete: true };
         if entries >= prev.store_entries.saturating_add(STORE_ENTRIES_GROWTH) {
-            let superseded = crate::gc::superseded_incremental_entries(dirs, crate::gc::INCREMENTAL_ENTRIES_KEPT);
-            report.superseded_entries = superseded.len();
-            remove_paths(&superseded, &mut report);
+            retire_superseded_cache(dirs, &mut report);
             record.store_entries = store_entries(dirs);
         }
         record.signature = change_signature(dirs, target, &options_key).unwrap_or(0);
@@ -2312,6 +2401,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         return report;
     }
 
+    retire_superseded_cache(dirs, &mut report);
     let mut locks = Vec::new();
     let mut profiles = Vec::new();
     for profile in profile_dirs(target) {
@@ -2324,10 +2414,6 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         }
     }
     report.profiles = profiles.len();
-    // Removing a cache entry never affects a target directory: restored files are clones, not links.
-    let superseded = crate::gc::superseded_incremental_entries(dirs, crate::gc::INCREMENTAL_ENTRIES_KEPT);
-    report.superseded_entries = superseded.len();
-    remove_paths(&superseded, &mut report);
     let store = OnceCell::new();
     let store_index = || store.get_or_init(|| StoreIndex::new(&dirs.store()).with_budget(opts.pass_bytes, opts.pass_budget));
     let covered = |paths: &[(PathBuf, u64)]| opts.cache_enabled && store_index().covers(paths);
@@ -2533,6 +2619,20 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     report
 }
 
+fn retire_superseded_cache(dirs: &Dirs, report: &mut Report) {
+    let superseded = crate::gc::superseded_cache_retirements(dirs, crate::gc::INCREMENTAL_ENTRIES_KEPT);
+    report.superseded_entries = superseded.len();
+    let store = crate::cache::Cache::new(dirs);
+    for (path, bytes, snapshot) in superseded {
+        match store.try_retire_entry(&snapshot) {
+            Ok(crate::cache::EntryRetirementOutcome::Retired) => { report.removed_bytes += bytes; report.removed.push((path, bytes)); }
+            Ok(crate::cache::EntryRetirementOutcome::Busy) => report.retained_cache_entries += 1,
+            Ok(crate::cache::EntryRetirementOutcome::Stale) => {}
+            Err(error) => report.errors.push((path, error.to_string())),
+        }
+    }
+}
+
 fn remove_or_plan(paths: Vec<(PathBuf, u64)>, dry_run: bool, report: &mut Report) {
     if dry_run {
         for (path, bytes) in paths {
@@ -2621,13 +2721,42 @@ fn allocated(root: &Path) -> u64 {
     total
 }
 
-type StoredArtifact = (PathBuf, crate::cache::StoredFile);
+struct CoverageGroup {
+    group: crate::cache::metadata_slice::RestoreGroup,
+    signature: String,
+    cost: u64,
+}
+
+struct CoverageEntry {
+    path: PathBuf,
+    manifest: FileKey,
+    stderr: String,
+    files: Vec<crate::cache::StoredFile>,
+    groups: Vec<CoverageGroup>,
+}
+
+impl CoverageEntry {
+    fn current(&self) -> bool {
+        regular_key(&self.path.join("meta.json")) == Some(self.manifest)
+            && regular_key(&self.path.join(&self.stderr)).is_some()
+    }
+}
+
+#[derive(Clone)]
+struct StoredArtifact {
+    path: PathBuf,
+    entry: Arc<CoverageEntry>,
+    group: usize,
+    file: usize,
+}
+
 type StoreScan = (Vec<(u64, PathBuf)>, Vec<StoredArtifact>);
 
 /// Clone groups prove coverage cheaply; other filesystems verify only needed artifacts within a pass budget.
 #[derive(Default)]
 struct StoreIndex {
     by_size: HashMap<u64, Vec<PathBuf>>,
+    raw_context: HashMap<PathBuf, StoredArtifact>,
     encoded: HashMap<u64, Vec<StoredArtifact>>,
     proofs: RefCell<CoverageProofs>,
 }
@@ -2635,7 +2764,7 @@ struct StoreIndex {
 struct CoverageProofs {
     budget: Budget,
     hashes: HashMap<FileKey, String>,
-    encoded: HashMap<FileKey, Option<(u64, String)>>,
+    encoded: HashMap<(FileKey, String), bool>,
 }
 
 impl Default for CoverageProofs {
@@ -2675,17 +2804,18 @@ impl CoverageProofs {
         Some(hash)
     }
 
-    fn encoded_valid(&mut self, path: &Path, key: FileKey, meta: &crate::cache::StoredFile) -> bool {
-        let (Some(len), Some(hash)) = (meta.decoded_bytes, meta.content_hash.as_ref()) else { return false };
-        if let Some(proof) = self.encoded.get(&key) {
-            return proof.as_ref().is_some_and(|(decoded, expected)| *decoded == len && expected == hash);
-        }
-        let Some(cost) = key.size.checked_add(len) else { return false };
-        if !self.spend(cost) {
-            return false;
-        }
-        let valid = crate::cache::payload::verify(path, meta).is_ok() && regular_key(path) == Some(key);
-        self.encoded.insert(key, valid.then(|| (len, hash.clone())));
+    // One verified group can serve several outputs only with the same backing identity and complete descriptor.
+    fn encoded_valid(&mut self, artifact: &StoredArtifact, key: FileKey) -> bool {
+        let entry = &artifact.entry;
+        let group = &entry.groups[artifact.group];
+        if !entry.current() || regular_key(&artifact.path) != Some(key) { return false; }
+        let proof_key = (key, group.signature.clone());
+        if let Some(valid) = self.encoded.get(&proof_key) { return *valid; }
+        let Some(cost) = key.size.checked_add(group.cost) else { return false };
+        if !self.spend(cost) { return false; }
+        let valid = crate::cache::metadata_slice::verify_group(&entry.path, &entry.files, &group.group).is_ok()
+            && regular_key(&artifact.path) == Some(key) && entry.current();
+        self.encoded.insert(proof_key, valid);
         valid
     }
 }
@@ -2707,28 +2837,56 @@ impl StoreIndex {
                     if let Ok(bytes) = fs::read(path)
                         && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
                         && let Some(parent) = path.parent()
-                        && entry.files.iter().all(|f| crate::cache::safe_file_name(&f.name) && crate::cache::safe_file_name(&f.stored))
                         && crate::cache::safe_file_name(&entry.stderr)
                         && sys::lstat(&parent.join(&entry.stderr)).is_ok_and(|m| m.is_file())
+                        && let Ok(groups) = crate::cache::metadata_slice::validate_groups(&entry.files)
+                        && (cfg!(unix) || groups.iter().all(|group| group.slice_indices.is_empty()))
+                        && regular_key(path) == Some(FileKey::of(meta))
                     {
-                        acc.1.extend(entry.files.into_iter().filter(|f| !f.text).map(|f| (parent.join(&f.stored), f)));
+                        let groups = groups.into_iter().map(|group| {
+                            Ok(CoverageGroup {
+                                signature: crate::cache::metadata_slice::proof_signature(&entry.files, &group)?,
+                                cost: crate::cache::metadata_slice::cost(&entry.files, &group)?, group,
+                            })
+                        }).collect::<io::Result<Vec<_>>>();
+                        if let Ok(groups) = groups {
+                            let context = Arc::new(CoverageEntry {
+                                path: parent.to_path_buf(), manifest: FileKey::of(meta), stderr: entry.stderr,
+                                files: entry.files, groups,
+                            });
+                            for (group, records) in context.groups.iter().enumerate() {
+                                for file in std::iter::once(records.group.base_index).chain(records.group.slice_indices.iter().copied()) {
+                                    let record = &context.files[file];
+                                    if !record.text {
+                                        acc.1.push(StoredArtifact { path: parent.join(&record.stored), entry: Arc::clone(&context), group, file });
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if meta.len() > 0 {
                     acc.0.push((meta.len(), path.to_path_buf()));
                 }
             },
         );
-        let raw: HashSet<PathBuf> = parts.iter().flat_map(|part| part.1.iter()).filter(|(_, f)| f.encoding.is_raw()).map(|(p, _)| p.clone()).collect();
+        let raw: HashMap<PathBuf, StoredArtifact> = parts.iter().flat_map(|part| part.1.iter())
+            .filter(|artifact| artifact.entry.files[artifact.file].encoding.is_raw())
+            .map(|artifact| (artifact.path.clone(), artifact.clone())).collect();
         for (files, entries) in parts {
-            for (len, path) in files.into_iter().filter(|(_, path)| path.ancestors().any(|p| raw.contains(p))) {
-                index.by_size.entry(len).or_default().push(path);
+            for (len, path) in files {
+                if let Some(context) = path.ancestors().find_map(|ancestor| raw.get(ancestor)) {
+                    index.raw_context.insert(path.clone(), context.clone());
+                    index.by_size.entry(len).or_default().push(path);
+                }
             }
-            for (path, file) in entries.into_iter().filter(|(_, f)| !f.encoding.is_raw() && !f.dir) {
+            for artifact in entries {
+                let file = &artifact.entry.files[artifact.file];
+                if file.encoding.is_raw() || file.dir { continue; }
                 if let (Some(len), Some(hash)) = (file.decoded_bytes, file.content_hash.as_ref())
-                    && len > 0 && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-                    && regular_key(&path).is_some()
+                    && len > 0 && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && regular_key(&artifact.path).is_some()
                 {
-                    index.encoded.entry(len).or_default().push((path, file));
+                    index.encoded.entry(len).or_default().push(artifact);
                 }
             }
         }
@@ -2736,7 +2894,7 @@ impl StoreIndex {
             paths.sort();
         }
         for paths in index.encoded.values_mut() {
-            paths.sort_by(|a, b| a.0.cmp(&b.0));
+            paths.sort_by(|a, b| a.path.cmp(&b.path));
         }
         index
     }
@@ -2749,15 +2907,29 @@ impl StoreIndex {
         self
     }
 
+    fn raw_restorable(&self, source: &Path, expected: FileKey, proofs: &mut CoverageProofs) -> bool {
+        let Some(artifact) = self.raw_context.get(source) else { return false };
+        artifact.entry.current() && (artifact.entry.groups[artifact.group].group.slice_indices.is_empty()
+            || proofs.encoded_valid(artifact, expected))
+    }
+
     fn covers_file(&self, path: &Path, meta: &sys::Meta) -> bool {
+        self.covers_file_with_raw_proof(path, meta, |_| {})
+    }
+
+    fn covers_file_with_raw_proof(&self, path: &Path, meta: &sys::Meta, mut after_raw_proof: impl FnMut(&Path)) -> bool {
         let candidates = self.by_size.get(&meta.len());
         if let Some((group, _)) = apfs::clone_info(path)
-            && candidates.is_some_and(|cands| cands.iter().any(|c| {
-                sys::lstat(c).is_ok_and(|source| source.is_file() && source.len() == meta.len() && source.mode() & 0o7777 == meta.mode() & 0o7777)
-                    && apfs::clone_info(c).is_some_and(|(g, _)| g == group)
+            && candidates.is_some_and(|cands| cands.iter().any(|candidate| {
+                let Ok(source) = sys::lstat(candidate) else { return false };
+                source.is_file() && source.len() == meta.len() && source.mode() & 0o7777 == meta.mode() & 0o7777
+                    && self.raw_restorable(candidate, FileKey::of(&source), &mut self.proofs.borrow_mut())
+                    && apfs::clone_info(candidate).is_some_and(|(found, _)| found == group)
+                    && regular_key(candidate) == Some(FileKey::of(&source))
+                    && self.raw_context[candidate].entry.current()
             }))
         {
-            return true;
+            return regular_key(path) == Some(FileKey::of(meta));
         }
         if candidates.is_none() && !self.encoded.contains_key(&meta.len()) {
             return false;
@@ -2766,15 +2938,16 @@ impl StoreIndex {
         let mut proof = self.proofs.borrow_mut();
         let Some(hash) = proof.hash(path, key) else { return false };
         if let Some(encoded) = self.encoded.get(&meta.len()) {
-            for (source, payload) in encoded {
-                if payload.content_hash.as_ref() != Some(&hash) {
-                    continue;
-                }
-                let Ok(source_meta) = sys::lstat(source) else { continue };
-                if source_meta.is_file() && source_meta.mode() & 0o7777 == meta.mode() & 0o7777
-                    && proof.encoded_valid(source, FileKey::of(&source_meta), payload)
+            for artifact in encoded {
+                let payload = &artifact.entry.files[artifact.file];
+                if payload.content_hash.as_ref() != Some(&hash) || !artifact.entry.current() { continue; }
+                let Ok(source_meta) = sys::lstat(&artifact.path) else { continue };
+                let Ok(mode) = crate::cache::metadata_slice::restored_mode(&artifact.entry.path, &artifact.entry.files, artifact.file) else { continue };
+                if source_meta.is_file() && mode & 0o7777 == meta.mode() & 0o7777
+                    && proof.encoded_valid(artifact, FileKey::of(&source_meta))
                 {
-                    return regular_key(path) == Some(key);
+                    return regular_key(path) == Some(key) && artifact.entry.current()
+                        && regular_key(&artifact.path) == Some(FileKey::of(&source_meta));
                 }
             }
         }
@@ -2784,8 +2957,13 @@ impl StoreIndex {
                 if !source_meta.is_file() || source_meta.len() != meta.len() || source_meta.mode() & 0o7777 != meta.mode() & 0o7777 {
                     continue;
                 }
-                if proof.hash(source, FileKey::of(&source_meta)).as_ref() == Some(&hash) {
-                    return regular_key(path) == Some(key);
+                let source_key = FileKey::of(&source_meta);
+                if !self.raw_restorable(source, source_key, &mut proof) { continue; }
+                after_raw_proof(source);
+                let context = &self.raw_context[source].entry;
+                if proof.hash(source, source_key).as_ref() == Some(&hash) {
+                    return regular_key(path) == Some(key) && context.current()
+                        && regular_key(source) == Some(FileKey::of(&source_meta));
                 }
             }
         }
@@ -3058,6 +3236,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compaction_retires_only_superseded_cache_states_and_prunes_known_manifests() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-compact-cache-retirement"));
+        let dirs = Dirs::at(&root);
+        let store = crate::cache::Cache::new(&dirs);
+        let prekey = "ac".repeat(20);
+        let mut paths = Vec::new();
+        for n in 1..=4 {
+            let key = format!("{n:040x}");
+            let staged = store.stage().unwrap();
+            fs::write(staged.join("meta.json"), serde_json::to_vec(&serde_json::json!({
+                "crate_name":"c", "version":"1", "compile_ms":1, "created_unix":1, "stderr":"",
+                "incremental_unit":"ab".repeat(20), "prekey":prekey,
+                "files":[{"name":"artifact", "stored":"f0", "text":false, "bytes":32}]
+            })).unwrap()).unwrap();
+            fs::write(staged.join("f0"), [n as u8; 32]).unwrap();
+            store.publish(&staged, &key).unwrap();
+            store.add_candidate(&prekey, crate::cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() });
+            let path = store.entry_dir(&key);
+            File::options().write(true).open(path.join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs((5 - n) * 5000)).unwrap();
+            paths.push(path);
+        }
+        let mut report = Report::default();
+        retire_superseded_cache(&dirs, &mut report);
+        assert!(report.errors.is_empty());
+        assert_eq!(report.superseded_entries, 2);
+        assert_eq!(report.removed.len(), 2);
+        assert!(paths[..2].iter().all(|path| !path.exists()));
+        assert!(paths[2..].iter().all(|path| path.exists()));
+        assert_eq!(store.candidates(&prekey).into_iter().map(|row| row.key).collect::<Vec<_>>(), vec![format!("{:040x}", 4), format!("{:040x}", 3)]);
+        let mut second = Report::default();
+        retire_superseded_cache(&dirs, &mut second);
+        assert!(second.removed.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn busy_cache_retirement_marks_auto_pass_incomplete_and_retries_without_growth() {
+        cache_retirement_retry_after_obstruction(false);
+    }
+
+    #[test]
+    fn blocked_retirement_queue_marks_auto_pass_incomplete_and_retries_after_repair() {
+        cache_retirement_retry_after_obstruction(true);
+    }
+
+    fn cache_retirement_retry_after_obstruction(queue_obstructed: bool) {
+        let tag = if queue_obstructed { "frust-compact-blocked-queue" } else { "frust-compact-busy-cache" };
+        let root = fsx::temp_sibling(&std::env::temp_dir().join(tag));
+        let dirs = Dirs::at(&root);
+        let store = crate::cache::Cache::new(&dirs);
+        let target = dirs.targets().join("workspace/toolchain");
+        fs::create_dir_all(&target).unwrap();
+        for n in 1..=3 {
+            let key = format!("{n:040x}");
+            let staged = store.stage().unwrap();
+            fs::write(staged.join("meta.json"), serde_json::to_vec(&serde_json::json!({
+                "crate_name":"c", "version":"1", "compile_ms":1, "created_unix":1, "stderr":"",
+                "incremental_unit":"ab".repeat(20),
+                "files":[{"name":"artifact", "stored":"f0", "text":false, "bytes":32}]
+            })).unwrap()).unwrap();
+            fs::write(staged.join("f0"), [n as u8; 32]).unwrap();
+            store.publish(&staged, &key).unwrap();
+            File::options().write(true).open(store.entry_dir(&key).join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs((4 - n) * 5000)).unwrap();
+        }
+        let mut opts = AutoOptions::from_env(&Config::from_env());
+        opts.enabled = true;
+        opts.every = Duration::from_secs(600);
+        opts.min_growth = u64::MAX;
+        opts.compress = false;
+        opts.cache_enabled = false;
+        let guard = if queue_obstructed {
+            fs::write(crate::cache::evicted_dir(&dirs), b"owned queue obstruction").unwrap();
+            None
+        } else { Some(crate::cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap()) };
+        let first = auto_compact_with(&dirs, &target, &opts);
+        assert_eq!(first.retained_cache_entries, usize::from(!queue_obstructed));
+        assert_eq!(first.errors.len(), usize::from(queue_obstructed));
+        assert!(first.removed.is_empty());
+        assert_eq!(first.removed_bytes, 0);
+        assert!(store.has_entry(&format!("{:040x}", 1)));
+        let marker_path = target.join(AUTO_MARKER);
+        let marker: AutoMarker = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert!(!marker.complete);
+        assert_eq!(marker.interval(&opts), AUTO_RETRY_EVERY);
+        drop(guard);
+        if queue_obstructed {
+            let saved = dirs.tmp().join("saved-owned-obstruction");
+            sys::rename(&crate::cache::evicted_dir(&dirs), &saved).unwrap();
+            assert_eq!(fs::read(saved).unwrap(), b"owned queue obstruction");
+        }
+        File::options().write(true).open(&marker_path).unwrap().set_modified(SystemTime::now() - AUTO_RETRY_EVERY - Duration::from_secs(1)).unwrap();
+        let retry = auto_compact_with(&dirs, &target, &opts);
+        assert_eq!(retry.retained_cache_entries, 0);
+        assert_eq!(retry.removed.len(), 1);
+        assert!(retry.errors.is_empty());
+        assert!(!store.has_entry(&format!("{:040x}", 1)));
+        assert!(store.has_entry(&format!("{:040x}", 2)) && store.has_entry(&format!("{:040x}", 3)));
+        let marker: AutoMarker = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert!(marker.complete);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn store_index_excludes_encoded_payloads_and_keeps_legacy_raw_files() {
         let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-store-index"));
         let entry = root.join("aa").join("a".repeat(40));
@@ -3069,7 +3350,7 @@ mod tests {
         fs::write(entry.join("meta.json"), serde_json::to_vec(&serde_json::json!({
             "crate_name":"c", "version":"1", "compile_ms":1, "created_unix":1, "stderr":"stderr",
             "files":[
-                {"name":"artifact", "stored":"f0", "text":false, "bytes":65536, "encoding":"lz4_blocks_v1"},
+                {"name":"artifact", "stored":"f0", "text":false, "bytes":65536, "encoding":"lz4_blocks_v1", "decoded_bytes":65536, "content_hash":"0".repeat(64)},
                 {"name":"legacy", "stored":"f1", "text":false, "bytes":9},
                 {"name":"bundle", "stored":"bundle", "text":false, "bytes":12, "dir":true}
             ]
@@ -3088,15 +3369,176 @@ mod tests {
         fs::create_dir_all(&entry).unwrap();
         let file = crate::cache::payload::store(source, &entry.join("f0"), compress).unwrap();
         let meta = crate::cache::EntryMeta {
-            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None,
+            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None,
             files: vec![crate::cache::StoredFile {
                 name: source.file_name().unwrap().to_str().unwrap().into(), stored: "f0".into(), text: false, bytes: file.bytes, dir: false,
-                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash,
+                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None,
             }], stderr: "stderr".into(),
         };
         fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         fs::write(entry.join("stderr"), b"").unwrap();
         entry
+    }
+
+    #[cfg(unix)]
+    fn coverage_slice_entry(root: &Path, compress: bool) -> (PathBuf, PathBuf, crate::cache::EntryMeta) {
+        let artifact = root.join("debug/deps/libapp-0123456789abcdef.rmeta");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        let metadata: Vec<_> = (0..128 * 1024 + 211).map(|index| (index % 251) as u8).collect();
+        fs::write(&artifact, &metadata).unwrap();
+        sys::set_path_mode(&artifact, 0o751).unwrap();
+        let mut member = vec![0x7f; 37];
+        member.extend_from_slice(&metadata);
+        member.extend_from_slice(&[0x39; 113]);
+        let mut archive = b"!<arch>\n".to_vec();
+        archive.extend_from_slice(format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", "lib.rmeta/", 0, 0, 0, "100644", member.len()).as_bytes());
+        archive.extend_from_slice(&member);
+        if !member.len().is_multiple_of(2) { archive.push(b'\n'); }
+        let source = root.join("source.rlib");
+        fs::write(&source, archive).unwrap();
+        sys::set_path_mode(&source, 0o640).unwrap();
+        let entry = root.join("store/aa").join("a".repeat(40));
+        fs::create_dir_all(&entry).unwrap();
+        let stored = crate::cache::payload::store(&source, &entry.join("f0"), compress).unwrap();
+        let base = crate::cache::StoredFile {
+            name: "libapp-0123456789abcdef.rlib".into(), stored: "f0".into(), text: false, bytes: stored.bytes,
+            encoding: stored.encoding, stored_bytes: stored.stored_bytes, decoded_bytes: stored.decoded_bytes,
+            content_hash: stored.content_hash, metadata_slice: None, dir: false,
+        };
+        let target = crate::cache::StoredFile {
+            name: artifact.file_name().unwrap().to_string_lossy().into_owned(), stored: "f1".into(), text: false,
+            bytes: fsx::allocated_size(&artifact), encoding: crate::cache::payload::Encoding::Raw, stored_bytes: None,
+            decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false,
+        };
+        let slice = crate::cache::metadata_slice::build(&entry.join("f0"), &base, &artifact, &target, None).unwrap().unwrap();
+        let meta = crate::cache::EntryMeta {
+            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None,
+            files: vec![base, slice], stderr: "stderr".into(),
+        };
+        fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        fs::write(entry.join("stderr"), b"").unwrap();
+        (artifact, entry, meta)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_slice_coverage_checks_full_backing_modes_and_replaced_sources() {
+        for compress in [false, true] {
+            let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-slice-coverage"));
+            let (artifact, entry, meta) = coverage_slice_entry(&root, compress);
+            assert_ne!(sys::stat(&artifact).unwrap().mode() & 0o7777, sys::stat(&entry.join("f0")).unwrap().mode() & 0o7777);
+            let index = StoreIndex::new(&root.join("store"));
+            let paths = [(artifact.clone(), 0)];
+            assert!(index.covers(&paths));
+            let left = index.proofs.borrow().budget.bytes_left;
+            assert!(index.covers(&paths));
+            assert_eq!(index.proofs.borrow().budget.bytes_left, left);
+            let backing = entry.join("f0");
+            let original = fs::read(&backing).unwrap();
+            let mut corrupt = original.clone();
+            corrupt[0] ^= 1;
+            fs::write(&backing, &corrupt).unwrap();
+            assert!(!index.covers(&paths), "a raw backing rewrite outside the slice still invalidates its full commitment");
+            fs::write(&backing, &original).unwrap();
+            assert!(index.covers(&paths));
+            fsx::write_atomic(&backing, &corrupt).unwrap();
+            assert!(!index.covers(&paths), "an old successful inode proof cannot cover a replacement");
+            fs::remove_file(&backing).unwrap();
+            assert!(!index.covers(&paths));
+            assert_eq!(meta.files[1].stored_bytes, Some(0));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_slice_raw_coverage_rejects_backing_replacement_after_group_proof() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-slice-proof-race"));
+        let (_, entry, _) = coverage_slice_entry(&root, false);
+        let backing = entry.join("f0");
+        let original_key = regular_key(&backing).unwrap();
+        let mut replacement = fs::read(&backing).unwrap();
+        replacement[0] ^= 1;
+        let target = root.join("debug/deps/libapp-0123456789abcdef.rlib");
+        fs::write(&target, &replacement).unwrap();
+        sys::set_path_mode(&target, 0o640).unwrap();
+        let index = StoreIndex::new(&root.join("store"));
+        let mut reached_proof = false;
+        let covered = index.covers_file_with_raw_proof(&target, &sys::lstat(&target).unwrap(), |source| {
+            assert_eq!(source, backing);
+            assert_eq!(regular_key(source), Some(original_key));
+            fsx::write_atomic(source, &replacement).unwrap();
+            sys::set_path_mode(source, 0o640).unwrap();
+            reached_proof = true;
+        });
+        assert!(reached_proof, "the mutation must happen after a complete successful group proof");
+        assert!(index.proofs.borrow().encoded.values().any(|valid| *valid));
+        assert!(!covered, "matching replacement bytes cannot inherit a different backing's group proof");
+        assert_eq!(fs::read(&backing).unwrap(), fs::read(&target).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_slice_group_signatures_prevent_descriptor_proof_aliases() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-slice-descriptor-proof"));
+        let (artifact, entry, original) = coverage_slice_entry(&root, false);
+        let store = root.join("store");
+        let index = StoreIndex::new(&store);
+        let len = sys::stat(&artifact).unwrap().len();
+        let original_artifact = &index.encoded[&len][0];
+        let key = regular_key(&entry.join("f0")).unwrap();
+        let mut proofs = CoverageProofs::default();
+        assert!(proofs.encoded_valid(original_artifact, key));
+        proofs.budget.bytes_left = 0;
+        for change in 0..4 {
+            let mut modified = original.clone();
+            let slice = &mut modified.files[1];
+            match change {
+                0 => slice.metadata_slice.as_mut().unwrap().offset += 1,
+                1 => slice.content_hash = Some("0".repeat(64)),
+                2 => slice.metadata_slice.as_mut().unwrap().mode = 0o100600,
+                _ => slice.metadata_slice.as_mut().unwrap().source_content_hash = "1".repeat(64),
+            }
+            fsx::write_atomic(&entry.join("meta.json"), &serde_json::to_vec(&modified).unwrap()).unwrap();
+            let changed = StoreIndex::new(&store);
+            let candidate = &changed.encoded[&len][0];
+            assert_eq!(regular_key(&candidate.path), Some(key));
+            assert!(!proofs.encoded_valid(candidate, key), "changed descriptor {change} cannot use an old same-inode proof");
+            assert!(!index.covers(&[(artifact.clone(), 0)]), "a changed manifest invalidates the original entry context");
+        }
+        let mut invalid = original;
+        invalid.files[1].metadata_slice.as_mut().unwrap().mode = 0o040700;
+        fs::write(entry.join("meta.json"), serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let invalid = StoreIndex::new(&store);
+        assert!(invalid.by_size.is_empty() && invalid.encoded.is_empty(), "invalid modes reject the whole entry, including raw backing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_slice_verification_charges_complete_source_and_preserves_uncovered_artifacts() {
+        for compress in [false, true] {
+            let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-slice-budget"));
+            let (artifact, entry, meta) = coverage_slice_entry(&root, compress);
+            let target_len = sys::stat(&artifact).unwrap().len();
+            let backing_len = sys::stat(&entry.join("f0")).unwrap().len();
+            let slice_only_budget = target_len + backing_len + target_len;
+            let index = StoreIndex::new(&root.join("store")).with_budget(slice_only_budget, Duration::from_secs(10));
+            assert!(!index.covers(&[(artifact.clone(), 0)]));
+            assert!(artifact.is_file());
+            assert!(index.proofs.borrow().encoded.is_empty());
+            assert!(meta.files[1].metadata_slice.as_ref().unwrap().source_decoded_bytes > target_len);
+            if !compress {
+                let backing_target = root.join("debug/deps/libapp-0123456789abcdef.rlib");
+                fsx::clone_new(&entry.join("f0"), &backing_target).unwrap();
+                let mut broken = meta;
+                broken.files[1].content_hash = Some("0".repeat(64));
+                fs::write(entry.join("meta.json"), serde_json::to_vec(&broken).unwrap()).unwrap();
+                assert!(!StoreIndex::new(&root.join("store")).covers(&[(backing_target, 0)]), "a raw base cannot cover an artifact when its grouped restore would fail");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -3695,6 +4137,9 @@ mod tests {
         report.retained_incremental = 1;
         assert!(!auto_pass_complete(&report));
         report.retained_incremental = 0;
+        report.retained_cache_entries = 1;
+        assert!(!auto_pass_complete(&report));
+        report.retained_cache_entries = 0;
         report.errors.push((PathBuf::from("artifact"), "cannot remove".into()));
         assert!(!auto_pass_complete(&report));
     }

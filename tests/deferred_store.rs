@@ -138,6 +138,34 @@ fn a_deferred_store_completes_after_the_build_and_serves_the_next_one() {
     assert_eq!(app_output(&sb, &a), output);
 }
 
+#[test]
+fn default_deferred_build_script_stores_and_restores_its_executable() {
+    let sb = Sandbox::new("ds-build-script");
+    sb.vendor_crate("leaf", "1.0.0", "pub fn value() -> u32 { include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\")) }\n");
+    let script = sb.vendor().join("leaf-1.0.0/build.rs");
+    fs::write(
+        &script,
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("value.rs"), "41u32").unwrap();
+}
+"#,
+    )
+    .unwrap();
+    common::settle(&script);
+    let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
+    build_deferred(&sb, &project);
+    wait_for_stores(&sb, 3);
+    assert_eq!(sb.count_cache("miss", "build_script_build"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(app_output(&sb, &project), "41");
+    clean(&sb, &project);
+    build_deferred(&sb, &project);
+    wait_for_stores(&sb, 3);
+    assert_eq!(sb.count_cache("hit", "build_script_build"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(app_output(&sb, &project), "41");
+}
+
 /// With every slot taken the wrapper stores before it returns, so the entry exists the moment the build ends.
 #[test]
 fn an_exhausted_slot_pool_stores_inline() {

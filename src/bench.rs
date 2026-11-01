@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+mod concurrent;
+
 use crate::compact::{self, AutoOptions, Category, CompactOptions};
 use crate::config::Config as FrustConfig;
 use crate::fsx::{self, allocated_size, human_bytes};
@@ -78,6 +80,8 @@ pub struct Machine {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub evidence_schema_version: u32,
+    pub store_policy: StorePolicy,
+    pub store_completion_method: &'static str,
     pub rustc: String,
     pub cache_compression: String,
     pub legacy_release_profile: &'static str,
@@ -113,6 +117,7 @@ pub struct Report {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChurnReport {
     pub evidence_schema_version: u32,
+    pub store_policy: StorePolicy,
     pub cache_compression: String,
     pub auto_compaction_policy: AutoCompactionPolicy,
     pub configs: Vec<String>,
@@ -174,6 +179,9 @@ pub struct BinaryDiff {
 }
 
 pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
+    if flags.iter().any(|flag| flag == "--concurrent" || flag.starts_with("--concurrent=")) {
+        return concurrent::run(flags);
+    }
     let quick = flags.iter().any(|f| f == "--quick");
     let json = flags.iter().any(|f| f == "--json");
     let churn_only = flags.iter().any(|f| f == "--churn");
@@ -190,15 +198,27 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
         Ok(value) => value,
         Err(error) => { eprintln!("frust bench: {error}"); return 1; }
     };
-    let scratch = std::env::temp_dir().join(format!("frust-bench-{}", std::process::id()));
+    let store = match store_from_flags(flags) {
+        Ok(value) => value,
+        Err(error) => { eprintln!("frust bench: {error}"); return 1; }
+    };
+    let settle_edits = match settle_edits_from_flags(flags) {
+        Ok(value) => value,
+        Err(error) => { eprintln!("frust bench: {error}"); return 1; }
+    };
+    let keep_scratch = flags.iter().any(|flag| flag == "--keep-scratch");
+    let prefix = store.scratch_prefix(keep_scratch);
+    let scratch = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     remove_abandoned_scratch(&std::env::temp_dir());
     if let Err(msg) = fsx::require_free_space(&std::env::temp_dir(), MIN_FREE_BYTES) {
         eprintln!("frust bench: refusing to run: {msg}");
         return 1;
     }
-    let guard = Scratch(scratch.clone());
+    let mut guard = Scratch(scratch.clone(), keep_scratch);
     if flags.iter().any(|f| f == "--profiles") {
-        let result = profile_matrix(&scratch, quick, runs, &compression);
+        let result = profile_matrix(&scratch, quick, runs, &compression, store);
+        // Any deferred failure may leave a helper owning fixture files.
+        if store == StorePolicy::Deferred && result.is_err() { guard.1 = true; }
         drop(guard);
         return match result {
             Ok(report) => {
@@ -244,7 +264,7 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
         };
     }
     if flags.iter().any(|f| f == "--growth") {
-        let result = growth_bench(&scratch, &GrowthOptions::from_flags(flags, quick), &s, json);
+        let result = growth_bench(&scratch, &GrowthOptions::from_flags(flags, quick), &s, json, keep_scratch, settle_edits);
         drop(guard);
         return match result {
             Ok(report) => {
@@ -262,7 +282,7 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
         };
     }
     if churn_only {
-        let result = churn_bench(&scratch, quick, &s, json, &compression);
+        let result = churn_bench(&scratch, quick, &s, json, &compression, keep_scratch);
         drop(guard);
         return match result {
             Ok(report) => {
@@ -279,11 +299,13 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
             }
         };
     }
-    let result = bench(&scratch, quick, runs, &s, json, &compression).and_then(|mut report| {
-        report.churn = Some(churn_bench(&scratch.join("churn"), quick, &s, json, &compression)?);
+    let result = bench(&scratch, quick, runs, &s, json, &compression, store).and_then(|mut report| {
+        report.churn = Some(churn_bench(&scratch.join("churn"), quick, &s, json, &compression, keep_scratch)?);
         report.machine.load_after = load_average();
         Ok(report)
     });
+    let failed = result.as_ref().ok().and_then(failed_checks);
+    if store == StorePolicy::Deferred && (result.is_err() || failed.is_some()) { guard.1 = true; }
     drop(guard);
     match result {
         Ok(report) => {
@@ -292,7 +314,7 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
             } else {
                 print_report(&report, &s);
             }
-            match failed_checks(&report) {
+            match failed {
                 Some(why) => {
                     eprintln!("frust bench: correctness check failed: {why}");
                     1
@@ -323,10 +345,14 @@ fn remove_abandoned_scratch(tmp: &Path) {
 }
 
 /// Refuses to remove anything not created by this module.
-struct Scratch(PathBuf);
+struct Scratch(PathBuf, bool);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if self.1 {
+            if self.0.is_dir() { eprintln!("frust bench: retained scratch at {}", self.0.display()); }
+            return;
+        }
         let name = self.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if name.starts_with("frust-bench-") && self.0.starts_with(std::env::temp_dir()) {
             let _ = fs::remove_dir_all(&self.0);
@@ -342,6 +368,7 @@ struct Ctx {
     probe_id: String,
     audit: Option<CompilerAudit>,
     compression: String,
+    store: StorePolicy,
 }
 
 #[derive(Clone)]
@@ -360,7 +387,7 @@ impl CompilerAudit {
         let rustc = std::env::var_os("RUSTC").map(PathBuf::from)
             .or_else(|| resolve_tool("rustc")).ok_or("rustc not found")?;
         let quoted = shell_quote(&rustc)?;
-        let script = format!("#!/bin/sh\ncompile=0\nprobe=0\nfor arg do\n    case \"$arg\" in\n        --emit|--emit=*) compile=1 ;;\n        --print|--print=*|-vV|--version) probe=1 ;;\n    esac\ndone\nif [ \"$compile\" = 1 ] && [ \"$probe\" = 0 ] && [ -n \"${{FRUST_BENCH_AUDIT:-}}\" ]; then\n    printf '%s\\0' \"$@\" > \"$FRUST_BENCH_AUDIT/$$\" || exit 125\nfi\nexec {quoted} \"$@\"\n");
+        let script = format!("#!/bin/sh\nif [ -n \"${{FRUST_BENCH_AUDIT:-}}\" ]; then\n    printf '%s\\0' \"$@\" > \"$FRUST_BENCH_AUDIT/$$\" || exit 125\nfi\nexec {quoted} \"$@\"\n");
         fs::write(&compiler, script).map_err(|e| e.to_string())?;
         sys::set_path_mode(&compiler, 0o755).map_err(|e| e.to_string())?;
         Ok(Some(Self { compiler, logs: scratch.join("compiler-invocations") }))
@@ -433,6 +460,8 @@ fn benchmark_maintenance_config() -> FrustConfig {
 #[derive(Debug, Serialize)]
 pub struct ProfileMatrix {
     evidence_schema_version: u32,
+    store_policy: StorePolicy,
+    store_completion_method: &'static str,
     rustc_verbose: String,
     cargo_version: String,
     machine: Machine,
@@ -449,6 +478,103 @@ pub struct ProfileMatrix {
     profiles: Vec<ProfileResult>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedAllocation {
+    status: &'static str,
+    cache_home_applicable: bool,
+    target_plus_store_bytes: Option<u64>,
+    cache_home_bytes: Option<u64>,
+    other_managed_bytes: Option<u64>,
+    retired_payload_bytes: Option<u64>,
+    total_managed_bytes: Option<u64>,
+    method: &'static str,
+    error: Option<String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct RetiredAllocationSnapshot {
+    tmp_identity: Option<(u64, u64)>,
+    queue_stamp: Option<crate::cache::hashing::Stamp>,
+    children: Vec<PathBuf>,
+}
+
+fn retired_allocation_snapshot(dirs: &Dirs) -> Result<RetiredAllocationSnapshot, String> {
+    let mut snapshot = RetiredAllocationSnapshot { tmp_identity: None, queue_stamp: None, children: Vec::new() };
+    let directory = |path: &Path| -> Result<Option<sys::Meta>, String> {
+        match sys::lstat(path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(Some(meta)),
+            Ok(_) => Err(format!("unsafe retired-payload directory {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
+    };
+    let Some(tmp) = directory(&dirs.tmp())? else { return Ok(snapshot) };
+    snapshot.tmp_identity = Some((tmp.dev(), tmp.ino()));
+    let queue = crate::cache::evicted_dir(dirs);
+    let Some(meta) = directory(&queue)? else { return Ok(snapshot) };
+    snapshot.queue_stamp = Some(crate::cache::hashing::Stamp::of(&meta));
+    snapshot.children = fs::read_dir(&queue).map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())).collect::<Result<_, _>>()?;
+    snapshot.children.sort();
+    Ok(snapshot)
+}
+
+fn managed_allocation(target: &Path, home: Option<&Path>) -> ManagedAllocation {
+    let method = "Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.";
+    let measured = (|| -> Result<_, String> {
+        let Some(home) = home else {
+            let target = compact::physical_size_checked(&[target]).map_err(|error| error.to_string())?;
+            return Ok((target, None, None, None, target));
+        };
+        let dirs = Dirs::at(home);
+        let store = dirs.store();
+        let retired = retired_allocation_snapshot(&dirs)?;
+        let retired_roots: Vec<_> = retired.children.iter().map(PathBuf::as_path).collect();
+        let mut target_store = vec![target];
+        let store_absent = match sys::lstat(&store) {
+            Ok(_) => { target_store.push(store.as_path()); false }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(format!("{}: {error}", store.display())),
+        };
+        let home_roots = [home];
+        let managed_roots = [target, home];
+        let measured = compact::physical_sizes_checked(&[target_store.as_slice(), &home_roots, &managed_roots, retired_roots.as_slice()])
+            .map_err(|error| error.to_string())?;
+        if retired_allocation_snapshot(&dirs)? != retired {
+            return Err("retired-payload queue identity or membership changed during inventory".into());
+        }
+        if store_absent {
+            match sys::lstat(&store) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(format!("optional allocation root changed during inventory: {}", store.display())),
+            }
+        }
+        let other = measured[2].checked_sub(measured[0]).ok_or("inconsistent managed allocation: target/store exceeds full union")?;
+        Ok((measured[0], Some(measured[1]), Some(other), Some(measured[3]), measured[2]))
+    })();
+    match measured {
+        Ok((target_plus_store, cache_home, other, retired, total)) => ManagedAllocation {
+            status: "available", cache_home_applicable: home.is_some(), target_plus_store_bytes: Some(target_plus_store),
+            cache_home_bytes: cache_home, other_managed_bytes: other, retired_payload_bytes: retired, total_managed_bytes: Some(total), method, error: None,
+        },
+        Err(error) => ManagedAllocation {
+            status: "unavailable", cache_home_applicable: home.is_some(), target_plus_store_bytes: None,
+            cache_home_bytes: None, other_managed_bytes: None, retired_payload_bytes: None, total_managed_bytes: None, method, error: Some(error),
+        },
+    }
+}
+
+fn managed_allocation_text(allocation: &ManagedAllocation) -> String {
+    match allocation.total_managed_bytes {
+        Some(total) => match allocation.other_managed_bytes {
+            Some(other) => format!("{} managed total ({} target plus store; {} other managed; {} retired payload breakdown)", human_bytes(total),
+                human_bytes(allocation.target_plus_store_bytes.unwrap()), human_bytes(other), human_bytes(allocation.retired_payload_bytes.unwrap())),
+            None => format!("{} managed total (Cargo target only)", human_bytes(total)),
+        },
+        None => format!("managed allocation unavailable: {}", allocation.error.as_deref().unwrap_or("unknown allocation error")),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ProfileResult {
     name: &'static str,
@@ -463,6 +589,8 @@ struct ProfileResult {
     frust_target_bytes: u64,
     frust_store_bytes: u64,
     frust_target_plus_store_bytes: u64,
+    cargo_managed_allocation: ManagedAllocation,
+    frust_managed_allocation: ManagedAllocation,
     same_directory_binaries_identical: bool,
     restored_binaries_identical: bool,
     runtime_outputs_equal: bool,
@@ -491,6 +619,7 @@ struct ProfileSample {
     target_bytes: u64,
     store_bytes: u64,
     target_plus_store_bytes: u64,
+    managed_allocation: ManagedAllocation,
 }
 
 fn expected_edit_output(output: &[u8], edit: u32) -> bool {
@@ -514,6 +643,16 @@ fn validate_build_evidence(run: &Run, phase: &str, frust: bool) -> Result<(), St
     if phase == "no-op" && (run.cache_hits != 0 || run.cache_misses != 0) {
         return Err(format!("no-op sample unexpectedly recorded {} cache hits and {} misses", run.cache_hits, run.cache_misses));
     }
+    if phase == "no-op" {
+        if run.rustc_call_count.is_some_and(|count| count != 0)
+            || run.rustc_query_invocations.as_ref().is_some_and(|queries| !queries.is_empty()) {
+            return Err("no-op sample unexpectedly executed rustc calls or queries".into());
+        }
+        let audited = run.rustc_invocations.is_some() || run.rustc_query_invocations.is_some() || run.rustc_call_count.is_some();
+        if audited && (run.rustc_invocations.is_none() || run.rustc_query_invocations.is_none() || run.rustc_call_count.is_none()) {
+            return Err("no-op sample is missing complete rustc call and query evidence".into());
+        }
+    }
     if phase == "clean rebuild" && frust && (run.cache_hits == 0 || run.cache_misses != 0) {
         return Err(format!("warm restore requires hits and zero misses, got {} hits and {} misses", run.cache_hits, run.cache_misses));
     }
@@ -536,7 +675,7 @@ fn evidence_failure(run: &Run, context: &str, reason: &str) -> String {
     format!("{context}: {reason}\nbuild evidence:\n{}", serde_json::to_string_pretty(run).unwrap_or_else(|error| format!("cannot serialize evidence: {error}")))
 }
 
-fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -> Result<ProfileMatrix, String> {
+fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str, store: StorePolicy) -> Result<ProfileMatrix, String> {
     let root = scratch.join("profile-matrix");
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
@@ -544,7 +683,7 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
     let fcargo = fcargo_beside(&exe);
     let wrapper = exe.with_file_name(format!("frust-wrap{}", std::env::consts::EXE_SUFFIX));
     let probe = Probe::run(None, &root).ok_or("could not query rustc")?;
-    let ctx = Ctx { cargo, fcargo, home: root.join("home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(&root)?, compression: compression.to_string() };
+    let ctx = Ctx { cargo, fcargo, home: root.join("home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(&root)?, compression: compression.to_string(), store };
     let load_before = load_average();
     let libs = if quick { 2 } else { 8 };
     let project = root.join("app");
@@ -578,7 +717,7 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
         resolve_offline(&warm_ctx, &warm_project)?;
         for frust in [false, true] {
             clear(&warm_target)?;
-            timed(&warm_ctx, frust, &mut build_command(&warm_ctx, frust, &warm_project, Some(&warm_target), &borrowed, "off"))?;
+            timed_with_store(&warm_ctx, frust, &mut build_command(&warm_ctx, frust, &warm_project, Some(&warm_target), &borrowed, "off"), store)?;
         }
         clear(&warm_target)?;
         clear(&warm_ctx.home)?;
@@ -601,7 +740,7 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
                         move_dir(&snapshots[arm], &target)?;
                     }
                     let mut cmd = build_command(&ctx, frust, &project, Some(&target), &borrowed, "off");
-                    let build = timed(&ctx, frust, &mut cmd)?;
+                    let build = timed_with_store(&ctx, frust, &mut cmd, store)?;
                     validate_build_evidence(&build, phase, frust).map_err(|reason| {
                         evidence_failure(&build, &format!("{name}, repetition {}, {}, {phase}", rep + 1, if frust { "frust" } else { "cargo" }), &reason)
                     })?;
@@ -632,6 +771,7 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
                         target_bytes: fsx::physical_size(&[&target]),
                         store_bytes: if frust { fsx::physical_size(&[&dirs.store()]) } else { 0 },
                         target_plus_store_bytes: fsx::physical_size(&roots),
+                        managed_allocation: managed_allocation(&target, frust.then_some(ctx.home.as_path())),
                     });
                     move_dir(&target, &snapshots[arm])?;
                 }
@@ -652,6 +792,8 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
             frust_target_bytes: fsx::physical_size(&[&snapshots[1]]),
             frust_store_bytes: fsx::physical_size(&[&dirs.store()]),
             frust_target_plus_store_bytes: fsx::physical_size(&[&snapshots[1], &dirs.store()]),
+            cargo_managed_allocation: managed_allocation(&snapshots[0], None),
+            frust_managed_allocation: managed_allocation(&snapshots[1], Some(&ctx.home)),
             same_directory_binaries_identical: true, restored_binaries_identical: true, runtime_outputs_equal: true,
         });
     }
@@ -659,13 +801,15 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
     if !cargo_version.status.success() { return Err("cargo --version failed".into()); }
     Ok(ProfileMatrix {
         evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
+        store_policy: store,
+        store_completion_method: store.completion_method(),
         rustc_verbose: probe.rustc_verbose,
         cargo_version: String::from_utf8_lossy(&cargo_version.stdout).trim().to_string(),
         machine: machine_context(load_before), cache_compression: compression.to_string(),
         filesystem: sys::fs_type_name(&root), reflink_supported: fsx::reflink_supported(&root),
         warmup: "One untimed trivial compile per tool and profile; isolated targets and cache, outside the measured graph.",
         compiler_audit_available: ctx.audit.is_some(),
-        compiler_audit_method: "Stable RUSTC shim retains every actual --emit compilation, excluding --print/version queries. Declared Cargo units have artifact-notification flags and normal unit output directories. Build-script capability probes require metadata-only output strictly inside profile/build/<unit-hash>/out/<subdirectory>, without Cargo artifact notifications; all other calls are unknown. Warm restores require zero declared-unit and unknown compilations, zero ledger misses and positive cache hits; compiler probes remain visible and contribute to wall time. cargo_compile_notices counts stderr Compiling diagnostics, not actual compiler invocations. No-ops require zero notices, cache hits/misses and audited compiler calls. Build wall times include audit shell startup/logging. Byte identity uses one source and target path; every measured binary is executed.",
+        compiler_audit_method: "Stable RUSTC shim retains every backend call. rustc_query_invocations contains version/help and known inspection-only --print queries, including queries with --emit; rustc_invocations and compilation counts contain the remaining calls. Compilation-bearing, unknown or malformed print requests are never hidden as queries. rustc_call_count counts both. Declared Cargo units have artifact-notification flags and normal unit output directories. Build-script capability probes require metadata-only output strictly inside profile/build/<unit-hash>/out/<subdirectory>, without Cargo artifact notifications; all other non-query calls are unknown. Warm restores require zero declared-unit and unknown compilations, zero ledger misses and positive cache hits; queries and compiler capability probes remain visible and contribute to wall time. cargo_compile_notices counts stderr Compiling diagnostics, not actual compiler invocations. No-ops require zero notices, cache hits/misses and all audited backend calls. Build wall times include audit shell startup/logging. Byte identity uses one source and target path; every measured binary is executed.",
         frontend_blake3: crate::cache::hash_file(&ctx.fcargo).map_err(|e| e.to_string())?,
         wrapper_blake3: crate::cache::hash_file(&wrapper).map_err(|e| e.to_string())?,
         local_crates: libs, registry_deps: registry, profiles,
@@ -673,13 +817,68 @@ fn profile_matrix(scratch: &Path, quick: bool, runs: usize, compression: &str) -
 }
 
 fn print_profile_matrix(report: &ProfileMatrix) {
+    println!("Store policy: {} (build times measure foreground completion)", report.store_policy.label());
     for profile in &report.profiles {
         println!("{} (lto={}, codegen-units={}, panic={})", profile.name, profile.lto, profile.codegen_units, profile.panic);
         for summary in &profile.summaries {
             println!("  {:<14} {:<6} {}ms [{}–{}], n={}", summary.phase, summary.tool, summary.median_ms, summary.min_ms, summary.max_ms, summary.runs);
         }
+        if report.store_policy == StorePolicy::Deferred {
+            for phase in ["cold", "clean rebuild", "no-op", "edit"] {
+                let mut drains: Vec<_> = profile.samples.iter().filter(|sample| sample.tool == "frust" && sample.phase == phase)
+                    .filter_map(|sample| sample.build.store_drain_millis).collect();
+                let mut settled: Vec<_> = profile.samples.iter().filter(|sample| sample.tool == "frust" && sample.phase == phase)
+                    .filter_map(|sample| sample.build.settled_millis).collect();
+                if !drains.is_empty() {
+                    let drain_median = median(&mut drains);
+                    let settled_median = median(&mut settled);
+                    println!("  {phase:<14} frust observed store drain {}ms [{}–{}]; settled {}ms [{}–{}]", drain_median, drains[0], drains[drains.len()-1], settled_median, settled[0], settled[settled.len()-1]);
+                }
+            }
+        }
         println!("  Cargo target {}; frust target plus store {}; binaries and runtime outputs matched", human_bytes(profile.cargo_target_bytes), human_bytes(profile.frust_target_plus_store_bytes));
+        println!("  Cargo {}; frust {}", managed_allocation_text(&profile.cargo_managed_allocation), managed_allocation_text(&profile.frust_managed_allocation));
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorePolicy { Sync, Deferred }
+
+impl StorePolicy {
+    fn label(self) -> &'static str {
+        match self { Self::Sync => "sync", Self::Deferred => "deferred" }
+    }
+
+    fn scratch_prefix(self, keep: bool) -> &'static str {
+        if keep || self == Self::Deferred { "frust-bench-retained" } else { "frust-bench" }
+    }
+
+    fn completion_method(self) -> &'static str {
+        match self {
+            Self::Sync => "Build samples use synchronous cache storage; millis measures foreground completion including storage. Drain and settled fields are omitted.",
+            Self::Deferred => "Build samples retain foreground millis, plus observed time from child exit until no job files remain and all existing slot locks are held exclusively together. Settled millis run from child start through that proof; helper counts and fallback frequency are not inferred. Maintenance rows and the separate churn section remain synchronous.",
+        }
+    }
+}
+
+fn store_from_flags(flags: &[String]) -> Result<StorePolicy, String> {
+    let mut selected = None;
+    for (index, flag) in flags.iter().enumerate() {
+        let value = if flag == "--store" { Some(flags.get(index + 1).map(String::as_str).unwrap_or("")) }
+            else { flag.strip_prefix("--store=") };
+        let Some(value) = value else { continue };
+        if selected.is_some() { return Err("--store may be specified only once".into()); }
+        selected = Some(match value {
+            "sync" => StorePolicy::Sync,
+            "deferred" => StorePolicy::Deferred,
+            _ => return Err(format!("--store requires sync or deferred, got `{value}`")),
+        });
+    }
+    if selected.is_some() && flags.iter().any(|flag| matches!(flag.as_str(), "--growth" | "--churn" | "--linking" | "--latency")) {
+        return Err("--store is supported only with the general benchmark or --profiles, without --growth, --churn, --linking or --latency".into());
+    }
+    Ok(selected.unwrap_or(StorePolicy::Sync))
 }
 
 fn compression_from_flags(flags: &[String]) -> Result<String, String> {
@@ -909,7 +1108,7 @@ fn linking_bench(scratch: &Path, quick: bool, runs: usize) -> Result<LinkReport,
     {
         return Err("--linking requires a compiler native to the current host".into());
     }
-    let ctx = Ctx { cargo, fcargo, home: scratch.join("link-home"), probe_id: probe.id, audit: CompilerAudit::create(scratch)?, compression: "auto".into() };
+    let ctx = Ctx { cargo, fcargo, home: scratch.join("link-home"), probe_id: probe.id, audit: CompilerAudit::create(scratch)?, compression: "auto".into(), store: StorePolicy::Sync };
     let project = scratch.join("linking").join("app");
     let libs = if quick { 4 } else { 12 };
     let registry = write_growth_project(&project, libs, true).and_then(|_| resolve_offline(&ctx, &project)).is_ok();
@@ -1002,7 +1201,7 @@ fn warm_up(ctx: &Ctx, scratch: &Path) -> Result<(), String> {
     let dir = scratch.join("warmup");
     let project = dir.join("app");
     write_project(&project, 0, false)?;
-    let warm = Ctx { cargo: ctx.cargo.clone(), fcargo: ctx.fcargo.clone(), home: dir.join("home"), probe_id: ctx.probe_id.clone(), audit: ctx.audit.clone(), compression: ctx.compression.clone() };
+    let warm = Ctx { home: dir.join("home"), ..ctx.clone() };
     let target = dir.join("target");
     let profiles: [&[&str]; 2] = [&[], &["--release"]];
     for extra in profiles {
@@ -1089,7 +1288,7 @@ fn app_binary(dir: &Path) -> PathBuf {
     dir.join(format!("app{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool, compression: &str) -> Result<Report, String> {
+fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool, compression: &str, store: StorePolicy) -> Result<Report, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -1098,7 +1297,7 @@ fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool, comp
         return Err("fcargo binary not found next to frust; install all binaries".into());
     }
     let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
-    let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(scratch)?, compression: compression.to_string() };
+    let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(scratch)?, compression: compression.to_string(), store };
     let load_before = load_average();
     warm_up(&ctx, scratch)?;
 
@@ -1264,6 +1463,8 @@ fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool, comp
     let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     Ok(Report {
         evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
+        store_policy: store,
+        store_completion_method: store.completion_method(),
         rustc: probe.release,
         cache_compression: ctx.compression.clone(),
         legacy_release_profile: "opt-level=3, full/fat LTO, codegen-units=1, panic=abort, incremental=false",
@@ -1291,7 +1492,7 @@ fn bench(scratch: &Path, quick: bool, runs: usize, s: &Styler, quiet: bool, comp
         runtime_median_us_frust: runtime.frust_us,
         runtime_outputs_equal: runtime.outputs_equal,
         churn: None,
-        profile_matrix: profile_matrix(scratch, quick, runs, &ctx.compression)?,
+        profile_matrix: profile_matrix(scratch, quick, runs, &ctx.compression, store)?,
     })
 }
 
@@ -1394,11 +1595,17 @@ fn validate_growth(report: &GrowthReport) -> Result<(), String> {
         return Err("growth benchmark did not record every variant's edit output".into());
     }
     for (variant, build) in &report.repeat_builds {
-        if report.compiler_audit_available && build.rustc_invocations.is_none() {
+        if report.compiler_audit_available && (build.rustc_invocations.is_none()
+            || build.rustc_query_invocations.is_none() || build.rustc_call_count.is_none()) {
             return Err("unchanged growth rebuild is missing available compiler audit evidence".into());
         }
         validate_build_evidence(build, "no-op", *variant != GrowthVariant::Cargo)
             .map_err(|reason| evidence_failure(build, &format!("{} unchanged growth rebuild", variant.label()), &reason))?;
+    }
+    if report.edit_policy == "settled" && (report.source_settlements.len() != report.outputs.len()
+        || report.source_settlements.iter().any(|(_, checks)| checks.len() != report.edits + 1
+            || checks.iter().any(|check| check.sources != report.libs + 1 || check.minimum_settle_slack_ns <= 0))) {
+        return Err("settled growth is missing safe source-stamp evidence for a build".into());
     }
     let expected = &report.outputs[0].1;
     if report.outputs.iter().any(|(_, output)| output != expected) {
@@ -1446,12 +1653,12 @@ const CHURN: [Config; 6] = [
 
 const EDITS: usize = 20;
 
-fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool, compression: &str) -> Result<ChurnReport, String> {
+fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool, compression: &str, keep_scratch: bool) -> Result<ChurnReport, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
     let fcargo = fcargo_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
     let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
-    let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(scratch)?, compression: compression.to_string() };
+    let ctx = Ctx { cargo, fcargo, home: scratch.join("frust-home"), probe_id: probe.id.clone(), audit: CompilerAudit::create(scratch)?, compression: compression.to_string(), store: StorePolicy::Sync };
     let libs = if quick { 3 } else { 6 };
     let proj = scratch.join("churn").join("app");
     let registry = write_project(&proj, libs, true).and_then(|_| resolve_offline(&ctx, &proj)).is_ok();
@@ -1462,7 +1669,7 @@ fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool, compression
     let dirs = Dirs::at(&ctx.home);
     let central = workspace::central_target(&dirs, Some(&canonical(&proj)), &ctx.probe_id);
     // Every build is a compaction pass here, showing the steady state the defaults converge to.
-    let auto_ctx = Ctx { cargo: ctx.cargo.clone(), fcargo: ctx.fcargo.clone(), home: scratch.join("frust-auto-home"), probe_id: ctx.probe_id.clone(), audit: ctx.audit.clone(), compression: ctx.compression.clone() };
+    let auto_ctx = Ctx { home: scratch.join("frust-auto-home"), ..ctx.clone() };
     let auto_dirs = Dirs::at(&auto_ctx.home);
     let auto_central = workspace::central_target(&auto_dirs, Some(&canonical(&proj)), &ctx.probe_id);
     let auto_opts = benchmark_auto_options(false);
@@ -1583,10 +1790,11 @@ fn churn_bench(scratch: &Path, quick: bool, s: &Styler, quiet: bool, compression
         max_scratch: max_scratch_bytes(),
         compression: compression.to_string(),
     };
-    let growth = growth_bench(&scratch.join("growth-loop"), &growth_opts, s, quiet)?;
+    let growth = growth_bench(&scratch.join("growth-loop"), &growth_opts, s, quiet, keep_scratch, false)?;
 
     let result = ChurnReport {
         evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
+        store_policy: StorePolicy::Sync,
         cache_compression: compression.to_string(),
         auto_compaction_policy: AutoCompactionPolicy::from(&auto_opts),
         configs,
@@ -1663,7 +1871,10 @@ pub struct GrowthRow {
     pub target: u64,
     pub store: u64,
     pub target_plus_store: u64,
+    pub managed_allocation: ManagedAllocation,
     pub rustc_compilations: Option<usize>,
+    pub source_settle_ms: u64,
+    pub cache_evidence: Option<GrowthCacheEvidence>,
     pub incremental_dir: u64,
     pub anatomy: compact::IncrementalAnatomy,
     pub crate_dirs: Vec<(String, u64)>,
@@ -1675,6 +1886,10 @@ pub struct GrowthRow {
 pub struct GrowthReport {
     pub evidence_schema_version: u32,
     pub cache_compression: String,
+    pub edit_policy: &'static str,
+    pub source_settle_timeout_ms: Option<u64>,
+    pub source_settlements: Vec<(GrowthVariant, Vec<SourceSettlement>)>,
+    pub cache_evidence_method: &'static str,
     pub compiler_audit_available: bool,
     pub auto_compaction_policy: AutoCompactionPolicy,
     pub libs: usize,
@@ -1740,6 +1955,158 @@ fn guard_scratch(scratch: &Path, max: u64) -> Result<(), String> {
     Ok(())
 }
 
+const SOURCE_SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn settle_edits_from_flags(flags: &[String]) -> Result<bool, String> {
+    let selected: Vec<_> = flags.iter().filter(|flag| flag.starts_with("--settle-edits")).collect();
+    if selected.is_empty() { return Ok(false); }
+    if selected.len() != 1 || selected[0] != "--settle-edits" || !flags.iter().any(|flag| flag == "--growth")
+        || flags.iter().any(|flag| matches!(flag.as_str(), "--profiles" | "--linking" | "--latency" | "--churn")) {
+        return Err("--settle-edits is a single flag supported only with --growth".into());
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceSettlement {
+    sources: usize,
+    coarse_sources: usize,
+    checked_ns: i128,
+    minimum_settle_slack_ns: i128,
+    wait_millis: u64,
+}
+
+fn source_settle_slack(stamp: &crate::cache::hashing::Stamp, now: i128) -> i128 {
+    let margin = if stamp.coarse() { crate::cache::hashing::SETTLE_MARGIN_NS } else { 100_000_000 };
+    now - margin - stamp.mtime_ns.max(stamp.ctime_ns)
+}
+
+type GrowthSourceStamps = Vec<(PathBuf, crate::cache::hashing::Stamp)>;
+
+// Settlement waits observe real stamps; the build clock starts only after the unchanged sources pass the compiler guard.
+fn wait_sources_settled(paths: &[PathBuf], timeout: Duration) -> Result<(SourceSettlement, GrowthSourceStamps), String> {
+    let started = Instant::now();
+    loop {
+        let stamps = paths.iter().map(|path| crate::cache::hashing::Stamp::read(path)
+            .map(|stamp| (path.clone(), stamp)).map_err(|error| format!("{}: {error}", path.display())))
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = crate::cache::hashing::now_ns();
+        if started.elapsed() > timeout {
+            return Err(format!("growth sources did not settle within {}ms; timestamps or source activity remain unsafe", timeout.as_millis()));
+        }
+        if stamps.iter().all(|(_, stamp)| !stamp.too_new_for(now))
+            && stamps.iter().all(|(path, stamp)| crate::cache::hashing::Stamp::read(path).ok().as_ref() == Some(stamp)) {
+            return Ok((SourceSettlement {
+                sources: stamps.len(), coarse_sources: stamps.iter().filter(|(_, stamp)| stamp.coarse()).count(), checked_ns: now,
+                minimum_settle_slack_ns: stamps.iter().map(|(_, stamp)| source_settle_slack(stamp, now)).min().unwrap_or(0),
+                wait_millis: started.elapsed().as_millis() as u64,
+            }, stamps));
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero()) else {
+            return Err(format!("growth sources did not settle within {}ms; timestamps or source activity remain unsafe", timeout.as_millis()));
+        };
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GrowthCacheEvidence {
+    nonzero_byte_miss_records: u64,
+    zero_byte_miss_records: u64,
+    observed_entry_keys: usize,
+    observed_entries_by_crate: std::collections::BTreeMap<String, usize>,
+    observed_entry_keys_by_crate: std::collections::BTreeMap<String, Vec<String>>,
+    retained_complete_entries: usize,
+    retained_unit_records: usize,
+    retained_unit_keys: usize,
+    retained_unit_missing_entries: usize,
+    max_retained_keys_per_unit: usize,
+    retained_keys_per_unit_limit: usize,
+    retired_payload_entries: usize,
+}
+
+fn growth_directory_entries(path: &Path) -> Result<Vec<PathBuf>, String> {
+    match sys::lstat(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => return Err(format!("unexpected growth evidence directory {}", path.display())),
+    }
+    fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))?
+        .map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())).collect()
+}
+
+struct GrowthLedgerSnapshot {
+    text: String,
+    identity: Option<(u64, u64)>,
+    _file: Option<fs::File>,
+}
+
+fn growth_ledger(dirs: &Dirs) -> Result<GrowthLedgerSnapshot, String> {
+    let path = dirs.ledger();
+    let named = match sys::lstat(&path) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && meta.ino() != 0 => meta,
+        Ok(_) => return Err("growth ledger is not an identifiable regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GrowthLedgerSnapshot { text: String::new(), identity: None, _file: None });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let expected = crate::cache::hashing::Stamp::of(&named);
+    let mut file = fs::File::open(&path).map_err(|error| error.to_string())?;
+    let matches = |meta: &sys::Meta| meta.is_file() && !meta.file_type().is_symlink()
+        && crate::cache::hashing::Stamp::of(meta) == expected;
+    if !matches(&sys::fstat(&file).map_err(|error| error.to_string())?) {
+        return Err("growth ledger changed while opening its snapshot".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| error.to_string())?;
+    if !matches(&sys::fstat(&file).map_err(|error| error.to_string())?)
+        || !matches(&sys::lstat(&path).map_err(|error| error.to_string())?) {
+        return Err("growth ledger changed while reading its snapshot".into());
+    }
+    Ok(GrowthLedgerSnapshot { text, identity: Some((expected.dev, expected.ino)), _file: Some(file) })
+}
+
+fn growth_ledger_added<'a>(before: &GrowthLedgerSnapshot, after: &'a GrowthLedgerSnapshot) -> Result<&'a str, String> {
+    if before.identity.is_some() && before.identity != after.identity {
+        return Err("growth ledger identity changed; cache outcome counts are unavailable".into());
+    }
+    after.text.strip_prefix(&before.text)
+        .ok_or_else(|| "growth ledger changed instead of appending; cache outcome counts are unavailable".into())
+}
+
+fn growth_store_records(dirs: &Dirs) -> Result<Vec<(String, crate::cache::EntryMeta)>, String> {
+    let mut records = Vec::new();
+    for shard in growth_directory_entries(&dirs.store())? {
+        for entry in growth_directory_entries(&shard)? {
+            let key = entry.file_name().and_then(|name| name.to_str()).ok_or("non-UTF-8 growth entry key")?;
+            if !crate::cache::valid_key(key) { return Err("invalid growth cache entry key".into()); }
+            if !sys::lstat(&entry).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) {
+                return Err("invalid growth cache entry directory".into());
+            }
+            let metadata = entry.join("meta.json");
+            if !sys::lstat(&metadata).is_ok_and(|meta| meta.is_file()) { return Err(format!("missing growth entry record {}", metadata.display())); }
+            let record: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&metadata).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("{}: {error}", metadata.display()))?;
+            let groups = crate::cache::metadata_slice::validate_groups(&record.files).map_err(|error| error.to_string())?;
+            if !crate::cache::safe_file_name(&record.stderr)
+                || !sys::lstat(&entry.join(&record.stderr)).is_ok_and(|meta| meta.is_file()) {
+                return Err("invalid growth entry stderr".into());
+            }
+            for group in groups {
+                let backing = &record.files[group.base_index];
+                let meta = sys::lstat(&entry.join(&backing.stored)).map_err(|error| error.to_string())?;
+                if meta.file_type().is_symlink() || if backing.dir { !meta.is_dir() } else { !meta.is_file() } {
+                    return Err("invalid growth entry backing".into());
+                }
+            }
+            records.push((key.to_string(), record));
+        }
+    }
+    Ok(records)
+}
+
 /// Every 40th step restores the snapshot taken 20 steps earlier; other steps edit `lib0`, `lib1` or the app in turn, alternating body and signature edits.
 struct GrowthScript {
     project: PathBuf,
@@ -1796,7 +2163,7 @@ impl GrowthScript {
     }
 }
 
-fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -> Result<GrowthReport, String> {
+fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool, keep_scratch: bool, settle_edits: bool) -> Result<GrowthReport, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
     let fcargo = fcargo_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
@@ -1807,11 +2174,15 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
     let audit = CompilerAudit::create(scratch)?;
     let proj = scratch.join("growth").join("app");
     let registry = write_growth_project(&proj, opts.libs, true)
-        .and_then(|_| resolve_offline(&Ctx { cargo: cargo.clone(), fcargo: fcargo.clone(), home: scratch.join("unused"), probe_id: probe.id.clone(), audit: None, compression: opts.compression.clone() }, &proj))
+        .and_then(|_| resolve_offline(&Ctx { cargo: cargo.clone(), fcargo: fcargo.clone(), home: scratch.join("unused"), probe_id: probe.id.clone(), audit: None, compression: opts.compression.clone(), store: StorePolicy::Sync }, &proj))
         .is_ok();
     let mut report = GrowthReport {
         evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
         cache_compression: opts.compression.clone(),
+        edit_policy: if settle_edits { "settled" } else { "immediate" },
+        source_settle_timeout_ms: settle_edits.then_some(SOURCE_SETTLE_TIMEOUT.as_millis() as u64),
+        source_settlements: Vec::new(),
+        cache_evidence_method: "Settled mode observes new entry keys after each synchronous build, validating descriptors and declared backing/stderr presence; this is not a full restore integrity test. Checked ledger append deltas count nonzero-byte and zero-byte misses without claiming publication from miss bytes; replacement or truncation fails the diagnostic. Unit records expose retained keys and missing entries. Other modes do not collect this diagnostic. Allocation and source-settle waiting are outside the build clock.",
         compiler_audit_available: audit.is_some(),
         auto_compaction_policy: AutoCompactionPolicy::from(&benchmark_auto_options(false)),
         libs: opts.libs,
@@ -1841,14 +2212,14 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
         );
     }
     for &variant in &opts.variants {
-        // Each variant replays the same edit script on a fresh project and removes its directories afterwards.
+        // Each variant replays the same edit script on a fresh project at the same source path.
         let project_parent = scratch.join("growth");
         if project_parent.exists() {
             fs::remove_dir_all(&project_parent).map_err(|e| e.to_string())?;
         }
         write_growth_project(&proj, opts.libs, registry)?;
         let home = scratch.join(format!("growth-home-{}", variant.label().replace('+', "-")));
-        let ctx = Ctx { cargo: cargo.clone(), fcargo: fcargo.clone(), home: home.clone(), probe_id: probe.id.clone(), audit: audit.clone(), compression: opts.compression.clone() };
+        let ctx = Ctx { cargo: cargo.clone(), fcargo: fcargo.clone(), home: home.clone(), probe_id: probe.id.clone(), audit: audit.clone(), compression: opts.compression.clone(), store: StorePolicy::Sync };
         if registry {
             resolve_offline(&ctx, &proj)?;
         }
@@ -1858,8 +2229,9 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
             _ => workspace::central_target(&dirs, Some(&canonical(&proj)), &probe.id),
         };
         let mut run = GrowthRun::new(&ctx, variant, &proj, &target, &dirs);
+        run.settle_edits = settle_edits;
         let mut script = GrowthScript { project: proj.clone(), libs: opts.libs, snapshot: Vec::new(), features: false };
-        let mut outcome: Result<(), String> = run.build(script.args()).map(|_| ());
+        let mut outcome = run.settle_sources(&script.sources()).and_then(|_| run.build(script.args()).map(|_| ()));
         let mut step = 0;
         while outcome.is_ok() {
             if step % opts.every == 0 || step == opts.edits {
@@ -1875,6 +2247,7 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
             outcome = guard_scratch(scratch, opts.max_scratch).and_then(|_| {
                 step += 1;
                 script.step(step)?;
+                run.settle_sources(&script.sources())?;
                 run.build(script.args()).map(|_| ())
             });
         }
@@ -1892,15 +2265,20 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool) -
             }
         }
         report.edit_outputs.push((variant, run.outputs.clone()));
-        if home.exists() {
-            fs::remove_dir_all(&home).map_err(|e| e.to_string())?;
-        }
-        if target.exists() {
-            fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
-        }
+        report.source_settlements.push((variant, run.source_settlements.clone()));
+        cleanup_growth_variant(&home, &target, keep_scratch)?;
     }
     validate_growth(&report)?;
     Ok(report)
+}
+
+fn cleanup_growth_variant(home: &Path, target: &Path, keep_scratch: bool) -> Result<(), String> {
+    if !keep_scratch {
+        for path in [home, target] {
+            if path.exists() { fs::remove_dir_all(path).map_err(|error| error.to_string())?; }
+        }
+    }
+    Ok(())
 }
 
 struct GrowthRun<'a> {
@@ -1914,18 +2292,95 @@ struct GrowthRun<'a> {
     build_ms: u64,
     rustc_compilations: Option<usize>,
     outputs: Vec<String>,
+    settle_edits: bool,
+    source_settle_ms: u64,
+    source_settlements: Vec<SourceSettlement>,
+    settled_sources: GrowthSourceStamps,
+    cache_evidence: GrowthCacheEvidence,
+    observed_entries: std::collections::HashSet<String>,
 }
 
 impl<'a> GrowthRun<'a> {
     fn new(ctx: &'a Ctx, variant: GrowthVariant, project: &'a Path, target: &'a Path, dirs: &'a Dirs) -> GrowthRun<'a> {
         let auto = benchmark_auto_options(false);
-        GrowthRun { ctx, variant, project, target, dirs, auto, cargo_compile_notices: 0, build_ms: 0, rustc_compilations: ctx.audit.as_ref().map(|_| 0), outputs: Vec::new() }
+        GrowthRun { ctx, variant, project, target, dirs, auto, cargo_compile_notices: 0, build_ms: 0, rustc_compilations: ctx.audit.as_ref().map(|_| 0), outputs: Vec::new(),
+            settle_edits: false, source_settle_ms: 0, source_settlements: Vec::new(), settled_sources: Vec::new(),
+            cache_evidence: GrowthCacheEvidence::default(), observed_entries: std::collections::HashSet::new() }
+    }
+
+    fn settle_sources(&mut self, sources: &[PathBuf]) -> Result<(), String> {
+        if !self.settle_edits { return Ok(()); }
+        let (proof, stamps) = wait_sources_settled(sources, SOURCE_SETTLE_TIMEOUT)?;
+        self.source_settle_ms += proof.wait_millis;
+        self.source_settlements.push(proof);
+        self.settled_sources = stamps;
+        Ok(())
+    }
+
+    fn revalidate_settled_sources(&self) -> Result<(), String> {
+        for (path, stamp) in &self.settled_sources {
+            if crate::cache::hashing::Stamp::read(path).ok().as_ref() != Some(stamp) {
+                return Err(format!("settled growth source changed unexpectedly: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_cache(&mut self, before: &GrowthLedgerSnapshot) -> Result<(), String> {
+        let after = growth_ledger(self.dirs)?;
+        let added = growth_ledger_added(before, &after)?;
+        for line in added.lines() {
+            let event: crate::events::Event = serde_json::from_str(line).map_err(|error| error.to_string())?;
+            if let crate::events::Event::Cache { result: crate::events::CacheResult::Miss, bytes, .. } = event {
+                if bytes == 0 { self.cache_evidence.zero_byte_miss_records += 1; }
+                else { self.cache_evidence.nonzero_byte_miss_records += 1; }
+            }
+        }
+        let records = growth_store_records(self.dirs)?;
+        let current: std::collections::HashSet<_> = records.iter().map(|(key, _)| key.as_str()).collect();
+        for (key, record) in &records {
+            if self.observed_entries.insert(key.clone()) {
+                *self.cache_evidence.observed_entries_by_crate.entry(record.crate_name.clone()).or_default() += 1;
+                self.cache_evidence.observed_entry_keys_by_crate.entry(record.crate_name.clone()).or_default().push(key.clone());
+            }
+        }
+        for keys in self.cache_evidence.observed_entry_keys_by_crate.values_mut() { keys.sort(); }
+        self.cache_evidence.observed_entry_keys = self.observed_entries.len();
+        self.cache_evidence.retained_complete_entries = records.len();
+        let mut unit_records = 0;
+        let mut unit_keys = 0;
+        let mut missing = 0;
+        let mut maximum = 0;
+        for shard in growth_directory_entries(&self.dirs.root().join(crate::cache::UNITS_DIR))? {
+            for path in growth_directory_entries(&shard)? {
+                if !sys::lstat(&path).is_ok_and(|meta| meta.is_file()) { return Err("invalid growth unit record".into()); }
+                let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+                let keys: Vec<_> = text.lines().collect();
+                if keys.iter().any(|key| !crate::cache::valid_key(key)) { return Err("invalid growth unit entry key".into()); }
+                unit_records += 1;
+                unit_keys += keys.len();
+                missing += keys.iter().filter(|key| !current.contains(**key)).count();
+                maximum = maximum.max(keys.len());
+            }
+        }
+        if maximum > crate::wrapper::UNIT_VERSIONS { return Err("growth unit version retention exceeded its limit".into()); }
+        self.cache_evidence.retained_unit_records = unit_records;
+        self.cache_evidence.retained_unit_keys = unit_keys;
+        self.cache_evidence.retained_unit_missing_entries = missing;
+        self.cache_evidence.max_retained_keys_per_unit = maximum;
+        self.cache_evidence.retained_keys_per_unit_limit = crate::wrapper::UNIT_VERSIONS;
+        self.cache_evidence.retired_payload_entries = growth_directory_entries(&crate::cache::evicted_dir(self.dirs))?.len();
+        Ok(())
     }
 
     /// fcargo's own automatic compaction is off here so only the variant's policy applies.
     fn build(&mut self, args: &[&str]) -> Result<Run, String> {
         let frust = self.variant != GrowthVariant::Cargo;
+        let before = if self.settle_edits && frust { Some(growth_ledger(self.dirs)?) } else { None };
+        self.revalidate_settled_sources()?;
         let (run, n) = build_logged(self.ctx, frust, self.project, self.target, args, &[("FRUST_AUTO_COMPACT", "off")])?;
+        self.revalidate_settled_sources()?;
+        if let Some(before) = before { self.observe_cache(&before)?; }
         if self.variant == GrowthVariant::Auto {
             compact::auto_compact_with(self.dirs, self.target, &self.auto);
         }
@@ -1962,7 +2417,10 @@ impl<'a> GrowthRun<'a> {
             target: compact::physical_size(&[self.target]),
             store,
             target_plus_store: if self.variant == GrowthVariant::Cargo { compact::physical_size(&[self.target]) } else { compact::physical_size(&[self.target, &self.dirs.store()]) },
+            managed_allocation: managed_allocation(self.target, (self.variant != GrowthVariant::Cargo).then_some(self.ctx.home.as_path())),
             rustc_compilations: self.rustc_compilations,
+            source_settle_ms: self.source_settle_ms,
+            cache_evidence: (self.settle_edits && self.variant != GrowthVariant::Cargo).then(|| self.cache_evidence.clone()),
             incremental_dir: compact::physical_size(&[&incremental]),
             anatomy: compact::incremental_anatomy(&profile),
             crate_dirs,
@@ -1988,6 +2446,12 @@ fn print_growth_row(r: &GrowthRow) {
         human_bytes(r.store),
         r.cargo_compile_notices
     );
+    println!("    {}", managed_allocation_text(&r.managed_allocation));
+    if let Some(evidence) = &r.cache_evidence {
+        println!("    {}ms source-settle wait outside builds; {} observed entry keys, {} retained entries; unit keys max {}/{}; misses {} nonzero-byte / {} zero-byte; {} retired payload entries",
+            r.source_settle_ms, evidence.observed_entry_keys, evidence.retained_complete_entries, evidence.max_retained_keys_per_unit,
+            evidence.retained_keys_per_unit_limit, evidence.nonzero_byte_miss_records, evidence.zero_byte_miss_records, evidence.retired_payload_entries);
+    }
 }
 
 fn print_growth(g: &GrowthReport, s: &Styler) {
@@ -2009,6 +2473,7 @@ fn print_growth(g: &GrowthReport, s: &Styler) {
             b.rustc_compilations.map_or("unavailable".to_string(), |calls| calls.to_string()),
             duration_ms(b.build_ms)
         );
+        println!("    {}", managed_allocation_text(&b.managed_allocation));
     }
     for (v, build) in &g.repeat_builds {
         let actual = build.rustc_invocations.as_ref().map_or("unavailable".to_string(), |calls| calls.len().to_string());
@@ -2174,7 +2639,7 @@ fn latency_bench(scratch: &Path, flags: &[String], quick: bool, s: &Styler, quie
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
     let probe = Probe::run(None, scratch).ok_or("could not query rustc")?;
-    let ctx = Ctx { cargo: cargo.clone(), fcargo: cargo, home: scratch.join("unused-home"), probe_id: probe.id, audit: CompilerAudit::create(scratch)?, compression: "auto".into() };
+    let ctx = Ctx { cargo: cargo.clone(), fcargo: cargo, home: scratch.join("unused-home"), probe_id: probe.id, audit: CompilerAudit::create(scratch)?, compression: "auto".into(), store: StorePolicy::Sync };
     let proj = scratch.join("latency").join("app");
     let registry = write_growth_project(&proj, libs, true).and_then(|_| resolve_offline(&ctx, &proj)).is_ok();
     if !registry {
@@ -2347,6 +2812,8 @@ fn build_logged(ctx: &Ctx, frust: bool, project: &Path, target: &Path, args: &[&
 }
 
 struct Captured {
+    started: Instant,
+    exited: Instant,
     success: bool,
     stderr: String,
     millis: u64,
@@ -2372,10 +2839,11 @@ fn spawn_capture(cmd: &mut Command) -> Result<Captured, String> {
         });
     }
     let status = child.wait().map_err(|e| e.to_string())?;
-    let millis = started.elapsed().as_millis() as u64;
+    let exited = Instant::now();
+    let millis = exited.duration_since(started).as_millis() as u64;
     let _ = done_rx.recv_timeout(DRAIN);
     let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    Ok(Captured { success: status.success(), stderr: String::from_utf8_lossy(&bytes).into_owned(), millis })
+    Ok(Captured { started, exited, success: status.success(), stderr: String::from_utf8_lossy(&bytes).into_owned(), millis })
 }
 
 fn failure_tail(text: &str) -> String {
@@ -2387,6 +2855,7 @@ fn failure_tail(text: &str) -> String {
 fn print_churn(c: &ChurnReport, s: &Styler) {
     println!();
     println!("{}", s.bold("Churn summary"));
+    println!("  store policy                  {}", c.store_policy.label());
     let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { (1.0 - a as f64 / b as f64) * 100.0 };
     println!("  configurations built          {}", c.configs.len());
     println!("  plain cargo, accumulated      {}", human_bytes(c.cargo_target));
@@ -2632,9 +3101,16 @@ fn guard_disk(scratch: &Path) -> Result<(), String> {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Run {
     millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_drain_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settled_millis: Option<u64>,
     sequence: u64,
     cargo_compile_notices: usize,
+    // Queries stay separate so existing compilation totals keep their meaning.
     rustc_invocations: Option<Vec<Vec<String>>>,
+    rustc_query_invocations: Option<Vec<Vec<String>>>,
+    rustc_call_count: Option<usize>,
     rustc_invocation_classes: Option<Vec<CompilationClass>>,
     rustc_compilation_counts: Option<CompilationCounts>,
     cache_hits: u64,
@@ -2679,6 +3155,51 @@ fn rustc_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     })
 }
 
+fn rustc_query(args: &[String]) -> bool {
+    const INSPECTION_PRINTS: &[&str] = &[
+        "calling-conventions", "cfg", "code-models", "crate-name", "deployment-target", "file-names", "host-tuple",
+        "relocation-models", "split-debuginfo", "stack-protector-strategies", "sysroot", "target-cpus", "target-features",
+        "target-libdir", "target-list", "tls-models",
+    ];
+    const VALUE_OPTIONS: &[&str] = &[
+        "--cap-lints", "--cfg", "--check-cfg", "--codegen", "--color", "--crate-name", "--crate-type", "--diagnostic-width",
+        "--edition", "--emit", "--error-format", "--extern", "--force-warn", "--json", "--out-dir", "--remap-path-prefix",
+        "--remap-path-scope", "--sysroot", "--target", "-A", "-C", "-D", "-F", "-L", "-W", "-Z", "-l", "-o",
+    ];
+    let mut query = false;
+    let mut print_paths = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" || arg.starts_with('@') { return false; }
+        let print = if arg == "--print" {
+            let Some(value) = iter.next() else { return false };
+            Some(value.as_str())
+        } else { arg.strip_prefix("--print=") };
+        if let Some(print) = print {
+            // rustc takes one kind per flag; commas and later '=' belong to an output path.
+            let (kind, output) = print.split_once('=').map_or((print, None), |(kind, path)| (kind, Some(path)));
+            if !INSPECTION_PRINTS.contains(&kind) { return false; }
+            if let Some(path) = output {
+                if path.is_empty() || path != "-" && print_paths.contains(&path) { return false; }
+                if path != "-" { print_paths.push(path); }
+            }
+            query = true;
+        } else if matches!(arg.as_str(), "-V" | "-vV" | "--version" | "-h" | "--help") {
+            query = true;
+        } else if VALUE_OPTIONS.contains(&arg.as_str()) {
+            if iter.next().is_none() { return false; }
+        } else if arg.starts_with("--") {
+            if !arg.split_once('=').is_some_and(|(name, _)| VALUE_OPTIONS.contains(&name)) && arg != "--test" && arg != "--verbose" {
+                return false;
+            }
+        } else if arg.starts_with('-') && arg != "-" && !["-A", "-C", "-D", "-F", "-L", "-W", "-Z", "-l", "-o"]
+            .iter().any(|&prefix| arg.starts_with(prefix) && arg.len() > prefix.len()) {
+            return false;
+        }
+    }
+    query
+}
+
 fn classify_compilation(args: &[String]) -> CompilationClass {
     let Some(out) = rustc_flag(args, "--out-dir").map(Path::new) else { return CompilationClass::Unknown };
     let artifact_notifications = rustc_flag(args, "--json").is_some_and(|values| values.split(',').any(|value| value == "artifacts"));
@@ -2702,7 +3223,7 @@ fn classify_compilation(args: &[String]) -> CompilationClass {
     let parts = out.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
     let Some(parts) = parts else { return CompilationClass::Unknown };
     let probe_directory = parts.windows(5).any(|parts| {
-        let profile = matches!(parts[0], "debug" | "release");
+        let profile = matches!(parts[0], "debug" | "release" | "coldone" | "coldtwo");
         let unit_hash = parts[2].rsplit_once('-').is_some_and(|(name, hash)| {
             !name.is_empty() && hash.len() >= 8 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
@@ -2749,7 +3270,86 @@ fn build_command(ctx: &Ctx, frust: bool, project: &Path, target: Option<&Path>, 
     cmd
 }
 
+struct DeferredSlots(Vec<(PathBuf, fs::File)>);
+
+impl Drop for DeferredSlots {
+    fn drop(&mut self) {
+        for (_, file) in &self.0 { let _ = sys::unlock(file); }
+    }
+}
+
+fn deferred_entries(directory: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+    match fs::read_dir(directory) {
+        Ok(entries) => entries.map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>().map(Some).map_err(|error| format!("{}: {error}", directory.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", directory.display())),
+    }
+}
+
+fn deferred_slots(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut slots: Vec<_> = paths.iter().filter(|path| path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"slot-")))
+        .cloned().collect();
+    slots.sort(); slots
+}
+
+fn has_deferred_jobs(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"job-") && name.as_encoded_bytes().ends_with(b".json")))
+}
+
+fn deferred_stores_idle(home: &Path) -> Result<bool, String> {
+    let directory = Dirs::at(home).deferred();
+    let Some(paths) = deferred_entries(&directory)? else { return Ok(true) };
+    if has_deferred_jobs(&paths) { return Ok(false); }
+    let slots = deferred_slots(&paths);
+    let mut held = DeferredSlots(Vec::new());
+    for path in &slots {
+        let named = sys::lstat(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if !named.is_file() || named.file_type().is_symlink() || named.nlink() != 1 || named.ino() == 0 {
+            return Err(format!("unsafe deferred slot {}", path.display()));
+        }
+        let file = fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error| error.to_string())?;
+        let opened = sys::fstat(&file).map_err(|error| error.to_string())?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) || !opened.is_file() || opened.nlink() != 1 { return Ok(false); }
+        match sys::try_lock(&file, sys::LockKind::Exclusive) {
+            Ok(()) => held.0.push((path.clone(), file)),
+            Err(fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(fs::TryLockError::Error(error)) => return Err(format!("{}: {error}", path.display())),
+        }
+    }
+    // All existing slots stay locked together through the final job and pathname recheck.
+    let Some(after) = deferred_entries(&directory)? else { return Ok(false) };
+    if has_deferred_jobs(&after) || deferred_slots(&after) != slots { return Ok(false); }
+    for (path, file) in &held.0 {
+        let current = sys::lstat(path).map_err(|error| error.to_string())?;
+        let opened = sys::fstat(file).map_err(|error| error.to_string())?;
+        if !current.is_file() || current.file_type().is_symlink() || current.nlink() != 1
+            || (current.dev(), current.ino()) != (opened.dev(), opened.ino()) { return Ok(false); }
+    }
+    Ok(true)
+}
+
+/// Waits only on this benchmark's isolated home; completion proves no pending job and exclusive ownership of every existing slot.
+pub fn drain_deferred_stores(home: &Path, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if deferred_stores_idle(home)? { return Ok(()); }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Err(format!("deferred stores did not drain within {}ms in {}", timeout.as_millis(), home.display()));
+        };
+        if remaining.is_zero() { return Err(format!("deferred stores did not drain in {}", home.display())); }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 fn timed(ctx: &Ctx, frust: bool, cmd: &mut Command) -> Result<Run, String> {
+    timed_with_store(ctx, frust, cmd, ctx.store)
+}
+
+fn timed_with_store(ctx: &Ctx, frust: bool, cmd: &mut Command, store: StorePolicy) -> Result<Run, String> {
+    cmd.env("FRUST_STORE_SYNC", if store == StorePolicy::Sync { "1" } else { "0" });
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let audit_dir = ctx.audit.as_ref().map(|audit| audit.logs.join(sequence.to_string()));
@@ -2762,11 +3362,16 @@ fn timed(ctx: &Ctx, frust: bool, cmd: &mut Command) -> Result<Run, String> {
     fs::write(dirs.auto_gc_marker(), b"").map_err(|e| e.to_string())?;
     let before = crate::stats::totals(&crate::stats::read_ledger(&dirs));
     let captured = spawn_capture(cmd)?;
+    let (store_drain_millis, settled_millis) = if frust && store == StorePolicy::Deferred {
+        drain_deferred_stores(&ctx.home, Duration::from_secs(120)).map_err(|error| format!("deferred-store drain failed: {error}"))?;
+        let settled = Instant::now();
+        (Some(settled.duration_since(captured.exited).as_millis() as u64), Some(settled.duration_since(captured.started).as_millis() as u64))
+    } else { (None, None) };
     if !captured.success {
         return Err(format!("build failed:\n{}", failure_tail(&captured.stderr)));
     }
     let after = crate::stats::totals(&crate::stats::read_ledger(&dirs));
-    let rustc_invocations = audit_dir.map(|dir| {
+    let rustc_calls = audit_dir.map(|dir| {
         let mut paths = fs::read_dir(dir).map_err(|e| e.to_string())?
             .map(|e| e.map(|e| e.path()).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
         paths.sort();
@@ -2774,13 +3379,21 @@ fn timed(ctx: &Ctx, frust: bool, cmd: &mut Command) -> Result<Run, String> {
             bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
         })).collect::<Result<Vec<Vec<String>>, String>>()
     }).transpose()?;
+    let rustc_call_count = rustc_calls.as_ref().map(Vec::len);
+    let (rustc_queries, rustc_compiles): (Vec<_>, Vec<_>) = rustc_calls.into_iter().flatten().partition(|args| rustc_query(args));
+    let rustc_invocations = rustc_call_count.map(|_| rustc_compiles);
+    let rustc_query_invocations = rustc_call_count.map(|_| rustc_queries);
     let rustc_invocation_classes = rustc_invocations.as_ref().map(|invocations| invocations.iter().map(|args| classify_compilation(args)).collect());
     let rustc_compilation_counts = rustc_invocations.as_ref().map(|invocations| CompilationCounts::from_invocations(invocations));
     Ok(Run {
         millis: captured.millis,
+        store_drain_millis,
+        settled_millis,
         sequence,
         cargo_compile_notices: captured.stderr.lines().filter(|l| l.trim_start().starts_with("Compiling ")).count(),
         rustc_invocations,
+        rustc_query_invocations,
+        rustc_call_count,
         rustc_invocation_classes,
         rustc_compilation_counts,
         cache_hits: if frust { after.hits.saturating_sub(before.hits) } else { 0 },
@@ -2942,6 +3555,8 @@ fn write_lib_with(dir: &Path, index: usize, registry: bool, growth: bool) -> Res
 fn print_report(report: &Report, s: &Styler) {
     println!();
     println!("{}", s.bold("Summary"));
+    println!("  store policy                  {} (build times measure foreground completion)", report.store_policy.label());
+    println!("  {}", s.dim(report.store_completion_method));
     let m = &report.machine;
     println!("  machine                       {}, {} ({} cores), rustc {}", m.os, m.cpu, m.cores, report.rustc);
     let load = |v: Option<f64>| v.map_or("unavailable".to_string(), |l| format!("{l:.2}"));
@@ -3012,6 +3627,163 @@ mod tests {
     use super::*;
 
     #[test]
+    fn store_policy_defaults_to_sync_and_accepts_general_and_profile_modes() {
+        let flags = |values: &[&str]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        assert_eq!(store_from_flags(&[]).unwrap(), StorePolicy::Sync);
+        assert_eq!(store_from_flags(&flags(&["--store=sync"])).unwrap(), StorePolicy::Sync);
+        assert_eq!(store_from_flags(&flags(&["--store", "deferred"])).unwrap(), StorePolicy::Deferred);
+        assert_eq!(store_from_flags(&flags(&["--profiles", "--store=sync"])).unwrap(), StorePolicy::Sync);
+        assert_eq!(store_from_flags(&flags(&["--profiles", "--store", "deferred"])).unwrap(), StorePolicy::Deferred);
+    }
+
+
+    #[test]
+    fn retained_deferred_scratch_survives_abandoned_sweep_but_success_still_cleans() {
+        let root = std::env::temp_dir().join(format!("frust-bench-retention-test-{}", std::process::id()));
+        let dead = (1_000_000_000..1_000_000_100).find(|pid| !sys::pid_alive(*pid)).expect("a verified dead positive PID");
+        let ordinary = root.join(format!("{}-{dead}", StorePolicy::Sync.scratch_prefix(false)));
+        let retained = root.join(format!("{}-{dead}", StorePolicy::Deferred.scratch_prefix(false)));
+        assert_eq!(StorePolicy::Sync.scratch_prefix(true), StorePolicy::Deferred.scratch_prefix(false));
+        for path in [&ordinary, &retained] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("payload"), b"owned benchmark fixture").unwrap();
+        }
+        remove_abandoned_scratch(&root);
+        assert!(!ordinary.exists());
+        assert_eq!(fs::read(retained.join("payload")).unwrap(), b"owned benchmark fixture");
+        let success = root.join(format!("{}-{}", StorePolicy::Deferred.scratch_prefix(false), std::process::id()));
+        fs::create_dir(&success).unwrap();
+        drop(Scratch(success.clone(), false));
+        assert!(!success.exists(), "deferred success without --keep-scratch still cleans normally");
+        fs::create_dir(&success).unwrap();
+        drop(Scratch(success.clone(), true));
+        remove_abandoned_scratch(&root);
+        assert!(success.is_dir(), "a failed deferred drain preserves its original paths");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn growth_variant_cleanup_retains_original_data_only_when_requested() {
+        let root = std::env::temp_dir().join(format!("frust-bench-growth-retention-test-{}", std::process::id()));
+        let home = root.join("home");
+        let target = root.join("target");
+        for directory in [&home, &target] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("payload"), b"original dataset").unwrap();
+        }
+        let before = sys::lstat(&home.join("payload")).unwrap();
+        cleanup_growth_variant(&home, &target, true).unwrap();
+        let retained = sys::lstat(&home.join("payload")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (retained.dev(), retained.ino()));
+        assert_eq!(fs::read(target.join("payload")).unwrap(), b"original dataset");
+        cleanup_growth_variant(&home, &target, false).unwrap();
+        assert!(!home.exists() && !target.exists());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn managed_allocation_separates_other_and_retired_from_nested_target_and_shared_payload() {
+        let home = std::env::temp_dir().join(format!("frust-bench-managed-allocation-test-{}", std::process::id()));
+        let target = home.join("targets/current");
+        let store = home.join("store");
+        let control = home.join("manifests");
+        let temporary = home.join("tmp");
+        let retired = temporary.join("evicted");
+        for path in [&target, &store, &control, &temporary, &retired] { fs::create_dir_all(path).unwrap(); }
+        let empty = managed_allocation(&target, Some(&home));
+        assert_eq!(empty.retired_payload_bytes, Some(0), "an empty persistent queue has no stranded payload");
+        let payload = target.join("artifact");
+        let pending = temporary.join("staged");
+        fs::write(&payload, vec![7; 4096]).unwrap();
+        fs::write(&pending, vec![9; 4096]).unwrap();
+        fs::hard_link(&payload, store.join("payload")).unwrap();
+        fs::hard_link(&payload, control.join("shared")).unwrap();
+        fs::hard_link(&payload, retired.join("shared-retired")).unwrap();
+        let retired_file = retired.join("old-payload");
+        fs::write(&retired_file, vec![11; 4096]).unwrap();
+        let bytes = |path: &Path| sys::lstat(path).unwrap().allocated();
+        let artifacts = bytes(&target) + bytes(&store) + bytes(&payload);
+        let metadata = bytes(&home) + bytes(&home.join("targets")) + bytes(&control) + bytes(&temporary) + bytes(&pending)
+            + bytes(&retired) + bytes(&retired_file);
+        let measured = managed_allocation(&target, Some(&home));
+        assert_eq!(measured.status, "available", "{:?}", measured.error);
+        assert_eq!(measured.target_plus_store_bytes, Some(artifacts));
+        assert_eq!(measured.other_managed_bytes, Some(metadata));
+        assert_eq!(measured.retired_payload_bytes, Some(bytes(&payload) + bytes(&retired_file)));
+        assert_eq!(measured.cache_home_bytes, Some(artifacts + metadata));
+        assert_eq!(measured.total_managed_bytes, Some(artifacts + metadata));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn missing_managed_allocation_serializes_as_unavailable_not_zero() {
+        let root = std::env::temp_dir().join(format!("frust-bench-missing-allocation-{}", std::process::id()));
+        assert!(!root.exists());
+        let measured = serde_json::to_value(managed_allocation(&root, None)).unwrap();
+        assert_eq!(measured["status"], "unavailable");
+        assert!(measured["total_managed_bytes"].is_null());
+        assert!(measured["cache_home_bytes"].is_null());
+        assert!(measured["error"].as_str().is_some_and(|error| error.contains("frust-bench-missing-allocation")));
+    }
+
+    #[test]
+    fn growth_ledger_rejects_same_prefix_replacement_and_accepts_real_append() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-growth-ledger-proof"));
+        fs::create_dir(&root).unwrap();
+        let dirs = Dirs::at(&root);
+        let absent = growth_ledger(&dirs).unwrap();
+        fs::write(dirs.ledger(), b"first record\n").unwrap();
+        let first = growth_ledger(&dirs).unwrap();
+        assert_eq!(growth_ledger_added(&absent, &first).unwrap(), "first record\n");
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new().append(true).open(dirs.ledger()).unwrap();
+            file.write_all(b"second record\n").unwrap();
+        }
+        let appended = growth_ledger(&dirs).unwrap();
+        assert_eq!(growth_ledger_added(&first, &appended).unwrap(), "second record\n");
+        let replacement = root.join("replacement");
+        fs::write(&replacement, format!("{}third record\n", appended.text)).unwrap();
+        sys::rename(&replacement, &dirs.ledger()).unwrap();
+        let replaced = growth_ledger(&dirs).unwrap();
+        assert_ne!(appended.identity, replaced.identity);
+        assert!(replaced.text.starts_with(&appended.text));
+        assert!(growth_ledger_added(&appended, &replaced).unwrap_err().contains("identity changed"));
+        fs::write(dirs.ledger(), b"first record\n").unwrap();
+        let truncated = growth_ledger(&dirs).unwrap();
+        assert!(growth_ledger_added(&replaced, &truncated).is_err());
+        drop((first, appended, replaced, truncated));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_settle_checks_match_fine_and_coarse_stamp_safety() {
+        let fine = crate::cache::hashing::Stamp { dev: 1, ino: 1, size: 1, mtime_ns: 10_500_000_001, ctime_ns: 10_500_000_001 };
+        let coarse = crate::cache::hashing::Stamp { mtime_ns: 10_000_000_000, ctime_ns: 10_000_000_000, ..fine };
+        for stamp in [fine, coarse] {
+            for now in [10_550_000_000, 10_700_000_000, 12_000_000_000, 12_100_000_000] {
+                assert_eq!(source_settle_slack(&stamp, now) > 0, !stamp.too_new_for(now));
+            }
+        }
+    }
+
+    #[test]
+    fn source_settle_timeout_preserves_fresh_inputs_and_success_records_real_stamps() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-source-settlement"));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("lib.rs");
+        fs::write(&source, b"pub fn value() -> u32 { 7 }\n").unwrap();
+        let original = crate::cache::hashing::Stamp::read(&source).unwrap();
+        assert!(wait_sources_settled(std::slice::from_ref(&source), Duration::ZERO).is_err());
+        let (proof, stamps) = wait_sources_settled(std::slice::from_ref(&source), SOURCE_SETTLE_TIMEOUT).unwrap();
+        assert_eq!(proof.sources, 1);
+        assert!(proof.minimum_settle_slack_ns > 0);
+        assert_eq!(stamps[0].1, original);
+        assert_eq!(crate::cache::hashing::Stamp::read(&source).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn observable_edits_replace_the_body_input_without_growing_source() {
         let root = std::env::temp_dir().join(format!("frust-bench-edit-test-{}", std::process::id()));
         write_project(&root, 0, false).unwrap();
@@ -3034,7 +3806,7 @@ mod tests {
         let actual = vec![["--crate-name", "app", "--emit=metadata,link", "--json=artifacts", "--out-dir", "/target/release/deps"].into_iter().map(str::to_string).collect()];
         let compiled = Run { rustc_invocations: Some(actual), cargo_compile_notices: 1, ..Run::default() };
         let restored = Run { rustc_invocations: Some(Vec::new()), cargo_compile_notices: 1, cache_hits: 1, ..Run::default() };
-        let noop = Run { rustc_invocations: Some(Vec::new()), ..Run::default() };
+        let noop = Run { rustc_invocations: Some(Vec::new()), rustc_query_invocations: Some(Vec::new()), rustc_call_count: Some(0), ..Run::default() };
         assert!(validate_build_evidence(&compiled, "cold", false).is_ok());
         assert!(validate_build_evidence(&compiled, "edit", true).is_ok());
         assert!(validate_build_evidence(&restored, "clean rebuild", true).is_ok());
@@ -3048,12 +3820,79 @@ mod tests {
     #[test]
     fn no_op_rejects_cache_activity_even_without_compile_notices_or_actual_compiler_calls() {
         for invocations in [None, Some(Vec::new())] {
-            let noop = Run { rustc_invocations: invocations, ..Run::default() };
+            let audited = invocations.is_some();
+            let noop = Run {
+                rustc_invocations: invocations, rustc_query_invocations: audited.then(Vec::new),
+                rustc_call_count: audited.then_some(0), ..Run::default()
+            };
             assert!(validate_build_evidence(&noop, "no-op", true).is_ok());
             for (cache_hits, cache_misses) in [(1, 0), (0, 1), (2, 3)] {
                 let cached_work = Run { cache_hits, cache_misses, ..noop.clone() };
                 assert!(validate_build_evidence(&cached_work, "no-op", true).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn no_op_rejects_queries_and_missing_call_evidence_while_restores_keep_queries_visible() {
+        let mut run = Run {
+            rustc_invocations: Some(Vec::new()), rustc_query_invocations: Some(Vec::new()),
+            rustc_call_count: Some(0), ..Run::default()
+        };
+        assert!(validate_build_evidence(&run, "no-op", true).is_ok());
+        let queries = [vec!["-V"], vec!["-vV"], vec!["--version"], vec!["--help"], vec!["-h"],
+            vec!["--emit=metadata", "--print=file-names"], vec!["--emit", "link", "--print", "cfg"]];
+        for args in queries {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(rustc_query(&args));
+            run.rustc_query_invocations = Some(vec![args]);
+            run.rustc_call_count = Some(1);
+            assert!(validate_build_evidence(&run, "no-op", true).is_err());
+            run.cache_hits = 1;
+            assert!(validate_build_evidence(&run, "clean rebuild", true).is_ok());
+            run.cache_hits = 0;
+        }
+        run.rustc_query_invocations = Some(Vec::new());
+        run.rustc_call_count = None;
+        assert!(validate_build_evidence(&run, "no-op", true).is_err());
+        run.rustc_call_count = Some(0);
+        run.rustc_query_invocations = None;
+        assert!(validate_build_evidence(&run, "no-op", true).is_err());
+        run.rustc_query_invocations = Some(Vec::new());
+        run.rustc_invocations = None;
+        assert!(validate_build_evidence(&run, "no-op", true).is_err());
+        let unknown = vec!["--crate-name=unexpected".to_string()];
+        assert!(!rustc_query(&unknown));
+        assert_eq!(classify_compilation(&unknown), CompilationClass::Unknown);
+    }
+
+    #[test]
+    fn inspection_queries_require_every_print_kind_and_respect_option_operands() {
+        let flags = |values: &[&str]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        for args in [
+            vec!["--emit=obj", "--print=file-names"],
+            vec!["--print", "cfg", "--print=file-names=out,with=equals"],
+            vec!["--print=file-names=out,link-args=filename"],
+            vec!["--crate-name", "___", "--crate-type=lib", "-Copt-level=1", "--print=file-names", "-"],
+            vec!["--version", "--print=cfg"],
+        ] {
+            assert!(rustc_query(&flags(&args)), "{args:?}");
+        }
+        // Unknown and compilation-bearing requests win over every recognized inspection.
+        for args in [
+            vec!["--print=link-args"], vec!["--print", "native-static-libs"],
+            vec!["--print=cfg", "--print=link-args"], vec!["--print=link-args", "--print=file-names"],
+            vec!["--version", "--print=native-static-libs=output"],
+            vec!["--help", "--print=future-unknown-kind"],
+            vec!["--print=cfg", "--print=file-names,cfg"], vec!["--print=cfg,file-names"],
+            vec!["--print=cfg", "--print"], vec!["--print", "--print=cfg"],
+            vec!["--print="], vec!["--print=file-names="],
+            vec!["--print=cfg=output", "--print=file-names=output"],
+            vec!["--printer=cfg"], vec!["--printcfg"],
+            vec!["--remap-path-prefix", "--print=cfg"], vec!["-o", "--print=sysroot"],
+            vec!["--", "--print=cfg"], vec!["--unknown-option", "--print=cfg"], vec!["-vV", "@response"],
+        ] {
+            assert!(!rustc_query(&flags(&args)), "{args:?}");
         }
     }
 
@@ -3155,12 +3994,13 @@ mod tests {
     fn growth_validation_rejects_stops_stale_outputs_and_recompilation() {
         let mut report = GrowthReport {
             evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
-            cache_compression: "auto".into(), libs: 2, registry_deps: false, edits: 2, every: 1,
+            cache_compression: "auto".into(), edit_policy: "immediate", source_settle_timeout_ms: None,
+            source_settlements: Vec::new(), cache_evidence_method: "test", libs: 2, registry_deps: false, edits: 2, every: 1,
             compiler_audit_available: true,
             auto_compaction_policy: AutoCompactionPolicy::from(&benchmark_auto_options(false)),
             rows: Vec::new(), repeat_builds: vec![
-                (GrowthVariant::Cargo, Run { rustc_invocations: Some(Vec::new()), ..Run::default() }),
-                (GrowthVariant::Auto, Run { rustc_invocations: Some(Vec::new()), ..Run::default() }),
+                (GrowthVariant::Cargo, Run { rustc_invocations: Some(Vec::new()), rustc_query_invocations: Some(Vec::new()), rustc_call_count: Some(0), ..Run::default() }),
+                (GrowthVariant::Auto, Run { rustc_invocations: Some(Vec::new()), rustc_query_invocations: Some(Vec::new()), rustc_call_count: Some(0), ..Run::default() }),
             ],
             outputs: vec![(GrowthVariant::Cargo, "same".into()), (GrowthVariant::Auto, "same".into())],
             edit_outputs: vec![(GrowthVariant::Cargo, vec!["a".into(), "b".into()]), (GrowthVariant::Auto, vec!["a".into(), "b".into()])],
@@ -3185,6 +4025,14 @@ mod tests {
         assert!(validate_growth(&report).is_err(), "an available audit cannot be omitted from repeat evidence");
         report.repeat_builds[1].1.rustc_invocations = Some(Vec::new());
         assert!(validate_growth(&report).is_ok());
+        report.repeat_builds[1].1.rustc_query_invocations = Some(vec![vec!["--version".into()]]);
+        report.repeat_builds[1].1.rustc_call_count = Some(1);
+        assert!(validate_growth(&report).is_err(), "compiler queries invalidate an unchanged growth rebuild");
+        report.repeat_builds[1].1.rustc_query_invocations = None;
+        report.repeat_builds[1].1.rustc_call_count = Some(0);
+        assert!(validate_growth(&report).is_err(), "available query evidence cannot be omitted");
+        report.repeat_builds[1].1.rustc_query_invocations = Some(Vec::new());
+        assert!(validate_growth(&report).is_ok());
         report.stopped.push((GrowthVariant::Auto, "budget exhausted".into()));
         assert!(validate_growth(&report).is_err());
     }
@@ -3197,7 +4045,7 @@ mod tests {
         let dirs = Dirs::at(root.join("home"));
         let mut ctx = Ctx {
             cargo: PathBuf::from("cargo"), fcargo: PathBuf::from("fcargo"), home: dirs.root().to_path_buf(),
-            probe_id: "test".into(), audit: None, compression: "auto".into(),
+            probe_id: "test".into(), audit: None, compression: "auto".into(), store: StorePolicy::Sync,
         };
         let run = GrowthRun::new(&ctx, GrowthVariant::Cargo, &project, &target, &dirs);
         let unknown = serde_json::to_value(run.row(0)).unwrap();
@@ -3250,23 +4098,77 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn compiler_audit_records_real_compilations_and_ignores_probes() {
+    fn compiler_audit_records_real_compilations_and_separates_queries_including_emit() {
         let root = std::env::temp_dir().join(format!("frust-bench-audit-test-{}", std::process::id()));
         let audit = CompilerAudit::create(&root).unwrap().unwrap();
         fs::create_dir_all(&audit.logs).unwrap();
         let probe = Command::new(&audit.compiler).arg("--version").env("FRUST_BENCH_AUDIT", &audit.logs).output().unwrap();
         assert!(probe.status.success());
-        assert_eq!(fs::read_dir(&audit.logs).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&audit.logs).unwrap().count(), 1);
         let source = root.join("probe.rs");
         fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
         let compile = Command::new(&audit.compiler).args(["--crate-name", "probe", "--crate-type=lib", "--emit=metadata", "--out-dir"])
             .arg(&root).arg(&source).env("FRUST_BENCH_AUDIT", &audit.logs).output().unwrap();
         assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
+        let print = Command::new(&audit.compiler)
+            .args(["--crate-name", "probe", "--crate-type=lib", "--emit=metadata", "--print=file-names"])
+            .arg(&source).env("FRUST_BENCH_AUDIT", &audit.logs).output().unwrap();
+        assert!(print.status.success(), "{}", String::from_utf8_lossy(&print.stderr));
         let paths: Vec<_> = fs::read_dir(&audit.logs).unwrap().map(|e| e.unwrap().path()).collect();
-        assert_eq!(paths.len(), 1);
-        let args = fs::read(&paths[0]).unwrap();
-        assert!(args.split(|b| *b == 0).any(|arg| arg == b"--emit=metadata"));
+        assert_eq!(paths.len(), 3);
+        let calls: Vec<Vec<String>> = paths.iter().map(|path| fs::read(path).unwrap()
+            .split(|byte| *byte == 0).filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8(arg.to_vec()).unwrap()).collect()).collect();
+        let (queries, compiles): (Vec<_>, Vec<_>) = calls.into_iter().partition(|args| rustc_query(args));
+        assert_eq!(queries.len(), 2);
+        assert_eq!(compiles.len(), 1);
+        assert_eq!(CompilationCounts::from_invocations(&compiles).total, 1);
+        assert!(queries.iter().any(|args| args.iter().any(|arg| arg == "--emit=metadata")));
+        assert!(compiles[0].iter().any(|arg| arg == "--emit=metadata"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compilation_prints_and_query_looking_operands_emit_objects_and_fail_restore_audit() {
+        let root = std::env::temp_dir().join(format!("frust-bench-print-work-test-{}", std::process::id()));
+        let _scratch = Scratch(root.clone(), false);
+        let source = root.join("probe.rs");
+        let audit = CompilerAudit::create(&root).unwrap().unwrap();
+        fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let ctx = Ctx {
+            cargo: PathBuf::from("cargo"), fcargo: PathBuf::from("fcargo"), home: root.join("home"),
+            probe_id: "test".into(), audit: Some(audit.clone()), compression: "off".into(), store: StorePolicy::Sync,
+        };
+        // Each audited command must produce real code, including option operands that resemble queries.
+        for (name, kind, extra, filename) in [
+            ("link_args", "lib", vec!["--print=link-args"], "probe.o"),
+            ("native_static_libs", "staticlib", vec!["--print", "native-static-libs"], "probe.o"),
+            ("remap_operand", "lib", vec!["--remap-path-prefix", "--print=cfg"], "probe.o"),
+            ("output_operand", "lib", vec!["-o", "--print=sysroot"], "--print=sysroot"),
+            ("after_sentinel", "lib", vec!["--"], "probe.o"),
+        ] {
+            let directory = root.join(name).join("deps");
+            fs::create_dir_all(&directory).unwrap();
+            let input = if name == "after_sentinel" {
+                fs::copy(&source, directory.join("--print=cfg")).unwrap();
+                PathBuf::from("--print=cfg")
+            } else { source.clone() };
+            let mut command = Command::new(&audit.compiler);
+            command.current_dir(&directory).args(["--crate-name=probe", "--crate-type", kind, "--emit=obj",
+                "--error-format=json", "--json=artifacts", "--out-dir"])
+                .arg(&directory).args(extra).arg(input);
+            let mut run = timed(&ctx, false, &mut command).unwrap();
+            assert!(fs::metadata(directory.join(filename)).unwrap().len() > 0, "{name}");
+            assert_eq!(run.rustc_call_count, Some(1));
+            assert!(run.rustc_query_invocations.as_ref().unwrap().is_empty(), "{name}");
+            let counts = run.rustc_compilation_counts.unwrap();
+            assert_eq!(counts.total, 1);
+            assert_eq!(counts.cargo_units, 1);
+            assert!(validate_build_evidence(&run, "cold", false).is_ok());
+            run.cache_hits = 1;
+            assert!(validate_build_evidence(&run, "clean rebuild", true).is_err(), "{name}");
+        }
     }
 
     #[test]
