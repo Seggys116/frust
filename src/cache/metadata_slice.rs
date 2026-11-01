@@ -189,7 +189,7 @@ fn stream(source: &File, base: &StoredFile, out: &mut impl Write) -> io::Result<
 fn decode_staged(
     source: &File,
     base: &StoredFile,
-    decoded: &mut File,
+    decoded: &mut impl Write,
 ) -> io::Result<(u64, String)> {
     match base.encoding {
         Encoding::Lz4BlocksV1 => {
@@ -241,6 +241,72 @@ fn hashing<W>(output: W) -> HashWriter<W> {
     }
 }
 
+struct MemberHeader<'a> {
+    name: &'a str,
+    size: u64,
+    end: u64,
+    next: u64,
+}
+
+fn member_header(header: &[u8; 60], at: u64, total: u64) -> Option<MemberHeader<'_>> {
+    if &header[58..] != b"`\n" {
+        return None;
+    }
+    let size = std::str::from_utf8(&header[48..58])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let end = at.checked_add(60)?.checked_add(size)?;
+    let next = end.checked_add(size % 2)?;
+    if next > total {
+        return None;
+    }
+    Some(MemberHeader {
+        name: std::str::from_utf8(&header[..16]).ok()?.trim_end(),
+        size,
+        end,
+        next,
+    })
+}
+
+// Both parsers resolve the same supported archive names and resource bounds.
+enum MemberName {
+    Table(usize),
+    Bsd(usize),
+    Resolved(bool),
+}
+
+fn member_name(name: &str, size: u64, names: &[u8]) -> Option<MemberName> {
+    if name == "//" {
+        return (size <= 1024 * 1024).then_some(MemberName::Table(size as usize));
+    }
+    if let Some(n) = name.strip_prefix("#1/") {
+        let n = n.parse::<u64>().ok().filter(|n| *n <= size && *n <= 4096)?;
+        return Some(MemberName::Bsd(n as usize));
+    }
+    let resolved = if name.starts_with('/') && name.len() > 1 && name != "/SYM64/" {
+        let index = name[1..]
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n < names.len())?;
+        if index != 0 && names[index - 1] != b'\n' {
+            return None;
+        }
+        let len = names[index..].iter().position(|b| *b == b'\n')?;
+        std::str::from_utf8(&names[index..index + len])
+            .ok()?
+            .trim_end_matches('/')
+    } else {
+        name.trim_end_matches('/')
+    };
+    Some(MemberName::Resolved(resolved == "lib.rmeta"))
+}
+
+fn bsd_metadata(bytes: &[u8]) -> Option<bool> {
+    Some(std::str::from_utf8(bytes).ok()?.trim_end_matches('\0') == "lib.rmeta")
+}
+
 // Unknown archive layouts are a normal storage fallback.
 fn member_ranges(file: &mut File, total: u64) -> io::Result<Option<Vec<(u64, u64)>>> {
     let mut magic = [0; 8];
@@ -259,76 +325,295 @@ fn member_ranges(file: &mut File, total: u64) -> io::Result<Option<Vec<(u64, u64
             return Ok(None);
         }
         file.seek(SeekFrom::Start(at))?;
-        let mut header = [0; 60];
-        file.read_exact(&mut header)?;
-        if &header[58..] != b"`\n" {
-            return Ok(None);
-        }
-        let Some(size) = std::str::from_utf8(&header[48..58])
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-        else {
+        let mut bytes = [0; 60];
+        file.read_exact(&mut bytes)?;
+        let Some(header) = member_header(&bytes, at, total) else {
             return Ok(None);
         };
-        let Some(end) = at.checked_add(60).and_then(|n| n.checked_add(size)) else {
+        let Some(name) = member_name(header.name, header.size, &names) else {
             return Ok(None);
         };
-        if end > total {
-            return Ok(None);
-        }
-        let Ok(name) = std::str::from_utf8(&header[..16]) else {
-            return Ok(None);
-        };
-        let name = name.trim_end();
         let mut start = at + 60;
-        let resolved;
-        if name == "//" {
-            if size > 1024 * 1024 {
-                return Ok(None);
+        let metadata = match name {
+            MemberName::Table(size) => {
+                names.resize(size, 0);
+                file.read_exact(&mut names)?;
+                false
             }
-            names.resize(size as usize, 0);
-            file.read_exact(&mut names)?;
-            resolved = "".to_owned();
-        } else if let Some(n) = name.strip_prefix("#1/") {
-            let Some(n) = n.parse::<u64>().ok().filter(|n| *n <= size && *n <= 4096) else {
-                return Ok(None);
-            };
-            let mut bytes = vec![0; n as usize];
-            file.read_exact(&mut bytes)?;
-            let Ok(value) = String::from_utf8(bytes) else {
-                return Ok(None);
-            };
-            resolved = value.trim_end_matches('\0').to_owned();
-            start += n;
-        } else if name.starts_with('/') && name.len() > 1 && name != "/SYM64/" {
-            let Some(index) = name[1..].parse::<usize>().ok().filter(|n| *n < names.len()) else {
-                return Ok(None);
-            };
-            if index != 0 && names[index - 1] != b'\n' {
-                return Ok(None);
+            MemberName::Bsd(size) => {
+                let mut bytes = vec![0; size];
+                file.read_exact(&mut bytes)?;
+                let Some(metadata) = bsd_metadata(&bytes) else {
+                    return Ok(None);
+                };
+                start += size as u64;
+                metadata
             }
-            let Some(len) = names[index..].iter().position(|b| *b == b'\n') else {
-                return Ok(None);
-            };
-            let Ok(value) = std::str::from_utf8(&names[index..index + len]) else {
-                return Ok(None);
-            };
-            resolved = value.trim_end_matches('/').to_owned();
-        } else {
-            resolved = name.trim_end_matches('/').to_owned();
-        }
-        if resolved == "lib.rmeta" {
-            found.push((start, end - start));
-        }
-        let Some(next) = end.checked_add(size % 2) else {
-            return Ok(None);
+            MemberName::Resolved(metadata) => metadata,
         };
-        if next > total {
-            return Ok(None);
+        if metadata {
+            found.push((start, header.end - start));
         }
-        at = next;
+        at = header.next;
     }
     Ok(Some(found))
+}
+
+enum Frame {
+    Magic,
+    Header,
+    Table { size: u64 },
+    Bsd { size: u64 },
+}
+
+enum SpoolState {
+    Frame {
+        kind: Frame,
+        bytes: Vec<u8>,
+        len: usize,
+    },
+    Body {
+        left: u64,
+        keep: bool,
+        pad: bool,
+    },
+    Padding,
+    Fallback,
+}
+
+// Private holes replace only bodies the authoritative parser never searches.
+struct ArchiveSpool<'a> {
+    file: &'a mut File,
+    total: u64,
+    consumed: u64,
+    written: u64,
+    names: Vec<u8>,
+    state: SpoolState,
+}
+
+impl<'a> ArchiveSpool<'a> {
+    fn new(file: &'a mut File, total: u64) -> Self {
+        Self {
+            file,
+            total,
+            consumed: 0,
+            written: 0,
+            names: Vec::new(),
+            state: Self::frame(Frame::Magic, 8),
+        }
+    }
+
+    fn frame(kind: Frame, len: usize) -> SpoolState {
+        SpoolState::Frame {
+            kind,
+            bytes: Vec::new(),
+            len,
+        }
+    }
+
+    fn body(left: u64, keep: bool, size: u64) -> SpoolState {
+        if left != 0 {
+            SpoolState::Body {
+                left,
+                keep,
+                pad: !size.is_multiple_of(2),
+            }
+        } else if !size.is_multiple_of(2) {
+            SpoolState::Padding
+        } else {
+            Self::frame(Frame::Header, 60)
+        }
+    }
+
+    fn complete_frame(&mut self, kind: Frame, bytes: Vec<u8>) -> SpoolState {
+        match kind {
+            Frame::Magic => {
+                if bytes == b"!<arch>\n" {
+                    Self::frame(Frame::Header, 60)
+                } else {
+                    SpoolState::Fallback
+                }
+            }
+            Frame::Header => {
+                let header_bytes: &[u8; 60] = bytes.as_slice().try_into().unwrap();
+                let Some(header) = member_header(header_bytes, self.consumed - 60, self.total)
+                else {
+                    return SpoolState::Fallback;
+                };
+                match member_name(header.name, header.size, &self.names) {
+                    Some(MemberName::Table(0)) => {
+                        self.names.clear();
+                        Self::body(0, false, 0)
+                    }
+                    Some(MemberName::Table(len)) => {
+                        Self::frame(Frame::Table { size: header.size }, len)
+                    }
+                    Some(MemberName::Bsd(0)) => Self::body(header.size, false, header.size),
+                    Some(MemberName::Bsd(len)) => {
+                        Self::frame(Frame::Bsd { size: header.size }, len)
+                    }
+                    Some(MemberName::Resolved(keep)) => Self::body(header.size, keep, header.size),
+                    None => SpoolState::Fallback,
+                }
+            }
+            Frame::Table { size } => {
+                self.names = bytes;
+                Self::body(0, false, size)
+            }
+            Frame::Bsd { size } => match bsd_metadata(&bytes) {
+                Some(keep) => Self::body(size - bytes.len() as u64, keep, size),
+                None => SpoolState::Fallback,
+            },
+        }
+    }
+
+    // A final skipped body still contributes to the logical archive length.
+    fn finish(&mut self, decoded_len: u64) -> io::Result<bool> {
+        let complete = matches!(&self.state,
+            SpoolState::Frame { kind: Frame::Header, bytes, .. } if bytes.is_empty());
+        if self.consumed != decoded_len || decoded_len != self.total || !complete {
+            return Ok(false);
+        }
+        self.file.set_len(decoded_len)?;
+        Ok(true)
+    }
+}
+
+impl Write for ArchiveSpool<'_> {
+    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
+        let len = input.len();
+        while !input.is_empty() {
+            let state = std::mem::replace(&mut self.state, SpoolState::Fallback);
+            let (take, keep) = match &state {
+                SpoolState::Frame { bytes, len, .. } => {
+                    ((len - bytes.len()).min(input.len()), true)
+                }
+                SpoolState::Body { left, keep, .. } => {
+                    ((*left).min(input.len() as u64) as usize, *keep)
+                }
+                SpoolState::Padding => (1, true),
+                SpoolState::Fallback => (input.len(), false),
+            };
+            self.consumed = self
+                .consumed
+                .checked_add(take as u64)
+                .ok_or_else(|| invalid("archive too large"))?;
+            if keep {
+                self.file.write_all(&input[..take])?;
+                self.written += take as u64;
+            } else if !matches!(&state, SpoolState::Fallback) {
+                self.file.seek(SeekFrom::Start(self.consumed))?;
+            }
+            self.state = match state {
+                SpoolState::Frame {
+                    kind,
+                    mut bytes,
+                    len,
+                } => {
+                    // Resource decline must not bypass the upstream integrity checks.
+                    if bytes.try_reserve(take).is_err() {
+                        SpoolState::Fallback
+                    } else {
+                        bytes.extend_from_slice(&input[..take]);
+                        if bytes.len() == len {
+                            self.complete_frame(kind, bytes)
+                        } else {
+                            SpoolState::Frame { kind, bytes, len }
+                        }
+                    }
+                }
+                SpoolState::Body { left, keep, pad } => {
+                    if left == take as u64 {
+                        if pad {
+                            SpoolState::Padding
+                        } else {
+                            Self::frame(Frame::Header, 60)
+                        }
+                    } else {
+                        SpoolState::Body {
+                            left: left - take as u64,
+                            keep,
+                            pad,
+                        }
+                    }
+                }
+                SpoolState::Padding => Self::frame(Frame::Header, 60),
+                SpoolState::Fallback => SpoolState::Fallback,
+            };
+            input = &input[take..];
+        }
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[derive(Default)]
+struct SpoolStats {
+    written: u64,
+    #[cfg(test)]
+    allocated: u64,
+    fallback: bool,
+}
+
+fn staged_spool(
+    source: &File,
+    base: &StoredFile,
+    path: &Path,
+    sparse: bool,
+    stats: &mut SpoolStats,
+) -> io::Result<(Temporary, File, u64, String)> {
+    let before = sys::fstat(source)?;
+    let check_source = || -> io::Result<()> {
+        if !payload::stable(&before, &sys::fstat(source)?)
+            || !payload::stable(&before, &sys::lstat(path)?)
+        {
+            return Err(invalid("staged backing changed during spool"));
+        }
+        Ok(())
+    };
+    let (mut scratch, mut decoded) = temporary(path)?;
+    let (proof, complete) = if sparse {
+        let total = if base.encoding.is_raw() {
+            before.len()
+        } else {
+            base.decoded_bytes
+                .ok_or_else(|| invalid("missing backing length"))?
+        };
+        let mut spool = ArchiveSpool::new(&mut decoded, total);
+        // Verification sees every original byte, including discarded payloads.
+        let proof = decode_staged(source, base, &mut spool)?;
+        let complete = spool.finish(proof.0)?;
+        stats.written = spool.written;
+        (proof, complete)
+    } else {
+        let proof = decode_staged(source, base, &mut decoded)?;
+        stats.written = proof.0;
+        (proof, true)
+    };
+    check_source()?;
+    // Retry only a verified stream, through the same descriptor into fresh scratch.
+    if !complete {
+        stats.fallback = true;
+        let mut source_cursor = source;
+        source_cursor.seek(SeekFrom::Start(0))?;
+        let (fresh_scratch, mut fresh_decoded) = temporary(path)?;
+        let fresh_proof = decode_staged(source, base, &mut fresh_decoded)?;
+        check_source()?;
+        if fresh_proof != proof {
+            return Err(invalid("staged backing changed during fallback"));
+        }
+        stats.written = stats.written.saturating_add(fresh_proof.0);
+        scratch = fresh_scratch;
+        decoded = fresh_decoded;
+    }
+    #[cfg(test)]
+    {
+        stats.allocated = sys::fstat(&decoded)?.allocated();
+    }
+    Ok((scratch, decoded, proof.0, proof.1))
 }
 
 // Compare the entire candidate and hash the bytes actually compared.
@@ -417,6 +702,34 @@ fn build_inner(
     commitment: Option<&Commitment>,
     before_proof: impl FnOnce(),
 ) -> io::Result<Option<StoredFile>> {
+    build_inner_spool(
+        staged_base,
+        base,
+        original,
+        target,
+        commitment,
+        before_proof,
+        SpoolOptions {
+            sparse: true,
+            stats: &mut SpoolStats::default(),
+        },
+    )
+}
+
+struct SpoolOptions<'a> {
+    sparse: bool,
+    stats: &'a mut SpoolStats,
+}
+
+fn build_inner_spool(
+    staged_base: &Path,
+    base: &StoredFile,
+    original: &Path,
+    target: &StoredFile,
+    commitment: Option<&Commitment>,
+    before_proof: impl FnOnce(),
+    spool: SpoolOptions<'_>,
+) -> io::Result<Option<StoredFile>> {
     if !cfg!(unix)
         || base.dir
         || base.text
@@ -456,8 +769,8 @@ fn build_inner(
         return Err(invalid("invalid staged backing"));
     }
     // Private scratch makes archive parsing independent of live build outputs.
-    let (_scratch, mut decoded) = temporary(staged_base)?;
-    let (source_len, source_hash) = decode_staged(&source, base, &mut decoded)?;
+    let (_scratch, mut decoded, source_len, source_hash) =
+        staged_spool(&source, base, staged_base, spool.sparse, spool.stats)?;
     if !payload::stable(&source_before, &sys::fstat(&source)?)
         || !payload::stable(&source_before, &sys::lstat(staged_base)?)
     {
@@ -801,6 +1114,273 @@ mod tests {
             out.push(b'\n');
         }
     }
+    // Compare parser decisions and every searchable byte, independently of chunking.
+    fn sparse_equivalent(archive: &[u8], chunks: &[usize]) -> (bool, u64) {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("archive");
+        fs::write(&path, archive).unwrap();
+        let mut full = File::open(&path).unwrap();
+        let ranges = member_ranges(&mut full, archive.len() as u64).unwrap();
+        let (_temp, mut sparse) = temporary(&path).unwrap();
+        let mut spool = ArchiveSpool::new(&mut sparse, archive.len() as u64);
+        let mut output = hashing(&mut spool);
+        let mut at = 0usize;
+        for &chunk in chunks {
+            let end = at.saturating_add(chunk).min(archive.len());
+            output.write_all(&archive[at..end]).unwrap();
+            at = end;
+        }
+        output.write_all(&archive[at..]).unwrap();
+        output.flush().unwrap();
+        assert_eq!(output.bytes, archive.len() as u64);
+        assert_eq!(output.hash.finalize(), blake3::hash(archive));
+        let complete = spool.finish(archive.len() as u64).unwrap();
+        let written = spool.written;
+        assert_eq!(complete, ranges.is_some());
+        if let Some(ranges) = ranges {
+            assert_eq!(sparse.metadata().unwrap().len(), archive.len() as u64);
+            sparse.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(
+                member_ranges(&mut sparse, archive.len() as u64).unwrap(),
+                Some(ranges.clone())
+            );
+            for (offset, len) in ranges {
+                let expected = &archive[offset as usize..(offset + len) as usize];
+                let mut actual = vec![0; len as usize];
+                sparse.seek(SeekFrom::Start(offset)).unwrap();
+                sparse.read_exact(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+        (complete, written)
+    }
+
+    #[test]
+    fn sparse_spool_preserves_all_archive_boundaries_and_names() {
+        let mut archive = b"!<arch>\n".to_vec();
+        archive_member(&mut archive, "/", b"symbols");
+        archive_member(&mut archive, "/SYM64/", b"symbols64");
+        archive_member(&mut archive, "empty.o/", b"");
+        archive_member(&mut archive, "lib.rmeta/", b"first");
+        archive_member(&mut archive, "//", b"code.o/\nlib.rmeta/\n");
+        archive_member(&mut archive, "/8", b"second");
+        archive_member(&mut archive, "/0", b"skipped");
+        archive_member(&mut archive, "//", b"lib.rmeta/\n");
+        archive_member(&mut archive, "/0", b"third");
+        archive_member(&mut archive, "//", b"");
+        archive_member(&mut archive, "#1/12", b"lib.rmeta\0\0\0fourth");
+        archive_member(&mut archive, "#1/6", b"code.oignored");
+        archive_member(&mut archive, "#1/0", b"");
+        archive_member(&mut archive, "lib.rmeta/", b"");
+        archive_member(&mut archive, "last.o/", &[0x5a; 256]);
+        let (complete, written) = sparse_equivalent(&archive, &vec![1; archive.len()]);
+        assert!(complete);
+        assert!(written < archive.len() as u64 - 256);
+        for split in 0..=archive.len() {
+            assert!(sparse_equivalent(&archive, &[split]).0);
+        }
+        assert!(sparse_equivalent(b"!<arch>\n", &[1; 8]).0);
+    }
+
+    #[test]
+    fn sparse_spool_malformed_layouts_match_full_parser() {
+        let mut valid = b"!<arch>\n".to_vec();
+        archive_member(&mut valid, "lib.rmeta/", b"body");
+        let mut cases = vec![Vec::new(), b"!<thin>\n".to_vec()];
+        for len in [1, 7, 9, 67, valid.len() - 1] {
+            cases.push(valid[..len].to_vec());
+        }
+        for (offset, value) in [(8, 0xff), (56, b'x'), (66, b'x')] {
+            let mut bad = valid.clone();
+            bad[offset] = value;
+            cases.push(bad);
+        }
+        for (name, body) in [
+            ("#1/999", &b"body"[..]),
+            ("#1/4097", &b"body"[..]),
+            ("#1/1", &[0xff][..]),
+            ("/0", &b"body"[..]),
+            ("/999999999999999", &b"body"[..]),
+        ] {
+            let mut bad = b"!<arch>\n".to_vec();
+            archive_member(&mut bad, name, body);
+            cases.push(bad);
+        }
+        for (table, name) in [
+            (&b"lib.rmeta/\n"[..], "/1"),
+            (&b"lib.rmeta/"[..], "/0"),
+            (&b"\xff/\n"[..], "/0"),
+            (&b""[..], "/0"),
+        ] {
+            let mut bad = b"!<arch>\n".to_vec();
+            archive_member(&mut bad, "//", table);
+            archive_member(&mut bad, name, b"body");
+            cases.push(bad);
+        }
+        let mut huge = b"!<arch>\n".to_vec();
+        archive_member(&mut huge, "//", b"");
+        huge[56..66].copy_from_slice(b"9999999999");
+        cases.push(huge);
+        let mut odd = b"!<arch>\n".to_vec();
+        archive_member(&mut odd, "code.o/", b"x");
+        odd.pop();
+        cases.push(odd);
+        for archive in cases {
+            assert!(!sparse_equivalent(&archive, &vec![1; archive.len()]).0);
+        }
+        let header: [u8; 60] = valid[8..68].try_into().unwrap();
+        assert!(member_header(&header, u64::MAX - 30, u64::MAX).is_none());
+        assert!(member_name("//", 1024 * 1024 + 1, &[]).is_none());
+        assert!(member_name("#1/4097", 4097, &[]).is_none());
+    }
+
+    #[test]
+    fn sparse_spool_generated_archives_match_full_parser() {
+        let mut seed = 0x28f4b16eu32;
+        for case in 0..80usize {
+            let mut archive = b"!<arch>\n".to_vec();
+            for member in 0..1 + case % 11 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let body = vec![(seed >> 24) as u8; (seed as usize >> 8) % 127];
+                match (case + member) % 4 {
+                    0 => archive_member(&mut archive, "lib.rmeta/", &body),
+                    1 => archive_member(&mut archive, "code.o/", &body),
+                    2 => {
+                        archive_member(&mut archive, "//", b"lib.rmeta/\n");
+                        archive_member(&mut archive, "/0", &body);
+                    }
+                    _ => {
+                        let mut named = b"lib.rmeta\0".to_vec();
+                        named.extend_from_slice(&body);
+                        archive_member(&mut archive, "#1/10", &named);
+                    }
+                }
+            }
+            if case % 3 == 0 {
+                let index = seed as usize % archive.len();
+                archive[index] ^= 0x80;
+            }
+            sparse_equivalent(
+                &archive,
+                &vec![1 + case % 71; archive.len() / (1 + case % 71)],
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_spool_keeps_duplicate_and_prefixed_range_matches() {
+        let scratch = Scratch::new();
+        let target = scratch.0.join("target");
+        fs::write(&target, b"metadata").unwrap();
+        for duplicate in [false, true] {
+            let mut archive = b"!<arch>\n".to_vec();
+            archive_member(&mut archive, "code.o/", b"metadata");
+            archive_member(&mut archive, "lib.rmeta/", b"prefix metadata suffix");
+            archive_member(
+                &mut archive,
+                "lib.rmeta/",
+                if duplicate { b"metadata" } else { b"different" },
+            );
+            let path = scratch.0.join("archive");
+            fs::write(&path, &archive).unwrap();
+            let mut results = Vec::new();
+            for sparse in [false, true] {
+                let source = File::open(&path).unwrap();
+                let (_temp, mut decoded, len, _) = staged_spool(
+                    &source,
+                    &record("libdemo.rlib", "f0"),
+                    &path,
+                    sparse,
+                    &mut SpoolStats::default(),
+                )
+                .unwrap();
+                decoded.seek(SeekFrom::Start(0)).unwrap();
+                let ranges = member_ranges(&mut decoded, len).unwrap().unwrap();
+                results.push(
+                    unique_range(
+                        &mut decoded,
+                        &mut File::open(&target).unwrap(),
+                        &ranges,
+                        8,
+                        blake3::hash(b"metadata").to_hex().as_str(),
+                    )
+                    .unwrap(),
+                );
+            }
+            assert_eq!(results[0], results[1]);
+            assert_eq!(results[0].is_none(), duplicate);
+        }
+    }
+
+    #[test]
+    fn sparse_spool_length_and_io_errors_do_not_become_success() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("archive");
+        fs::write(&path, b"!<arch>\n").unwrap();
+        let mut readonly = File::open(&path).unwrap();
+        let mut spool = ArchiveSpool::new(&mut readonly, 8);
+        assert!(spool.write_all(b"!<arch>\n").is_err());
+        let (_temp, mut output) = temporary(&path).unwrap();
+        let mut spool = ArchiveSpool::new(&mut output, 8);
+        spool.write_all(b"!<arch>\n").unwrap();
+        assert!(!spool.finish(9).unwrap());
+    }
+
+    #[test]
+    fn sparse_fallback_requires_complete_backing_verification() {
+        for compress in [false, true] {
+            for corruption in ["none", "hash", "trailing", "truncated"] {
+                if !compress && corruption != "none" {
+                    continue;
+                }
+                let scratch = Scratch::new();
+                let original = scratch.0.join("original");
+                let content = vec![0x57; payload::MIN_BYTES as usize * 2];
+                fs::write(&original, &content).unwrap();
+                let path = scratch.0.join("f0");
+                let stored = payload::store(&original, &path, compress).unwrap();
+                let mut base = record("libdemo.rlib", "f0");
+                base.encoding = stored.encoding;
+                base.stored_bytes = stored.stored_bytes;
+                base.decoded_bytes = stored.decoded_bytes;
+                base.content_hash = stored.content_hash;
+                if compress {
+                    assert_eq!(base.encoding, Encoding::Lz4BlocksV1);
+                }
+                match corruption {
+                    "hash" => base.content_hash = Some("0".repeat(64)),
+                    "trailing" => OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"x")
+                        .unwrap(),
+                    "truncated" => {
+                        let file = OpenOptions::new().write(true).open(&path).unwrap();
+                        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+                    }
+                    _ => {}
+                }
+                let source = File::open(&path).unwrap();
+                let mut stats = SpoolStats::default();
+                let result = staged_spool(&source, &base, &path, true, &mut stats);
+                if corruption == "none" {
+                    let (_temp, mut decoded, len, hash) = result.unwrap();
+                    assert!(stats.fallback);
+                    assert_eq!(len, content.len() as u64);
+                    assert_eq!(hash, blake3::hash(&content).to_hex().to_string());
+                    decoded.seek(SeekFrom::Start(0)).unwrap();
+                    let mut actual = Vec::new();
+                    decoded.read_to_end(&mut actual).unwrap();
+                    assert_eq!(actual, content);
+                } else {
+                    assert!(result.is_err(), "{corruption}");
+                    assert!(!stats.fallback, "integrity error must not retry");
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn fixture(scratch: &Scratch, compress: bool) -> (Vec<StoredFile>, Vec<u8>, Vec<u8>) {
         let metadata: Vec<_> = (0..1024 * 1024 + 211).map(|i| (i % 251) as u8).collect();
@@ -838,6 +1418,124 @@ mod tests {
         .unwrap()
         .unwrap();
         (vec![base, range], archive, metadata)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual real-input paired release profile; set FRUST_METADATA_PROFILE_RLIB/RMETA/COMPRESS"]
+    fn profile_sparse_archive_spool_against_full_reference() {
+        if cfg!(debug_assertions) {
+            panic!("run this profile with --release");
+        }
+        let rlib = PathBuf::from(
+            std::env::var_os("FRUST_METADATA_PROFILE_RLIB").expect("set raw rlib path"),
+        );
+        let rmeta = PathBuf::from(
+            std::env::var_os("FRUST_METADATA_PROFILE_RMETA").expect("set matching raw rmeta path"),
+        );
+        let compress = match std::env::var("FRUST_METADATA_PROFILE_COMPRESS").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => panic!("set FRUST_METADATA_PROFILE_COMPRESS to 0 or 1"),
+        };
+        let scratch = Scratch::new();
+        let path = scratch.0.join("f0");
+        let (source_meta, source_commitment) = payload::capture(&rlib).unwrap();
+        let (target_meta, commitment) = payload::capture(&rmeta).unwrap();
+        let store_start = std::time::Instant::now();
+        let stored =
+            payload::store_committed(&rlib, &path, compress, Some(&source_commitment)).unwrap();
+        let store_ms = store_start.elapsed().as_secs_f64() * 1000.0;
+        let mut base = record("libprofile.rlib", "f0");
+        base.bytes = stored.bytes;
+        base.encoding = stored.encoding;
+        base.stored_bytes = stored.stored_bytes;
+        base.decoded_bytes = stored.decoded_bytes;
+        base.content_hash = stored.content_hash;
+        let target = record("libprofile.rmeta", "f1");
+        let dest = scratch.0.join("restored");
+        fs::create_dir(&dest).unwrap();
+        let mut times = [Vec::new(), Vec::new()];
+        let mut disk = [(0, 0); 2];
+        let mut reference = None;
+        // Alternate paired order; restoration and validation are outside the timer.
+        for pair in 0..7usize {
+            let order = if pair.is_multiple_of(2) {
+                [0, 1]
+            } else {
+                [1, 0]
+            };
+            for variant in order {
+                let mut stats = SpoolStats::default();
+                let start = std::time::Instant::now();
+                let slice = build_inner_spool(
+                    &path,
+                    &base,
+                    &rmeta,
+                    &target,
+                    Some(&commitment),
+                    || {},
+                    SpoolOptions {
+                        sparse: variant == 1,
+                        stats: &mut stats,
+                    },
+                )
+                .unwrap()
+                .expect("real inputs must support a unique metadata slice");
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert!(
+                    !stats.fallback,
+                    "profile requires supported archive grammar"
+                );
+                let value = serde_json::to_value(&slice).unwrap();
+                if let Some(expected) = &reference {
+                    assert_eq!(&value, expected);
+                } else {
+                    reference = Some(value);
+                }
+                if pair != 0 {
+                    times[variant].push(elapsed);
+                }
+                disk[variant] = (stats.written, stats.allocated);
+                let files = vec![base.clone(), slice];
+                let group = validate_groups(&files).unwrap().remove(0);
+                verify_group(&scratch.0, &files, &group).unwrap();
+                restore_group(&scratch.0, &dest, &files, &group).unwrap();
+                for (original, name, proof, len) in [
+                    (&rlib, &files[0].name, &source_commitment, source_meta.len()),
+                    (&rmeta, &files[1].name, &commitment, target_meta.len()),
+                ] {
+                    let mut restored = File::open(dest.join(name)).unwrap();
+                    assert_eq!(restored.metadata().unwrap().len(), len);
+                    assert!(
+                        equal_range(
+                            &mut File::open(original).unwrap(),
+                            &mut restored,
+                            0,
+                            len,
+                            &proof.hash
+                        )
+                        .unwrap()
+                    );
+                    assert!(proof.matches(&sys::lstat(original).unwrap()));
+                }
+            }
+        }
+        eprintln!(
+            "archive_spool rlib={} rmeta={} requested_compression={} encoding={:?} decoded_bytes={} store_ms={} full_ms={:?} sparse_ms={:?} full_written={} sparse_written={} full_allocated={} sparse_allocated={}",
+            rlib.display(),
+            rmeta.display(),
+            compress,
+            base.encoding,
+            source_meta.len(),
+            store_ms,
+            times[0],
+            times[1],
+            disk[0].0,
+            disk[1].0,
+            disk[0].1,
+            disk[1].1
+        );
     }
 
     #[test]
