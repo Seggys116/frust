@@ -1032,9 +1032,10 @@ impl Plan {
             .iter()
             .map(|file| self.resolve(&self.norm(file)))
             .collect();
-        let threads = extern_hash_threads(
+        let threads = extern_hash_threads_with(
             paths.len(),
-            thread::available_parallelism().map_or(1, |n| n.get()),
+            DETACHED_STORE.load(Ordering::Relaxed),
+            || thread::available_parallelism().map_or(1, |n| n.get()),
         );
         // Keep failures beside their input so validation and entry keys retain dep-info order.
         let hashed = parallel_with_threads(&paths, threads, |_, path| {
@@ -1380,9 +1381,10 @@ fn parallel<T: Sync, R: Send>(
     items: &[T],
     job: impl Fn(usize, &T) -> io::Result<R> + Sync,
 ) -> io::Result<Vec<R>> {
-    let threads = extern_hash_threads(
+    let threads = extern_hash_threads_with(
         items.len(),
-        thread::available_parallelism().map_or(1, |n| n.get()),
+        DETACHED_STORE.load(Ordering::Relaxed),
+        || thread::available_parallelism().map_or(1, |n| n.get()),
     );
     parallel_with_threads(items, threads, job)
 }
@@ -1425,13 +1427,26 @@ impl WorkerBudget {
 }
 
 fn worker_budget(desired: usize) -> WorkerBudget {
-    let cpus = thread::available_parallelism().map_or(1, |n| n.get());
-    worker_budget_for(
+    worker_budget_with(
         desired,
-        cpus,
         DETACHED_STORE.load(Ordering::Relaxed),
         JOBSERVER.get().and_then(Option::as_ref),
+        || thread::available_parallelism().map_or(1, |n| n.get()),
     )
+}
+
+fn worker_budget_with(
+    desired: usize,
+    detached: bool,
+    client: Option<&jobserver::Client>,
+    discover_cpus: impl FnOnce() -> usize,
+) -> WorkerBudget {
+    let cpus = if desired <= 1 || detached {
+        1
+    } else {
+        discover_cpus()
+    };
+    worker_budget_for(desired, cpus, detached, client)
 }
 
 fn worker_budget_for(
@@ -2281,6 +2296,18 @@ fn extern_hash_threads(inputs: usize, cpus: usize) -> usize {
     inputs.div_ceil(8).clamp(1, 4).min((cpus / 2).clamp(1, 4))
 }
 
+fn extern_hash_threads_with(
+    inputs: usize,
+    detached: bool,
+    discover_cpus: impl FnOnce() -> usize,
+) -> usize {
+    if inputs <= 8 || detached {
+        1
+    } else {
+        extern_hash_threads(inputs, discover_cpus())
+    }
+}
+
 impl KeyContext<'_> {
     fn prekey(
         &self,
@@ -2293,9 +2320,10 @@ impl KeyContext<'_> {
             .iter()
             .filter(|(_, path)| matches!(path, PathArg::Extern { .. }))
             .count();
-        let threads = extern_hash_threads(
+        let threads = extern_hash_threads_with(
             inputs,
-            thread::available_parallelism().map_or(1, |n| n.get()),
+            DETACHED_STORE.load(Ordering::Relaxed),
+            || thread::available_parallelism().map_or(1, |n| n.get()),
         );
         self.prekey_with_threads(tool, rest, parsed, threads)
     }
@@ -3268,6 +3296,71 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn forced_serial_workers_skip_cpu_discovery() {
+        for detached in [false, true] {
+            for inputs in 0..=8 {
+                assert_eq!(
+                    extern_hash_threads_with(inputs, detached, || {
+                        panic!("serial inputs queried CPUs")
+                    }),
+                    1
+                );
+            }
+        }
+        for inputs in [9, 32, usize::MAX] {
+            assert_eq!(
+                extern_hash_threads_with(inputs, true, || panic!("detached inputs queried CPUs")),
+                1
+            );
+        }
+        for desired in [0, 1] {
+            let budget = worker_budget_with(desired, false, None, || {
+                panic!("serial budget queried CPUs")
+            });
+            assert_eq!(budget.threads, 1);
+            assert!(budget._tokens.is_empty());
+        }
+        for desired in [0, 1, 2, 4, usize::MAX] {
+            let budget = worker_budget_with(desired, true, None, || {
+                panic!("detached store queried CPUs")
+            });
+            assert_eq!(budget.threads, 1);
+            assert!(budget._tokens.is_empty());
+        }
+    }
+
+    #[test]
+    fn parallel_workers_rediscover_cpu_limits_and_preserve_bounds() {
+        let calls = std::cell::Cell::new(0);
+        for cpus in [1, 2, 4, 6, 8, 64] {
+            for inputs in [9, 16, 32, 100, usize::MAX] {
+                let before = calls.get();
+                let threads = extern_hash_threads_with(inputs, false, || {
+                    calls.set(calls.get() + 1);
+                    cpus
+                });
+                assert_eq!(calls.get(), before + 1);
+                assert_eq!(threads, extern_hash_threads(inputs, cpus));
+                assert!((1..=4).contains(&threads));
+            }
+            for desired in [2, 4, usize::MAX] {
+                let before = calls.get();
+                let budget = worker_budget_with(desired, false, None, || {
+                    calls.set(calls.get() + 1);
+                    cpus
+                });
+                assert_eq!(calls.get(), before + 1);
+                assert_eq!(
+                    budget.threads,
+                    worker_budget_for(desired, cpus, false, None).threads
+                );
+                assert!((1..=4).contains(&budget.threads));
+                assert!(budget._tokens.is_empty());
+            }
+        }
     }
 
     #[test]
