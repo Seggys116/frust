@@ -1450,12 +1450,9 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             Err(err) => failures.push((removal.path.clone(), err)),
         }
     }
-    if plan.trim_ledger
-        && let Ok(text) = fs::read_to_string(dirs.ledger())
-    {
-        let keep: Vec<&str> = text.lines().rev().take(20_000).collect();
-        let trimmed: String = keep.into_iter().rev().map(|l| format!("{l}\n")).collect();
-        let _ = fsx::write_atomic(&dirs.ledger(), trimmed.as_bytes());
+    drop(profiles);
+    if plan.trim_ledger {
+        let _ = crate::events::trim_ledger(dirs);
     }
     (freed, failures)
 }

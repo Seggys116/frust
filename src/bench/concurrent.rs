@@ -19,6 +19,25 @@ struct BinaryBaseline {
     command: String,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+struct NativeDebugFile {
+    hash: String,
+    bytes: u64,
+    mode: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Serialize)]
+struct NativeDebugProof {
+    bundle: PathBuf,
+    files: BTreeMap<String, NativeDebugFile>,
+    executable_mode: u32,
+    uuid: String,
+    sources_with_types_and_locals: Vec<String>,
+    inspection_logs: PathBuf,
+}
+
 #[derive(Serialize)]
 struct Role {
     profile: String,
@@ -41,6 +60,8 @@ struct Role {
     binary_hash: String,
     runtime_stdout_hash: String,
     runtime_stdout: String,
+    #[cfg(target_os = "macos")]
+    native_debug: NativeDebugProof,
 }
 
 #[derive(Serialize)]
@@ -117,6 +138,10 @@ struct ConcurrentReport {
     groups: Vec<Group>,
     paired_foreground_frust_minus_cargo: Summary,
     paired_settled_frust_minus_cargo: Summary,
+    #[cfg(target_os = "macos")]
+    native_debug_policy: &'static str,
+    #[cfg(target_os = "macos")]
+    native_debug_cache_restores: Vec<serde_json::Value>,
 }
 
 pub(super) fn run(flags: &[String]) -> i32 {
@@ -331,9 +356,11 @@ fn benchmark(
     }
     let manifest = project.join("Cargo.toml");
     let mut text = fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
-    text.push_str(
-        "\n[profile.coldone]\ninherits = \"dev\"\n\n[profile.coldtwo]\ninherits = \"dev\"\n",
-    );
+    for role in ROLES {
+        let _ = write!(text, "\n[profile.{role}]\ninherits = \"dev\"\n");
+        #[cfg(target_os = "macos")]
+        text.push_str("debug = true\nincremental = true\nsplit-debuginfo = \"packed\"\nstrip = \"debuginfo\"\n");
+    }
     fs::write(&manifest, text).map_err(|error| error.to_string())?;
     resolve_offline(&ctx, &project)?;
     let sources = source_paths(&project)?;
@@ -358,6 +385,10 @@ fn benchmark(
     let mut compiler_info_hashes = BTreeMap::new();
     let mut expected = BTreeMap::new();
     let mut output = None;
+    #[cfg(target_os = "macos")]
+    let mut native_debug_cache_restores = Vec::new();
+    #[cfg(target_os = "macos")]
+    let _ = wait_sources_settled(&sources, SOURCE_SETTLE_TIMEOUT)?;
     for frust in [false, true] {
         // Warm each tool and role independently, copying only its compiler-info memo later.
         for role in 0..2 {
@@ -373,6 +404,18 @@ fn benchmark(
                 &mut expected,
                 &mut output,
             )?;
+            #[cfg(target_os = "macos")]
+            if frust {
+                native_debug_cache_restores.push(restore_native_debug(
+                    &ctx,
+                    &project,
+                    &targets,
+                    role,
+                    &group.roles[0],
+                    &mut expected,
+                    &mut output,
+                )?);
+            }
             warmups.push(group);
             let memo = targets[role].join(".rustc_info.json");
             let key = format!("{}-{}", if frust { "frust" } else { "cargo" }, ROLES[role]);
@@ -516,6 +559,10 @@ fn benchmark(
         groups,
         paired_foreground_frust_minus_cargo: Summary::new(foreground_deltas),
         paired_settled_frust_minus_cargo: Summary::new(settled_deltas),
+        #[cfg(target_os = "macos")]
+        native_debug_policy: "Both fixture profiles retain full debug information and incremental compilation, with split-debuginfo=packed and strip=debuginfo. Whole executable bytes are compared unchanged. Native DWARF verification, source/type/local-variable checks and executable/bundle UUID checks run after settled clocks for every role; separate untimed warmup clean restores prove executable, runtime and complete debug bundle preservation with zero declared-unit or unknown compilations.",
+        #[cfg(target_os = "macos")]
+        native_debug_cache_restores,
     })
 }
 
@@ -858,6 +905,291 @@ fn native_binary_diagnostics(
     foreground.failure.map_or(Ok(()), Err)
 }
 
+#[cfg(target_os = "macos")]
+fn dwarf_named_entry(text: &str, tag: &str, name: &str, located: bool) -> bool {
+    text.split("DW_TAG_").any(|entry| {
+        entry.starts_with(tag)
+            && entry
+                .lines()
+                .any(|line| line.contains("DW_AT_name") && line.contains(&format!("\"{name}\"")))
+            && if located {
+                entry
+                    .lines()
+                    .any(|line| line.contains("DW_AT_type") && line.contains("\"u64\""))
+                    && entry.contains("DW_AT_location")
+            } else {
+                entry.contains("DW_AT_byte_size") && entry.contains("DW_AT_encoding")
+            }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dwarf_sources(text: &str, sources: &[String]) -> Result<(), String> {
+    if !dwarf_named_entry(text, "base_type", "u64", false) {
+        return Err("native debug bundle lacks the resolved u64 base type".into());
+    }
+    for source in sources {
+        // Parent compile-unit attributes bind each required local and type to its fixture source.
+        let entries = text
+            .split("DW_TAG_compile_unit")
+            .filter(|unit| {
+                unit.split("DW_TAG_").next().is_some_and(|header| {
+                    header
+                        .lines()
+                        .any(|line| line.contains("DW_AT_name") && line.contains(source))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let locals = if source == "src/main.rs" {
+            dwarf_named_entry(&entries, "variable", "total", true)
+        } else {
+            dwarf_named_entry(&entries, "formal_parameter", "seed", true)
+                && dwarf_named_entry(&entries, "variable", "v", true)
+        };
+        if !locals {
+            return Err(format!(
+                "native debug bundle lacks full source/type/local-variable evidence for {source}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn native_debug_proof(
+    binary: &Path,
+    profile: &Path,
+    project: &Path,
+    logs: &Path,
+) -> Result<NativeDebugProof, String> {
+    let mut bundles = Vec::new();
+    for entry in fs::read_dir(profile.join("deps")).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name
+            .strip_prefix("app-")
+            .and_then(|name| name.strip_suffix(".dSYM"))
+            .is_some_and(|hash| {
+                hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+        {
+            bundles.push(entry.path());
+        }
+    }
+    if bundles.len() != 1 {
+        return Err("native fixture must own exactly one primary app debug bundle".into());
+    }
+    let bundle = bundles.pop().unwrap();
+    let mut files = BTreeMap::new();
+    // Hash the complete regular-file bundle, including auxiliary relocation metadata.
+    let paths = source_paths(&bundle)?;
+    let mut bytes = 0u64;
+    for path in paths {
+        let meta = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        bytes = bytes
+            .checked_add(meta.len())
+            .ok_or("native debug bundle size overflow")?;
+        if !meta.is_file() || files.len() >= 64 || bytes > 512 * 1024 * 1024 {
+            return Err("native debug bundle exceeds regular-file inventory bounds".into());
+        }
+        let relative = path
+            .strip_prefix(&bundle)
+            .map_err(|error| error.to_string())?
+            .display()
+            .to_string();
+        files.insert(
+            relative,
+            NativeDebugFile {
+                hash: crate::cache::hash_file(&path).map_err(|error| error.to_string())?,
+                bytes: meta.len(),
+                mode: sys::lstat(&path).map_err(|error| error.to_string())?.mode(),
+            },
+        );
+    }
+    let stem = bundle
+        .file_stem()
+        .ok_or("native debug bundle has no stem")?;
+    let dwarf = bundle.join("Contents/Resources/DWARF").join(stem);
+    if !files
+        .get(&format!(
+            "Contents/Resources/DWARF/{}",
+            stem.to_string_lossy()
+        ))
+        .is_some_and(|file| file.bytes > 0)
+        || !files.contains_key("Contents/Info.plist")
+    {
+        return Err("native debug bundle lacks its DWARF payload or Info.plist".into());
+    }
+    fs::create_dir_all(logs).map_err(|error| error.to_string())?;
+    let inspections = [
+        ("verify", vec!["--verify", "--quiet"], vec![dwarf.as_path()]),
+        (
+            "entries",
+            vec![
+                "--debug-info",
+                "--regex",
+                "--name=^(total|seed|v|u64)$",
+                "--show-parents",
+            ],
+            vec![dwarf.as_path()],
+        ),
+        ("uuid", vec!["--uuid"], vec![binary, dwarf.as_path()]),
+    ];
+    let mut commands = Vec::new();
+    for (name, args, paths) in inspections {
+        let mut command = Command::new("/usr/bin/dwarfdump");
+        command
+            .args(args)
+            .args(paths)
+            .stdin(Stdio::null())
+            .stdout(
+                fs::File::create(logs.join(format!("{name}.stdout")))
+                    .map_err(|error| error.to_string())?,
+            )
+            .stderr(
+                fs::File::create(logs.join(format!("{name}.stderr")))
+                    .map_err(|error| error.to_string())?,
+            );
+        commands.push((commands.len(), command));
+    }
+    // Full native debug inspection runs outside every foreground and settled build clock.
+    let foreground = run_foregrounds(commands, Duration::from_secs(10))?;
+    if let Some(error) = foreground.failure {
+        return Err(format!(
+            "native debug verification failed in {}: {error}",
+            logs.display()
+        ));
+    }
+    let read = |name: &str| -> Result<String, String> {
+        let mut bytes = Vec::new();
+        fs::File::open(logs.join(name))
+            .map_err(|error| error.to_string())?
+            .take(32 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 32 * 1024 * 1024 {
+            return Err("native debug inspection output exceeds 32 MiB".into());
+        }
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    };
+    let uuids = read("uuid.stdout")?;
+    let uuids = uuids
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("UUID: ")
+                .and_then(|line| line.split_whitespace().next())
+        })
+        .collect::<Vec<_>>();
+    if uuids.len() != 2
+        || uuids[0] != uuids[1]
+        || uuids[0].len() != 36
+        || !uuids[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err("native executable and full debug bundle UUIDs do not match".into());
+    }
+    let mut sources = vec!["src/main.rs".into()];
+    for entry in fs::read_dir(project.join("libs")).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name
+            .strip_prefix("lib")
+            .is_some_and(|index| index.parse::<usize>().is_ok())
+        {
+            sources.push(format!("libs/{name}/src/lib.rs"));
+        }
+    }
+    sources.sort();
+    verify_dwarf_sources(&read("entries.stdout")?, &sources)?;
+    Ok(NativeDebugProof {
+        bundle,
+        files,
+        executable_mode: sys::lstat(binary)
+            .map_err(|error| error.to_string())?
+            .mode(),
+        uuid: uuids[0].into(),
+        sources_with_types_and_locals: sources,
+        inspection_logs: logs.into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn restore_native_debug(
+    ctx: &Ctx,
+    project: &Path,
+    targets: &[PathBuf; 2],
+    role: usize,
+    original: &Role,
+    expected: &mut BTreeMap<usize, BinaryBaseline>,
+    output: &mut Option<Vec<u8>>,
+) -> Result<serde_json::Value, String> {
+    let archive = ctx
+        .home
+        .with_file_name("retained")
+        .join(format!("native-debug-restore-{}", ROLES[role]));
+    fs::create_dir_all(
+        archive
+            .parent()
+            .ok_or("native restore archive has no parent")?,
+    )
+    .map_err(|error| error.to_string())?;
+    // Removing the whole active profile by rename forces actual cache recovery, preserving the original proof.
+    sys::rename(&targets[role].join(ROLES[role]), &archive).map_err(|error| error.to_string())?;
+    let restored = group(
+        ctx,
+        project,
+        targets,
+        &[role],
+        true,
+        "native-debug-restore",
+        0,
+        None,
+        expected,
+        output,
+    )?;
+    let result = &restored.roles[0];
+    let hits = restored
+        .cache_events
+        .iter()
+        .filter(|event| event["result"] == "hit")
+        .count();
+    let misses = restored
+        .cache_events
+        .iter()
+        .filter(|event| event["result"] == "miss")
+        .count();
+    if result.rustc_compilation_counts.cargo_units != 0
+        || result.rustc_compilation_counts.unknown != 0
+        || hits == 0
+        || misses != 0
+        || original.binary_hash != result.binary_hash
+        || original.runtime_stdout != result.runtime_stdout
+        || original.native_debug.files != result.native_debug.files
+        || original.native_debug.executable_mode != result.native_debug.executable_mode
+        || original.native_debug.uuid != result.native_debug.uuid
+    {
+        return Err(format!(
+            "native {} clean cache restore did not preserve executable, runtime and complete debug bundle without declared-unit or unknown compilations",
+            ROLES[role]
+        ));
+    }
+    Ok(
+        serde_json::json!({"phase": "untimed native debug clean cache restore", "profile": ROLES[role],
+        "original": original.native_debug, "restored": result.native_debug,
+        "original_binary_hash": original.binary_hash, "restored_binary_hash": result.binary_hash,
+        "original_runtime_stdout_hash": original.runtime_stdout_hash, "restored_runtime_stdout_hash": result.runtime_stdout_hash,
+        "rustc_compilation_counts": result.rustc_compilation_counts,
+        "rustc_invocations": result.rustc_invocations, "rustc_query_invocations": result.rustc_query_invocations,
+        "cache_hits": hits, "cache_misses": misses, "command": result.command, "archive": archive}),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn group(
     ctx: &Ctx,
@@ -1069,6 +1401,13 @@ fn group(
         } else {
             *expected_output = Some(output.clone());
         }
+        #[cfg(target_os = "macos")]
+        let native_debug = native_debug_proof(
+            &binary,
+            &targets[role].join(ROLES[role]),
+            project,
+            &directory.join(format!("native-debug-{}", ROLES[role])),
+        )?;
         roles.push(Role {
             profile: ROLES[role].into(),
             target: targets[role].clone(),
@@ -1093,6 +1432,8 @@ fn group(
             binary_hash,
             runtime_stdout_hash: blake3::hash(&output).to_hex().to_string(),
             runtime_stdout: String::from_utf8(output).map_err(|error| error.to_string())?,
+            #[cfg(target_os = "macos")]
+            native_debug,
         });
     }
     let first_spawn = roles

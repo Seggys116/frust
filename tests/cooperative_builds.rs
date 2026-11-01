@@ -367,6 +367,17 @@ fn cargo_j1_compiles_independent_unit_while_shared_unit_waits_for_another_build(
         },
     );
     assert!(!builds.gate.exists());
+    // The compiler marker precedes deferred-slot acquisition, so settle its accepted store before releasing the owner.
+    builds.until("independent unit's accepted positive-byte cache miss", || {
+        assert!(!builds.gate.exists());
+        sb.cache_events().iter().any(|event| {
+            event["crate"] == "independent_dep"
+                && event["result"] == "miss"
+                && event["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+        })
+    });
+    frust::bench::drain_deferred_stores(&builds.home, DEADLINE).unwrap();
+    assert!(!builds.gate.exists());
     assert_eq!(
         builds
             .events()

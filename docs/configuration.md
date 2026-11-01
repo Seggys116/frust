@@ -81,6 +81,19 @@ identity, probe ID and Cargo version identify the selected toolchain. Foreground
 watchdog; a timeout or spawn failure cancels their owned process groups, with a five-second reaping
 budget. Store draining has its own 120-second bound. All failed concurrent runs retain their scratch.
 
+On macOS, both concurrent fixture profiles explicitly retain full debug information and incremental
+compilation, using `split-debuginfo = "packed"` and `strip = "debuginfo"`. Debug information lives in
+complete dSYM bundles; executable comparison still hashes every original byte. This avoids native
+incremental compilation's random object filename suffixes appearing in executable debug maps. Every
+role verifies the bundle's DWARF structure, fixture source units, types and located local variables,
+and matching executable/bundle UUIDs after its settled build clock. Two additional untimed warmup
+checks rename away each frust profile and prove real cache restoration with zero declared-unit or
+unknown compilations, positive cache hits, no misses, identical executable/runtime hashes and identical
+bundle file paths, bytes and modes. Native inspection has a shared ten-second process-group watchdog
+and bounded output reads. JSON includes `native_debug_policy`, role `native_debug` proofs and separate
+`native_debug_cache_restores`; these fields and the fixture policy apply only on macOS. Directory
+outputs use the existing inline cache-store fallback when deferred capture cannot freeze them.
+
 The general report preserves its separate churn and maintenance experiments with synchronous storage;
 the churn section reports its own `store_policy`. Explicit `--store` is incompatible with `--growth`,
 `--churn`, `--linking` and `--latency`.

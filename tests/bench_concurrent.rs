@@ -159,6 +159,65 @@ fn assert_groups(report: &Value, store: &str) {
     );
     let groups = report["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 12);
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            report["native_debug_policy"]
+                .as_str()
+                .unwrap()
+                .contains("split-debuginfo=packed")
+        );
+        for group in report["warmups"].as_array().unwrap().iter().chain(groups) {
+            for role in group["roles"].as_array().unwrap() {
+                assert_native_debug(&role["native_debug"]);
+                for args in role["rustc_invocations"].as_array().unwrap() {
+                    let args = args.as_array().unwrap();
+                    if args.iter().any(|arg| arg == "app") {
+                        for flag in ["debuginfo=2", "split-debuginfo=packed", "strip=debuginfo"] {
+                            assert!(
+                                args.iter().any(|arg| arg == flag),
+                                "missing {flag}: {args:?}"
+                            );
+                        }
+                        assert!(args.iter().any(|arg| {
+                            arg.as_str()
+                                .is_some_and(|arg| arg.starts_with("incremental="))
+                        }));
+                    }
+                }
+            }
+        }
+        let restores = report["native_debug_cache_restores"].as_array().unwrap();
+        assert_eq!(restores.len(), 2);
+        for (index, restored) in restores.iter().enumerate() {
+            assert_eq!(restored["profile"], ["coldone", "coldtwo"][index]);
+            assert_eq!(restored["rustc_compilation_counts"]["cargo_units"], 0);
+            assert_eq!(restored["rustc_compilation_counts"]["unknown"], 0);
+            assert!(restored["cache_hits"].as_u64().unwrap() > 0);
+            assert_eq!(restored["cache_misses"], 0);
+            assert_eq!(
+                restored["original_binary_hash"],
+                restored["restored_binary_hash"]
+            );
+            assert_eq!(
+                restored["original_runtime_stdout_hash"],
+                restored["restored_runtime_stdout_hash"]
+            );
+            assert_eq!(restored["original"]["files"], restored["restored"]["files"]);
+            assert_eq!(restored["original"]["uuid"], restored["restored"]["uuid"]);
+            assert_eq!(
+                restored["original"]["executable_mode"],
+                restored["restored"]["executable_mode"]
+            );
+            assert_native_debug(&restored["original"]);
+            assert_native_debug(&restored["restored"]);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(report.get("native_debug_policy").is_none());
+        assert!(report.get("native_debug_cache_restores").is_none());
+    }
     for group in groups {
         let foreground = group["foreground_ns"].as_u64().unwrap();
         let drain = group["store_drain_ns"].as_u64().unwrap();
@@ -248,6 +307,31 @@ fn assert_groups(report: &Value, store: &str) {
             .len(),
         3
     );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_native_debug(proof: &Value) {
+    assert!(proof["bundle"].as_str().unwrap().ends_with(".dSYM"));
+    assert_eq!(proof["uuid"].as_str().unwrap().len(), 36);
+    assert_eq!(
+        proof["sources_with_types_and_locals"],
+        serde_json::json!([
+            "libs/lib0/src/lib.rs",
+            "libs/lib1/src/lib.rs",
+            "src/main.rs"
+        ])
+    );
+    assert_ne!(proof["executable_mode"].as_u64().unwrap() & 0o111, 0);
+    let files = proof["files"].as_object().unwrap();
+    assert!(files.contains_key("Contents/Info.plist"));
+    assert!(files.iter().any(
+        |(name, file)| name.starts_with("Contents/Resources/DWARF/app-")
+            && file["bytes"].as_u64().unwrap() > 0
+    ));
+    for file in files.values() {
+        assert_eq!(file["hash"].as_str().unwrap().len(), 64);
+        assert_ne!(file["mode"].as_u64().unwrap() & 0o444, 0);
+    }
 }
 
 #[test]
