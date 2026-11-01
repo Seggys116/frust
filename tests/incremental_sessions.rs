@@ -573,6 +573,88 @@ fn batched_guards_cover_every_inode_and_release_partial_acquisition() {
     assert!(sys::try_session_locks(&paths).unwrap().revalidate());
 }
 
+// A fresh process distinguishes native locks from a process-local serialization permit.
+fn assert_session_blocks_children(path: &Path) {
+    for protocol in protocols() {
+        let output = child_command(path, protocol)
+            .env("FRUST_SESSION_LOCK_BLOCKED", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{protocol}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+// Independent handles coexist while native locks still reject overlapping requests.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn disjoint_session_guards_coexist_and_failed_overlap_keeps_the_first_locked() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let unheld = Fixture::new();
+    let first_guard = sys::try_session_locks(std::slice::from_ref(&first.lock)).unwrap();
+    let second_guard = sys::try_session_locks(std::slice::from_ref(&second.lock))
+        .expect("an independent target must not need another target's process-local permit");
+    assert!(first_guard.revalidate() && second_guard.revalidate());
+
+    let refused = sys::try_session_locks(&[unheld.lock.clone(), first.lock.clone()]);
+    assert_eq!(
+        refused.err().expect("the first session is still locked").kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_session_blocks_children(&first.lock);
+    assert_session_blocks_children(&second.lock);
+    for protocol in protocols() {
+        drop(Holder::start(&unheld.lock, protocol));
+    }
+    drop(second_guard);
+    assert_session_blocks_children(&first.lock);
+    for protocol in protocols() {
+        drop(Holder::start(&second.lock, protocol));
+    }
+    drop(first_guard);
+    for protocol in protocols() {
+        drop(Holder::start(&first.lock, protocol));
+    }
+}
+
+// Process-owned record locks require refusal before a second guard opens any alias.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn process_record_session_guards_keep_serialization_and_protect_the_first_lock() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let first_guard = sys::try_session_locks(std::slice::from_ref(&first.lock)).unwrap();
+    for paths in [vec![second.lock.clone()], vec![second.lock.clone(), first.lock.clone()]] {
+        let refused = sys::try_session_locks(&paths);
+        assert_eq!(
+            refused.err().expect("process-record guards retain their permit").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(first_guard.revalidate());
+        assert_session_blocks_children(&first.lock);
+    }
+    drop(first_guard);
+    let second_guard = sys::try_session_locks(std::slice::from_ref(&second.lock)).unwrap();
+    assert!(second_guard.revalidate());
+    assert_session_blocks_children(&second.lock);
+    drop(second_guard);
+    for path in [&first.lock, &second.lock] {
+        for protocol in protocols() {
+            drop(Holder::start(path, protocol));
+        }
+    }
+}
+
 // Whole-profile admission must protect every selected crate before any profile is touched.
 #[test]
 fn retirement_sets_are_atomic_and_finalized_candidates_ignore_unrelated_working_sessions() {

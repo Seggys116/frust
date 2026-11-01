@@ -124,11 +124,14 @@ pub fn unlock(file: &File) -> io::Result<()> {
     imp::unlock(file)
 }
 
+// Closing any alias releases process-owned record locks; handle-owned locks need no global permit.
+#[cfg(all(unix, not(target_os = "macos")))]
 static SESSION_LOCK_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct SessionLocks {
     files: Vec<(PathBuf, File)>,
     locked: usize,
+    #[cfg(all(unix, not(target_os = "macos")))]
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -165,12 +168,18 @@ impl Drop for SessionLocks {
 
 /// Open and validate every descriptor before locking, so a duplicate can never close a held POSIX alias.
 pub fn try_session_locks(paths: &[PathBuf]) -> io::Result<SessionLocks> {
+    #[cfg(all(unix, not(target_os = "macos")))]
     let serial = match SESSION_LOCK_SERIAL.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
     };
-    let mut guard = SessionLocks { files: Vec::new(), locked: 0, _serial: serial };
+    let mut guard = SessionLocks {
+        files: Vec::new(),
+        locked: 0,
+        #[cfg(all(unix, not(target_os = "macos")))]
+        _serial: serial,
+    };
     let mut identities = std::collections::HashSet::new();
     let mut names = std::collections::HashSet::new();
     for path in paths {

@@ -84,6 +84,17 @@ impl Probe {
             return Some((entry.probe, CacheOutcome::Hit));
         }
 
+        let _guard = memo::cold_miss(dirs, &slot);
+        let Some(key) = probe_key(&rustc, &cargo, toolchain, cwd) else {
+            return probe_now(&rustc, &cargo, toolchain, cwd, false)
+                .map(|(p, _)| (p, CacheOutcome::Bypass));
+        };
+        if let Some(entry) = memo::load::<ProbeEntry>(&slot)
+            && entry.valid(&key)
+        {
+            return Some((entry.probe, CacheOutcome::Hit));
+        }
+
         let started = SystemTime::now();
         let (probe, sysroots) = probe_now(&rustc, &cargo, toolchain, cwd, true)?;
         let validate = validation_set(&sysroots);
@@ -248,16 +259,49 @@ fn unix_now() -> u64 {
 }
 
 pub(crate) mod memo {
-    use std::fs;
+    use std::fs::{self, File};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
 
+    use crate::lock::{ensure_dir, open_lock_file, shared_mode};
     use crate::paths::Dirs;
     use crate::sys;
+
+    pub struct ColdMissGuard(File);
+
+    impl Drop for ColdMissGuard {
+        fn drop(&mut self) {
+            let _ = sys::unlock(&self.0);
+        }
+    }
+
+    /// Stable guard inodes survive memo replacement and collection; contention only delays a miss briefly.
+    pub fn cold_miss(dirs: &Dirs, slot: &Path) -> Option<ColdMissGuard> {
+        if !dirs.root().is_dir() {
+            return None;
+        }
+        let mode = shared_mode(dirs);
+        let directory = dirs.root().join("memo-locks");
+        ensure_dir(&directory, mode).ok()?;
+        let stripe = blake3::hash(slot.as_os_str().as_encoded_bytes()).as_bytes()[0] & 15;
+        let file = open_lock_file(&directory.join(format!("{stripe:02}.lock")), mode).ok()?;
+        let started = Instant::now();
+        loop {
+            match sys::try_lock(&file, sys::LockKind::Exclusive) {
+                Ok(()) => return Some(ColdMissGuard(file)),
+                Err(fs::TryLockError::WouldBlock) => {
+                    let remaining = Duration::from_millis(250).checked_sub(started.elapsed())?;
+                    thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 
     /// Any replacement (new inode), in-place write or metadata change makes the signature differ.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

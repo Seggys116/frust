@@ -40,6 +40,17 @@ pub fn locate_cached(
     {
         return (Some(entry.root), CacheOutcome::Hit);
     }
+    let _guard = memo::cold_miss(dirs, &slot);
+    let Some((key, chain)) = locate_key(cwd, toolchain, manifest_path, toolchain_id) else {
+        return (locate(cwd, toolchain, manifest_path), CacheOutcome::Bypass);
+    };
+    if let Some(entry) = memo::load::<LocateEntry>(&slot)
+        && entry.format == LOCATE_FORMAT
+        && entry.key == key
+        && chain.contains(&entry.root)
+    {
+        return (Some(entry.root), CacheOutcome::Hit);
+    }
     let root = locate(cwd, toolchain, manifest_path);
     if let Some(root) = root.as_ref().filter(|r| chain.contains(r)) {
         // Inputs edited while cargo ran: use the answer, but do not memoise it.
