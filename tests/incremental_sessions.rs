@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use frust::sys;
 
@@ -212,17 +212,28 @@ impl Holder {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        loop {
-            let mut line = String::new();
-            assert!(
-                output.read_line(&mut line).unwrap() > 0,
-                "{protocol} child exited before acquiring its lock"
-            );
-            if line.trim() == "SESSION_LOCK_READY" {
-                break;
+        let stdout = child.stdout.take().unwrap();
+        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut output = BufReader::new(stdout);
+            let acquired = loop {
+                let mut line = String::new();
+                match output.read_line(&mut line) {
+                    Ok(0) | Err(_) => break false,
+                    Ok(_) if line.trim() == "SESSION_LOCK_READY" => break true,
+                    Ok(_) => {}
+                }
+            };
+            let _ = ready.send((acquired, output));
+        });
+        let output = match result.recv_timeout(Duration::from_secs(10)) {
+            Ok((true, output)) => output,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{protocol} child did not acquire its lock before the deadline");
             }
-        }
+        };
         Self {
             child,
             _output: output,
@@ -233,9 +244,34 @@ impl Holder {
 impl Drop for Holder {
     fn drop(&mut self) {
         drop(self.child.stdin.take());
-        let status = self.child.wait().unwrap();
+        let status = wait_child(&mut self.child);
         assert!(status.success(), "lock holder failed: {status}");
     }
+}
+
+fn wait_child(child: &mut Child) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("session child exceeded its deadline");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn child_output(command: &mut Command) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_child(&mut child);
+    child.wait_with_output().unwrap()
 }
 
 fn protocols() -> Vec<&'static str> {
@@ -289,10 +325,9 @@ fn one_guard_holds_both_protocols_and_drops_them_explicitly() {
     assert!(guard.matches_path(&fixture.lock));
     assert!(sys::try_session_lock(&fixture.lock).is_err());
     for protocol in protocols() {
-        let output = child_command(&fixture.lock, protocol)
-            .env("FRUST_SESSION_LOCK_BLOCKED", "1")
-            .output()
-            .unwrap();
+        let output = child_output(
+            child_command(&fixture.lock, protocol).env("FRUST_SESSION_LOCK_BLOCKED", "1"),
+        );
         assert!(
             output.status.success(),
             "{protocol}: {}",
@@ -549,10 +584,8 @@ fn batched_guards_cover_every_inode_and_release_partial_acquisition() {
     assert!(guard.revalidate());
     for path in &paths {
         for protocol in protocols() {
-            let output = child_command(path, protocol)
-                .env("FRUST_SESSION_LOCK_BLOCKED", "1")
-                .output()
-                .unwrap();
+            let output =
+                child_output(child_command(path, protocol).env("FRUST_SESSION_LOCK_BLOCKED", "1"));
             assert!(
                 output.status.success(),
                 "{}",
@@ -576,10 +609,8 @@ fn batched_guards_cover_every_inode_and_release_partial_acquisition() {
 // A fresh process distinguishes native locks from a process-local serialization permit.
 fn assert_session_blocks_children(path: &Path) {
     for protocol in protocols() {
-        let output = child_command(path, protocol)
-            .env("FRUST_SESSION_LOCK_BLOCKED", "1")
-            .output()
-            .unwrap();
+        let output =
+            child_output(child_command(path, protocol).env("FRUST_SESSION_LOCK_BLOCKED", "1"));
         assert!(
             output.status.success(),
             "{protocol}: {}",
@@ -589,7 +620,7 @@ fn assert_session_blocks_children(path: &Path) {
 }
 
 // Independent handles coexist while native locks still reject overlapping requests.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[test]
 fn disjoint_session_guards_coexist_and_failed_overlap_keeps_the_first_locked() {
     let _serial = SERIAL
@@ -605,7 +636,10 @@ fn disjoint_session_guards_coexist_and_failed_overlap_keeps_the_first_locked() {
 
     let refused = sys::try_session_locks(&[unheld.lock.clone(), first.lock.clone()]);
     assert_eq!(
-        refused.err().expect("the first session is still locked").kind(),
+        refused
+            .err()
+            .expect("the first session is still locked")
+            .kind(),
         io::ErrorKind::WouldBlock
     );
     assert_session_blocks_children(&first.lock);
@@ -624,8 +658,31 @@ fn disjoint_session_guards_coexist_and_failed_overlap_keeps_the_first_locked() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn unrelated_alias_close_preserves_native_session_locks() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new();
+    let guard = sys::try_session_lock(&fixture.lock).unwrap();
+    drop(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.lock)
+            .unwrap(),
+    );
+    assert_session_blocks_children(&fixture.lock);
+    assert!(guard.matches_path(&fixture.lock));
+    drop(guard);
+    for protocol in protocols() {
+        drop(Holder::start(&fixture.lock, protocol));
+    }
+}
+
 // Process-owned record locks require refusal before a second guard opens any alias.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 #[test]
 fn process_record_session_guards_keep_serialization_and_protect_the_first_lock() {
     let _serial = SERIAL
@@ -634,10 +691,16 @@ fn process_record_session_guards_keep_serialization_and_protect_the_first_lock()
     let first = Fixture::new();
     let second = Fixture::new();
     let first_guard = sys::try_session_locks(std::slice::from_ref(&first.lock)).unwrap();
-    for paths in [vec![second.lock.clone()], vec![second.lock.clone(), first.lock.clone()]] {
+    for paths in [
+        vec![second.lock.clone()],
+        vec![second.lock.clone(), first.lock.clone()],
+    ] {
         let refused = sys::try_session_locks(&paths);
         assert_eq!(
-            refused.err().expect("process-record guards retain their permit").kind(),
+            refused
+                .err()
+                .expect("process-record guards retain their permit")
+                .kind(),
             io::ErrorKind::WouldBlock
         );
         assert!(first_guard.revalidate());

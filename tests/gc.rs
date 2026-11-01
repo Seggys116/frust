@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use frust::{compact, config::Config, fsx, gc, lock, paths::Dirs, sys};
 
-// Parent tests share the process-wide nonblocking compiler-session admission permit.
+// Parent tests serialize retirement and native session lock scenarios.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 const SESSION: &str = "s-0000000001-0000001-0000000000000000000000000";
@@ -688,13 +688,13 @@ fn interrupted_retirement_keeps_profile_discovery_and_retries_remaining_payloads
 }
 
 #[test]
-fn process_session_admission_contention_retains_payloads_until_release() {
+fn native_session_contention_retains_payloads_until_release() {
     let _serial = SERIAL.lock().unwrap();
     let other = Target::new(true);
     let fixture = Target::new(true);
     let plan = fixture.plan();
     assert_eq!(retirement_count(&plan), 1);
-    let lock_path = other.profile.join("incremental/unit").join(SESSION_LOCK);
+    let lock_path = fixture.profile.join("incremental/unit").join(SESSION_LOCK);
     let held = sys::try_session_lock(&lock_path).unwrap();
     let (freed, errors) = gc::execute(&fixture.dirs, &plan);
     assert_eq!(freed, 0);
@@ -707,6 +707,31 @@ fn process_session_admission_contention_retains_payloads_until_release() {
     assert!(!fixture.has_payload() && other.has_payload());
     assert!(empty_directory(&fixture.profile.join("deps")));
     assert!(empty_directory(&fixture.profile.join(".fingerprint")));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unrelated_native_session_guard_allows_idle_target_retirement() {
+    let _serial = SERIAL.lock().unwrap();
+    let other = Target::new(true);
+    let fixture = Target::new(true);
+    let plan = fixture.plan();
+    assert_eq!(retirement_count(&plan), 1);
+    let lock_path = other.profile.join("incremental/unit").join(SESSION_LOCK);
+    let held = sys::try_session_lock(&lock_path).unwrap();
+    let probe = File::options().read(true).write(true).open(&lock_path).unwrap();
+    assert_eq!(io::Error::from(sys::try_lock(&probe, sys::LockKind::Exclusive).unwrap_err()).kind(), io::ErrorKind::WouldBlock);
+    let (freed, errors) = gc::execute(&fixture.dirs, &plan);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(freed >= 2 * 1024 * 1024);
+    assert!(!fixture.has_payload() && other.has_payload());
+    assert!(empty_directory(&fixture.profile.join("deps")));
+    assert!(empty_directory(&fixture.profile.join(".fingerprint")));
+    assert!(other.profile.join("incremental/unit").join(SESSION).is_dir());
+    assert_eq!(io::Error::from(sys::try_lock(&probe, sys::LockKind::Exclusive).unwrap_err()).kind(), io::ErrorKind::WouldBlock);
+    drop(held);
+    sys::try_lock(&probe, sys::LockKind::Exclusive).unwrap();
+    sys::unlock(&probe).unwrap();
 }
 
 #[test]

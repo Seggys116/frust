@@ -250,37 +250,78 @@ pub fn open_session_lock(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn session_record_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
+pub(super) fn session_record_lock(
+    file: &File,
+    mode: super::SessionRecordMode,
+    kind: libc::c_short,
+) -> io::Result<()> {
     // SAFETY: flock is plain data; zero length locks the whole file, including future bytes.
     let mut record: libc::flock = unsafe { std::mem::zeroed() };
     record.l_type = kind;
     record.l_whence = libc::SEEK_SET as _;
-    // SAFETY: the descriptor remains open and record is initialized for F_SETLK.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &record) } == 0 {
+    let command = match mode {
+        #[cfg(target_os = "linux")]
+        super::SessionRecordMode::Ofd => libc::F_OFD_SETLK,
+        super::SessionRecordMode::Posix => libc::F_SETLK,
+    };
+    // SAFETY: the descriptor remains open and record is initialized for the selected nonblocking command.
+    if unsafe { libc::fcntl(file.as_raw_fd(), command, &record) } == 0 {
         Ok(())
     } else {
-        let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN)) {
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
-        } else {
-            Err(error)
-        }
+        Err(io::Error::last_os_error())
     }
 }
 
-pub fn try_lock_session(file: &File) -> io::Result<()> {
+#[cfg(not(target_os = "macos"))]
+pub(super) fn try_lock_session(
+    file: &File,
+    mode: super::SessionRecordMode,
+) -> Result<(), super::SessionLockError> {
+    try_lock_session_with(file, mode, &mut session_record_lock)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn try_lock_session_with(
+    file: &File,
+    mode: super::SessionRecordMode,
+    record: &mut impl FnMut(&File, super::SessionRecordMode, libc::c_short) -> io::Result<()>,
+) -> Result<(), super::SessionLockError> {
     file.try_lock().map_err(io::Error::from)?;
-    #[cfg(not(target_os = "macos"))]
-    if let Err(error) = session_record_lock(file, libc::F_WRLCK as _) {
+    if let Err(error) = record(file, mode, libc::F_WRLCK as _) {
         let _ = file.unlock();
-        return Err(error);
+        #[cfg(target_os = "linux")]
+        if mode == super::SessionRecordMode::Ofd
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+            )
+        {
+            return Err(super::SessionLockError::OfdUnsupported(error));
+        }
+        return Err(
+            if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN)) {
+                io::Error::from(io::ErrorKind::WouldBlock).into()
+            } else {
+                error.into()
+            },
+        );
     }
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub fn try_lock_session(file: &File) -> io::Result<()> {
+    file.try_lock().map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn unlock_session(file: &File, mode: super::SessionRecordMode) {
+    let _ = session_record_lock(file, mode, libc::F_UNLCK as _);
+    let _ = file.unlock();
+}
+
+#[cfg(target_os = "macos")]
 pub fn unlock_session(file: &File) {
-    #[cfg(not(target_os = "macos"))]
-    let _ = session_record_lock(file, libc::F_UNLCK as _);
     let _ = file.unlock();
 }
 

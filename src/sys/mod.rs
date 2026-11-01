@@ -124,42 +124,116 @@ pub fn unlock(file: &File) -> io::Result<()> {
     imp::unlock(file)
 }
 
-// Closing any alias releases process-owned record locks; handle-owned locks need no global permit.
+// Readers use handle-owned locks; legacy record locks exclude every session descriptor open.
 #[cfg(all(unix, not(target_os = "macos")))]
-static SESSION_LOCK_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SESSION_LOCK_SERIAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionRecordMode {
+    #[cfg(target_os = "linux")]
+    Ofd,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Posix,
+    #[cfg(any(windows, target_os = "macos"))]
+    Handle,
+}
+
+#[derive(Debug)]
+enum SessionLockError {
+    Io(io::Error),
+    #[cfg(target_os = "linux")]
+    OfdUnsupported(io::Error),
+}
+
+impl From<io::Error> for SessionLockError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl SessionLockError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Io(error) => error,
+            #[cfg(target_os = "linux")]
+            Self::OfdUnsupported(error) => error,
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+enum SessionPermit {
+    #[cfg(target_os = "linux")]
+    Read {
+        _guard: std::sync::RwLockReadGuard<'static, ()>,
+    },
+    LegacyWrite {
+        _guard: std::sync::RwLockWriteGuard<'static, ()>,
+    },
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn legacy_session_permit() -> io::Result<SessionPermit> {
+    let guard = match SESSION_LOCK_SERIAL.try_write() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+    };
+    Ok(SessionPermit::LegacyWrite { _guard: guard })
+}
 
 pub struct SessionLocks {
     files: Vec<(PathBuf, File)>,
     locked: usize,
+    record_mode: SessionRecordMode,
     #[cfg(all(unix, not(target_os = "macos")))]
-    _serial: std::sync::MutexGuard<'static, ()>,
+    _permit: SessionPermit,
 }
 
 impl SessionLocks {
     pub fn metadata(&self, path: &Path) -> io::Result<Meta> {
-        self.files.iter().find(|(candidate, _)| candidate == path)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)).and_then(|(_, file)| fstat(file))
+        self.files
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            .and_then(|(_, file)| fstat(file))
     }
 
     pub fn matches_path(&self, path: &Path) -> bool {
-        self.files.iter().find(|(candidate, _)| candidate == path)
+        self.files
+            .iter()
+            .find(|(candidate, _)| candidate == path)
             .is_some_and(|(_, file)| session_identity_matches(path, file))
     }
 
     pub fn revalidate(&self) -> bool {
-        self.files.iter().all(|(path, file)| session_identity_matches(path, file))
+        self.files
+            .iter()
+            .all(|(path, file)| session_identity_matches(path, file))
     }
 }
 
 fn session_identity_matches(path: &Path, file: &File) -> bool {
-    let (Ok(current), Ok(opened)) = (lstat(path), fstat(file)) else { return false };
-    current.is_file() && !current.file_type().is_symlink() && current.nlink() == 1 && opened.nlink() == 1
-        && current.ino() != 0 && current.ino() == opened.ino() && current.dev() == opened.dev()
+    let (Ok(current), Ok(opened)) = (lstat(path), fstat(file)) else {
+        return false;
+    };
+    current.is_file()
+        && !current.file_type().is_symlink()
+        && current.nlink() == 1
+        && opened.nlink() == 1
+        && current.ino() != 0
+        && current.ino() == opened.ino()
+        && current.dev() == opened.dev()
 }
 
 impl Drop for SessionLocks {
     fn drop(&mut self) {
         for (_, file) in &self.files[..self.locked] {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            imp::unlock_session(file, self.record_mode);
+            #[cfg(any(windows, target_os = "macos"))]
             imp::unlock_session(file);
         }
         self.files.clear();
@@ -169,46 +243,121 @@ impl Drop for SessionLocks {
 /// Open and validate every descriptor before locking, so a duplicate can never close a held POSIX alias.
 pub fn try_session_locks(paths: &[PathBuf]) -> io::Result<SessionLocks> {
     #[cfg(all(unix, not(target_os = "macos")))]
-    let serial = match SESSION_LOCK_SERIAL.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
-    };
-    let mut guard = SessionLocks {
+    {
+        try_session_locks_with(paths, &mut imp::open_session_lock, &mut imp::try_lock_session)
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let guard = SessionLocks {
+            files: Vec::new(),
+            locked: 0,
+            record_mode: SessionRecordMode::Handle,
+        };
+        session_lock_attempt(paths, guard, &mut imp::open_session_lock, &mut |file, _| {
+            imp::try_lock_session(file).map_err(Into::into)
+        })
+        .map_err(SessionLockError::into_io)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn try_session_locks_with(
+    paths: &[PathBuf],
+    open: &mut impl FnMut(&Path) -> io::Result<File>,
+    lock: &mut impl FnMut(&File, SessionRecordMode) -> Result<(), SessionLockError>,
+) -> io::Result<SessionLocks> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = match SESSION_LOCK_SERIAL.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+        };
+        let guard = SessionLocks {
+            files: Vec::new(),
+            locked: 0,
+            record_mode: SessionRecordMode::Ofd,
+            _permit: SessionPermit::Read { _guard: read },
+        };
+        match session_lock_attempt(paths, guard, open, lock) {
+            Ok(guard) => return Ok(guard),
+            Err(SessionLockError::OfdUnsupported(_)) => {}
+            Err(error) => return Err(error.into_io()),
+        }
+    }
+    // The failed attempt closes every descriptor before releasing its read permit.
+    let permit = legacy_session_permit()?;
+    let guard = SessionLocks {
         files: Vec::new(),
         locked: 0,
-        #[cfg(all(unix, not(target_os = "macos")))]
-        _serial: serial,
+        record_mode: SessionRecordMode::Posix,
+        _permit: permit,
     };
+    session_lock_attempt(paths, guard, open, lock).map_err(SessionLockError::into_io)
+}
+
+fn session_lock_attempt(
+    paths: &[PathBuf],
+    mut guard: SessionLocks,
+    open: &mut impl FnMut(&Path) -> io::Result<File>,
+    lock: &mut impl FnMut(&File, SessionRecordMode) -> Result<(), SessionLockError>,
+) -> Result<SessionLocks, SessionLockError> {
     let mut identities = std::collections::HashSet::new();
     let mut names = std::collections::HashSet::new();
     for path in paths {
         if !names.insert(path) {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
-        if !matches!(fs_type_name(path).as_deref(), Some("ext4" | "xfs" | "btrfs" | "tmpfs" | "overlay" | "zfs" | "f2fs" | "ramfs" | "bcachefs" | "apfs" | "hfs" | "ntfs" | "refs")) {
-            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        if !matches!(
+            fs_type_name(path).as_deref(),
+            Some(
+                "ext4"
+                    | "xfs"
+                    | "btrfs"
+                    | "tmpfs"
+                    | "overlay"
+                    | "zfs"
+                    | "f2fs"
+                    | "ramfs"
+                    | "bcachefs"
+                    | "apfs"
+                    | "hfs"
+                    | "ntfs"
+                    | "refs"
+            )
+        ) {
+            return Err(io::Error::from(io::ErrorKind::Unsupported).into());
         }
         let before = lstat(path)?;
-        if !before.is_file() || before.file_type().is_symlink() || before.nlink() != 1 || before.ino() == 0 {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        if !before.is_file()
+            || before.file_type().is_symlink()
+            || before.nlink() != 1
+            || before.ino() == 0
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
-        let file = imp::open_session_lock(path)?;
+        let file = open(path)?;
         let opened = fstat(&file)?;
-        if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.is_file() || opened.nlink() != 1 {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        if opened.dev() != before.dev()
+            || opened.ino() != before.ino()
+            || !opened.is_file()
+            || opened.nlink() != 1
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
         }
         if !identities.insert((opened.dev(), opened.ino())) {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
         guard.files.push((path.clone(), file));
     }
     for (_, file) in &guard.files {
-        imp::try_lock_session(file)?;
+        lock(file, guard.record_mode)?;
         guard.locked += 1;
     }
     if !guard.revalidate() {
-        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
     }
     Ok(guard)
 }
@@ -537,143 +686,4 @@ pub(crate) fn non_utf8_os_string() -> OsString {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("frust-sys-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn directory_watcher_falls_back_to_a_bounded_wait() {
-        let mut watcher = DirectoryWatcher { inner: None };
-        let timeout = Duration::from_millis(10);
-        let started = Instant::now();
-        assert!(!watcher.wait(timeout));
-        assert!(started.elapsed() >= timeout);
-    }
-
-    #[test]
-    fn directory_watcher_unavailable_path_uses_fallback() {
-        let dir = scratch("watch-unavailable");
-        let mut watcher = DirectoryWatcher::new(&[&dir.join("absent")]);
-        assert!(watcher.inner.is_none());
-        assert!(!watcher.wait(Duration::ZERO));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn meta_reports_identity_links_and_times() {
-        let dir = scratch("meta");
-        let file = dir.join("f");
-        fs::write(&file, b"hello").unwrap();
-        let meta = stat(&file).unwrap();
-        assert_eq!(meta.len(), 5);
-        assert_eq!(meta.nlink(), 1);
-        assert!(meta.ino() != 0);
-        let (secs, nsec) = meta.mtime();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        assert!((now - secs).abs() < 600);
-        assert!((0..1_000_000_000).contains(&nsec));
-        let open = File::open(&file).unwrap();
-        let by_handle = fstat(&open).unwrap();
-        assert_eq!((by_handle.dev(), by_handle.ino()), (meta.dev(), meta.ino()));
-        fs::hard_link(&file, dir.join("g")).unwrap();
-        assert_eq!(stat(&file).unwrap().nlink(), 2);
-        // Windows identity requires stat, lstat or fstat rather than bare std metadata.
-        if cfg!(unix) {
-            assert_eq!(Meta::from(fs::metadata(&file).unwrap()).ino(), meta.ino());
-        }
-        assert!(stat(&dir.join("absent")).is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn positional_io_leaves_the_cursor_alone() {
-        let dir = scratch("positional");
-        let path = dir.join("f");
-        let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
-        write_all_at(&file, b"world", 6).unwrap();
-        write_all_at(&file, b"hello ", 0).unwrap();
-        let mut buf = [0u8; 5];
-        read_exact_at(&file, &mut buf, 6).unwrap();
-        assert_eq!(&buf, b"world");
-        assert_eq!(fs::read(&path).unwrap(), b"hello world");
-        assert!(read_exact_at(&file, &mut [0u8; 8], 8).is_err(), "reading past the end fails");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn locks_conflict_between_handles() {
-        let dir = scratch("lock");
-        let path = dir.join("f");
-        fs::write(&path, b"").unwrap();
-        let (a, b) = (File::open(&path).unwrap(), File::open(&path).unwrap());
-        lock(&a, LockKind::Exclusive).unwrap();
-        assert!(matches!(try_lock(&b, LockKind::Exclusive), Err(fs::TryLockError::WouldBlock)));
-        assert!(matches!(try_lock(&b, LockKind::Shared), Err(fs::TryLockError::WouldBlock)));
-        unlock(&a).unwrap();
-        try_lock(&b, LockKind::Shared).unwrap();
-        try_lock(&a, LockKind::Shared).unwrap();
-        assert!(matches!(try_lock(&File::open(&path).unwrap(), LockKind::Exclusive), Err(fs::TryLockError::WouldBlock)));
-        unlock(&a).unwrap();
-        unlock(&b).unwrap();
-        lock(&b, LockKind::Shared).unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rename_replaces_an_existing_target() {
-        let dir = scratch("rename");
-        fs::write(dir.join("from"), b"new").unwrap();
-        fs::write(dir.join("to"), b"old").unwrap();
-        rename(&dir.join("from"), &dir.join("to")).unwrap();
-        assert_eq!(fs::read(dir.join("to")).unwrap(), b"new");
-        assert!(!dir.join("from").exists());
-        assert!(rename(&dir.join("from"), &dir.join("other")).is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn set_mtime_now_moves_files_and_directories_forward() {
-        let dir = scratch("mtime");
-        let file = dir.join("f");
-        fs::write(&file, b"x").unwrap();
-        let sub = dir.join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        let old = SystemTime::now() - Duration::from_secs(7200);
-        File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
-        // Opening directories on Windows requires backup semantics, so only Unix ages this one.
-        #[cfg(unix)]
-        File::open(&sub).unwrap().set_modified(old).unwrap();
-        for path in [&file, &sub] {
-            set_mtime_now(path).unwrap();
-            let age = fs::metadata(path).unwrap().modified().unwrap().elapsed().unwrap_or_default();
-            assert!(age < Duration::from_secs(600), "{}", path.display());
-        }
-        assert!(set_mtime_now(&dir.join("absent")).is_err());
-        assert!(!dir.join("absent").exists(), "touching a missing path creates nothing");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn pipe_reads_never_block_and_report_end_of_stream() {
-        let (reader, mut writer) = io::pipe().unwrap();
-        let mut pipe = Pipe::from(reader);
-        let mut buf = [0u8; 16];
-        assert_eq!(pipe.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(wait_readable([Some(&pipe), None], Duration::from_millis(10)), [false, false]);
-        writer.write_all(b"hi").unwrap();
-        assert_eq!(wait_readable([None, Some(&pipe)], Duration::from_secs(5)), [false, true]);
-        assert_eq!(pipe.read(&mut buf).unwrap(), 2);
-        assert_eq!(&buf[..2], b"hi");
-        drop(writer);
-        assert_eq!(wait_readable([Some(&pipe), None], Duration::from_secs(5)), [true, false]);
-        assert_eq!(pipe.read(&mut buf).unwrap(), 0);
-    }
-}
+mod tests;
