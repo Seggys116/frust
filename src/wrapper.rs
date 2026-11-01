@@ -1207,11 +1207,23 @@ impl Plan {
                     .and_then(|stem| indices.get(format!("{stem}.rlib").as_str()).copied())
             })
             .collect();
-        let store_file = |i: usize, name: &String| -> io::Result<StoredFile> {
+        let captured_backings: BTreeSet<usize> = paired
+            .iter()
+            .enumerate()
+            .filter_map(|(i, base)| {
+                let base = (*base)?;
+                let commitment = commitments?.get(&names[i])?;
+                commitment.valid().then_some(base)
+            })
+            .collect();
+        let store_file = |i: usize,
+                          name: &String,
+                          capture: bool|
+         -> io::Result<(StoredFile, Option<cache::payload::StoreProof>)> {
             let src = out_dir.join(name);
             let stored = format!("f{i}");
             let text = name.ends_with(".d");
-            let payload = if text {
+            let (payload, proof) = if text {
                 let raw = if name == dep_info.0 {
                     dep_info.1.to_string()
                 } else {
@@ -1220,48 +1232,65 @@ impl Plan {
                 let body = dep_info_tokenised(&raw, profile);
                 let bytes = body.len() as u64;
                 fs::write(staged.join(&stored), body)?;
-                cache::payload::StoredPayload {
-                    bytes,
-                    encoding: cache::payload::Encoding::Raw,
-                    stored_bytes: None,
-                    decoded_bytes: None,
-                    content_hash: None,
-                }
-            } else {
-                cache::payload::store_committed(
+                (
+                    cache::payload::StoredPayload {
+                        bytes,
+                        encoding: cache::payload::Encoding::Raw,
+                        stored_bytes: None,
+                        decoded_bytes: None,
+                        content_hash: None,
+                    },
+                    None,
+                )
+            } else if capture {
+                cache::payload::store_proven(
                     &src,
                     &staged.join(&stored),
                     compress,
                     commitments.and_then(|c| c.get(name)),
+                    true,
                 )?
+            } else {
+                (
+                    cache::payload::store_committed(
+                        &src,
+                        &staged.join(&stored),
+                        compress,
+                        commitments.and_then(|c| c.get(name)),
+                    )?,
+                    None,
+                )
             };
             let dir = !text && src.is_dir();
-            Ok(StoredFile {
-                name: name.clone(),
-                stored,
-                text,
-                bytes: payload.bytes,
-                dir,
-                encoding: payload.encoding,
-                stored_bytes: payload.stored_bytes,
-                decoded_bytes: payload.decoded_bytes,
-                content_hash: payload.content_hash,
-                metadata_slice: None,
-            })
+            Ok((
+                StoredFile {
+                    name: name.clone(),
+                    stored,
+                    text,
+                    bytes: payload.bytes,
+                    dir,
+                    encoding: payload.encoding,
+                    stored_bytes: payload.stored_bytes,
+                    decoded_bytes: payload.decoded_bytes,
+                    content_hash: payload.content_hash,
+                    metadata_slice: None,
+                },
+                proof,
+            ))
         };
         let normal = parallel(names, |i, name| {
             if paired[i].is_some() {
                 Ok(None)
             } else {
-                store_file(i, name).map(Some)
+                store_file(i, name, captured_backings.contains(&i)).map(Some)
             }
         })?;
-        // Range proofs read the completed staged backing, including its compression and integrity checks.
+        // Only this exclusive staging transaction can consume its producer captures; unavailable proofs decode the staged backing.
         let files = parallel(names, |i, name| {
             let Some(base_index) = paired[i] else {
-                return Ok(normal[i].as_ref().unwrap().clone());
+                return Ok(normal[i].as_ref().unwrap().0.clone());
             };
-            let base = normal[base_index].as_ref().unwrap();
+            let (base, proof) = normal[base_index].as_ref().unwrap();
             let src = out_dir.join(name);
             let target = StoredFile {
                 name: name.clone(),
@@ -1275,15 +1304,18 @@ impl Plan {
                 content_hash: None,
                 metadata_slice: None,
             };
-            match cache::metadata_slice::build(
+            match cache::metadata_slice::build_proven(
                 &staged.join(&base.stored),
                 base,
                 &src,
                 &target,
                 commitments.and_then(|c| c.get(name)),
-            )? {
+                proof.as_ref(),
+            )?
+            .0
+            {
                 Some(file) => Ok(file),
-                None => store_file(i, name),
+                None => store_file(i, name, false).map(|(file, _)| file),
             }
         })?;
         cache::metadata_slice::validate_groups(&files)?;
@@ -4086,6 +4118,165 @@ mod tests {
             fs::read_to_string(rlib.parent().unwrap().join("k.d")).unwrap(),
             job.dep_text
         );
+    }
+
+    #[test]
+    fn committed_paired_outputs_publish_and_restore_without_capture_files() {
+        let s = Scratch::new("paired-publish-restore");
+        let (mut job, _, rlib) = fixture(&s);
+        let rmeta = rlib.with_file_name("libk.rmeta");
+        let metadata = vec![0x5a; 96 * 1024 + 17];
+        let mut archive = b"!<arch>\n".to_vec();
+        for (name, bytes) in [
+            ("lib.rmeta/", metadata.clone()),
+            ("code.o/", vec![0x65; 96 * 1024 + 1]),
+        ] {
+            archive.extend_from_slice(
+                format!(
+                    "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    0,
+                    0,
+                    0,
+                    "644",
+                    bytes.len()
+                )
+                .as_bytes(),
+            );
+            archive.extend_from_slice(&bytes);
+            if bytes.len() % 2 != 0 {
+                archive.push(b'\n');
+            }
+        }
+        fs::write(&rlib, &archive).unwrap();
+        fs::write(&rmeta, &metadata).unwrap();
+        #[cfg(unix)]
+        {
+            sys::set_path_mode(&rlib, 0o640).unwrap();
+            sys::set_path_mode(&rmeta, 0o751).unwrap();
+        }
+        job.names.push("libk.rmeta".to_string());
+        job.outputs = job
+            .names
+            .iter()
+            .map(|name| (name.clone(), wire(&rlib.with_file_name(name))))
+            .collect();
+        for name in ["libk.rlib", "libk.rmeta"] {
+            let (_, commitment) = cache::payload::capture(&rlib.with_file_name(name)).unwrap();
+            assert!(commitment.valid());
+            job.commitments.insert(name.to_string(), commitment);
+        }
+        let frozen = Frozen::from_job(&job).unwrap();
+        let modes: Vec<_> = job
+            .names
+            .iter()
+            .map(|name| sys::lstat(&rlib.with_file_name(name)).unwrap().mode())
+            .collect();
+        let plan = Plan::from_job(&job).unwrap();
+        let staged = plan.cache.stage().unwrap();
+        let compressed =
+            cache_compression_requested() && cache::payload::compression_supported(&staged);
+        let meta = plan
+            .stage_entry(
+                &staged,
+                &job.names,
+                (&job.dep_name, &job.dep_text),
+                b"",
+                7,
+                Some(&frozen.commitments),
+            )
+            .unwrap();
+        let backing = &meta.files[1];
+        let target = &meta.files[2];
+        assert_eq!(
+            meta.files
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["k.d", "libk.rlib", "libk.rmeta"]
+        );
+        assert!(meta.files[0].text && meta.files[0].encoding.is_raw());
+        if compressed && cfg!(unix) {
+            assert_eq!(backing.encoding, cache::payload::Encoding::Lz4BlocksV1);
+            assert_eq!(
+                target.encoding,
+                cache::payload::Encoding::InlineMetadataSliceV1
+            );
+            assert_eq!(target.stored, backing.stored);
+            assert_eq!(backing.decoded_bytes, Some(archive.len() as u64));
+            assert_eq!(
+                backing.content_hash,
+                Some(blake3::hash(&archive).to_hex().to_string())
+            );
+            assert_eq!(target.decoded_bytes, Some(metadata.len() as u64));
+            assert_eq!(
+                target.content_hash,
+                Some(blake3::hash(&metadata).to_hex().to_string())
+            );
+            let slice = target.metadata_slice.as_ref().unwrap();
+            assert_eq!(slice.offset, 68);
+            assert_eq!(
+                slice.source_encoding,
+                cache::metadata_slice::SourceEncoding::Lz4BlocksV1
+            );
+            assert_eq!(slice.source_decoded_bytes, archive.len() as u64);
+            assert_eq!(
+                Some(&slice.source_content_hash),
+                backing.content_hash.as_ref()
+            );
+            assert_eq!(slice.mode, modes[2]);
+            assert_eq!(target.stored_bytes, Some(0));
+        } else {
+            assert!(backing.encoding.is_raw() && target.encoding.is_raw());
+            assert_ne!(target.stored, backing.stored);
+            assert!(backing.content_hash.is_none() && target.content_hash.is_none());
+            assert!(backing.metadata_slice.is_none() && target.metadata_slice.is_none());
+        }
+        let key = "de".repeat(20);
+        plan.cache.publish(&staged, &key).unwrap();
+        assert!(!staged.exists());
+        let entry = plan.cache.entry_dir(&key);
+        let mut declared: BTreeSet<String> = meta.files.iter().map(|f| f.stored.clone()).collect();
+        declared.extend(["meta.json".to_string(), "stderr".to_string()]);
+        let expected: BTreeSet<_> = if compressed && cfg!(unix) {
+            ["f0", "f1", "meta.json", "stderr"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            ["f0", "f1", "f2", "meta.json", "stderr"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(declared, expected);
+        let actual: BTreeSet<_> = fs::read_dir(&entry)
+            .unwrap()
+            .map(|item| {
+                let item = item.unwrap();
+                assert!(item.file_type().unwrap().is_file());
+                item.file_name().into_string().unwrap()
+            })
+            .collect();
+        assert_eq!(actual, declared);
+        let published: EntryMeta =
+            serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&published).unwrap(),
+            serde_json::to_value(&meta).unwrap()
+        );
+        for name in &job.names {
+            fs::write(rlib.with_file_name(name), b"later build").unwrap();
+        }
+        plan.restore(&entry, &published).unwrap();
+        assert_eq!(fs::read(&rlib).unwrap(), archive);
+        assert_eq!(fs::read(&rmeta).unwrap(), metadata);
+        assert_eq!(
+            fs::read(rlib.with_file_name("k.d")).unwrap(),
+            job.dep_text.as_bytes()
+        );
+        for (name, mode) in job.names.iter().zip(modes) {
+            assert_eq!(sys::lstat(&rlib.with_file_name(name)).unwrap().mode(), mode);
+        }
     }
 
     #[test]

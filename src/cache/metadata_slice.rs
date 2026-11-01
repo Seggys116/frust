@@ -381,8 +381,62 @@ enum SpoolState {
     Fallback,
 }
 
+// The private file has one producer; sealing retains only a checked read descriptor.
+pub(crate) struct EncoderCapture {
+    temp: Temporary,
+    file: File,
+    sealed: Option<sys::Meta>,
+}
+impl EncoderCapture {
+    pub(crate) fn new(staged: &Path) -> io::Result<Self> {
+        let (temp, file) = temporary(staged)?;
+        Ok(Self {
+            temp,
+            file,
+            sealed: None,
+        })
+    }
+    pub(crate) fn writer(&mut self) -> &mut File {
+        &mut self.file
+    }
+    #[cfg(test)]
+    pub(crate) fn readonly_for_control(&mut self) -> io::Result<()> {
+        self.file = File::open(&self.temp.0)?;
+        Ok(())
+    }
+    pub(crate) fn seal(&mut self, len: u64) -> io::Result<()> {
+        self.file.flush()?;
+        let before = sys::fstat(&self.file)?;
+        if before.len() != len || !payload::stable(&before, &sys::lstat(&self.temp.0)?) {
+            return Err(invalid("capture changed before seal"));
+        }
+        let readonly = File::open(&self.temp.0)?;
+        let after = sys::fstat(&readonly)?;
+        if !payload::stable(&before, &after) || !payload::stable(&after, &sys::lstat(&self.temp.0)?)
+        {
+            return Err(invalid("capture changed during seal"));
+        }
+        self.file = readonly;
+        self.sealed = Some(after);
+        Ok(())
+    }
+    pub(crate) fn stable(&self) -> bool {
+        self.sealed.as_ref().is_some_and(|m| {
+            sys::fstat(&self.file).is_ok_and(|now| payload::stable(m, &now))
+                && sys::lstat(&self.temp.0).is_ok_and(|now| payload::stable(m, &now))
+        })
+    }
+    pub(crate) fn reader(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn path(&self) -> &Path {
+        &self.temp.0
+    }
+}
+
 // Private holes replace only bodies the authoritative parser never searches.
-struct ArchiveSpool<'a> {
+pub(crate) struct ArchiveSpool<'a> {
     file: &'a mut File,
     total: u64,
     consumed: u64,
@@ -392,7 +446,7 @@ struct ArchiveSpool<'a> {
 }
 
 impl<'a> ArchiveSpool<'a> {
-    fn new(file: &'a mut File, total: u64) -> Self {
+    pub(crate) fn new(file: &'a mut File, total: u64) -> Self {
         Self {
             file,
             total,
@@ -468,7 +522,7 @@ impl<'a> ArchiveSpool<'a> {
     }
 
     // A final skipped body still contributes to the logical archive length.
-    fn finish(&mut self, decoded_len: u64) -> io::Result<bool> {
+    pub(crate) fn finish(&mut self, decoded_len: u64) -> io::Result<bool> {
         let complete = matches!(&self.state,
             SpoolState::Frame { kind: Frame::Header, bytes, .. } if bytes.is_empty());
         if self.consumed != decoded_len || decoded_len != self.total || !complete {
@@ -694,6 +748,106 @@ pub fn build(
     commitment: Option<&Commitment>,
 ) -> io::Result<Option<StoredFile>> {
     build_inner(staged_base, base, original, target, commitment, || {})
+}
+
+// Optional producer proofs leave the public build path and its staged verification intact.
+pub(crate) fn build_proven(
+    staged: &Path,
+    base: &StoredFile,
+    original: &Path,
+    target: &StoredFile,
+    commitment: Option<&Commitment>,
+    proof: Option<&payload::StoreProof>,
+) -> io::Result<(Option<StoredFile>, bool)> {
+    build_proven_hook(staged, base, original, target, commitment, proof, || {})
+}
+pub(crate) fn build_proven_hook(
+    staged: &Path,
+    base: &StoredFile,
+    original: &Path,
+    target: &StoredFile,
+    commitment: Option<&Commitment>,
+    proof: Option<&payload::StoreProof>,
+    after_parse: impl FnOnce(),
+) -> io::Result<(Option<StoredFile>, bool)> {
+    let candidate = (|| -> io::Result<Option<StoredFile>> {
+        let Some(proof) = proof.filter(|p| p.usable(staged, base)) else {
+            return Ok(None);
+        };
+        if !cfg!(unix)
+            || base.dir
+            || base.text
+            || target.dir
+            || target.text
+            || base.metadata_slice.is_some()
+            || stem(&target.name, ".rmeta").is_none()
+            || stem(&target.name, ".rmeta") != stem(&base.name, ".rlib")
+        {
+            return Ok(None);
+        }
+        let Some(commitment) = commitment else {
+            return Ok(None);
+        };
+        let target_path_before = sys::lstat(original)?;
+        let mut target_file = File::open(original)?;
+        let before = sys::fstat(&target_file)?;
+        if !payload::stable(&target_path_before, &before)
+            || !commitment.valid()
+            || !commitment.matches(&before)
+        {
+            return Err(invalid("metadata changed before captured range"));
+        }
+        let mut captured = proof.reader()?;
+        captured.seek(SeekFrom::Start(0))?;
+        let len = base
+            .decoded_bytes
+            .ok_or_else(|| invalid("missing captured length"))?;
+        let offset = match member_ranges(&mut captured, len)? {
+            Some(ranges) => unique_range(
+                &mut captured,
+                &mut target_file,
+                &ranges,
+                before.len(),
+                &commitment.hash,
+            )?,
+            None => None,
+        };
+        after_parse();
+        if !proof.usable(staged, base) {
+            return Ok(None);
+        }
+        let after = sys::fstat(&target_file)?;
+        if !commitment.matches(&after) || !payload::stable(&after, &sys::lstat(original)?) {
+            return Err(invalid("metadata changed during captured range"));
+        }
+        let Some(offset) = offset else {
+            return Ok(None);
+        };
+        let mut result = target.clone();
+        result.stored = base.stored.clone();
+        result.bytes = before.allocated();
+        result.encoding = Encoding::InlineMetadataSliceV1;
+        result.stored_bytes = Some(0);
+        result.decoded_bytes = Some(before.len());
+        result.content_hash = Some(commitment.hash.clone());
+        result.metadata_slice = Some(MetadataSlice {
+            offset,
+            source_encoding: SourceEncoding::Lz4BlocksV1,
+            source_decoded_bytes: len,
+            source_content_hash: base
+                .content_hash
+                .clone()
+                .ok_or_else(|| invalid("missing captured hash"))?,
+            mode: before.mode(),
+        });
+        validate_groups(&[base.clone(), result.clone()])?;
+        Ok(Some(result))
+    })()
+    .unwrap_or(None);
+    if candidate.is_some() {
+        return Ok((candidate, true));
+    }
+    build(staged, base, original, target, commitment).map(|v| (v, false))
 }
 
 fn build_inner(
@@ -1452,6 +1606,262 @@ mod tests {
         .unwrap()
         .unwrap();
         (vec![base, range], archive, metadata)
+    }
+
+    #[cfg(unix)]
+    struct ProducerFixture {
+        base: StoredFile,
+        target: StoredFile,
+        proof: payload::StoreProof,
+        commitment: Commitment,
+        archive: Vec<u8>,
+        metadata: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    fn producer_fixture(scratch: &Scratch) -> ProducerFixture {
+        let (files, archive, metadata) = fixture(scratch, true);
+        let source = scratch.0.join("source");
+        let (_, backing_commitment) = payload::capture(&source).unwrap();
+        let (_, commitment) = payload::capture(&scratch.0.join("original")).unwrap();
+        let (stored, proof) = payload::store_proven(
+            &source,
+            &scratch.0.join("producer"),
+            true,
+            Some(&backing_commitment),
+            true,
+        )
+        .unwrap();
+        let mut base = record(&files[0].name, "producer");
+        base.bytes = stored.bytes;
+        base.encoding = stored.encoding;
+        base.stored_bytes = stored.stored_bytes;
+        base.decoded_bytes = stored.decoded_bytes;
+        base.content_hash = stored.content_hash;
+        let target = record(&files[1].name, "f1");
+        ProducerFixture {
+            base,
+            target,
+            proof: proof.expect("supported producer archive"),
+            commitment,
+            archive,
+            metadata,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_ranges_match_staged_proofs_and_restore_bytes_hashes_and_modes() {
+        let scratch = Scratch::new();
+        let ProducerFixture {
+            base,
+            target,
+            proof,
+            commitment,
+            archive,
+            metadata,
+        } = producer_fixture(&scratch);
+        let staged = scratch.0.join("producer");
+        let original = scratch.0.join("original");
+        // A later raw rewrite must not redirect parsing away from the captured encoded stream.
+        fs::write(
+            scratch.0.join("source"),
+            b"a later build replaced the archive",
+        )
+        .unwrap();
+        let (range, used) = build_proven(
+            &staged,
+            &base,
+            &original,
+            &target,
+            Some(&commitment),
+            Some(&proof),
+        )
+        .unwrap();
+        assert!(used);
+        let range = range.unwrap();
+        let reference = build(&staged, &base, &original, &target, Some(&commitment))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&range).unwrap(),
+            serde_json::to_value(reference).unwrap()
+        );
+        let files = vec![base, range];
+        let groups = validate_groups(&files).unwrap();
+        let destination = scratch.0.join("restored");
+        fs::create_dir(&destination).unwrap();
+        restore_group(&scratch.0, &destination, &files, &groups[0]).unwrap();
+        assert_eq!(fs::read(destination.join(&files[0].name)).unwrap(), archive);
+        assert_eq!(
+            fs::read(destination.join(&files[1].name)).unwrap(),
+            metadata
+        );
+        for file in &files {
+            assert_eq!(
+                crate::cache::hash_file(&destination.join(&file.name)).unwrap(),
+                file.content_hash.clone().unwrap()
+            );
+        }
+        assert_eq!(
+            sys::lstat(&destination.join(&files[0].name))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            sys::lstat(&destination.join(&files[1].name))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o751
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_ranges_recheck_private_bindings_and_keep_canonical_corruption_errors() {
+        for case in [
+            "staged-corrupt",
+            "staged-replace",
+            "capture-corrupt",
+            "capture-replace",
+            "capture-during-parse",
+            "staged-during-parse",
+            "staged-mode",
+        ] {
+            let scratch = Scratch::new();
+            let ProducerFixture {
+                base,
+                target,
+                proof,
+                commitment,
+                ..
+            } = producer_fixture(&scratch);
+            let staged = scratch.0.join("producer");
+            let captured = proof.capture_path().to_path_buf();
+            match case {
+                "staged-corrupt" => fs::write(&staged, b"broken").unwrap(),
+                "capture-corrupt" => fs::write(&captured, b"broken").unwrap(),
+                "staged-replace" | "capture-replace" => {
+                    let path = if case == "staged-replace" {
+                        &staged
+                    } else {
+                        &captured
+                    };
+                    let replacement = scratch.0.join("replacement");
+                    fs::copy(path, &replacement).unwrap();
+                    sys::rename(&replacement, path).unwrap();
+                }
+                "staged-mode" => sys::set_path_mode(&staged, 0o600).unwrap(),
+                _ => {}
+            }
+            let result = build_proven_hook(
+                &staged,
+                &base,
+                &scratch.0.join("original"),
+                &target,
+                Some(&commitment),
+                Some(&proof),
+                || {
+                    if case == "capture-during-parse" {
+                        fs::write(&captured, b"broken").unwrap();
+                    }
+                    if case == "staged-during-parse" {
+                        fs::write(&staged, b"broken").unwrap();
+                    }
+                },
+            );
+            if case == "staged-corrupt" || case == "staged-during-parse" {
+                assert!(result.is_err(), "{case}");
+            } else {
+                let (range, used) = result.unwrap();
+                assert!(!used && range.is_some(), "{case}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_ranges_keep_missing_proof_and_invalid_target_commitment_behavior() {
+        let scratch = Scratch::new();
+        let ProducerFixture {
+            base,
+            target,
+            proof,
+            mut commitment,
+            ..
+        } = producer_fixture(&scratch);
+        let staged = scratch.0.join("producer");
+        let original = scratch.0.join("original");
+        for (committed, captured) in [(Some(&commitment), None), (None, Some(&proof))] {
+            let (range, used) =
+                build_proven(&staged, &base, &original, &target, committed, captured).unwrap();
+            assert!(!used && range.is_some());
+        }
+        for hash in ["0".repeat(64), "invalid".into()] {
+            commitment.hash = hash;
+            assert!(
+                build_proven(
+                    &staged,
+                    &base,
+                    &original,
+                    &target,
+                    Some(&commitment),
+                    Some(&proof)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_ranges_decline_unknown_thin_and_ambiguous_archives_without_losing_storage() {
+        let metadata = vec![0x37; 128 * 1024 + 17];
+        for kind in ["unknown", "thin", "ambiguous"] {
+            let scratch = Scratch::new();
+            let mut archive = b"!<arch>\n".to_vec();
+            match kind {
+                "unknown" => archive = vec![b'?'; 200_000],
+                "thin" => {
+                    archive = b"!<thin>\n".to_vec();
+                    archive.resize(200_000, b'?');
+                }
+                _ => {
+                    archive_member(&mut archive, "lib.rmeta/", &metadata);
+                    archive_member(&mut archive, "lib.rmeta/", &metadata);
+                }
+            }
+            let source = scratch.0.join("source");
+            let original = scratch.0.join("original");
+            fs::write(&source, &archive).unwrap();
+            fs::write(&original, &metadata).unwrap();
+            let (_, commitment) = payload::capture(&original).unwrap();
+            let (stored, proof) =
+                payload::store_proven(&source, &scratch.0.join("f0"), true, None, true).unwrap();
+            let mut base = record("libdemo.rlib", "f0");
+            base.bytes = stored.bytes;
+            base.encoding = stored.encoding;
+            base.stored_bytes = stored.stored_bytes;
+            base.decoded_bytes = stored.decoded_bytes;
+            base.content_hash = stored.content_hash;
+            let target = record("libdemo.rmeta", "f1");
+            let (range, used) = build_proven(
+                &scratch.0.join("f0"),
+                &base,
+                &original,
+                &target,
+                Some(&commitment),
+                proof.as_ref(),
+            )
+            .unwrap();
+            assert!(range.is_none() && !used, "{kind}");
+            // Declining archive-specific optimization must leave ordinary backing storage usable.
+            payload::restore(&scratch.0.join("f0"), &scratch.0.join("restored"), &base).unwrap();
+            assert_eq!(fs::read(scratch.0.join("restored")).unwrap(), archive);
+        }
     }
 
     #[cfg(unix)]

@@ -181,6 +181,123 @@ fn store_inner(
     before_read: impl FnOnce(),
     before_clone: impl FnOnce(),
 ) -> io::Result<StoredPayload> {
+    store_inner_captured(
+        src,
+        dst,
+        compress,
+        commitment,
+        StoreHooks {
+            before_read,
+            before_clone,
+            after_read: || {},
+        },
+        CaptureOptions::default(),
+    )
+    .map(|v| v.0)
+}
+
+// An opaque owned capture represents the actual stream, never a reread of the live source.
+pub(crate) struct StoreProof {
+    capture: super::metadata_slice::EncoderCapture,
+    staged: File,
+    staged_path: PathBuf,
+    staged_meta: sys::Meta,
+    hash: String,
+    len: u64,
+}
+impl StoreProof {
+    pub(crate) fn usable(&self, path: &Path, base: &StoredFile) -> bool {
+        let check = || -> io::Result<bool> {
+            Ok(path == self.staged_path
+                && base.encoding == Encoding::Lz4BlocksV1
+                && base.decoded_bytes == Some(self.len)
+                && base.content_hash.as_ref() == Some(&self.hash)
+                && stable(&self.staged_meta, &sys::fstat(&self.staged)?)
+                && stable(&self.staged_meta, &sys::lstat(path)?)
+                && self.capture.stable())
+        };
+        check().unwrap_or(false)
+    }
+    pub(crate) fn reader(&self) -> io::Result<File> {
+        self.capture.reader()
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn capture_path(&self) -> &Path {
+        self.capture.path()
+    }
+}
+pub(crate) fn store_proven(
+    src: &Path,
+    dst: &Path,
+    compress: bool,
+    commitment: Option<&Commitment>,
+    capture: bool,
+) -> io::Result<(StoredPayload, Option<StoreProof>)> {
+    store_inner_captured(
+        src,
+        dst,
+        compress,
+        commitment,
+        StoreHooks {
+            before_read: || {},
+            before_clone: || {},
+            after_read: || {},
+        },
+        CaptureOptions {
+            enabled: capture,
+            fail_after: None,
+        },
+    )
+}
+#[cfg(all(test, unix))]
+pub(crate) fn store_proven_hook(
+    src: &Path,
+    dst: &Path,
+    commitment: Option<&Commitment>,
+    hook: impl FnOnce(),
+    fail_after: Option<u64>,
+) -> io::Result<(StoredPayload, Option<StoreProof>)> {
+    store_inner_captured(
+        src,
+        dst,
+        true,
+        commitment,
+        StoreHooks {
+            before_read: || {},
+            before_clone: || {},
+            after_read: hook,
+        },
+        CaptureOptions {
+            enabled: true,
+            fail_after,
+        },
+    )
+}
+struct StoreHooks<B, C, A> {
+    before_read: B,
+    before_clone: C,
+    after_read: A,
+}
+
+#[derive(Default)]
+struct CaptureOptions {
+    enabled: bool,
+    fail_after: Option<u64>,
+}
+
+fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
+    src: &Path,
+    dst: &Path,
+    compress: bool,
+    commitment: Option<&Commitment>,
+    hooks: StoreHooks<B, C, A>,
+    options: CaptureOptions,
+) -> io::Result<(StoredPayload, Option<StoreProof>)> {
+    let StoreHooks {
+        before_read,
+        before_clone,
+        after_read,
+    } = hooks;
     let meta = fs::symlink_metadata(src)?;
     if commitment.is_some_and(|c| !c.valid() || !meta.is_file()) {
         return Err(invalid("invalid artifact commitment"));
@@ -193,6 +310,21 @@ fn store_inner(
         if commitment.is_some_and(|c| !c.matches(&before)) {
             return Err(invalid("artifact changed after commitment"));
         }
+        let mut capture = if options.enabled && cfg!(unix) && before.len() <= 256 * 1024 * 1024 {
+            super::metadata_slice::EncoderCapture::new(dst).ok()
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if options.fail_after == Some(0)
+            && let Some(capture) = capture.as_mut()
+        {
+            capture.readonly_for_control()?;
+        }
+        let mut spool = capture
+            .as_mut()
+            .map(|c| super::metadata_slice::ArchiveSpool::new(c.writer(), before.len()));
+        let mut capture_failed = false;
         before_read();
         let mut input = BufReader::new((&source).take(before.len().saturating_add(1)));
         let output = OpenOptions::new()
@@ -220,6 +352,15 @@ fn store_inner(
             }
             hash.update(&block[..len]);
             decoded_bytes += len as u64;
+            // The same immutable block is observed and encoded; capture failure only removes the hint.
+            if !capture_failed
+                && let Some(spool) = spool.as_mut()
+            {
+                capture_failed = options
+                    .fail_after
+                    .is_some_and(|limit| limit > 0 && decoded_bytes > limit)
+                    || spool.write_all(&block[..len]).is_err();
+            }
             let packed = lz4_flex::block::compress_into(&block[..len], &mut encoded)
                 .map_err(io::Error::other)?;
             output.write_all(&(len as u32).to_le_bytes())?;
@@ -228,6 +369,7 @@ fn store_inner(
         }
         output.write_all(&[0; 8])?;
         output.flush()?;
+        after_read();
         let after = sys::fstat(&source)?;
         let content_hash = hash.finalize().to_hex().to_string();
         let unchanged = commitment.map_or_else(
@@ -237,20 +379,66 @@ fn store_inner(
         if decoded_bytes != before.len() || !unchanged {
             return Err(invalid("artifact changed while compressing"));
         }
+        let capture_complete = !capture_failed
+            && spool
+                .as_mut()
+                .is_some_and(|s| s.finish(decoded_bytes).unwrap_or(false));
+        drop(spool);
         let packed_bytes = output.get_ref().metadata()?.len();
         if packed_bytes.saturating_add(4096) <= decoded_bytes
             && packed_bytes <= decoded_bytes - decoded_bytes / 8
         {
             fs::set_permissions(&tmp.0, before.permissions())?;
+            let staged_before = capture_complete
+                .then(|| sys::fstat(output.get_ref()).ok())
+                .flatten();
+            let staged_writer = capture_complete
+                .then(|| output.get_ref().try_clone().ok())
+                .flatten();
             drop(output);
             sys::rename(&tmp.0, dst)?;
-            return Ok(StoredPayload {
-                bytes,
-                encoding: Encoding::Lz4BlocksV1,
-                stored_bytes: Some(fsx::allocated_size(dst)),
-                decoded_bytes: Some(decoded_bytes),
-                content_hash: Some(content_hash),
-            });
+            // Only our rename may move staged ctime; the writer FD binds identity across it.
+            let proof = (|| -> Option<StoreProof> {
+                if !capture_complete {
+                    return None;
+                }
+                let mut capture = capture?;
+                capture.seal(decoded_bytes).ok()?;
+                let writer = staged_writer?;
+                let prior = staged_before?;
+                let after = sys::fstat(&writer).ok()?;
+                if prior.dev() != after.dev()
+                    || prior.ino() != after.ino()
+                    || prior.len() != after.len()
+                    || prior.mode() != after.mode()
+                    || prior.mtime() != after.mtime()
+                {
+                    return None;
+                }
+                let staged = File::open(dst).ok()?;
+                let staged_meta = sys::fstat(&staged).ok()?;
+                if !stable(&after, &staged_meta) || !stable(&staged_meta, &sys::lstat(dst).ok()?) {
+                    return None;
+                }
+                Some(StoreProof {
+                    capture,
+                    staged,
+                    staged_path: dst.to_path_buf(),
+                    staged_meta,
+                    hash: content_hash.clone(),
+                    len: decoded_bytes,
+                })
+            })();
+            return Ok((
+                StoredPayload {
+                    bytes,
+                    encoding: Encoding::Lz4BlocksV1,
+                    stored_bytes: Some(fsx::allocated_size(dst)),
+                    decoded_bytes: Some(decoded_bytes),
+                    content_hash: Some(content_hash),
+                },
+                proof,
+            ));
         }
     }
     before_clone();
@@ -278,13 +466,16 @@ fn store_inner(
             return Err(invalid("staged artifact differs from commitment"));
         }
     }
-    Ok(StoredPayload {
-        bytes,
-        encoding: Encoding::Raw,
-        stored_bytes: Some(fsx::allocated_size(dst)),
-        decoded_bytes: None,
-        content_hash: None,
-    })
+    Ok((
+        StoredPayload {
+            bytes,
+            encoding: Encoding::Raw,
+            stored_bytes: Some(fsx::allocated_size(dst)),
+            decoded_bytes: None,
+            content_hash: None,
+        },
+        None,
+    ))
 }
 
 /// A failed decode leaves the previous destination intact; raw entries retain their original clone path.
@@ -439,6 +630,167 @@ mod tests {
         assert_eq!(meta.encoding, Encoding::Lz4BlocksV1);
         assert!(fs::metadata(&encoded).unwrap().len() < content.len() as u64 / 4);
         (encoded, meta, content)
+    }
+
+    #[cfg(unix)]
+    fn producer_archive(scratch: &Scratch) -> (PathBuf, Vec<u8>, Commitment) {
+        let mut archive = b"!<arch>\n".to_vec();
+        for (name, bytes) in [
+            ("lib.rmeta/", vec![0x5a; 128 * 1024 + 17]),
+            ("code.o/", vec![0x65; 2 * BLOCK_BYTES + 1]),
+        ] {
+            archive.extend_from_slice(
+                format!(
+                    "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    0,
+                    0,
+                    0,
+                    "644",
+                    bytes.len()
+                )
+                .as_bytes(),
+            );
+            archive.extend_from_slice(&bytes);
+            if bytes.len() % 2 != 0 {
+                archive.push(b'\n');
+            }
+        }
+        let source = scratch.0.join("source");
+        fs::write(&source, &archive).unwrap();
+        sys::set_path_mode(&source, 0o640).unwrap();
+        let (_, commitment) = capture(&source).unwrap();
+        (source, archive, commitment)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_capture_preserves_fresh_consumed_bytes_after_a_late_header_rewrite() {
+        let scratch = Scratch::new();
+        let (source, archive, commitment) = producer_archive(&scratch);
+        let modified = fs::metadata(&source).unwrap().modified().unwrap();
+        let staged = scratch.0.join("f0");
+        let (stored, proof) = store_proven_hook(
+            &source,
+            &staged,
+            Some(&commitment),
+            || {
+                use std::io::{Seek, SeekFrom};
+                let mut file = File::options().write(true).open(&source).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(b"?").unwrap();
+                file.set_times(fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            },
+            None,
+        )
+        .unwrap();
+        let meta = metadata(stored);
+        let proof = proof.expect("a captured stream needs no source settling delay");
+        assert!(proof.usable(&staged, &meta));
+        let captured_path = proof.capture_path().to_path_buf();
+        let restored = scratch.0.join("restored");
+        restore(&staged, &restored, &meta).unwrap();
+        assert_eq!(fs::read(&restored).unwrap(), archive);
+        assert_eq!(
+            sys::lstat(&restored).unwrap().mode(),
+            sys::lstat(&source).unwrap().mode()
+        );
+        assert_ne!(fs::read(&source).unwrap(), archive);
+        drop(proof);
+        assert!(!captured_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_capture_io_and_incomplete_failures_keep_verified_ordinary_storage() {
+        for fail_after in [0, BLOCK_BYTES as u64] {
+            let scratch = Scratch::new();
+            let (source, archive, commitment) = producer_archive(&scratch);
+            let staged = scratch.0.join("f0");
+            let (stored, proof) =
+                store_proven_hook(&source, &staged, Some(&commitment), || {}, Some(fail_after))
+                    .unwrap();
+            assert!(proof.is_none());
+            let meta = metadata(stored);
+            assert_eq!(meta.encoding, Encoding::Lz4BlocksV1);
+            let restored = scratch.0.join("restored");
+            restore(&staged, &restored, &meta).unwrap();
+            assert_eq!(fs::read(&restored).unwrap(), archive);
+            let mut names: Vec<_> = fs::read_dir(&scratch.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                ["f0", "restored", "source"].map(std::ffi::OsString::from)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_capture_never_survives_failed_ordinary_commitment_verification() {
+        let scratch = Scratch::new();
+        let (source, _, mut commitment) = producer_archive(&scratch);
+        commitment.hash = "0".repeat(64);
+        assert!(
+            store_proven(
+                &source,
+                &scratch.0.join("f0"),
+                true,
+                Some(&commitment),
+                true
+            )
+            .is_err()
+        );
+        let names: Vec<_> = fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("source")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_capture_is_optional_for_raw_small_and_incompressible_outputs() {
+        for (name, bytes, compress, capture_enabled) in [
+            ("small", vec![7; 100], true, true),
+            ("raw", vec![7; MIN_BYTES as usize], false, true),
+            ("unpaired", vec![7; MIN_BYTES as usize], true, false),
+        ] {
+            let scratch = Scratch::new();
+            let source = scratch.0.join("source");
+            fs::write(&source, &bytes).unwrap();
+            let (stored, proof) = store_proven(
+                &source,
+                &scratch.0.join("f0"),
+                compress,
+                None,
+                capture_enabled,
+            )
+            .unwrap();
+            assert!(proof.is_none(), "{name}");
+            let meta = metadata(stored);
+            restore(&scratch.0.join("f0"), &scratch.0.join("restored"), &meta).unwrap();
+            assert_eq!(fs::read(scratch.0.join("restored")).unwrap(), bytes);
+        }
+        let scratch = Scratch::new();
+        let (source, _, _) = producer_archive(&scratch);
+        let mut state = 0x1234_5678_u32;
+        let noise: Vec<_> = (0..MIN_BYTES)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        fs::write(&source, &noise).unwrap();
+        let (stored, proof) =
+            store_proven(&source, &scratch.0.join("f0"), true, None, true).unwrap();
+        assert!(stored.encoding.is_raw() && proof.is_none());
+        assert_eq!(fs::read(scratch.0.join("f0")).unwrap(), noise);
     }
 
     #[test]
