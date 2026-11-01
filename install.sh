@@ -1,7 +1,5 @@
 #!/bin/sh
-# Install frust on macOS or Linux.
-#   curl -fsSL https://raw.githubusercontent.com/Seggys116/frust/main/install.sh | sh
-# Environment: FRUST_VERSION (for example v0.1.0, default latest), FRUST_INSTALL_DIR (default ~/.local/bin).
+# FRUST_VERSION selects the release; FRUST_INSTALL_DIR overrides the default ~/.local/bin.
 set -eu
 
 REPO="Seggys116/frust"

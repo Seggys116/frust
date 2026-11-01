@@ -27,6 +27,7 @@ fn compile_errors_propagate_cargos_exit_code_and_diagnostics() {
     let sb = Sandbox::new("errors");
     let p = sb.project("bad", &[], "fn main() { let x: u32 = \"no\"; }\n");
     let ours = sb.bin("fcargo").arg("build").current_dir(&p).output().unwrap();
+    // Cargo's own failing build supplies the exit-code oracle; the type error checks that its diagnostic also reaches the caller.
     let theirs = sb.cargo().arg("build").env("CARGO_TARGET_DIR", sb.root.join("plain-target")).current_dir(&p).output().unwrap();
     assert_eq!(ours.status.code(), theirs.status.code());
     assert!(stderr(&ours).contains("mismatched types"));

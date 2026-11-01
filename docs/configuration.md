@@ -11,10 +11,10 @@ For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` tur
 | `FRUST_CACHE_PRIMARY_INCREMENTAL` | `on` | Cache incrementally compiled workspace outputs. Clean builds and branch switches can restore matching outputs; the next edit may need to rebuild incremental state. Storing changed states adds cache work; see [benchmarks](benchmarks.md). |
 | `FRUST_COMPACT_INCREMENTAL_IDLE_DAYS` | `7` | Idle incremental reuse data retention. Metadata-only state with unknown ownership can expire without cache coverage; fresh, active and unreadable state is protected. See [cleanup rules](how-it-works.md#incremental-data-and-compaction) |
 | `FRUST_BENCH_MAX_SCRATCH_MIB` | `4096` | Stops `frust bench` when its scratch directory passes this physical size |
-| `FRUST_CACHE_INCREMENTAL` | `on` | Cache incremental compiles of non-primary path dependencies in dev builds |
+| `FRUST_CACHE_INCREMENTAL` | `on` | Cache incremental compiles of non-primary path dependencies, including optimized profiles |
 | `FRUST_CACHE_TRUST_STAMPS` | `on` | How far recorded file stamps are believed on a lookup. `on` accepts an input whose stamp is unchanged without reading it and re-hashes some of those inputs on every hit (all of them when there are four or fewer, otherwise one chosen at random). `audit` re-hashes every such input. `off` (or `0`, `false`, `no`) always hashes content. Any other value means `on`. A stamp that matched while the content differed is a violation: it is logged under `stamp-trust/` in `FRUST_HOME`, the compile runs, and stamps are not trusted on that volume for 7 days. Stamps are never trusted on network, FAT or FUSE filesystems or ones of unknown type, and on Windows only on NTFS and ReFS. `frust doctor` reports the state. See [how it works](how-it-works.md#stamp-trust-and-audits) |
 | `FRUST_KEYLOCK_WAIT_SECS` | `300` | How long a compile waits for another process compiling the same unit before compiling anyway. A waiter that is released looks the entry up again and restores it. Whole seconds; `0` does not wait |
-| `FRUST_STORE_SYNC` | `off` | `on` stores each compile result inside the wrapper before it returns. By default a detached helper finishes the store after rustc exits so cargo does not wait for it |
+| `FRUST_STORE_SYNC` | `off` | `on` stores each compile result inside the wrapper before it returns. By default bounded background workers finish storage after rustc exits; Linux and macOS use a broker for multiple misses, with helper and inline fallbacks |
 | `FRUST_GC_SYNC` | `off` | `on` runs the daily automatic gc inline, including draining eligible idle central targets, and can delay the invoking command. By default the daily collector runs detached |
 | `FRUST_CACHE_MAX_GIB` | `16` | Cache-store allocation budget enforced by `frust gc` and the daily automatic gc; encoded payloads count at their stored allocation |
 | `FRUST_AUTO_COMPACT` | `on` | Compact central targets after successful builds, before handing the build lock to a waiter. Completed passes are throttled for 10 minutes; incomplete passes retry after 30 seconds |
@@ -81,18 +81,31 @@ identity, probe ID and Cargo version identify the selected toolchain. Foreground
 watchdog; a timeout or spawn failure cancels their owned process groups, with a five-second reaping
 budget. Store draining has its own 120-second bound. All failed concurrent runs retain their scratch.
 
-On macOS, both concurrent fixture profiles explicitly retain full debug information and incremental
-compilation, using `split-debuginfo = "packed"` and `strip = "debuginfo"`. Debug information lives in
-complete dSYM bundles; executable comparison still hashes every original byte. This avoids native
-incremental compilation's random object filename suffixes appearing in executable debug maps. Every
-role verifies the bundle's DWARF structure, fixture source units, types and located local variables,
-and matching executable/bundle UUIDs after its settled build clock. Two additional untimed warmup
-checks rename away each frust profile and prove real cache restoration with zero declared-unit or
-unknown compilations, positive cache hits, no misses, identical executable/runtime hashes and identical
-bundle file paths, bytes and modes. Native inspection has a shared ten-second process-group watchdog
-and bounded output reads. JSON includes `native_debug_policy`, role `native_debug` proofs and separate
-`native_debug_cache_restores`; these fields and the fixture policy apply only on macOS. Directory
-outputs use the existing inline cache-store fallback when deferred capture cannot freeze them.
+Select `--concurrent-profile=dev|release|thin|fat` (default `dev`) to give both roles the same settings.
+For example, `frust bench --concurrent --concurrent-profile=thin --quick --runs=7 --json` measures
+matching ThinLTO builds. Release uses `lto=false`, 16 codegen units and unwind; thin uses ThinLTO,
+16 units and unwind; fat uses fat LTO, one unit and abort. All three release selections default to
+nonincremental compilation and disable debug information. JSON records the selection and effective settings;
+executable bytes, runtime, native compilation, peer reuse and no-op checks remain mandatory.
+This option requires `--concurrent` and cannot be repeated.
+For release, thin or fat profiles, `--concurrent-incremental=on|off` explicitly overrides incremental
+compilation for both roles; for example, `frust bench --concurrent --concurrent-profile=thin
+--concurrent-incremental=on --quick --runs=7 --json`. The override requires `--concurrent`, cannot
+be repeated, and is rejected for dev, whose existing incremental behavior is unchanged. JSON records
+the effective incremental setting; all native-argument, executable, peer-reuse and no-op checks remain.
+
+On macOS, the default `dev` profiles retain full debug information and incremental compilation,
+using `split-debuginfo = "packed"` and `strip = "debuginfo"`. Debug information lives in complete
+dSYM bundles, avoiding random incremental object suffixes in executable debug maps. Every dev role
+verifies DWARF structure, fixture source units, types, located local variables and matching
+executable/bundle UUIDs after its settled clock. Two additional untimed dev warmups prove clean cache
+restoration with zero declared-unit or unknown compilations, positive hits, no misses and identical
+executable/runtime hashes and bundle file paths, bytes and modes. Native inspection has a shared
+ten-second process-group watchdog and bounded output reads. Release selections report this inspection
+as not applicable because debug information is disabled; all profiles still compare every executable
+byte. macOS JSON includes `native_debug_policy`, optional role `native_debug` proofs and separate
+`native_debug_cache_restores`. Directory outputs retain the inline store fallback when deferred
+capture cannot freeze them.
 
 The general report preserves its separate churn and maintenance experiments with synchronous storage;
 the churn section reports its own `store_policy`. Explicit `--store` is incompatible with `--growth`,

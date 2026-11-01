@@ -17,6 +17,7 @@ pub mod paths;
 pub mod run;
 pub mod signals;
 pub mod stats;
+pub(crate) mod store_broker;
 pub mod style;
 pub mod sys;
 pub mod toolchain;
@@ -39,6 +40,7 @@ pub enum Persona {
     Wrap,
 }
 
+#[inline(always)]
 pub fn main_for(persona: Persona) -> i32 {
     let mut argv = std::env::args_os();
     let argv0 = argv.next().unwrap_or_default();

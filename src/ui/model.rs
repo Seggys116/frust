@@ -1,5 +1,4 @@
-//! Build progress state machine: pure, no I/O, no clock of its own.
-//! Cargo stdout, stderr and cache events have no mutual ordering, so hits, artifacts and `Compiling` lines may arrive in any order.
+//! Pure build progress state machine without I/O or its own clock; Cargo stdout, stderr and cache events may arrive in any order.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};

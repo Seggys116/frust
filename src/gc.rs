@@ -13,12 +13,13 @@ use crate::fsx;
 use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::stats;
+use crate::store_broker;
 use crate::sys::{self, LockKind, Meta};
 
 /// Younger manifests and lock directories are left alone even if they look orphaned: a build may be writing them.
 const METADATA_GRACE: Duration = Duration::from_secs(3600);
 const AUTO_GC_EVERY: Duration = Duration::from_secs(86_400);
-/// Per-prekey locks, deferred-store jobs and their slot locks older than this are removed when nothing holds them.
+/// Unheld prekey locks and stale deferred metadata become collectible after this age; canonical slots persist.
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(86_400);
 /// Hidden flag of `frust gc` that runs one daily collection and prints nothing.
 pub const AUTO_CHILD_FLAG: &str = "--auto-background";
@@ -115,6 +116,7 @@ pub struct Plan {
     retired_entries: HashMap<PathBuf, cache::RetiredChildProof>,
     unit_retirements: HashMap<PathBuf, UnitRetirement>,
     cache_retirements: HashMap<PathBuf, cache::EntryRetirementSnapshot>,
+    broker_retirements: HashMap<PathBuf, store_broker::StaleRunProof>,
 }
 
 impl Plan {
@@ -777,6 +779,13 @@ fn plan_scratch(dirs: &Dirs, plan: &mut Plan) {
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .is_some_and(|age| age > Duration::from_secs(3600));
             if old {
+                if entry.file_name().to_string_lossy().starts_with("store-broker-") {
+                    if let Some(proof) = store_broker::stale_run_proof(dirs, &entry.path()) {
+                        plan.removals.push(Removal { class: Class::Scratch, bytes: proof.bytes, path: entry.path() });
+                        plan.broker_retirements.insert(entry.path(), proof);
+                    }
+                    continue;
+                }
                 plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&entry.path()), path: entry.path() });
             }
         }
@@ -1198,7 +1207,7 @@ fn plan_keylocks(dirs: &Dirs, plan: &mut Plan) {
     }
 }
 
-/// Job files, their temporaries and unheld slot locks left by helpers that were killed.
+/// Collect stale jobs, temporaries and unheld noncanonical slots while preserving execution-lock identities.
 fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
     let Ok(entries) = fs::read_dir(dirs.deferred()) else { return };
     for entry in entries.flatten() {
@@ -1206,7 +1215,12 @@ fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
         if !mtime_age(&path).is_some_and(|age| age > DEFERRED_MAX_AGE) {
             continue;
         }
-        let is_slot = entry.file_name().to_string_lossy().starts_with(DEFERRED_SLOT_PREFIX);
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(name.strip_prefix(DEFERRED_SLOT_PREFIX), Some("0" | "1" | "2" | "3")) {
+            continue;
+        }
+        let is_slot = name.starts_with(DEFERRED_SLOT_PREFIX);
         if is_slot && flock_held(&path) != Some(false) {
             continue;
         }
@@ -1361,6 +1375,12 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
     for removal in &plan.removals {
         if removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
             || plan.manifest_retirements.contains_key(&removal.path) { continue; }
+        if let Some(proof) = plan.broker_retirements.get(&removal.path) {
+            if let Err(error) = store_broker::retire_stale_run(dirs, &removal.path, proof, &mut freed) {
+                failures.push((removal.path.clone(), error));
+            }
+            continue;
+        }
         if removal.path.parent() == Some(cache::evicted_dir(dirs).as_path()) {
             let Some(proof) = plan.retired_entries.get(&removal.path) else { continue };
             if !proof.valid(dirs, &removal.path) { continue; }

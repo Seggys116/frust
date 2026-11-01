@@ -1,3 +1,5 @@
+//! Build-size estimates fall back from specific to general keys and skip unchanged writes to avoid repeated temp-file rewrites.
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -20,7 +22,6 @@ fn read_units(dirs: &Dirs, key: &str) -> Option<u32> {
     (record.units > 0).then_some(record.units)
 }
 
-/// Keys run most specific first, so a first `-p foo` build still gets the last plain build's estimate.
 pub fn expected_units(dirs: &Dirs, keys: &[String]) -> Option<u32> {
     keys.iter().find_map(|key| read_units(dirs, key))
 }
@@ -32,7 +33,6 @@ pub fn remember_units(dirs: &Dirs, keys: &[String], units: u32) {
 }
 
 fn remember_one(dirs: &Dirs, key: &str, units: u32) {
-    // Warm rebuilds repeat the same count; reading is cheaper than a temp-file rewrite.
     if units == 0 || read_units(dirs, key) == Some(units) {
         return;
     }

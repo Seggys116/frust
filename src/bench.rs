@@ -182,6 +182,14 @@ pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
     if flags.iter().any(|flag| flag == "--concurrent" || flag.starts_with("--concurrent=")) {
         return concurrent::run(flags);
     }
+    if flags.iter().any(|flag| flag == "--concurrent-profile" || flag.starts_with("--concurrent-profile=")) {
+        eprintln!("frust bench: --concurrent-profile requires --concurrent");
+        return 1;
+    }
+    if flags.iter().any(|flag| flag == "--concurrent-incremental" || flag.starts_with("--concurrent-incremental=")) {
+        eprintln!("frust bench: --concurrent-incremental requires --concurrent");
+        return 1;
+    }
     let quick = flags.iter().any(|f| f == "--quick");
     let json = flags.iter().any(|f| f == "--json");
     let churn_only = flags.iter().any(|f| f == "--churn");

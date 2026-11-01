@@ -1,26 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 380" width="960" height="380" role="img" aria-labelledby="title description">
 <title id="title">Storage after 200 edits</title>
-<desc id="description">One immediate-edit sequence. Full managed allocation is Cargo 371.1 MiB and frust 225.5 MiB, 39.2 percent smaller. Component values are independently rounded.</desc>
-<metadata id="original-cohort-evidence">Measured source commit 321931ee0ebeaa02cd3177c18f12e5f002c56d17. Intel(R) Core(TM) Ultra 7 255H | Linux 7.0.0-42-generic x86_64 | ext4 | rustc 1.97.1. Full managed allocation after edits; target plus additional unique cache allocation plus managed remainder. Retired paths lie beneath other managed roots. Standalone retired_payload_bytes may overlap target/store allocation through shared inodes or extents, is nonadditive, and is annotated separately rather than stacked. Checked unique device/inode allocated blocks; no confidence intervals or repeated-run distribution implied. Policy: {&quot;enabled&quot;: true, &quot;every_seconds&quot;: 0, &quot;min_growth_bytes&quot;: 0, &quot;keep_other_profile_seconds&quot;: 1209600, &quot;uncached_dead_grace_seconds&quot;: 86400, &quot;dead_incremental_grace_seconds&quot;: 3600, &quot;incremental_idle_seconds&quot;: 604800, &quot;max_target_bytes&quot;: 8589934592, &quot;current_window_seconds&quot;: 3600, &quot;hot_window_seconds&quot;: 3600, &quot;hot_categories&quot;: [&quot;Dylib&quot;, &quot;DepsExecutables&quot;, &quot;Examples&quot;], &quot;cache_enabled&quot;: true, &quot;compress&quot;: true, &quot;pass_budget_ms&quot;: 2000, &quot;pass_bytes&quot;: 536870912}. [[&quot;Cargo&quot;, [389169152, 0, 0], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, null], [&quot;Auto&quot;, [182841344, 50421760, 3198976], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, 0]]</metadata>
+<desc id="description">After 200 edits, Cargo 371.2 MiB and frust 225.8 MiB; 39.2% smaller. Allocated blocks count unique device/inode entries including directories. Components rounded independently. One synchronous 200-settled-mixed-edit sequence; controlled compaction assessed every build, not default cadence; full managed allocated blocks.</desc>
+<metadata id="original-cohort-evidence">Data cohort SHA256 07c77c1abcb91564c1bdb0948c7961c780b74fd5f00aef2695cc68ed21d90e70. 2026-11-01. Core Ultra 7 255H | Linux | ext4 | rustc 1.97.1. After 200 edits, Cargo 371.2 MiB and frust 225.8 MiB; 39.2% smaller. Allocated blocks count unique device/inode entries including directories. Components rounded independently. One synchronous 200-settled-mixed-edit sequence; controlled compaction assessed every build, not default cadence; full managed allocated blocks.</metadata>
 <rect width="960" height="380" rx="16" fill="#0d1117"/>
 <g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
 <text x="32" y="46" font-size="30" fill="#e6edf3" font-weight="650" text-anchor="start">Storage after 200 edits</text>
-<text x="32" y="76" font-size="17" fill="#9ba9b8" font-weight="400" text-anchor="start">Full managed allocation · MiB · one immediate-edit sequence</text>
+<text x="32" y="76" font-size="17" fill="#9ba9b8" font-weight="400" text-anchor="start">Managed MiB · one settled sequence · compaction each build</text>
 <text x="928" y="120" font-size="24" fill="#39d0c3" font-weight="650" text-anchor="end">39.2% smaller</text>
 <text x="32" y="174" font-size="20" fill="#e6edf3" font-weight="550" text-anchor="start">Cargo</text>
 <rect x="155.000000" y="154" width="620.000000" height="26" fill="#8592a3"/>
-<text x="928" y="176" font-size="28" fill="#c2cad4" font-weight="650" text-anchor="end">371.1</text>
+<text x="928" y="176" font-size="28" fill="#c2cad4" font-weight="650" text-anchor="end">371.2</text>
 <text x="32" y="233" font-size="20" fill="#e6edf3" font-weight="550" text-anchor="start">frust</text>
-<rect x="155.000000" y="213" width="291.371598" height="26" fill="#39d0c3"/>
-<rect x="446.371598" y="213" width="80.361089" height="26" fill="#6188e8"/>
-<rect x="526.732687" y="213" width="5.179197" height="26" fill="#c9b2ed"/>
-<text x="928" y="235" font-size="28" fill="#39d0c3" font-weight="650" text-anchor="end">225.5</text>
-<text x="155" y="279" font-size="17" fill="#39d0c3" font-weight="400" text-anchor="start">Target 174.4</text>
-<text x="365" y="279" font-size="17" fill="#8daaff" font-weight="400" text-anchor="start">Cache 48.1</text>
+<rect x="155.000000" y="213" width="290.913090" height="26" fill="#39d0c3"/>
+<rect x="445.913090" y="213" width="81.129971" height="26" fill="#6188e8"/>
+<rect x="527.043061" y="213" width="5.115070" height="26" fill="#c9b2ed"/>
+<text x="928" y="235" font-size="28" fill="#39d0c3" font-weight="650" text-anchor="end">225.8</text>
+<text x="155" y="279" font-size="17" fill="#39d0c3" font-weight="400" text-anchor="start">Target 174.2</text>
+<text x="365" y="279" font-size="17" fill="#8daaff" font-weight="400" text-anchor="start">Cache 48.6</text>
 <text x="560" y="279" font-size="17" fill="#c9b2ed" font-weight="400" text-anchor="start">Other 3.1</text>
-<text x="32" y="316" font-size="15" fill="#9ba9b8" font-weight="400" text-anchor="start">Cargo: target 371.1 · cache 0 · other 0. Components rounded independently.</text>
+<text x="32" y="316" font-size="15" fill="#9ba9b8" font-weight="400" text-anchor="start">Cargo: target 371.2 · cache 0.0 · other 0.0. Components rounded independently.</text>
 <path d="M32 334H928" stroke="#26313d"/>
 <text x="32" y="356" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="start">2026-11-01 · Core Ultra 7 255H · Linux / ext4 · rustc 1.97.1</text>
-<text x="928" y="356" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="end">Cohort 321931e</text>
+<text x="928" y="356" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="end">Data 07c77c1</text>
 </g>
 </svg>

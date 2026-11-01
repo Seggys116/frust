@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 pub(crate) mod jobserver_loan;
+pub(crate) mod store_transport;
 
 #[cfg(unix)]
 mod unix;

@@ -93,7 +93,7 @@ fn print_help() {
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
         ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
-        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking]"),
+        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent [--concurrent-profile=dev|release|thin|fat] [--concurrent-incremental=on|off]] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
         ("tool", "run any toolchain tool unchanged: frust tool rustfmt --version"),

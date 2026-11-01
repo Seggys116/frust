@@ -1,12 +1,10 @@
-//! Everything lives under one root so it can be inspected, moved or deleted as a unit.
-
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::sys;
 
-/// File-name prefix of the slot locks in `Dirs::deferred`; gc keys on it.
+/// Deferred-store jobs share `Dirs::deferred` with slot locks whose file-name prefix gc keys on.
 pub const DEFERRED_SLOT_PREFIX: &str = "slot-";
 
 #[derive(Debug, Clone)]
@@ -66,7 +64,6 @@ impl Dirs {
         self.root.join("keylocks")
     }
 
-    /// Job files and slot locks of deferred stores.
     pub fn deferred(&self) -> PathBuf {
         self.tmp().join("deferred")
     }

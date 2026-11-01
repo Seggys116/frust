@@ -111,7 +111,7 @@ fn export_failure(sandbox: &Sandbox, output: &std::process::Output) -> std::io::
     ))
 }
 
-fn run(store: Option<&str>) -> Value {
+fn run(store: Option<&str>, profile: Option<&str>, incremental: Option<&str>) -> Value {
     let sandbox = Sandbox::new(if store.is_some() {
         "concurrent-sync"
     } else {
@@ -126,6 +126,12 @@ fn run(store: Option<&str>) -> Value {
         .env("RUSTC_WORKSPACE_WRAPPER", "/missing/cleared-by-benchmark")
         .env("CARGO_ENCODED_RUSTFLAGS", "--invalid-benchmark-flag")
         .env("FRUST_CACHE", "off");
+    if let Some(profile) = profile {
+        command.arg(format!("--concurrent-profile={profile}"));
+    }
+    if let Some(incremental) = incremental {
+        command.arg(format!("--concurrent-incremental={incremental}"));
+    }
     if let Some(store) = store {
         command.arg(format!("--store={store}"));
     }
@@ -160,7 +166,7 @@ fn assert_groups(report: &Value, store: &str) {
     let groups = report["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 12);
     #[cfg(target_os = "macos")]
-    {
+    if report["selected_profile"] == "dev" {
         assert!(
             report["native_debug_policy"]
                 .as_str()
@@ -211,6 +217,26 @@ fn assert_groups(report: &Value, store: &str) {
             );
             assert_native_debug(&restored["original"]);
             assert_native_debug(&restored["restored"]);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if report["selected_profile"] != "dev" {
+        assert!(
+            report["native_debug_policy"]
+                .as_str()
+                .unwrap()
+                .contains("Not applicable")
+        );
+        assert!(
+            report["native_debug_cache_restores"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for group in report["warmups"].as_array().unwrap().iter().chain(groups) {
+            for role in group["roles"].as_array().unwrap() {
+                assert!(role["native_debug"].is_null());
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -336,12 +362,162 @@ fn assert_native_debug(proof: &Value) {
 
 #[test]
 fn concurrent_defaults_to_deferred_and_proves_peer_reuse_and_noops() {
-    assert_groups(&run(None), "deferred");
+    let report = run(None, None, None);
+    assert_eq!(report["selected_profile"], "dev");
+    assert_eq!(report["effective_profile"]["incremental"], true);
+    assert_groups(&report, "deferred");
 }
 
 #[test]
 fn concurrent_explicit_sync_preserves_correctness_and_reuse() {
-    assert_groups(&run(Some("sync")), "sync");
+    assert_groups(&run(Some("sync"), None, None), "sync");
+}
+
+#[test]
+fn concurrent_release_profiles_preserve_native_flags_peer_reuse_and_noops() {
+    for (profile, lto, units, panic) in [
+        ("release", "false", 16, "unwind"),
+        ("thin", "thin", 16, "unwind"),
+        ("fat", "fat", 1, "abort"),
+    ] {
+        for incremental in [None, Some("on")] {
+            let enabled = incremental.is_some();
+            let report = run(None, Some(profile), incremental);
+            // Reuse the full cold-group, peer-sharing, executable and no-op assertions for each profile.
+            assert_groups(&report, "deferred");
+            assert_eq!(report["selected_profile"], profile);
+            assert_eq!(
+                report["effective_profile"],
+                serde_json::json!({"inherits":"release", "lto":lto, "codegen_units":units, "panic":panic, "incremental":enabled, "debug":false})
+            );
+            let mut apps = 0;
+            let mut local_units = [0; 3];
+            for group in report["groups"].as_array().unwrap() {
+                for role in group["roles"].as_array().unwrap() {
+                    for call in role["rustc_invocations"].as_array().unwrap() {
+                        let args: Vec<_> = call
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|arg| arg.as_str().unwrap())
+                            .collect();
+                        for (index, name) in ["app", "lib0", "lib1"].iter().enumerate() {
+                            if args.windows(2).any(|pair| pair == ["--crate-name", *name]) {
+                                local_units[index] += 1;
+                                assert_eq!(
+                                    args.iter().any(|arg| arg.starts_with("incremental=")),
+                                    enabled,
+                                    "{profile} {name}: {args:?}"
+                                );
+                            }
+                        }
+                        // Host-side build scripts can retain different optimization settings from the application.
+                        if !args.windows(2).any(|pair| pair == ["--crate-name", "app"]) {
+                            continue;
+                        }
+                        apps += 1;
+                        assert!(args.contains(&"opt-level=3"));
+                        assert!(args.contains(&format!("codegen-units={units}").as_str()));
+                        assert!(
+                            !args
+                                .iter()
+                                .any(|arg| matches!(*arg, "debuginfo=1" | "debuginfo=2"))
+                        );
+                        match profile {
+                            "thin" => assert!(args.contains(&"lto=thin")),
+                            "fat" => {
+                                assert!(args.contains(&"lto") || args.contains(&"lto=fat"));
+                                assert!(args.contains(&"panic=abort"));
+                            }
+                            _ => assert!(!args.iter().any(|arg| matches!(
+                                *arg,
+                                "lto" | "lto=fat" | "lto=thin" | "panic=abort"
+                            ))),
+                        }
+                    }
+                }
+            }
+            assert!(apps > 0);
+            assert!(local_units.iter().all(|count| *count > 0));
+        }
+    }
+}
+
+#[test]
+fn concurrent_profile_rejects_orphan_invalid_and_duplicate_options() {
+    let sandbox = Sandbox::new("concurrent-profile-flags");
+    for flags in [
+        vec!["--concurrent-profile=release"],
+        vec!["--concurrent-profile"],
+        vec!["--concurrent", "--concurrent-profile"],
+        vec!["--concurrent", "--concurrent-profile="],
+        vec!["--concurrent", "--concurrent-profile=debug"],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=dev",
+            "--concurrent-profile=fat",
+        ],
+    ] {
+        let output = sandbox
+            .bin("frust")
+            .arg("bench")
+            .args(&flags)
+            .arg("--json")
+            .env("RUSTC", sandbox.root.join("missing-rustc"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{flags:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--concurrent-profile"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn concurrent_incremental_rejects_orphan_dev_invalid_and_duplicate_options() {
+    let sandbox = Sandbox::new("concurrent-incremental-flags");
+    for flags in [
+        vec!["--concurrent-incremental=on"],
+        vec!["--concurrent-incremental"],
+        vec!["--concurrent", "--concurrent-incremental=on"],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=dev",
+            "--concurrent-incremental=off",
+        ],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=release",
+            "--concurrent-incremental",
+        ],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=release",
+            "--concurrent-incremental=",
+        ],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=release",
+            "--concurrent-incremental=true",
+        ],
+        vec![
+            "--concurrent",
+            "--concurrent-profile=thin",
+            "--concurrent-incremental=on",
+            "--concurrent-incremental=off",
+        ],
+    ] {
+        let output = sandbox
+            .bin("frust")
+            .arg("bench")
+            .args(&flags)
+            .arg("--json")
+            .env("RUSTC", sandbox.root.join("missing-rustc"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{flags:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--concurrent-incremental"));
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated warm full/fat LTO rebuild, Cargo 4.94 s versus frust 144 ms, 34.3x faster" width="880">
+<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated warm full/fat LTO rebuild, Cargo 4.99 s versus frust 144 ms, 34.7x faster" width="880">
 
 **A thin accelerator that sits on top of the Rust toolchain you already have.**
 
@@ -101,13 +101,13 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 20.3x faster; isolated cold paired differences reported separately" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 21.0x faster; isolated cold paired differences reported separately" width="760"></p>
 
-Warm debug restores were **20.3× faster**; managed storage was **39.2% smaller** after 200 edits. Cold builds still have overhead. [Method and results](docs/benchmarks.md).
+Warm debug restores were **21.0× faster**; managed storage was **39.2% smaller** after 200 edits. Cold builds and warm edits still have overhead. [Method and results](docs/benchmarks.md).
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.8x faster, ThinLTO 34.5x, full/fat LTO 34.3x; median and observed range of seven runs" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 26.2x faster, ThinLTO 33.8x, full/fat LTO 34.7x; median and observed range of seven runs" width="760"></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 immediate edits: Cargo 371.1 MiB versus frust 225.5 MiB, including target, cache and other managed bytes; automatic compression" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 settled edits with compaction checked after each build: Cargo 371.2 MiB versus frust 225.8 MiB, including target, cache and other managed bytes; automatic compression" width="760"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 

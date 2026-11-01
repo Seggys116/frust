@@ -14,6 +14,8 @@ use frust::paths::Dirs;
 const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
 const LEAF: &str = "pub fn value() -> u32 { 41 }\n";
 const WAIT_CAP: Duration = Duration::from_secs(30);
+const EXECUTION_SLOTS: usize = 4;
+const ADMISSION_SLOTS: usize = 8;
 
 fn deferred_dir(sb: &Sandbox) -> PathBuf {
     sb.home().join("tmp").join("deferred")
@@ -21,7 +23,14 @@ fn deferred_dir(sb: &Sandbox) -> PathBuf {
 
 /// A build with the deferral enabled, which the sandbox turns off for every other test.
 fn build_deferred(sb: &Sandbox, project: &Path) -> std::process::Output {
-    let out = sb.bin("fcargo").arg("build").current_dir(project).env_remove("FRUST_STORE_SYNC").output().unwrap();
+    let out = sb
+        .bin("fcargo")
+        .arg("build")
+        .current_dir(project)
+        .env("FRUST_CACHE", "1")
+        .env_remove("FRUST_STORE_SYNC")
+        .output()
+        .unwrap();
     assert_success(&out);
     out
 }
@@ -55,16 +64,72 @@ fn stored(sb: &Sandbox) -> usize {
         .count()
 }
 
-/// True when no slot lock is held, that is, when no helper is still running.
+fn job_markers(sb: &Sandbox) -> Vec<PathBuf> {
+    fs::read_dir(deferred_dir(sb))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("job-"))
+        })
+        .collect()
+}
+
+fn broker_directories(sb: &Sandbox) -> Vec<PathBuf> {
+    fs::read_dir(sb.home().join("tmp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("store-broker-"))
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn published_entries(sb: &Sandbox) -> usize {
+    fs::read_dir(sb.home().join("store"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|shard| fs::read_dir(shard.path()).into_iter().flatten().flatten())
+        .filter(|entry| entry.path().join("meta.json").is_file())
+        .count()
+}
+
+fn hold_pool(dir: &Path, prefix: &str, count: usize) -> Vec<File> {
+    fs::create_dir_all(dir).unwrap();
+    (0..count)
+        .map(|i| {
+            let file = File::create(dir.join(format!("{prefix}{i}"))).unwrap();
+            frust::sys::lock(&file, frust::sys::LockKind::Exclusive).unwrap();
+            file
+        })
+        .collect()
+}
+
+/// Stores have released their execution slots, markers and lease directories.
 fn helpers_idle(sb: &Sandbox) -> bool {
-    fs::read_dir(deferred_dir(sb)).into_iter().flatten().flatten().all(|entry| {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("slot-") {
-            return true;
-        }
-        let file = File::open(entry.path()).unwrap();
-        frust::sys::try_lock(&file, frust::sys::LockKind::Exclusive).is_ok()
-    })
+    fs::read_dir(deferred_dir(sb))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .all(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("slot-") {
+                return true;
+            }
+            let file = File::open(entry.path()).unwrap();
+            frust::sys::try_lock(&file, frust::sys::LockKind::Exclusive).is_ok()
+        })
+        && job_markers(sb).is_empty()
+        && broker_directories(sb).is_empty()
 }
 
 /// Waits for `expected` stored units and for every helper to finish, so nothing writes into the sandbox after the test.
@@ -166,20 +231,18 @@ fn default_deferred_build_script_stores_and_restores_its_executable() {
     assert_eq!(app_output(&sb, &project), "41");
 }
 
-/// With every slot taken the wrapper stores before it returns, so the entry exists the moment the build ends.
+/// Exhausting admission and execution capacity preserves the inline fallback.
 #[test]
-fn an_exhausted_slot_pool_stores_inline() {
+fn exhausted_admission_and_execution_pools_store_inline() {
     let sb = Sandbox::new("ds-pool");
     sb.vendor_crate("leaf", "1.0.0", LEAF);
     let a = sb.project("a", &[("leaf", "1.0.0")], MAIN);
-    fs::create_dir_all(deferred_dir(&sb)).unwrap();
-    let taken: Vec<File> = (0..16)
-        .map(|i| {
-            let file = File::create(deferred_dir(&sb).join(format!("slot-{i}"))).unwrap();
-            frust::sys::lock(&file, frust::sys::LockKind::Exclusive).unwrap();
-            file
-        })
-        .collect();
+    let execution = hold_pool(&deferred_dir(&sb), "slot-", EXECUTION_SLOTS);
+    let admission = hold_pool(
+        &Dirs::at(sb.home()).locks(),
+        "store-queue-",
+        ADMISSION_SLOTS,
+    );
 
     build_deferred(&sb, &a);
 
@@ -190,11 +253,214 @@ fn an_exhausted_slot_pool_stores_inline() {
         .filter(|e| e.file_name().to_string_lossy().starts_with("job-"))
         .collect();
     assert!(jobs.is_empty(), "no job was handed to a helper: {jobs:?}");
-    drop(taken);
+    drop((execution, admission));
     clean(&sb, &a);
     build_deferred(&sb, &a);
     wait_for_stores(&sb, 2);
     assert_eq!(sb.count_cache("hit", "leaf"), 1);
+}
+
+#[test]
+fn unobserved_lock_off_builds_keep_inline_fallback_and_restore() {
+    let sb = Sandbox::new("ds-lock-off");
+    sb.vendor_crate("leaf", "1.0.0", LEAF);
+    let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
+    let execution = hold_pool(&deferred_dir(&sb), "slot-", EXECUTION_SLOTS);
+    let build = || {
+        let output = sb.bin("fcargo").arg("build").current_dir(&project)
+            .env("FRUST_CACHE", "1").env("FRUST_LOCK", "0").env("FRUST_RENDER", "off")
+            .env_remove("FRUST_STORE_SYNC").output().unwrap();
+        assert_success(&output);
+    };
+    build();
+    assert_eq!(stored(&sb), 2);
+    assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
+    assert!(!sb.home().join("locks/store-queue-0").exists());
+    let compiled = leaf_rlib(&sb, &project);
+    assert_eq!(app_output(&sb, &project), "41");
+    drop(execution);
+    clean(&sb, &project);
+    build();
+    wait_for_stores(&sb, 2);
+    assert_eq!(sb.count_cache("hit", "leaf"), 1);
+    assert_eq!(sb.count_cache("hit", "app"), 1);
+    assert_eq!(leaf_rlib(&sb, &project), compiled);
+    assert_eq!(app_output(&sb, &project), "41");
+    assert!(broker_directories(&sb).is_empty());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
+    let sb = Sandbox::new(&format!("ds-queued-{}", "nested".repeat(24)));
+    assert!(sb.root.file_name().unwrap().len() < 255);
+    assert!(sb.home().as_os_str().len() > 108);
+    sb.vendor_crate("leaf", "1.0.0", LEAF);
+    let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
+    fs::write(project.join("build.rs"), r#"fn main() {
+        println!("cargo:rerun-if-changed=build.rs");
+        let gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("broker-ready");
+        let start = std::time::Instant::now();
+        while !gate.exists() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "broker gate timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }"#).unwrap();
+    common::settle(&project.join("build.rs"));
+    let execution = hold_pool(&deferred_dir(&sb), "slot-", EXECUTION_SLOTS);
+
+    std::thread::scope(|scope| {
+        let build = scope.spawn(|| build_deferred(&sb, &project));
+        let start = Instant::now();
+        loop {
+            let ready = broker_directories(&sb).iter().any(|run| {
+                let Some(cap) = fs::read(run.join("capability.json")).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return false };
+                let Some(token) = cap["token"].as_str() else { return false };
+                Path::new("/tmp").join(format!("frust-{}/b-{token}/s", frust::sys::user_id())).exists()
+            });
+            if ready { break; }
+            assert!(start.elapsed() < WAIT_CAP, "first real miss did not activate the broker");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(project.join("broker-ready"), b"ready").unwrap();
+        build.join().unwrap();
+    });
+
+    let early = stored(&sb);
+    assert!((1..3).contains(&early), "early units store inline, but the gated app stays queued: {early}");
+    assert_eq!(published_entries(&sb), early);
+    let queued = job_markers(&sb);
+    assert_eq!(queued.len(), 3 - early, "all later units remain queued: {queued:?}");
+    assert!(queued.iter().all(|path| {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("-broker-")
+    }));
+    assert!(queued.iter().any(|path| {
+        let job: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        job["args"].as_array().unwrap().windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "app")
+    }), "the app compiled after activation must remain broker-owned");
+    let broker_runs = broker_directories(&sb);
+    assert_eq!(
+        broker_runs.len(),
+        1,
+        "the draining broker outlives the frontend"
+    );
+    let run_dir = &broker_runs[0];
+    let capability: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join("capability.json")).unwrap()).unwrap();
+    let token = capability["token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    let endpoint_dir = frust::paths::private_temp_dir(Path::new("/tmp"))
+        .unwrap()
+        .join(format!("b-{token}"));
+    assert!(endpoint_dir.is_dir());
+    frust::sys::verify_private_dir(&endpoint_dir).unwrap();
+    assert!(endpoint_dir.join("s").exists());
+    assert_eq!(sb.count_cache("miss", "leaf"), 1);
+    assert_eq!(sb.count_cache("miss", "app"), 1);
+    assert!(
+        sb.cache_events()
+            .iter()
+            .all(|event| event["bytes"].as_u64().is_some_and(|bytes| bytes > 0))
+    );
+    let compiled = leaf_rlib(&sb, &project);
+    assert_eq!(app_output(&sb, &project), "41");
+
+    drop(execution);
+    wait_for_stores(&sb, 3);
+    assert_eq!(published_entries(&sb), 3);
+    assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
+    assert!(!endpoint_dir.exists() && !run_dir.exists());
+
+    let events = sb.cache_events();
+    let noop = sb
+        .bin("fcargo")
+        .args(["build", "--message-format=json"])
+        .current_dir(&project)
+        .env("FRUST_CACHE", "1")
+        .env_remove("FRUST_STORE_SYNC")
+        .output()
+        .unwrap();
+    assert_success(&noop);
+    let artifacts: Vec<serde_json::Value> = stdout(&noop)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value["reason"] == "compiler-artifact")
+        .collect();
+    assert_eq!(artifacts.len(), 3, "{artifacts:?}");
+    assert!(artifacts.iter().all(|artifact| artifact["fresh"] == true));
+    assert_eq!(
+        sb.cache_events(),
+        events,
+        "the no-op performs no cache work"
+    );
+    assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
+    assert_eq!(leaf_rlib(&sb, &project), compiled);
+
+    clean(&sb, &project);
+    build_deferred(&sb, &project);
+    wait_for_stores(&sb, 3);
+    assert_eq!(sb.count_cache("hit", "leaf"), 1);
+    assert_eq!(sb.count_cache("hit", "app"), 1);
+    assert_eq!(sb.count_cache("miss", "leaf"), 1);
+    assert_eq!(sb.count_cache("miss", "app"), 1);
+    assert_eq!(
+        leaf_rlib(&sb, &project),
+        compiled,
+        "the full restored leaf matches rustc's output"
+    );
+    assert_eq!(app_output(&sb, &project), "41");
+    assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
+}
+
+/// Canonical slot inodes must survive GC so late acquisition cannot split the global execution limit.
+#[test]
+fn canonical_execution_slots_survive_gc_planned_before_acquisition() {
+    let sb = Sandbox::new("ds-stable-slots");
+    let dir = deferred_dir(&sb);
+    fs::create_dir_all(&dir).unwrap();
+    let slots: Vec<_> = (0..EXECUTION_SLOTS)
+        .map(|index| {
+            let path = dir.join(format!("slot-{index}"));
+            fs::write(&path, b"").unwrap();
+            age(&path, Duration::from_secs(2 * 86_400));
+            let meta = frust::sys::lstat(&path).unwrap();
+            (path, (meta.dev(), meta.ino()))
+        })
+        .collect();
+    let dirs = Dirs::at(sb.home());
+    let opts = GcOptions::new(u64::MAX);
+    let plans = [gc::plan(&dirs, &opts), gc::plan_maintenance(&dirs, &opts)];
+    let held: Vec<_> = slots
+        .iter()
+        .map(|(path, _)| {
+            let file = File::open(path).unwrap();
+            frust::sys::lock(&file, frust::sys::LockKind::Exclusive).unwrap();
+            file
+        })
+        .collect();
+    for plan in &plans {
+        let (_, failures) = gc::execute(&dirs, plan);
+        assert!(failures.is_empty(), "{failures:?}");
+        for (path, identity) in &slots {
+            let meta = frust::sys::lstat(path).unwrap();
+            assert_eq!((meta.dev(), meta.ino()), *identity);
+            let other = File::open(path).unwrap();
+            assert!(matches!(
+                frust::sys::try_lock(&other, frust::sys::LockKind::Exclusive),
+                Err(fs::TryLockError::WouldBlock)
+            ));
+        }
+    }
+    drop(held);
+    for (path, identity) in &slots {
+        let next = File::open(path).unwrap();
+        frust::sys::try_lock(&next, frust::sys::LockKind::Exclusive).unwrap();
+        let meta = frust::sys::fstat(&next).unwrap();
+        assert_eq!((meta.dev(), meta.ino()), *identity);
+    }
 }
 
 /// A helper handed a job it cannot use stores nothing, prints nothing and removes the job; gc collects what a killed helper left behind.

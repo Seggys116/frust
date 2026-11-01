@@ -17,11 +17,11 @@ The cache uses a two-step key, the same idea as ccache's direct mode.
 So an edited dependency, a changed `option_env!` value, a different feature set, profile, flag or compiler
 all miss. Nothing is cached when it cannot be done safely:
 
-* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (at most 4 entries per unit, reduced to the newest 2 by maintenance on every platform; a hit leaves no incremental session, so the first edit after a restore compiles that crate and its dependents in full; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
+* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (at most 4 entries per unit, reduced to the newest 2 by maintenance on every platform; a hit creates no native incremental session, so the first edit after a clean artifact-only restore rebuilds that crate and its dependents; existing sessions remain available to rustc; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
 * anything with `--print`, unknown `--emit` kinds, stdin input, response files or non-UTF-8 arguments,
 * tool chains such as `clippy-driver rustc ...`,
 * (workspace packages you are building are cached too when non-incremental, i.e. release builds; `FRUST_CACHE_PRIMARY=off` disables this.)
-* (Incrementally compiled units in unoptimised dev builds are cached, keyed without the session directory and without `CARGO_PRIMARY_PACKAGE`, so `-p` and whole-workspace builds share entries, and kept apart from non-incremental entries. Their outputs are functionally equivalent but not byte-identical to a non-incremental build. Release builds are non-incremental, so release byte-identity is unaffected. `FRUST_CACHE_INCREMENTAL=off` disables this.)
+* (Incrementally compiled units are cached in dev and explicitly incremental optimized profiles, including ThinLTO and fat LTO. Keys omit the session directory and `CARGO_PRIMARY_PACKAGE`, so matching `-p` and whole-workspace builds share artifacts. Optimization, LTO and other compiler settings remain in the key, and incremental entries stay apart from non-incremental entries. Rustc exclusively owns its session directories; cache hits restore completed artifacts. Incremental output can differ from non-incremental output. Release profiles remain non-incremental by default. `FRUST_CACHE_INCREMENTAL=off` disables this.)
 
 Because rustc flags are hashed as opaque text, new flags in future compilers need no support.
 
@@ -78,7 +78,7 @@ Related lookup behaviour:
 * Foreground hashing, candidate verification, output storage and restores share the same worker policy. With an
   inherited Cargo jobserver, the caller uses its existing slot and each additional worker needs a token acquired
   without waiting. If none is available, work stays on the caller. Without a jobserver, CPU and worker-count caps
-  still apply. Detached stores run serially and do not borrow Cargo tokens.
+  still apply. Each detached store uses one worker without borrowing Cargo tokens; shared slots bound active stores.
 * A current-format manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
   format number: new writes use 5, legacy formats 3 and 4 remain readable, and other formats are ignored and rewritten.
 * Evicting an entry is one rename into `tmp/evicted` under `FRUST_HOME`, so a concurrent restore fails cleanly
@@ -115,16 +115,16 @@ dependency), only one should compile it.
   during a loan is outside this recovery guarantee. Uncertain repayment fails the build before further compilation.
 * **Deferred store.** Storing a result means hashing inputs, copying outputs and writing a manifest, none of which
   cargo needs to wait for. After rustc succeeds, the wrapper records the identity of the outputs and inputs,
-  writes a job file under `tmp/deferred` and starts a detached helper (`frust-wrap --deferred-store <job>`, a
-  hidden argument) at background priority, then returns. The helper stores the entry only if those files still
-  match, prints nothing, always exits 0, and holds the key lock until it finishes. It does not record a second
-  cache event; the wrapper already recorded the miss. A bounded pool of slot locks (half the CPU count, between 1
-  and 4) limits how many helpers run at once.
-* Capacity is reserved before preparing a deferred job, so a saturated helper pool does not discover and freeze the same outputs twice.
+  writes a job file under `tmp/deferred` and hands it to a background worker. On Linux and macOS, an observed second
+  eligible compile attempt starts broker setup while Cargo is active. The broker admits up to eight jobs per shared
+  cache home, retaining job metadata without queued output copies. Single-unit builds use the detached helper.
+  Workers store an entry only if its files still match and hold the unit key lock until completion. The wrapper
+  records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4.
+* Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
 * The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
   result cannot be handed over (for example a directory output, or an incremental compile that printed an
   incremental-compilation warning), for unhashed metadata probes whose outputs may be deleted immediately,
-  or when the helper cannot be started.
+  or when a background handoff cannot complete.
 
 So the entry for a crate can appear a moment after cargo has moved on. A build started in that moment simply
 misses or waits on the key lock.

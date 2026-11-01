@@ -11,6 +11,7 @@ use crate::paths::Dirs;
 use crate::{fsx, lock, sys};
 
 const LEDGER_LIMIT: u64 = 8 * 1024 * 1024;
+const STORE_DEMAND_FRAME: &[u8] = b"{\"type\":\"store_demand\"}\n";
 
 struct LedgerGuard(File);
 
@@ -136,18 +137,36 @@ pub fn record_waited(dirs: &Dirs, event: &Event, waited_ms: u64) {
         }
 }
 
+pub(crate) fn request_store() {
+    if let Some(path) = std::env::var_os("FRUST_EVENTS").filter(|path| !path.is_empty()) {
+        append_store_demand(Path::new(&path));
+    }
+}
+
+fn append_store_demand(path: &Path) {
+    // Private demand never enters the ledger or recreates a feed after its phase closes.
+    if let Ok(mut file) = OpenOptions::new().append(true).open(path) {
+        let _ = file.write_all(STORE_DEMAND_FRAME);
+    }
+}
+
 pub struct Feed {
     path: PathBuf,
     offset: u64,
+    store_demands: u8,
 }
 
 impl Feed {
     pub fn new(path: PathBuf) -> Feed {
-        Feed { path, offset: 0 }
+        Feed { path, offset: 0, store_demands: 0 }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn take_store_demands(&mut self) -> u8 {
+        std::mem::take(&mut self.store_demands)
     }
 
     pub fn poll(&mut self) -> Vec<Event> {
@@ -166,7 +185,14 @@ impl Feed {
         }
         let complete = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
         self.offset += complete as u64;
-        text[..complete].lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        text[..complete].lines().filter_map(|line| {
+            if line.as_bytes() == &STORE_DEMAND_FRAME[..STORE_DEMAND_FRAME.len() - 1] {
+                self.store_demands = self.store_demands.saturating_add(1).min(2);
+                None
+            } else {
+                serde_json::from_str(line).ok()
+            }
+        }).collect()
     }
 }
 
@@ -421,6 +447,38 @@ mod tests {
         fs::write(&path, format!("{line}\n{line}\n")).unwrap();
         assert_eq!(feed.poll().len(), 1);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn private_store_demands_require_complete_frames_and_never_become_events_or_ledger_rows() {
+        let scratch = Scratch::new("store-demand");
+        let dirs = scratch.dirs();
+        let path = dirs.tmp().join("phase.jsonl");
+        append_store_demand(&path);
+        assert!(!dirs.tmp().exists());
+        fs::create_dir_all(dirs.tmp()).unwrap();
+        fs::write(&path, &STORE_DEMAND_FRAME[..STORE_DEMAND_FRAME.len() - 1]).unwrap();
+        let mut feed = Feed::new(path.clone());
+        assert!(feed.poll().is_empty());
+        assert_eq!(feed.take_store_demands(), 0);
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"\n").unwrap();
+        assert!(feed.poll().is_empty());
+        assert_eq!(feed.take_store_demands(), 1);
+        assert!(feed.poll().is_empty());
+        assert_eq!(feed.take_store_demands(), 0);
+        for _ in 0..3 { append_store_demand(&path); }
+        let event = Event::Cache {
+            t: 1, result: CacheResult::Miss, krate: "fixture".into(), version: "1".into(),
+            compile_ms: 1, saved_ms: 0, bytes: 1,
+        };
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+        let events = feed.poll();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::Cache { result: CacheResult::Miss, .. }));
+        assert_eq!(feed.take_store_demands(), 2);
+        assert!(serde_json::from_slice::<Event>(STORE_DEMAND_FRAME).is_err());
+        assert!(!dirs.ledger().exists());
     }
 
     #[test]

@@ -6,6 +6,127 @@ use std::collections::BTreeMap;
 const ROLES: [&str; 2] = ["coldone", "coldtwo"];
 type Units = BTreeMap<String, usize>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ConcurrentProfile {
+    Dev,
+    Release,
+    Thin,
+    Fat,
+}
+
+#[derive(Serialize)]
+struct EffectiveProfile {
+    inherits: &'static str,
+    lto: &'static str,
+    codegen_units: usize,
+    panic: &'static str,
+    incremental: bool,
+    debug: bool,
+}
+
+impl ConcurrentProfile {
+    fn parse(flags: &[String]) -> Result<Self, String> {
+        let mut selected = None;
+        for flag in flags {
+            if flag == "--concurrent-profile" {
+                return Err("--concurrent-profile requires =dev|release|thin|fat".into());
+            }
+            if let Some(value) = flag.strip_prefix("--concurrent-profile=") {
+                if selected.is_some() {
+                    return Err("--concurrent-profile must be specified once".into());
+                }
+                selected = Some(match value {
+                    "dev" => Self::Dev,
+                    "release" => Self::Release,
+                    "thin" => Self::Thin,
+                    "fat" => Self::Fat,
+                    _ => {
+                        return Err(
+                            "--concurrent-profile requires dev, release, thin or fat".into()
+                        );
+                    }
+                });
+            }
+        }
+        Ok(selected.unwrap_or(Self::Dev))
+    }
+
+    fn incremental(self, flags: &[String]) -> Result<bool, String> {
+        let mut selected = None;
+        for flag in flags {
+            if flag == "--concurrent-incremental" {
+                return Err("--concurrent-incremental requires =on|off".into());
+            }
+            if let Some(value) = flag.strip_prefix("--concurrent-incremental=") {
+                if selected.is_some() {
+                    return Err("--concurrent-incremental must be specified once".into());
+                }
+                selected = Some(match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--concurrent-incremental requires on or off".into()),
+                });
+            }
+        }
+        if self == Self::Dev && selected.is_some() {
+            return Err(
+                "--concurrent-incremental requires a release, thin or fat concurrent profile"
+                    .into(),
+            );
+        }
+        Ok(selected.unwrap_or(self == Self::Dev))
+    }
+
+    fn effective(self) -> EffectiveProfile {
+        EffectiveProfile {
+            inherits: if self == Self::Dev { "dev" } else { "release" },
+            lto: match self {
+                Self::Thin => "thin",
+                Self::Fat => "fat",
+                _ => "false",
+            },
+            codegen_units: match self {
+                Self::Dev => 256,
+                Self::Fat => 1,
+                _ => 16,
+            },
+            panic: if self == Self::Fat { "abort" } else { "unwind" },
+            incremental: self == Self::Dev,
+            debug: self == Self::Dev,
+        }
+    }
+
+    fn declarations(self, incremental: bool) -> String {
+        let mut text = String::new();
+        for role in ROLES {
+            let settings = self.effective();
+            let _ = write!(
+                text,
+                "\n[profile.{role}]\ninherits = \"{}\"\n",
+                settings.inherits
+            );
+            if self == Self::Dev {
+                #[cfg(target_os = "macos")]
+                text.push_str("debug = true\nincremental = true\nsplit-debuginfo = \"packed\"\nstrip = \"debuginfo\"\n");
+            } else {
+                // Override the fixture's fat release defaults for both equivalent roles.
+                let lto = if settings.lto == "false" {
+                    "false".to_string()
+                } else {
+                    format!("\"{}\"", settings.lto)
+                };
+                let _ = write!(
+                    text,
+                    "lto = {lto}\ncodegen-units = {}\npanic = \"{}\"\nincremental = {incremental}\ndebug = false\n",
+                    settings.codegen_units, settings.panic
+                );
+            }
+        }
+        text
+    }
+}
+
 #[derive(Serialize)]
 struct BinaryBaseline {
     hash: String,
@@ -61,7 +182,7 @@ struct Role {
     runtime_stdout_hash: String,
     runtime_stdout: String,
     #[cfg(target_os = "macos")]
-    native_debug: NativeDebugProof,
+    native_debug: Option<NativeDebugProof>,
 }
 
 #[derive(Serialize)]
@@ -131,6 +252,8 @@ struct ConcurrentReport {
     filesystem: Option<String>,
     machine: Machine,
     profiles: [&'static str; 2],
+    selected_profile: ConcurrentProfile,
+    effective_profile: EffectiveProfile,
     input_hashes: BTreeMap<String, String>,
     compiler_info_hashes: BTreeMap<String, String>,
     source_settlement: SourceSettlement,
@@ -147,6 +270,8 @@ struct ConcurrentReport {
 pub(super) fn run(flags: &[String]) -> i32 {
     let result = (|| {
         validate_flags(flags)?;
+        let profile = ConcurrentProfile::parse(flags)?;
+        let incremental = profile.incremental(flags)?;
         let quick = flags.iter().any(|flag| flag == "--quick");
         let runs = runs_from_flags(flags, quick)?;
         let compression = compression_from_flags(flags)?;
@@ -166,7 +291,15 @@ pub(super) fn run(flags: &[String]) -> i32 {
             std::process::id()
         ));
         let mut guard = Scratch(scratch.clone(), keep);
-        let result = benchmark(&scratch, quick, runs, &compression, store);
+        let result = benchmark(
+            &scratch,
+            quick,
+            runs,
+            &compression,
+            store,
+            profile,
+            incremental,
+        );
         // A failed group can leave deferred writers holding its fixture files.
         if result.is_err() {
             guard.1 = true;
@@ -319,6 +452,8 @@ fn benchmark(
     runs: usize,
     compression: &str,
     store: StorePolicy,
+    profile: ConcurrentProfile,
+    incremental: bool,
 ) -> Result<ConcurrentReport, String> {
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let cargo = resolve_tool("cargo").ok_or("cargo not found")?;
@@ -356,11 +491,7 @@ fn benchmark(
     }
     let manifest = project.join("Cargo.toml");
     let mut text = fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
-    for role in ROLES {
-        let _ = write!(text, "\n[profile.{role}]\ninherits = \"dev\"\n");
-        #[cfg(target_os = "macos")]
-        text.push_str("debug = true\nincremental = true\nsplit-debuginfo = \"packed\"\nstrip = \"debuginfo\"\n");
-    }
+    text.push_str(&profile.declarations(incremental));
     fs::write(&manifest, text).map_err(|error| error.to_string())?;
     resolve_offline(&ctx, &project)?;
     let sources = source_paths(&project)?;
@@ -396,6 +527,7 @@ fn benchmark(
                 &ctx,
                 &project,
                 &targets,
+                profile,
                 &[role],
                 frust,
                 "warmup",
@@ -405,7 +537,7 @@ fn benchmark(
                 &mut output,
             )?;
             #[cfg(target_os = "macos")]
-            if frust {
+            if frust && profile == ConcurrentProfile::Dev {
                 native_debug_cache_restores.push(restore_native_debug(
                     &ctx,
                     &project,
@@ -491,6 +623,7 @@ fn benchmark(
                 &ctx,
                 &project,
                 &targets,
+                profile,
                 &start_order,
                 frust,
                 "cold",
@@ -503,6 +636,7 @@ fn benchmark(
                 &ctx,
                 &project,
                 &targets,
+                profile,
                 &start_order,
                 frust,
                 "no-op",
@@ -533,7 +667,7 @@ fn benchmark(
         evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
         hash_algorithm: "blake3",
         mode: "concurrent_cold_groups",
-        method: "Two equivalent dev-inherited profiles; empty separate targets and shared home per group except independently warmed compiler-info. Alternating arm and spawn order. Blocking foreground waiters; one shared-home store drain before settled clock. Same compiler audit bridge, source and target paths in both arms.",
+        method: "Two equivalent selected profiles; empty separate targets and shared home per group except independently warmed compiler-info. Alternating arm and spawn order. Blocking foreground waiters; one shared-home store drain before settled clock. Same compiler audit bridge, source and target paths in both arms.",
         limits: [
             "Measures two concurrent builds with intra-group peer reuse, not isolated cold-build speed.",
             "OS page and registry caches remain warm; compiler instrumentation affects scheduling and reuse.",
@@ -552,6 +686,11 @@ fn benchmark(
         filesystem: sys::fs_type_name(root),
         machine: machine_context(before),
         profiles: ROLES,
+        selected_profile: profile,
+        effective_profile: EffectiveProfile {
+            incremental,
+            ..profile.effective()
+        },
         input_hashes,
         compiler_info_hashes,
         source_settlement,
@@ -560,7 +699,11 @@ fn benchmark(
         paired_foreground_frust_minus_cargo: Summary::new(foreground_deltas),
         paired_settled_frust_minus_cargo: Summary::new(settled_deltas),
         #[cfg(target_os = "macos")]
-        native_debug_policy: "Both fixture profiles retain full debug information and incremental compilation, with split-debuginfo=packed and strip=debuginfo. Whole executable bytes are compared unchanged. Native DWARF verification, source/type/local-variable checks and executable/bundle UUID checks run after settled clocks for every role; separate untimed warmup clean restores prove executable, runtime and complete debug bundle preservation with zero declared-unit or unknown compilations.",
+        native_debug_policy: if profile != ConcurrentProfile::Dev {
+            "Not applicable: selected release profile explicitly disables debug information; executable byte and runtime checks remain required."
+        } else {
+            "Both fixture profiles retain full debug information and incremental compilation, with split-debuginfo=packed and strip=debuginfo. Whole executable bytes are compared unchanged. Native DWARF verification, source/type/local-variable checks and executable/bundle UUID checks run after settled clocks for every role; separate untimed warmup clean restores prove executable, runtime and complete debug bundle preservation with zero declared-unit or unknown compilations."
+        },
         #[cfg(target_os = "macos")]
         native_debug_cache_restores,
     })
@@ -1145,6 +1288,7 @@ fn restore_native_debug(
         ctx,
         project,
         targets,
+        ConcurrentProfile::Dev,
         &[role],
         true,
         "native-debug-restore",
@@ -1154,6 +1298,14 @@ fn restore_native_debug(
         output,
     )?;
     let result = &restored.roles[0];
+    let original_debug = original
+        .native_debug
+        .as_ref()
+        .ok_or("missing original dev debug proof")?;
+    let restored_debug = result
+        .native_debug
+        .as_ref()
+        .ok_or("missing restored dev debug proof")?;
     let hits = restored
         .cache_events
         .iter()
@@ -1170,9 +1322,9 @@ fn restore_native_debug(
         || misses != 0
         || original.binary_hash != result.binary_hash
         || original.runtime_stdout != result.runtime_stdout
-        || original.native_debug.files != result.native_debug.files
-        || original.native_debug.executable_mode != result.native_debug.executable_mode
-        || original.native_debug.uuid != result.native_debug.uuid
+        || original_debug.files != restored_debug.files
+        || original_debug.executable_mode != restored_debug.executable_mode
+        || original_debug.uuid != restored_debug.uuid
     {
         return Err(format!(
             "native {} clean cache restore did not preserve executable, runtime and complete debug bundle without declared-unit or unknown compilations",
@@ -1195,6 +1347,7 @@ fn group(
     ctx: &Ctx,
     project: &Path,
     targets: &[PathBuf; 2],
+    profile: ConcurrentProfile,
     order: &[usize],
     frust: bool,
     phase: &'static str,
@@ -1203,6 +1356,7 @@ fn group(
     expected: &mut BTreeMap<usize, BinaryBaseline>,
     expected_output: &mut Option<Vec<u8>>,
 ) -> Result<Group, String> {
+    let _ = profile;
     let tool = if frust { "frust" } else { "cargo" };
     let audit = ctx.audit.as_ref().ok_or("compiler audit unavailable")?;
     let directory = audit
@@ -1402,12 +1556,16 @@ fn group(
             *expected_output = Some(output.clone());
         }
         #[cfg(target_os = "macos")]
-        let native_debug = native_debug_proof(
-            &binary,
-            &targets[role].join(ROLES[role]),
-            project,
-            &directory.join(format!("native-debug-{}", ROLES[role])),
-        )?;
+        let native_debug = if profile == ConcurrentProfile::Dev {
+            Some(native_debug_proof(
+                &binary,
+                &targets[role].join(ROLES[role]),
+                project,
+                &directory.join(format!("native-debug-{}", ROLES[role])),
+            )?)
+        } else {
+            None
+        };
         roles.push(Role {
             profile: ROLES[role].into(),
             target: targets[role].clone(),
@@ -1600,6 +1758,120 @@ fn validate_reuse(cargo: &Group, frust: &mut Group) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_profile_selection_and_release_overrides_are_explicit() {
+        assert_eq!(
+            ConcurrentProfile::parse(&[]).unwrap(),
+            ConcurrentProfile::Dev
+        );
+        for (name, profile, lto, units, panic) in [
+            ("dev", ConcurrentProfile::Dev, "false", 256, "unwind"),
+            ("release", ConcurrentProfile::Release, "false", 16, "unwind"),
+            ("thin", ConcurrentProfile::Thin, "thin", 16, "unwind"),
+            ("fat", ConcurrentProfile::Fat, "fat", 1, "abort"),
+        ] {
+            let flag = format!("--concurrent-profile={name}");
+            assert_eq!(
+                ConcurrentProfile::parse(std::slice::from_ref(&flag)).unwrap(),
+                profile
+            );
+            assert!(ConcurrentProfile::parse(&[flag.clone(), flag]).is_err());
+            let settings = profile.effective();
+            assert_eq!(
+                (settings.lto, settings.codegen_units, settings.panic),
+                (lto, units, panic)
+            );
+            let declarations = profile.declarations(profile == ConcurrentProfile::Dev);
+            for role in ROLES {
+                assert!(declarations.contains(&format!(
+                    "[profile.{role}]\ninherits = \"{}\"",
+                    settings.inherits
+                )));
+            }
+            if profile != ConcurrentProfile::Dev {
+                let encoded = if lto == "false" {
+                    lto.to_string()
+                } else {
+                    format!("\"{lto}\"")
+                };
+                for line in [
+                    format!("lto = {encoded}"),
+                    format!("codegen-units = {units}"),
+                    format!("panic = \"{panic}\""),
+                    "incremental = false".into(),
+                    "debug = false".into(),
+                ] {
+                    assert_eq!(
+                        declarations.lines().filter(|value| *value == line).count(),
+                        2,
+                        "{line}"
+                    );
+                }
+            }
+        }
+        for flag in [
+            "--concurrent-profile",
+            "--concurrent-profile=",
+            "--concurrent-profile=debug",
+        ] {
+            assert!(ConcurrentProfile::parse(&[flag.into()]).is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_incremental_override_is_release_only_and_explicit() {
+        assert!(ConcurrentProfile::Dev.incremental(&[]).unwrap());
+        for profile in [
+            ConcurrentProfile::Release,
+            ConcurrentProfile::Thin,
+            ConcurrentProfile::Fat,
+        ] {
+            assert!(!profile.incremental(&[]).unwrap());
+            for (value, enabled) in [("on", true), ("off", false)] {
+                let flag = format!("--concurrent-incremental={value}");
+                assert_eq!(
+                    profile.incremental(std::slice::from_ref(&flag)).unwrap(),
+                    enabled
+                );
+                assert!(profile.incremental(&[flag.clone(), flag]).is_err());
+                let declarations = profile.declarations(enabled);
+                let assignment = format!("incremental = {enabled}");
+                assert_eq!(
+                    declarations
+                        .lines()
+                        .filter(|line| *line == assignment)
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    declarations
+                        .lines()
+                        .filter(|line| *line == "debug = false")
+                        .count(),
+                    2
+                );
+            }
+        }
+        for value in ["on", "off"] {
+            assert!(
+                ConcurrentProfile::Dev
+                    .incremental(&[format!("--concurrent-incremental={value}")])
+                    .is_err()
+            );
+        }
+        for flag in [
+            "--concurrent-incremental",
+            "--concurrent-incremental=",
+            "--concurrent-incremental=true",
+        ] {
+            assert!(
+                ConcurrentProfile::Release
+                    .incremental(&[flag.into()])
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn concurrent_normalization_accepts_only_known_output_operands_and_boundaries() {

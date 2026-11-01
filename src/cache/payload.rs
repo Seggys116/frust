@@ -92,19 +92,10 @@ pub(super) fn stable(before: &sys::Meta, after: &sys::Meta) -> bool {
 }
 
 fn hash_open(source: &File, len: u64) -> io::Result<(u64, String)> {
-    let mut input = BufReader::new(source.take(len.saturating_add(1)));
-    let mut buffer = vec![0; BLOCK_BYTES];
-    let mut hash = blake3::Hasher::new();
-    let mut bytes = 0;
-    loop {
-        let n = input.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-        bytes += n as u64;
-    }
-    Ok((bytes, hash.finalize().to_hex().to_string()))
+    let limit = len.saturating_add(1);
+    let mut input = source.take(limit);
+    let hash = super::hashing::hash_reader(&mut input)?;
+    Ok((limit - input.limit(), hash))
 }
 
 pub fn capture(src: &Path) -> io::Result<(sys::Meta, Commitment)> {
@@ -333,8 +324,10 @@ fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
             .open(&tmp.0)?;
         let mut output = BufWriter::new(output);
         output.write_all(MAGIC)?;
-        let mut block = vec![0; BLOCK_BYTES];
-        let mut encoded = vec![0; lz4_flex::block::get_maximum_output_size(BLOCK_BYTES)];
+        // Keep the growth sentinel in the same frame even for an initially empty descriptor.
+        let block_bytes = before.len().saturating_add(1).min(BLOCK_BYTES as u64) as usize;
+        let mut block = vec![0; block_bytes];
+        let mut encoded = vec![0; lz4_flex::block::get_maximum_output_size(block_bytes)];
         let mut hash = blake3::Hasher::new();
         let mut decoded_bytes = 0u64;
         loop {
@@ -353,9 +346,7 @@ fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
             hash.update(&block[..len]);
             decoded_bytes += len as u64;
             // The same immutable block is observed and encoded; capture failure only removes the hint.
-            if !capture_failed
-                && let Some(spool) = spool.as_mut()
-            {
+            if !capture_failed && let Some(spool) = spool.as_mut() {
                 capture_failed = options
                     .fail_after
                     .is_some_and(|limit| limit > 0 && decoded_bytes > limit)
@@ -604,6 +595,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_output_hash_checks_length_sentinel_and_buffer_boundaries() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("bounded-hash");
+        for (actual, declared, consumed) in [
+            (0, 0, 0),
+            (0, u64::MAX, 0),
+            (1, 0, 1),
+            (9, 3, 4),
+            (9, 9, 9),
+            (9, 20, 9),
+            (9, u64::MAX, 9),
+            (262_145, 262_142, 262_143),
+            (262_145, 262_143, 262_144),
+            (262_145, 262_144, 262_145),
+            (1_048_577, 1_048_574, 1_048_575),
+            (1_048_577, 1_048_575, 1_048_576),
+            (1_048_577, 1_048_576, 1_048_577),
+        ] {
+            let content: Vec<u8> = (0..actual).map(|i| (i % 251) as u8).collect();
+            fs::write(&source, &content).unwrap();
+            let mut file = File::open(&source).unwrap();
+            let (bytes, hash) = hash_open(&file, declared).unwrap();
+            assert_eq!(bytes, consumed as u64);
+            assert_eq!(hash, blake3::hash(&content[..consumed]).to_hex().as_str());
+            let mut next = [0];
+            assert_eq!(file.read(&mut next).unwrap(), usize::from(consumed < actual));
+            if consumed < actual {
+                assert_eq!(next[0], content[consumed]);
+            }
+        }
+    }
+
     fn metadata(payload: StoredPayload) -> StoredFile {
         StoredFile {
             name: "artifact".into(),
@@ -634,10 +658,18 @@ mod tests {
 
     #[cfg(unix)]
     fn producer_archive(scratch: &Scratch) -> (PathBuf, Vec<u8>, Commitment) {
+        producer_archive_with_code_size(scratch, 2 * BLOCK_BYTES + 1)
+    }
+
+    #[cfg(unix)]
+    fn producer_archive_with_code_size(
+        scratch: &Scratch,
+        code_bytes: usize,
+    ) -> (PathBuf, Vec<u8>, Commitment) {
         let mut archive = b"!<arch>\n".to_vec();
         for (name, bytes) in [
             ("lib.rmeta/", vec![0x5a; 128 * 1024 + 17]),
-            ("code.o/", vec![0x65; 2 * BLOCK_BYTES + 1]),
+            ("code.o/", vec![0x65; code_bytes]),
         ] {
             archive.extend_from_slice(
                 format!(
@@ -805,6 +837,145 @@ mod tests {
         restore(&encoded, &restored, &meta).unwrap();
         assert_eq!(fs::read(&restored).unwrap(), content);
         assert_eq!(meta.stored_bytes, Some(fsx::allocated_size(&encoded)));
+    }
+
+    #[test]
+    fn compression_boundaries_preserve_frames_and_roundtrip() {
+        let minimum = MIN_BYTES as usize;
+        for (size, expected_frames) in [
+            (minimum - 1, vec![]),
+            (minimum, vec![minimum]),
+            (minimum + 1, vec![minimum + 1]),
+            (BLOCK_BYTES - 1, vec![BLOCK_BYTES - 1]),
+            (BLOCK_BYTES, vec![BLOCK_BYTES]),
+            (BLOCK_BYTES + 1, vec![BLOCK_BYTES, 1]),
+            (2 * BLOCK_BYTES + 17, vec![BLOCK_BYTES, BLOCK_BYTES, 17]),
+        ] {
+            let scratch = Scratch::new();
+            let source = scratch.0.join("source");
+            let staged = scratch.0.join("f0");
+            let content: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            fs::write(&source, &content).unwrap();
+            let (_, commitment) = capture(&source).unwrap();
+            let meta =
+                metadata(store_committed(&source, &staged, true, Some(&commitment)).unwrap());
+            let bytes = fs::read(&staged).unwrap();
+            if expected_frames.is_empty() {
+                assert!(meta.encoding.is_raw());
+                assert_eq!(bytes, content);
+            } else {
+                assert_eq!(meta.encoding, Encoding::Lz4BlocksV1);
+                assert_eq!(meta.decoded_bytes, Some(size as u64));
+                assert_eq!(meta.content_hash.as_deref(), Some(commitment.hash.as_str()));
+                assert!(bytes.starts_with(MAGIC));
+                let mut at = MAGIC.len();
+                let mut frames = Vec::new();
+                loop {
+                    let decoded =
+                        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                    let encoded =
+                        u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+                    at += 8;
+                    if decoded == 0 {
+                        assert_eq!(encoded, 0);
+                        assert_eq!(at, bytes.len());
+                        break;
+                    }
+                    assert!(encoded > 0 && encoded <= bytes.len() - at);
+                    frames.push(decoded);
+                    at += encoded;
+                }
+                assert_eq!(frames, expected_frames, "artifact size {size}");
+            }
+            let restored = scratch.0.join("restored");
+            restore(&staged, &restored, &meta).unwrap();
+            assert_eq!(fs::read(restored).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn compression_rejects_observed_growth_and_shrink_after_source_is_restored() {
+        for size in [MIN_BYTES as usize, BLOCK_BYTES, BLOCK_BYTES + 1] {
+            for changed_size in [0, size - 1, size + 1] {
+                for committed in [false, true] {
+                    let scratch = Scratch::new();
+                    let source = scratch.0.join("source");
+                    let staged = scratch.0.join("f0");
+                    let content = vec![0x57; size];
+                    fs::write(&source, &content).unwrap();
+                    let (_, commitment) = capture(&source).unwrap();
+                    let modified = fs::metadata(&source).unwrap().modified().unwrap();
+                    let read_finished = std::cell::Cell::new(false);
+                    let cloned = std::cell::Cell::new(false);
+                    let result = store_inner_captured(
+                        &source,
+                        &staged,
+                        true,
+                        committed.then_some(&commitment),
+                        StoreHooks {
+                            before_read: || {
+                                File::options()
+                                    .write(true)
+                                    .open(&source)
+                                    .unwrap()
+                                    .set_len(changed_size as u64)
+                                    .unwrap();
+                            },
+                            before_clone: || cloned.set(true),
+                            after_read: || {
+                                // Restored identity must not hide the length change consumed by the encoder.
+                                fs::write(&source, &content).unwrap();
+                                File::options()
+                                    .write(true)
+                                    .open(&source)
+                                    .unwrap()
+                                    .set_times(fs::FileTimes::new().set_modified(modified))
+                                    .unwrap();
+                                assert!(commitment.matches(&sys::stat(&source).unwrap()));
+                                read_finished.set(true);
+                            },
+                        },
+                        CaptureOptions {
+                            enabled: true,
+                            fail_after: None,
+                        },
+                    );
+                    assert!(read_finished.get());
+                    assert!(
+                        result.is_err(),
+                        "size {size}, changed {changed_size}, committed {committed}"
+                    );
+                    assert!(!cloned.get() && !staged.exists());
+                    assert_eq!(fs::read(&source).unwrap(), content);
+                    assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn small_compressed_archive_preserves_sparse_producer_capture() {
+        let scratch = Scratch::new();
+        let code_bytes = 32 * 1024;
+        let (source, archive, commitment) = producer_archive_with_code_size(&scratch, code_bytes);
+        assert!(archive.len() < BLOCK_BYTES);
+        let staged = scratch.0.join("f0");
+        let (stored, proof) =
+            store_proven(&source, &staged, true, Some(&commitment), true).unwrap();
+        let meta = metadata(stored);
+        assert_eq!(meta.encoding, Encoding::Lz4BlocksV1);
+        let proof = proof.expect("small archives retain producer capture");
+        assert!(proof.usable(&staged, &meta));
+        let mut captured = Vec::new();
+        proof.reader().unwrap().read_to_end(&mut captured).unwrap();
+        let code_start = archive.len() - code_bytes;
+        assert_eq!(captured.len(), archive.len());
+        assert_eq!(captured[..code_start], archive[..code_start]);
+        assert!(captured[code_start..].iter().all(|byte| *byte == 0));
+        let restored = scratch.0.join("restored");
+        restore(&staged, &restored, &meta).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), archive);
     }
 
     #[test]

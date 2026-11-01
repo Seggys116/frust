@@ -416,6 +416,63 @@ fn accelerator_env(cfg: &Config, probe: &Probe) -> Vec<(OsString, OsString)> {
     vars
 }
 
+fn prepare_store_broker(
+    cfg: &Config,
+    dirs: &Dirs,
+    env_vars: &[(OsString, OsString)],
+    feed: Option<&Feed>,
+    cmd: &mut Command,
+) -> Option<crate::store_broker::BrokerLaunch> {
+    cmd.env_remove(crate::store_broker::CAPABILITY_ENV);
+    if feed.is_some() && cfg.cache && !cfg.store_sync && env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER") {
+        return crate::store_broker::BrokerLaunch::prepare(dirs, cmd).ok();
+    }
+    None
+}
+
+fn create_phase_feed(dirs: &Dirs, mut next_path: impl FnMut() -> PathBuf) -> io::Result<Feed> {
+    fs::create_dir_all(dirs.tmp())?;
+    for _ in 0..8 {
+        let path = next_path();
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(Feed::new(path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "event feed names collided"))
+}
+
+fn prepare_phase_feed(dirs: &Dirs, cmd: &mut Command) -> Option<Feed> {
+    cmd.env_remove("FRUST_EVENTS");
+    // Exclusive creation isolates this phase from stale events and writers using an earlier path.
+    let feed = create_phase_feed(dirs, || crate::fsx::temp_sibling(&dirs.tmp().join("feed.jsonl"))).ok()?;
+    cmd.env("FRUST_EVENTS", feed.path());
+    Some(feed)
+}
+
+struct SupervisionFeed {
+    feed: Option<Feed>,
+    broker: Option<crate::store_broker::BrokerLaunch>,
+}
+
+impl SupervisionFeed {
+    fn poll(&mut self, active: bool) -> Vec<Event> {
+        let events = self.feed.as_mut().map(Feed::poll).unwrap_or_default();
+        let demands = self.feed.as_mut().map(Feed::take_store_demands).unwrap_or(0);
+        if active
+            && let Some(broker) = &mut self.broker
+        {
+            broker.note_store_demands(demands);
+        }
+        events
+    }
+
+    fn finish(self) {
+        if let Some(broker) = self.broker { broker.finish(); }
+    }
+}
+
 fn wrapper_path() -> Option<PathBuf> {
     let name = format!("frust-wrap{}", env::consts::EXE_SUFFIX);
     if let Ok(exe) = env::current_exe() {
@@ -655,8 +712,6 @@ impl Session {
         let history_keys = self.history_keys(&key, sub, rest);
         let expected = history::expected_units(&self.dirs, &history_keys);
 
-        let feed_path = self.dirs.tmp().join(format!("feed-{}.jsonl", std::process::id()));
-        let mut feed = Feed::new(feed_path.clone());
         let mut ui = style.map(|style| {
             Ui::new(
                 UiOptions {
@@ -715,12 +770,15 @@ impl Session {
             cmd.env(crate::wrapper::SLOT_SUPERVISOR_ENV, std::process::id().to_string());
         }
         let tracked = style.is_some() || guard.is_some();
-        if tracked {
-            let _ = fs::create_dir_all(self.dirs.tmp());
-            cmd.env("FRUST_EVENTS", &feed_path);
-        }
+        let feed = if tracked { prepare_phase_feed(&self.dirs, &mut cmd) } else { None };
+        let feed_path = feed.as_ref().map(|feed| feed.path().to_owned());
 
-        let mut progress = Progress { expected, ..Progress::default() };
+        let broker = prepare_store_broker(&self.cfg, &self.dirs, &self.env_vars, feed.as_ref(), &mut cmd);
+        let mut feed = SupervisionFeed { feed, broker };
+        let mut progress = Progress {
+            expected,
+            ..Progress::default()
+        };
         trace(&self.cfg, started, "lock acquired, starting cargo");
         let code = match (style, ui.as_mut()) {
             (Some(style), Some(ui)) => {
@@ -736,6 +794,8 @@ impl Session {
                 None => supervise_plain(cmd),
             },
         };
+        // Frontend EOF closes admission; queued stores outlive this Cargo phase.
+        feed.finish();
         trace(&self.cfg, started, "cargo finished");
 
         // A queued build cannot take the profile before due maintenance has had its nonblocking cleanup opportunity.
@@ -751,8 +811,8 @@ impl Session {
             guard.finish(BuildResult { code, units: progress.done, interrupted });
         }
         let stats = ui.as_mut().map(|ui| ui.finish(Outcome { success: code == 0, exit_code: code }, Instant::now()));
-        if tracked {
-            let _ = fs::remove_file(&feed_path);
+        if let Some(path) = feed_path {
+            let _ = fs::remove_file(path);
         }
         if code == 0
             && let Some(joined) = &joined {
@@ -848,7 +908,7 @@ impl Session {
         &self,
         mut cmd: Command,
         ui: &mut Ui,
-        feed: &mut Feed,
+        feed: &mut SupervisionFeed,
         progress: &mut Progress,
         mut lock: Option<&mut BuildLock>,
         shown: &mut Shown,
@@ -909,7 +969,7 @@ impl Session {
             }
             let now = Instant::now();
             // Cache events lag the JSON stream by a poll interval; drain them first.
-            for ev in feed.poll() {
+            for ev in feed.poll(status.is_none()) {
                 track_cache(progress, &ev, false);
                 if let Some(lock) = lock.as_deref_mut() {
                     lock.log_cache(&ev);
@@ -933,7 +993,7 @@ impl Session {
         let now = Instant::now();
         log_lines(lock.as_deref_mut(), &tails[0], &tails[1]);
         render_lines(ui, progress, shown, &tails[0], &tails[1], now);
-        for ev in feed.poll() {
+        for ev in feed.poll(false) {
             track_cache(progress, &ev, false);
             if let Some(lock) = lock.as_deref_mut() {
                 lock.log_cache(&ev);
@@ -1320,7 +1380,7 @@ fn supervise_plain(mut cmd: Command) -> i32 {
 }
 
 /// Output not going to a terminal passes through byte for byte so it can be logged; terminal output stays cargo's own, so followers get no output.
-fn supervise_plain_logged(cmd: Command, feed: &mut Feed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
+fn supervise_plain_logged(cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
     let capture_out = !io::stdout().is_terminal();
     let capture_err = !io::stderr().is_terminal();
     lock.log_start(false, capture_out && capture_err);
@@ -1331,7 +1391,7 @@ fn supervise_plain_logged(cmd: Command, feed: &mut Feed, progress: &mut Progress
     }
 }
 
-fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, lock: &mut BuildLock, capture_out: bool, capture_err: bool) -> i32 {
+fn supervise_tee(mut cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock, capture_out: bool, capture_err: bool) -> i32 {
     cmd.stdin(Stdio::inherit());
     cmd.stdout(if capture_out { Stdio::piped() } else { Stdio::inherit() });
     cmd.stderr(if capture_err { Stdio::piped() } else { Stdio::inherit() });
@@ -1366,7 +1426,7 @@ fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, loc
         if ready[1] {
             streams[1].read_tee(&mut chunk, &mut lines[1], &mut stderr);
         }
-        for ev in feed.poll() {
+        for ev in feed.poll(status.is_none()) {
             track_cache(progress, &ev, true);
             lock.log_cache(&ev);
         }
@@ -1380,7 +1440,7 @@ fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, loc
     let tails: Vec<Vec<Vec<u8>>> = streams.iter_mut().map(|s| s.take_partial().into_iter().collect()).collect();
     drop(streams);
     log_lines(Some(&mut *lock), &tails[0], &tails[1]);
-    for ev in feed.poll() {
+    for ev in feed.poll(false) {
         track_cache(progress, &ev, true);
         lock.log_cache(&ev);
     }
@@ -1393,12 +1453,13 @@ fn supervise_tee(mut cmd: Command, feed: &mut Feed, progress: &mut Progress, loc
 }
 
 /// The publisher is a scoped thread, always joined before this returns.
-fn supervise_plain_publishing(cmd: Command, feed: &mut Feed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
+fn supervise_plain_publishing(cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
     let (stop, stopped) = mpsc::channel::<()>();
     thread::scope(|scope| {
         let publisher = scope.spawn(move || {
             loop {
-                for ev in feed.poll() {
+                if !matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) { break; }
+                for ev in feed.poll(true) {
                     track_cache(progress, &ev, true);
                     lock.log_cache(&ev);
                 }
@@ -1409,7 +1470,7 @@ fn supervise_plain_publishing(cmd: Command, feed: &mut Feed, progress: &mut Prog
                     _ => break,
                 }
             }
-            for ev in feed.poll() {
+            for ev in feed.poll(false) {
                 track_cache(progress, &ev, true);
                 lock.log_cache(&ev);
             }
@@ -1495,6 +1556,169 @@ pub fn tool_main(tool: &str, args: Vec<OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_lease_bypasses_cache_off_sync_and_foreign_wrappers() {
+        let root = crate::fsx::temp_sibling(&env::temp_dir().join("frust-broker-bypass"));
+        let dirs = Dirs::at(&root);
+        let feed = prepare_phase_feed(&dirs, &mut Command::new("cargo")).unwrap();
+        let wrapper = vec![(os("RUSTC_WRAPPER"), os("frust-wrap"))];
+        let mut cfg = Config::from_env();
+        for (cache, synchronous, own_wrapper) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            cfg.cache = cache;
+            cfg.store_sync = synchronous;
+            let mut cmd = Command::new("cargo");
+            cmd.env(crate::store_broker::CAPABILITY_ENV, "inherited-capability");
+            let env_vars = if own_wrapper { wrapper.as_slice() } else { &[] };
+            assert!(prepare_store_broker(&cfg, &dirs, env_vars, Some(&feed), &mut cmd).is_none());
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| key == crate::store_broker::CAPABILITY_ENV
+                        && value.is_none())
+            );
+        }
+        assert_eq!(fs::read_dir(dirs.tmp()).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phase_feed_creation_preserves_collisions_and_disables_observation_on_failure() {
+        let root = crate::fsx::temp_sibling(&env::temp_dir().join("frust-feed-create"));
+        let dirs = Dirs::at(root.clone());
+        fs::create_dir_all(dirs.tmp()).unwrap();
+        let collision = dirs.tmp().join("existing-feed");
+        fs::write(&collision, b"preserve old events\n").unwrap();
+        let fresh = dirs.tmp().join("new-feed");
+        let mut attempts = 0;
+        let mut feed = create_phase_feed(&dirs, || {
+            attempts += 1;
+            if attempts == 1 { collision.clone() } else { fresh.clone() }
+        }).unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(feed.path(), fresh);
+        assert!(feed.poll().is_empty());
+        assert_eq!(fs::read(&collision).unwrap(), b"preserve old events\n");
+        attempts = 0;
+        let failed = create_phase_feed(&dirs, || { attempts += 1; collision.clone() });
+        assert_eq!(failed.err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(attempts, 8);
+        assert_eq!(fs::read(&collision).unwrap(), b"preserve old events\n");
+        let blocked = Dirs::at(root.join("blocked-home"));
+        fs::create_dir(blocked.root()).unwrap();
+        fs::write(blocked.tmp(), b"preserve obstruction").unwrap();
+        let mut command = Command::new("unused-cargo");
+        command.env("FRUST_EVENTS", &collision);
+        command.env(crate::store_broker::CAPABILITY_ENV, "inherited-capability");
+        let feed = prepare_phase_feed(&blocked, &mut command);
+        assert!(feed.is_none());
+        assert!(command.get_envs().any(|(key, value)| key == "FRUST_EVENTS" && value.is_none()));
+        let mut cfg = Config::from_env();
+        cfg.cache = true;
+        cfg.store_sync = false;
+        let wrapper = [(os("RUSTC_WRAPPER"), os("frust-wrap"))];
+        let broker = prepare_store_broker(&cfg, &blocked, &wrapper, feed.as_ref(), &mut command);
+        assert!(broker.is_none());
+        assert!(command.get_envs().any(|(key, value)| key == crate::store_broker::CAPABILITY_ENV && value.is_none()));
+        let mut feed = SupervisionFeed { feed, broker };
+        assert!(feed.poll(true).is_empty());
+        assert_eq!(fs::read(blocked.tmp()).unwrap(), b"preserve obstruction");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn only_two_active_private_demands_activate_and_publisher_returns_lease_ownership() {
+        let root = crate::fsx::temp_sibling(&env::temp_dir().join("frust-lazy-feed"));
+        fs::create_dir(&root).unwrap();
+        let dirs = Dirs::at(root.join("home"));
+        let event = |result| Event::Cache {
+            t: 0, result, krate: "fixture".into(), version: "1".into(), compile_ms: 1, saved_ms: 0, bytes: 1,
+        };
+        fs::create_dir_all(dirs.tmp()).unwrap();
+        let stale = dirs.tmp().join(format!("feed-{}.jsonl", std::process::id()));
+        let stale_miss = format!("{}\n", serde_json::to_string(&event(CacheResult::Miss)).unwrap());
+        let demand = "{\"type\":\"store_demand\"}\n";
+        let stale_contents = format!("{stale_miss}{demand}{demand}");
+        fs::write(&stale, &stale_contents).unwrap();
+        assert_eq!(Feed::new(stale.clone()).poll().len(), 1);
+        let mut command = Command::new("unused-cargo");
+        let fresh = prepare_phase_feed(&dirs, &mut command).unwrap();
+        let path = fresh.path().to_owned();
+        let mut cfg = Config::from_env();
+        cfg.cache = true;
+        cfg.store_sync = false;
+        let wrapper = [(os("RUSTC_WRAPPER"), os("frust-wrap"))];
+        let broker = prepare_store_broker(&cfg, &dirs, &wrapper, Some(&fresh), &mut command).unwrap();
+        let encoded = command.get_envs().find(|(key, _)| *key == crate::store_broker::CAPABILITY_ENV).unwrap().1.unwrap();
+        let cap: serde_json::Value = serde_json::from_str(encoded.to_str().unwrap()).unwrap();
+        let run = PathBuf::from(cap["run"].as_str().unwrap());
+        let mut feed = SupervisionFeed { feed: Some(fresh), broker: Some(broker) };
+        let append = |event: Event| {
+            let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+        };
+        assert_ne!(path, stale);
+        assert!(feed.poll(true).is_empty());
+        fs::OpenOptions::new().append(true).open(&stale).unwrap().write_all(demand.as_bytes()).unwrap();
+        assert!(feed.poll(true).is_empty());
+        append(event(CacheResult::Hit));
+        assert_eq!(feed.poll(true).len(), 1);
+        append(event(CacheResult::Miss));
+        assert_eq!(feed.poll(true).len(), 1);
+        assert!(!run.exists());
+        let request = || fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(demand.as_bytes()).unwrap();
+        request();
+        request();
+        assert!(feed.poll(false).is_empty());
+        assert!(feed.poll(true).is_empty());
+        assert!(!run.exists());
+        request();
+        assert!(feed.poll(true).is_empty());
+        assert!(!run.exists());
+        append(event(CacheResult::Miss));
+        assert_eq!(feed.poll(true).len(), 1);
+        assert!(!run.exists());
+        request();
+        let feed = thread::scope(|scope| scope.spawn(move || {
+            assert!(feed.poll(true).is_empty());
+            assert!(run.is_dir());
+            feed
+        }).join().unwrap());
+        feed.finish();
+        assert_eq!(fs::read_to_string(&stale).unwrap(), format!("{stale_contents}{demand}"));
+        assert_eq!(fs::read_dir(dirs.tmp()).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unobserved_phase_clears_capability_and_preserves_external_events() {
+        let root = crate::fsx::temp_sibling(&env::temp_dir().join("frust-unobserved-feed"));
+        fs::create_dir(&root).unwrap();
+        let external = root.join("external-events.jsonl");
+        fs::write(&external, b"preserve external events\n").unwrap();
+        let dirs = Dirs::at(root.join("unobserved-home"));
+        let mut cfg = Config::from_env();
+        cfg.cache = true;
+        cfg.store_sync = false;
+        let wrapper = [(os("RUSTC_WRAPPER"), os("frust-wrap"))];
+        let mut command = Command::new("unused-cargo");
+        command.env("FRUST_EVENTS", &external).env(crate::store_broker::CAPABILITY_ENV, "inherited-capability");
+        let broker = prepare_store_broker(&cfg, &dirs, &wrapper, None, &mut command);
+        assert!(broker.is_none());
+        assert!(command.get_envs().any(|(key, value)| key == crate::store_broker::CAPABILITY_ENV && value.is_none()));
+        assert!(command.get_envs().any(|(key, value)| key == "FRUST_EVENTS" && value == Some(external.as_os_str())));
+        let mut feed = SupervisionFeed { feed: None, broker };
+        assert!(feed.poll(true).is_empty());
+        feed.finish();
+        assert!(!dirs.root().exists());
+        assert_eq!(fs::read(&external).unwrap(), b"preserve external events\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fast_build_does_not_launch_a_planner_before_the_tick_or_after_exit() {

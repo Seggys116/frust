@@ -1,5 +1,4 @@
-//! Terminal UI for builds.
-//! Output goes to an injected writer and time is passed in, so the display can be driven headlessly (see [`vt`], [`demo`]).
+//! Build terminal UI with an injected writer and time for headless driving (see [`vt`], [`demo`]).
 
 pub mod demo;
 mod model;

@@ -1157,8 +1157,7 @@ fn decode_group<W: Write>(
     {
         return Err(invalid("backing changed during grouped decode"));
     }
-    // Validate all outputs before the first destination rename.
-    // Compressed digests are reusable only after complete stream verification.
+    // Verify all outputs before any destination rename; reuse compressed digests only after complete stream verification.
     let base_hash = match &tee.base_hash {
         Some(hash) => hash.finalize().to_hex().to_string(),
         None => base

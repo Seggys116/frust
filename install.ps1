@@ -1,6 +1,4 @@
-# Install frust on Windows.
-#   irm https://raw.githubusercontent.com/Seggys116/frust/main/install.ps1 | iex
-# Environment: FRUST_VERSION (for example v0.1.0, default latest), FRUST_INSTALL_DIR (default %LOCALAPPDATA%\frust\bin).
+# FRUST_VERSION selects the release; FRUST_INSTALL_DIR overrides the default %LOCALAPPDATA%\frust\bin.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 

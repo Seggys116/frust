@@ -1,5 +1,4 @@
-//! Filesystem helpers: copy-on-write clones, atomic writes, sizes and disk guards.
-//! Artifacts are cloned or copied, never hard-linked: rustc and linkers may rewrite a file in place and would corrupt the cache.
+//! Clone or copy artifacts, never hard-link: rustc/linker in-place rewrites could corrupt the cache.
 
 use std::fs::{self, File};
 use std::io::{self, Write};

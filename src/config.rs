@@ -17,7 +17,6 @@ pub enum RenderMode {
     Off,
 }
 
-/// Which OSC (operating system command) features the terminal gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Osc {
     pub progress: bool,
@@ -40,11 +39,10 @@ pub struct Config {
     pub gc_sync: bool,
     /// Store compile results before the wrapper exits instead of in a detached helper.
     pub store_sync: bool,
-    /// How long a compile waits for another process compiling the same unit.
     pub keylock_wait: Duration,
 }
 
-/// Upper bound on waiting for another process's compile of the same unit.
+/// Default same-unit compile wait, overridden by `FRUST_KEYLOCK_WAIT_SECS`.
 pub const KEY_WAIT_CAP: Duration = Duration::from_secs(300);
 
 impl Config {

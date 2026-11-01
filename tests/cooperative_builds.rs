@@ -294,14 +294,13 @@ fn package(root: &Path, name: &str, dependencies: &str, source: &str, binary: bo
     common::settle(&source_path);
 }
 
-#[test]
-fn cargo_j1_compiles_independent_unit_while_shared_unit_waits_for_another_build() {
-    let sb = Sandbox::new("cooperative-j1");
+fn independent_work_while_shared_unit_waits(tag: &str, inheritance: &str) {
+    let sb = Sandbox::new(tag);
     let project = sb.root.join("workspace");
     fs::create_dir(&project).unwrap();
-    fs::write(project.join("Cargo.toml"), "[workspace]\nmembers = [\"app\", \"shared_dep\", \"independent_dep\", \"relay0\", \"relay1\", \"relay2\", \"relay3\", \"relay4\", \"relay5\", \"relay6\", \"relay7\"]\nresolver = \"2\"\n\
-        [profile.owner]\ninherits = \"dev\"\ndebug = 0\nincremental = false\n\
-        [profile.follower]\ninherits = \"dev\"\ndebug = 0\nincremental = false\n").unwrap();
+    fs::write(project.join("Cargo.toml"), format!("[workspace]\nmembers = [\"app\", \"shared_dep\", \"independent_dep\", \"relay0\", \"relay1\", \"relay2\", \"relay3\", \"relay4\", \"relay5\", \"relay6\", \"relay7\"]\nresolver = \"2\"\n\
+        [profile.owner]\ninherits = \"{inheritance}\"\ndebug = 0\nincremental = false\n\
+        [profile.follower]\ninherits = \"{inheritance}\"\ndebug = 0\nincremental = false\n")).unwrap();
     package(
         &project,
         "shared_dep",
@@ -416,6 +415,16 @@ fn cargo_j1_compiles_independent_unit_while_shared_unit_waits_for_another_build(
     assert_success(&output);
     assert_eq!(stdout(&output), "95\n");
     frust::bench::drain_deferred_stores(&sb.home(), DEADLINE).unwrap();
+}
+
+#[test]
+fn cargo_j1_compiles_independent_unit_while_shared_unit_waits_for_another_build() {
+    independent_work_while_shared_unit_waits("cooperative-j1", "dev");
+}
+
+#[test]
+fn cargo_j1_release_compiles_independent_unit_while_shared_unit_waits() {
+    independent_work_while_shared_unit_waits("cooperative-release-j1", "release");
 }
 
 #[cfg(target_os = "linux")]

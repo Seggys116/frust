@@ -182,6 +182,9 @@ for arg in "$@"; do
     previous=$arg
 done
 if [ "$crate" = leaf ] && [ "$emit" = yes ]; then
+    if [ "${FRUST_TEST_REQUIRE_INCREMENTAL:-}" = yes ]; then
+        case " $* " in *incremental=*) ;; *) exit 3 ;; esac
+    fi
     printf 'compile\n' >> "$FRUST_TEST_COMPILER_COUNT"
     attempts=0
     while [ ! -f "$FRUST_TEST_COMPILER_GATE" ]; do
@@ -212,6 +215,9 @@ exec rustc "$@"
             .env("FRUST_TEST_COMPILER_GATE", &self.gate)
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(File::create(&stderr).unwrap());
         if deferred { command.env_remove("FRUST_STORE_SYNC"); }
+        if fs::read_to_string(project.join("Cargo.toml")).unwrap().contains("incremental = true") {
+            command.env("FRUST_TEST_REQUIRE_INCREMENTAL", "yes");
+        }
         common::own_group(&mut command);
         CountedBuild { child: Some(command.spawn().unwrap()), stderr }
     }
@@ -264,15 +270,34 @@ fn until(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 #[cfg(unix)]
-fn counted_profile_pair(tag: &str, deferred: bool, different_flags: bool) {
+const COUNTED_DEV: &str = "inherits = \"dev\"\ndebug = 0\nincremental = false\n";
+#[cfg(unix)]
+const COUNTED_RELEASE: &str = "inherits = \"release\"\nlto = false\ncodegen-units = 16\npanic = \"unwind\"\nincremental = false\n";
+#[cfg(unix)]
+const COUNTED_THIN: &str = "inherits = \"release\"\nlto = \"thin\"\ncodegen-units = 16\npanic = \"unwind\"\nincremental = false\n";
+#[cfg(unix)]
+const COUNTED_FAT: &str = "inherits = \"release\"\nlto = \"fat\"\ncodegen-units = 1\npanic = \"abort\"\nincremental = false\n";
+
+#[cfg(unix)]
+fn counted_profile_pair(tag: &str, deferred: bool, profiles: [&str; 2]) {
+    let different_flags = profiles[0] != profiles[1];
     let sb = Sandbox::new(tag);
     sb.vendor_crate("leaf", "1.0.0", &slow_leaf());
     let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
     let manifest = project.join("Cargo.toml");
     let mut text = fs::read_to_string(&manifest).unwrap();
-    for profile in ["cooperate-a", "cooperate-b"] {
-        text.push_str(&format!("\n[profile.{profile}]\ninherits = \"dev\"\ndebug = 0\nincremental = false\n"));
-        if different_flags && profile == "cooperate-b" { text.push_str("opt-level = 1\n"); }
+    if profiles.iter().any(|profile| profile.contains("incremental = true")) {
+        // Cargo enables native incremental sessions for this local dependency, unlike registry sources.
+        let leaf = project.join("leaf");
+        fs::create_dir_all(leaf.join("src")).unwrap();
+        fs::write(leaf.join("Cargo.toml"), "[package]\nname = \"leaf\"\nversion = \"1.0.0\"\nedition = \"2021\"\n").unwrap();
+        fs::write(leaf.join("src/lib.rs"), slow_leaf()).unwrap();
+        common::settle(&leaf.join("src/lib.rs"));
+        text = text.replace("leaf = \"=1.0.0\"", "leaf = { path = \"leaf\" }");
+        assert!(text.contains("leaf = { path = \"leaf\" }"));
+    }
+    for (profile, settings) in ["cooperate-a", "cooperate-b"].into_iter().zip(profiles) {
+        text.push_str(&format!("\n[profile.{profile}]\n{settings}"));
     }
     fs::write(manifest, text).unwrap();
     let compiler = CountedCompiler::new(&sb);
@@ -291,6 +316,12 @@ fn counted_profile_pair(tag: &str, deferred: bool, different_flags: bool) {
     if !different_flags {
         assert_eq!(sb.count_cache("miss", "leaf"), 1);
         assert_eq!(sb.count_cache("hit", "leaf"), 1);
+        for result in ["miss", "hit"] {
+            assert!(sb.cache_events().iter().any(|event| {
+                event["crate"] == "leaf" && event["result"] == result
+                    && event["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+            }));
+        }
     } else {
         assert_eq!(sb.count_cache("miss", "leaf"), 2);
         assert_eq!(sb.count_cache("hit", "leaf"), 0);
@@ -310,25 +341,71 @@ fn counted_profile_pair(tag: &str, deferred: bool, different_flags: bool) {
                 entries.all(|entry| entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with("job-")))
             })
         });
+        frust::bench::drain_deferred_stores(&sb.home(), Duration::from_secs(60)).unwrap();
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn identical_custom_profiles_share_one_actual_compiler_launch() {
-    counted_profile_pair("sf-profiles-counted", false, false);
+    counted_profile_pair("sf-profiles-counted", false, [COUNTED_DEV; 2]);
 }
 
 #[cfg(unix)]
 #[test]
 fn default_deferred_stores_share_one_actual_compiler_launch() {
-    counted_profile_pair("sf-deferred-counted", true, false);
+    counted_profile_pair("sf-deferred-counted", true, [COUNTED_DEV; 2]);
 }
 
 #[cfg(unix)]
 #[test]
 fn different_profile_flags_compile_independently_without_waiting_for_the_shared_gate() {
-    counted_profile_pair("sf-different-flags-counted", false, true);
+    counted_profile_pair("sf-different-flags-counted", false, [COUNTED_DEV, &format!("{COUNTED_DEV}opt-level = 1\n")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_release_profiles_share_one_deferred_compiler_launch() {
+    counted_profile_pair("sf-release-counted", true, [COUNTED_RELEASE; 2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_thin_lto_profiles_share_one_deferred_compiler_launch() {
+    counted_profile_pair("sf-thin-counted", true, [COUNTED_THIN; 2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_fat_lto_profiles_share_one_deferred_compiler_launch() {
+    counted_profile_pair("sf-fat-counted", true, [COUNTED_FAT; 2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_and_fat_lto_compile_independently_before_the_shared_gate_opens() {
+    counted_profile_pair("sf-release-fat-counted", true, [COUNTED_RELEASE, COUNTED_FAT]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_release_incremental_profiles_share_one_deferred_compiler_launch() {
+    let profile = COUNTED_RELEASE.replace("incremental = false", "incremental = true");
+    counted_profile_pair("sf-inc-release", true, [&profile; 2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_thin_incremental_profiles_share_one_deferred_compiler_launch() {
+    let profile = COUNTED_THIN.replace("incremental = false", "incremental = true");
+    counted_profile_pair("sf-inc-thin", true, [&profile; 2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn equivalent_fat_incremental_profiles_share_one_deferred_compiler_launch() {
+    let profile = COUNTED_FAT.replace("incremental = false", "incremental = true");
+    counted_profile_pair("sf-inc-fat", true, [&profile; 2]);
 }
 
 /// A holder that dies releases its lock with it, so a build waiting on it carries on.

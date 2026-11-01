@@ -2,6 +2,29 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0]
+
+### Changed
+
+* Concurrent cold builds share matching compiler units while retaining independent profile locks and original compiler flags.
+* Concurrent benchmarks select dev, release, thin or fat profiles with native compiler-flag and executable-byte checks.
+* Explicitly incremental optimized profiles share completed artifacts, including ThinLTO and fat LTO, while rustc retains its native sessions.
+* Cache format 5 stores verified metadata ranges inside their backing archives instead of duplicating metadata payloads.
+  Formats 3 and 4 remain readable. Public cache metadata types gain fields and an encoding variant.
+* Deferred stores use a bounded broker queue and shared execution slots on Linux and macOS, with the existing helper
+  and inline fallbacks. Multiple cache misses start broker setup during compilation; single-unit builds use the helper.
+* Compression scratch buffers follow artifact size while retaining the existing encoded frames and verification rules.
+* Output commitment hashing reuses bounded thread-local scratch storage instead of allocating a fresh block per file.
+* Fixed-persona launchers specialize shared dispatch code, reducing executable size while preserving renamed entrypoints.
+
+### Fixed
+
+* Native incremental session maintenance preserves the compiler's current completed session and held working sessions.
+* Retired cache entries prune their manifest and unit references; interrupted atomic records remain eligible for cleanup.
+* Garbage collection preserves execution-slot lock identities so concurrent stores retain their global worker bound.
+* Metadata proof generation reuses verified encoder input and avoids redundant archive scans and temporary writes.
+* Native linker diagnostics retain actual invocation evidence and reject unsupported or ambiguous measurements.
+
 ## [0.2.0]
 
 ### Added

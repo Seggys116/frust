@@ -83,13 +83,16 @@ const KEY_POLL_START: Duration = Duration::from_millis(5);
 const KEY_POLL_MAX: Duration = Duration::from_millis(40);
 
 /// Bumped whenever `StoreJob` changes incompatibly; a helper meeting another format stores nothing.
-const JOB_FORMAT: u32 = 2;
+const JOB_FORMAT: u32 = 3;
 
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
 static DETACHED_STORE: AtomicBool = AtomicBool::new(false);
 pub(crate) const SLOT_SUPERVISOR_ENV: &str = "FRUST_JOBSERVER_SUPERVISOR";
 
 pub fn run(args: Vec<OsString>) -> i32 {
+    if let Some(code) = crate::store_broker::broker_entry(&args) {
+        return code;
+    }
     if let Some(code) = sys::jobserver_loan::helper_entry(&args) {
         return code;
     }
@@ -139,11 +142,13 @@ fn compiler_command(tool: &OsString) -> Command {
 
 struct Plan {
     cfg: Config,
+    context: StoreContext,
     dirs: Dirs,
     cache: Cache,
     args: Vec<OsString>,
     parsed: RustcArgs,
     cwd: PathBuf,
+    output_dir_abs: PathBuf,
     profile: String,
     profile_abs: PathBuf,
     prekey: String,
@@ -184,10 +189,8 @@ impl Plan {
             return None;
         }
         if parsed.incremental() {
-            // Cached in unoptimised builds only; a miss still runs rustc's own incremental compile.
-            let reason = if !parsed.unoptimised() {
-                Some("optimised incremental compile")
-            } else if !incremental_units_enabled() {
+            // Cache only artifacts; a miss still runs rustc with its original incremental session.
+            let reason = if !incremental_units_enabled() {
                 Some("incremental compile (FRUST_CACHE_INCREMENTAL=off)")
             } else if primary && !primary_incremental_enabled() {
                 Some(
@@ -213,9 +216,14 @@ impl Plan {
             .to_string_lossy()
             .into_owned();
         let profile_abs = cwd.join(&profile);
+        let output_dir_abs = cwd.join(&parsed.out_dir);
+        let context = StoreContext::capture(&cwd);
         let trust = Arc::new(TrustGate::new(TrustMode::from_env(), &dirs, cfg.debug));
-        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots())
-            .with_stamp_trust(stamp_policy(&trust));
+        let hasher = Hasher::new(
+            Some(dirs.hashmemo()),
+            context.immutable_source_roots.clone(),
+        )
+        .with_stamp_trust(stamp_policy(&trust));
         let key = KeyContext {
             hasher: &hasher,
             cwd: &cwd,
@@ -242,15 +250,17 @@ impl Plan {
         ));
         // Registry and git crates never change, so they accumulate no versions and need no bookkeeping.
         let unit = env::var_os("CARGO_MANIFEST_DIR")
-            .filter(|dir| !dir.is_empty() && !hasher.in_immutable_root(Path::new(dir)))
+            .filter(|dir| !dir.is_empty() && !hasher.in_immutable_root(&cwd.join(dir)))
             .map(|_| unit);
         Some(Plan {
             cfg: cfg.clone(),
+            context,
             cache: Cache::new(&dirs),
             dirs,
             args: args.to_vec(),
             parsed,
             cwd,
+            output_dir_abs,
             profile,
             profile_abs,
             prekey,
@@ -265,20 +275,36 @@ impl Plan {
     }
 
     /// Rebuilds the plan a deferred store needs from the job; the key pieces come from the job, never recomputed.
-    fn from_job(job: &StoreJob) -> Option<Plan> {
-        if job.format != JOB_FORMAT || job.args.len() < 2 {
+    fn from_job(job: &StoreJob, worker_config: &Config) -> Option<Plan> {
+        // Serialized paths retain the producer's lexical identity across every job.
+        if job.format != JOB_FORMAT
+            || job.args.len() < 2
+            || !job.cwd.is_absolute()
+            || job
+                .context
+                .immutable_source_roots
+                .iter()
+                .any(|path| !path.is_absolute())
+            || job.watched.iter().any(|(path, _)| !path.is_absolute())
+            || job
+                .extern_hashes
+                .iter()
+                .any(|(path, _)| !path.is_absolute())
+            || job.inputs.iter().any(|(path, _)| !path.is_absolute())
+        {
             return None;
         }
         let args: Vec<OsString> = job.args.iter().map(OsString::from).collect();
         let parsed = rustc_args::parse(&args[1..]).ok()?;
-        let mut cfg = Config::from_env();
+        let mut cfg = worker_config.clone();
         // The helper is detached and silent.
         cfg.debug = false;
-        let dirs = Dirs::at(&job.home);
+        let dirs = Dirs::at(job.cwd.join(&job.home));
         let profile = rustc_args::profile_root(&parsed.out_dir)
             .to_string_lossy()
             .into_owned();
         let profile_abs = job.cwd.join(&profile);
+        let output_dir_abs = job.cwd.join(&parsed.out_dir);
         let watched = job
             .watched
             .iter()
@@ -290,16 +316,21 @@ impl Plan {
             &dirs,
             false,
         ));
-        let hasher = Hasher::new(Some(dirs.hashmemo()), immutable_source_roots())
-            .with_stamp_trust(stamp_policy(&trust));
+        let hasher = Hasher::new(
+            Some(dirs.hashmemo()),
+            job.context.immutable_source_roots.clone(),
+        )
+        .with_stamp_trust(stamp_policy(&trust));
         let cache = Cache::new(&dirs);
         Some(Plan {
             cfg,
+            context: job.context.clone(),
             cache,
             dirs,
             args,
             parsed,
             cwd: job.cwd.clone(),
+            output_dir_abs,
             profile,
             profile_abs,
             prekey: job.prekey.clone(),
@@ -423,7 +454,7 @@ impl Plan {
     }
 
     fn version(&self) -> String {
-        env::var("CARGO_PKG_VERSION").unwrap_or_default()
+        self.context.package_version.clone()
     }
 
     fn try_hit(&self, started: Instant) -> bool {
@@ -607,6 +638,11 @@ impl Plan {
 
     /// `key_lock` is held until the store has published, so a process queued behind it finds the entry.
     fn compile_and_store(&self, key_lock: Option<File>) -> i32 {
+        if self.can_defer_store()
+            && env::var_os(crate::store_broker::CAPABILITY_ENV).is_some_and(|value| !value.is_empty())
+        {
+            events::request_store();
+        }
         let started = Instant::now();
         // Taken after any wait and before rustc starts: an input changed after this may have been read in its old state.
         let spawned_ns = hashing::now_ns();
@@ -673,7 +709,7 @@ impl Plan {
         code
     }
 
-    /// Hands the store to a detached helper; false means nothing was handed over and the caller stores inline.
+    /// Returns true on acknowledged deferral; false requests inline fallback, possibly after a lost broker acknowledgement.
     fn defer_store(
         &self,
         captured: &[u8],
@@ -683,9 +719,7 @@ impl Plan {
         key_lock: Option<&File>,
     ) -> bool {
         // Capability probes reuse or delete these exact output names immediately after the wrapper returns.
-        if self.cfg.store_sync
-            || (self.parsed.metadata_only_library && self.parsed.extra_filename.is_empty())
-        {
+        if !self.can_defer_store() {
             return false;
         }
         match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock) {
@@ -700,6 +734,11 @@ impl Plan {
         }
     }
 
+    fn can_defer_store(&self) -> bool {
+        !self.cfg.store_sync
+            && !(self.parsed.metadata_only_library && self.parsed.extra_filename.is_empty())
+    }
+
     fn spawn_deferred(
         &self,
         captured: &[u8],
@@ -709,7 +748,13 @@ impl Plan {
         key_lock: Option<&File>,
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
-        let Some((slot, slot_path)) = acquire_slot(&deferred, slot_count()) else {
+        let broker = crate::store_broker::AdmissionPermit::try_reserve(&self.dirs)?;
+        let slot = if broker.is_none() {
+            acquire_slot(&deferred, slot_count())
+        } else {
+            None
+        };
+        if broker.is_none() && slot.is_none() {
             self.debug(&format!(
                 "deferred store slots busy or unavailable for {}; storing inline",
                 self.parsed.crate_name
@@ -720,13 +765,13 @@ impl Plan {
             return Ok(false);
         };
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
-        let mut keep: Vec<&File> = vec![&slot];
+        let mut keep: Vec<&File> = slot.iter().map(|(file, _)| file).collect();
         keep.extend(key_lock);
-        if !sys::inheritable_clear_of_stdio(&keep) {
+        if broker.is_none() && !sys::inheritable_clear_of_stdio(&keep) {
             return Ok(false);
         }
         // Where handles are not inherited the helper takes both locks again by path.
-        let helper_relocks = !sys::INHERITS_DESCRIPTORS;
+        let helper_relocks = broker.is_none() && !sys::INHERITS_DESCRIPTORS;
         let Some(args) = self
             .args
             .iter()
@@ -737,7 +782,8 @@ impl Plan {
         };
         let job = StoreJob {
             format: JOB_FORMAT,
-            home: self.dirs.root().to_path_buf(),
+            context: self.context.clone(),
+            home: self.cwd.join(self.dirs.root()),
             cwd: self.cwd.clone(),
             args,
             prekey: self.prekey.clone(),
@@ -770,15 +816,25 @@ impl Plan {
                 .iter()
                 .map(|(path, stamp)| (path.clone(), StampWire::of(stamp)))
                 .collect(),
-            slot_lock: helper_relocks.then_some(slot_path),
+            slot_lock: slot
+                .as_ref()
+                .filter(|_| helper_relocks)
+                .map(|(_, path)| self.cwd.join(path)),
             key_lock: key_lock
                 .filter(|_| helper_relocks)
-                .map(|_| keylock_path(&self.dirs, &self.prekey)),
+                .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
+        lock::ensure_dir(&deferred, None)?;
         let job_path = write_job(&deferred, &job)?;
-        match spawn_helper(&job_path, &self.cwd, &keep) {
-            Ok(()) => {
+        let handed_over = match broker {
+            Some(permit) => submit_broker_job(&job_path, |path| {
+                permit.submit(&self.cwd.join(path), key_lock)
+            }),
+            None => spawn_helper(&job_path, &self.cwd, &keep).map(|()| true),
+        };
+        match handed_over {
+            Ok(true) => {
                 // Recorded now so the run's feed sees the compile; the helper stores quietly.
                 events::record_waited(
                     &self.dirs,
@@ -795,6 +851,7 @@ impl Plan {
                 );
                 Ok(true)
             }
+            Ok(false) => Ok(false),
             Err(err) => {
                 let _ = fs::remove_file(&job_path);
                 Err(err)
@@ -829,7 +886,7 @@ impl Plan {
         }
         let names = self.output_files(captured, preexisting);
         let dep_name = names.iter().find(|n| n.ends_with(".d"))?.clone();
-        let dep_text = fs::read_to_string(self.parsed.out_dir.join(&dep_name)).ok()?;
+        let dep_text = fs::read_to_string(self.output_dir_abs.join(&dep_name)).ok()?;
         let mut inputs = HashMap::new();
         for file in &cache::depinfo::parse(&dep_text).files {
             let path = self.resolve(&self.norm(file));
@@ -846,10 +903,10 @@ impl Plan {
         }
         let mut outputs = Vec::with_capacity(names.len());
         let mut commitments = HashMap::new();
-        let compress = cache_compression_requested()
+        let compress = self.context.compression_requested
             && cache::payload::compression_supported(&self.dirs.tmp());
         for name in &names {
-            let path = self.parsed.out_dir.join(name);
+            let path = self.output_dir_abs.join(name);
             // A bundle's inner files can change without its own stamp moving.
             let mut meta = sys::stat(&path).ok()?;
             if meta.is_dir() {
@@ -901,7 +958,7 @@ impl Plan {
                 format!("{}{}.d", self.parsed.crate_name, extra),
                 format!("lib{}{}.rmeta", self.parsed.crate_name, extra),
             ] {
-                let path = self.parsed.out_dir.join(&name);
+                let path = self.output_dir_abs.join(&name);
                 if let Ok(meta) = sys::lstat(&path)
                     && meta.is_file()
                 {
@@ -922,7 +979,7 @@ impl Plan {
                 self.parsed.crate_name, self.parsed.extra_filename
             ),
         ];
-        if let Ok(entries) = fs::read_dir(&self.parsed.out_dir) {
+        if let Ok(entries) = fs::read_dir(&self.output_dir_abs) {
             for entry in entries.flatten() {
                 let filename = entry.file_name();
                 let name = filename.to_string_lossy();
@@ -1001,7 +1058,7 @@ impl Plan {
             .iter()
             .find(|n| n.ends_with(".d"))
             .ok_or_else(|| io::Error::other("no dep-info among outputs"))?;
-        let dep_text = fs::read_to_string(self.parsed.out_dir.join(dep_name))?;
+        let dep_text = fs::read_to_string(self.output_dir_abs.join(dep_name))?;
         self.store_outputs(
             captured,
             compile_ms,
@@ -1039,19 +1096,20 @@ impl Plan {
             .iter()
             .map(|file| self.resolve(&self.norm(file)))
             .collect();
-        let threads = extern_hash_threads_with(
-            paths.len(),
-            DETACHED_STORE.load(Ordering::Relaxed),
-            || thread::available_parallelism().map_or(1, |n| n.get()),
-        );
         // Keep failures beside their input so validation and entry keys retain dep-info order.
-        let hashed = parallel_with_threads(&paths, threads, |_, path| {
+        let hash_input = |_: usize, path: &PathBuf| {
             Ok(if path.is_dir() {
                 None
             } else {
                 Some(self.hasher.hash(path, self.persistable_source(path)))
             })
-        })?;
+        };
+        // Deferred work owns one worker; Cargo's implicit slot belongs to the compiler.
+        let hashed = if self.deferred {
+            parallel_with_limit(&paths, 1, hash_input)
+        } else {
+            parallel(&paths, hash_input)
+        }?;
         let mut inputs = Vec::with_capacity(paths.len());
         for ((file, path), hashed) in info.files.iter().zip(&paths).zip(hashed) {
             let Some(hashed) = hashed else { continue };
@@ -1104,7 +1162,7 @@ impl Plan {
         let hashed_ms = started.elapsed().as_millis();
 
         if !self.cache.has_entry(&key) {
-            if frozen.is_some_and(|f| !f.outputs_unchanged(&self.parsed.out_dir)) {
+            if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) {
                 return self.skip_store("an output changed after the compile", compile_ms);
             }
             let staged = self.cache.stage()?;
@@ -1118,7 +1176,7 @@ impl Plan {
             );
             match built {
                 // Checked again once cloned: an output replaced while being cloned must not be published.
-                Ok(_) if frozen.is_some_and(|f| !f.outputs_unchanged(&self.parsed.out_dir)) => {
+                Ok(_) if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) => {
                     let _ = fsx::remove_any(&staged);
                     return self.skip_store("an output changed while being stored", compile_ms);
                 }
@@ -1189,9 +1247,9 @@ impl Plan {
         commitments: Option<&HashMap<String, cache::payload::Commitment>>,
     ) -> io::Result<EntryMeta> {
         // The staging directory is private until one rename publishes it, so files are cloned straight to final names.
-        let (out_dir, profile) = (&self.parsed.out_dir, &self.profile);
+        let (out_dir, profile) = (&self.output_dir_abs, &self.profile);
         let compress =
-            cache_compression_requested() && cache::payload::compression_supported(staged);
+            self.context.compression_requested && cache::payload::compression_supported(staged);
         let indices: HashMap<&str, usize> = names
             .iter()
             .enumerate()
@@ -1278,15 +1336,20 @@ impl Plan {
                 proof,
             ))
         };
-        let normal = parallel(names, |i, name| {
+        let store_normal = |i: usize, name: &String| {
             if paired[i].is_some() {
                 Ok(None)
             } else {
                 store_file(i, name, captured_backings.contains(&i)).map(Some)
             }
-        })?;
+        };
+        let normal = if self.deferred {
+            parallel_with_limit(names, 1, store_normal)
+        } else {
+            parallel(names, store_normal)
+        }?;
         // Only this exclusive staging transaction can consume its producer captures; unavailable proofs decode the staged backing.
-        let files = parallel(names, |i, name| {
+        let store_metadata = |i: usize, name: &String| {
             let Some(base_index) = paired[i] else {
                 return Ok(normal[i].as_ref().unwrap().0.clone());
             };
@@ -1317,7 +1380,12 @@ impl Plan {
                 Some(file) => Ok(file),
                 None => store_file(i, name, false).map(|(file, _)| file),
             }
-        })?;
+        };
+        let files = if self.deferred {
+            parallel_with_limit(names, 1, store_metadata)
+        } else {
+            parallel(names, store_metadata)
+        }?;
         cache::metadata_slice::validate_groups(&files)?;
         let stderr_text = String::from_utf8_lossy(captured).replace(&self.profile, PROFILE_TOKEN);
         fs::write(staged.join("stderr"), stderr_text)?;
@@ -1586,10 +1654,32 @@ impl StampWire {
     }
 }
 
+// Producer policy is captured once; storage capabilities stay local to the volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoreContext {
+    package_version: String,
+    compression_requested: bool,
+    immutable_source_roots: Vec<PathBuf>,
+}
+
+impl StoreContext {
+    fn capture(cwd: &Path) -> Self {
+        Self {
+            package_version: env::var("CARGO_PKG_VERSION").unwrap_or_default(),
+            compression_requested: cache_compression_requested(),
+            immutable_source_roots: immutable_source_roots()
+                .iter()
+                .map(|root| cwd.join(root))
+                .collect(),
+        }
+    }
+}
+
 /// Everything a detached helper needs to finish a store, written before the wrapper returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreJob {
     format: u32,
+    context: StoreContext,
     home: PathBuf,
     cwd: PathBuf,
     args: Vec<String>,
@@ -1611,6 +1701,103 @@ struct StoreJob {
     /// Lock files the helper takes again itself when handles cannot be inherited.
     slot_lock: Option<PathBuf>,
     key_lock: Option<PathBuf>,
+}
+
+pub(crate) struct BrokerJob(StoreJob);
+
+impl BrokerJob {
+    pub(crate) fn decode(bytes: &[u8], dirs: &Dirs, key: Option<&File>) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid broker store job");
+        let job: StoreJob = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        if job.format != JOB_FORMAT
+            || !job.cwd.is_absolute()
+            || !job.home.is_absolute()
+            || job.home != dirs.root()
+            || !cache::valid_key(&job.prekey)
+            || job
+                .unit
+                .as_ref()
+                .is_some_and(|unit| !cache::valid_key(unit))
+            || !matches!(job.trust.as_str(), "on" | "off" | "audit")
+            || job.slot_lock.is_some()
+            || job.key_lock.is_some()
+            || job.spawned_ns.parse::<i128>().is_err()
+            || job.args.len() < 2
+            || job
+                .context
+                .immutable_source_roots
+                .iter()
+                .any(|path| !path.is_absolute())
+            || job
+                .watched
+                .iter()
+                .any(|(path, stamp)| !path.is_absolute() || stamp.stamp().is_none())
+            || job
+                .extern_hashes
+                .iter()
+                .any(|(path, _)| !path.is_absolute())
+            || job
+                .inputs
+                .iter()
+                .any(|(path, stamp)| !path.is_absolute() || stamp.stamp().is_none())
+            || job.names.is_empty()
+            || job.names.iter().any(|name| !cache::safe_file_name(name))
+            || job.names.iter().collect::<BTreeSet<_>>().len() != job.names.len()
+            || !job.dep_name.ends_with(".d")
+            || !job.names.contains(&job.dep_name)
+            || !job
+                .outputs
+                .iter()
+                .map(|(name, _)| name)
+                .eq(job.names.iter())
+            || job
+                .inputs
+                .iter()
+                .map(|(path, _)| path)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != job.inputs.len()
+            || Frozen::from_job(&job).is_none()
+        {
+            return Err(invalid());
+        }
+        let args: Vec<OsString> = job.args[1..].iter().map(OsString::from).collect();
+        let parsed = rustc_args::parse(&args).map_err(|_| invalid())?;
+        let profile = rustc_args::profile_root(&parsed.out_dir)
+            .to_string_lossy()
+            .into_owned();
+        let inputs: BTreeSet<_> = cache::depinfo::parse(&job.dep_text)
+            .files
+            .iter()
+            .map(|file| {
+                job.cwd.join(
+                    file.replace(&profile, PROFILE_TOKEN)
+                        .replace(PROFILE_TOKEN, &profile),
+                )
+            })
+            .collect();
+        if job.inputs.iter().any(|(path, _)| !inputs.contains(path)) {
+            return Err(invalid());
+        }
+        if let Some(key) = key {
+            // The received description must retain the producer's exact compile lock.
+            let expected = sys::lstat(&keylock_path(dirs, &job.prekey))?;
+            let received = sys::fstat(key)?;
+            if !expected.is_file()
+                || !received.is_file()
+                || expected.ino() == 0
+                || expected.dev() != received.dev()
+                || expected.ino() != received.ino()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(Self(job))
+    }
+
+    pub(crate) fn execute(self, worker_config: &Config) {
+        run_deferred_with(&self.0, worker_config);
+    }
 }
 
 /// The state of a finished compile as the wrapper left it; a deferred store proceeds only while the files still match.
@@ -1898,6 +2085,16 @@ fn write_job(dir: &Path, job: &StoreJob) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+fn submit_broker_job(
+    path: &Path,
+    submit: impl FnOnce(&Path) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let outcome = submit(path);
+    // Only the producer marker is ours; a lost ACK may already have a broker owner.
+    let _ = fs::remove_file(path);
+    outcome
+}
+
 fn read_job(path: &Path) -> Option<StoreJob> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
@@ -1924,7 +2121,7 @@ fn helper_beside(exe: &Path) -> io::Result<PathBuf> {
 /// Starts the detached helper. The `keep` files (the held locks) are inherited where the platform allows, so the locks outlive the wrapper.
 fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File]) -> io::Result<()> {
     let mut cmd = Command::new(helper_exe()?);
-    // The relative paths in the job (out-dir, FRUST_HOME) are resolved against the wrapper's own directory.
+    // Preserve the producer directory for compatibility with one-shot helpers.
     cmd.arg(DEFERRED_ARG).arg(cwd.join(job)).current_dir(cwd);
     sys::detach_command(&mut cmd, keep);
     cmd.spawn().map(drop)
@@ -1932,10 +2129,10 @@ fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File]) -> io::Result<()> {
 
 /// Takes the locks the wrapper could not hand over; blocking, because the wrapper releases its own as it returns.
 fn relock(job: &StoreJob) -> Vec<File> {
-    if job.format != JOB_FORMAT {
+    if job.format != JOB_FORMAT || !job.cwd.is_absolute() {
         return Vec::new();
     }
-    let dirs = Dirs::at(&job.home);
+    let dirs = Dirs::at(job.cwd.join(&job.home));
     let wanted = [
         (&job.slot_lock, None),
         (&job.key_lock, lock::shared_mode(&dirs)),
@@ -1943,7 +2140,7 @@ fn relock(job: &StoreJob) -> Vec<File> {
     let mut held = Vec::new();
     for (path, mode) in wanted {
         if let Some(path) = path
-            && let Ok(file) = lock::open_lock_file(path, mode)
+            && let Ok(file) = lock::open_lock_file(&job.cwd.join(path), mode)
             && sys::lock(&file, LockKind::Exclusive).is_ok()
         {
             held.push(file);
@@ -1981,8 +2178,12 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
 
 /// The key lock and slot lock were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
 fn run_deferred(job: &StoreJob) {
+    run_deferred_with(job, &Config::from_env());
+}
+
+fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
     let (Some(plan), Some(frozen), Ok(spawned_ns)) = (
-        Plan::from_job(job),
+        Plan::from_job(job, worker_config),
         Frozen::from_job(job),
         job.spawned_ns.parse::<i128>(),
     ) else {
@@ -2066,7 +2267,7 @@ struct TrustGate {
     mode: TrustMode,
     dirs: Dirs,
     debug: bool,
-    // One stat of the quarantine marker and one statfs per volume per process.
+    // Quarantine and filesystem verdicts belong to this job only.
     volumes: Mutex<HashMap<u64, bool>>,
 }
 
@@ -3854,6 +4055,7 @@ mod tests {
         args.push(deps.display().to_string());
         let job = StoreJob {
             format: JOB_FORMAT,
+            context: StoreContext::capture(&s.0),
             home: s.0.join("home"),
             cwd: s.0.clone(),
             args,
@@ -3882,9 +4084,28 @@ mod tests {
     }
 
     fn rows(job: &StoreJob) -> usize {
-        Cache::new(&Dirs::at(&job.home))
+        Cache::new(&Dirs::at(job.cwd.join(&job.home)))
             .candidates(&job.prekey)
             .len()
+    }
+
+    #[test]
+    fn store_demand_uses_the_same_deferral_guard_as_the_actual_handoff() {
+        let scratch = Scratch::new("store-demand-guard");
+        let (job, _, _) = fixture(&scratch);
+        let mut config = Config::from_env();
+        config.store_sync = false;
+        let mut plan = Plan::from_job(&job, &config).unwrap();
+        plan.parsed.metadata_only_library = false;
+        plan.parsed.extra_filename.clear();
+        assert!(plan.can_defer_store());
+        plan.cfg.store_sync = true;
+        assert!(!plan.can_defer_store());
+        plan.cfg.store_sync = false;
+        plan.parsed.metadata_only_library = true;
+        assert!(!plan.can_defer_store());
+        plan.parsed.extra_filename = "-fixture".into();
+        assert!(plan.can_defer_store());
     }
 
     #[test]
@@ -3892,7 +4113,7 @@ mod tests {
         let s = Scratch::new("published-before-lock");
         let (job, _, _) = fixture(&s);
         let counter = s.0.join("compiler-launches");
-        let mut plan = Plan::from_job(&job).unwrap();
+        let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         #[cfg(unix)]
         {
             plan.args = vec![
@@ -4006,7 +4227,7 @@ mod tests {
         let again: StoreJob = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
         assert_eq!(again, job);
 
-        let plan = Plan::from_job(&again).expect("plan");
+        let plan = Plan::from_job(&again, &Config::from_env()).expect("plan");
         assert_eq!(plan.prekey, job.prekey);
         assert_eq!(plan.cwd, job.cwd);
         assert_eq!(plan.parsed.crate_name, "k");
@@ -4019,14 +4240,14 @@ mod tests {
             ..job.clone()
         };
         assert!(
-            Plan::from_job(&other_format).is_none(),
+            Plan::from_job(&other_format, &Config::from_env()).is_none(),
             "a job of another format stores nothing"
         );
         let no_args = StoreJob {
             args: vec!["rustc".to_string()],
             ..job.clone()
         };
-        assert!(Plan::from_job(&no_args).is_none());
+        assert!(Plan::from_job(&no_args, &Config::from_env()).is_none());
         let mut bad = job.clone();
         bad.watched.push((
             s.0.join("lib.rs"),
@@ -4036,11 +4257,385 @@ mod tests {
             },
         ));
         assert!(
-            Plan::from_job(&bad).is_none(),
+            Plan::from_job(&bad, &Config::from_env()).is_none(),
             "an unreadable stamp is never guessed"
         );
         bad.inputs[0].1.mtime_ns = "x".to_string();
         assert!(Frozen::from_job(&bad).is_none());
+    }
+
+    #[test]
+    fn broker_jobs_validate_context_names_and_preserve_the_received_key_lock() {
+        let s = Scratch::new("broker-decode");
+        let (job, _, _) = fixture(&s);
+        let dirs = Dirs::at(&job.home);
+        let encode = |job: &StoreJob| serde_json::to_vec(job).unwrap();
+        let key_path = keylock_path(&dirs, &job.prekey);
+        let key = open_key_lock(&dirs, &key_path).unwrap();
+        assert!(try_key_lock(&key).unwrap());
+        let decoded = BrokerJob::decode(&encode(&job), &dirs, Some(&key)).unwrap();
+        let other = open_key_lock(&dirs, &key_path).unwrap();
+        assert!(!try_key_lock(&other).unwrap());
+        decoded.execute(&Config::from_env());
+        assert_eq!(rows(&job), 1);
+        assert!(!try_key_lock(&other).unwrap());
+        let wrong = File::create(s.0.join("wrong-key")).unwrap();
+        assert!(BrokerJob::decode(&encode(&job), &dirs, Some(&wrong)).is_err());
+        let mutations: [fn(&mut StoreJob); 12] = [
+            |job: &mut StoreJob| job.home = PathBuf::from("relative-home"),
+            |job: &mut StoreJob| job.cwd = PathBuf::from("relative-cwd"),
+            |job: &mut StoreJob| {
+                job.context
+                    .immutable_source_roots
+                    .push(PathBuf::from("relative-root"))
+            },
+            |job: &mut StoreJob| job.names.push("../escape".to_string()),
+            |job: &mut StoreJob| job.names.push(job.names[0].clone()),
+            |job: &mut StoreJob| job.dep_name = "missing.d".to_string(),
+            |job: &mut StoreJob| job.outputs.reverse(),
+            |job: &mut StoreJob| job.slot_lock = Some(PathBuf::from("slot-0")),
+            |job: &mut StoreJob| job.key_lock = Some(PathBuf::from("another-key")),
+            |job: &mut StoreJob| job.prekey = "../bad-key".to_string(),
+            |job: &mut StoreJob| job.trust = "unknown".to_string(),
+            |job: &mut StoreJob| job.format -= 1,
+        ];
+        for mutate in mutations {
+            let mut malformed = job.clone();
+            mutate(&mut malformed);
+            assert!(BrokerJob::decode(&encode(&malformed), &dirs, None).is_err());
+        }
+        assert!(BrokerJob::decode(&encode(&job), &Dirs::at(s.0.join("other-home")), None).is_err());
+    }
+
+    #[test]
+    fn producer_marker_cleanup_never_removes_an_independent_broker_marker() {
+        let s = Scratch::new("broker-marker");
+        let (job, _, _) = fixture(&s);
+        let deferred = Dirs::at(&job.home).deferred();
+        lock::ensure_dir(&deferred, None).unwrap();
+        for outcome in [Some(true), Some(false), None] {
+            let producer = write_job(&deferred, &job).unwrap();
+            let independent = deferred.join(format!(
+                "job-{}-broker-independent.json",
+                std::process::id()
+            ));
+            let result = submit_broker_job(&producer, |path| {
+                fs::write(&independent, fs::read(path).unwrap()).unwrap();
+                match outcome {
+                    Some(accepted) => Ok(accepted),
+                    None => Err(io::Error::new(io::ErrorKind::TimedOut, "ACK unknown")),
+                }
+            });
+            assert!(!producer.exists());
+            assert!(independent.is_file());
+            assert_eq!(read_job(&independent).unwrap(), job);
+            match outcome {
+                Some(accepted) => assert_eq!(result.unwrap(), accepted),
+                None => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut),
+            }
+        }
+    }
+
+    #[test]
+    fn broker_capability_fallback_child() {
+        let Some(home) = env::var_os("FRUST_TEST_BROKER_FALLBACK_HOME") else {
+            return;
+        };
+        let dirs = Dirs::at(home);
+        assert!(
+            crate::store_broker::AdmissionPermit::try_reserve(&dirs)
+                .unwrap()
+                .is_none()
+        );
+        let (held, _) = acquire_slot(&dirs.deferred(), 1).unwrap();
+        assert!(acquire_slot(&dirs.deferred(), 1).is_none());
+        drop(held);
+        assert!(acquire_slot(&dirs.deferred(), 1).is_some());
+    }
+
+    #[test]
+    fn direct_and_foreign_builds_keep_legacy_slots_without_a_valid_capability() {
+        let s = Scratch::new("broker-fallback");
+        for capability in [None, Some("untrusted-foreign-capability")] {
+            let mut child = Command::new(env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "wrapper::tests::broker_capability_fallback_child",
+                    "--nocapture",
+                ])
+                .env("FRUST_TEST_BROKER_FALLBACK_HOME", s.0.join("home"))
+                .env_remove(crate::store_broker::CAPABILITY_ENV);
+            if let Some(value) = capability {
+                child.env(crate::store_broker::CAPABILITY_ENV, value);
+            }
+            let result = child.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    fn relative_job(s: &Scratch) -> (StoreJob, PathBuf, PathBuf) {
+        let (mut job, src, rlib) = fixture(s);
+        *job.args.last_mut().unwrap() = "target/debug/deps".to_string();
+        job.home = PathBuf::from("cache-home");
+        job.dep_text = "target/debug/deps/k.d: lib.rs\n\nlib.rs:\n".to_string();
+        fs::write(rlib.with_file_name("k.d"), &job.dep_text).unwrap();
+        job.outputs = job
+            .names
+            .iter()
+            .map(|name| (name.clone(), wire(&rlib.with_file_name(name))))
+            .collect();
+        (job, src, rlib)
+    }
+
+    #[test]
+    fn sequential_deferred_jobs_use_their_own_paths_versions_and_compression() {
+        let first = Scratch::new("context-first");
+        let second = Scratch::new("context-second");
+        let cwd = env::current_dir().unwrap();
+        let environment: std::collections::BTreeMap<_, _> = env::vars_os().collect();
+        let mut worker_config = Config::from_env();
+        worker_config.debug = true;
+        worker_config.keylock_wait = Duration::from_millis(123);
+        for (scratch, version, compress) in [(&first, "1.2.3", false), (&second, "4.5.6", true)] {
+            let (mut job, _, rlib) = relative_job(scratch);
+            let expected = vec![b'p'; cache::payload::MIN_BYTES as usize * 2 + 13];
+            fs::write(&rlib, &expected).unwrap();
+            #[cfg(unix)]
+            sys::set_path_mode(&rlib, 0o751).unwrap();
+            job.outputs[1].1 = wire(&rlib);
+            job.context = StoreContext {
+                package_version: version.to_string(),
+                compression_requested: compress,
+                immutable_source_roots: vec![job.cwd.join("immutable")],
+            };
+            let plan = Plan::from_job(&job, &worker_config).unwrap();
+            assert!(!plan.cfg.debug);
+            assert!(worker_config.debug);
+            assert_eq!(plan.cfg.keylock_wait, worker_config.keylock_wait);
+            assert_eq!(plan.profile, "target/debug");
+            assert_eq!(plan.output_dir_abs, job.cwd.join("target/debug/deps"));
+            assert_eq!(plan.dirs.root(), job.cwd.join("cache-home"));
+            run_deferred_with(&job, &worker_config);
+            let candidates = plan.cache.candidates(&job.prekey);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].inputs[0].path, "lib.rs");
+            let (entry, meta) = plan.cache.load_entry(&candidates[0].key).unwrap();
+            assert_eq!(meta.version, version);
+            assert_eq!(meta.prekey.as_ref(), Some(&job.prekey));
+            let binary = meta
+                .files
+                .iter()
+                .find(|file| file.name == "libk.rlib")
+                .unwrap();
+            assert_eq!(
+                !binary.encoding.is_raw(),
+                compress && cache::payload::compression_supported(&entry)
+            );
+            let restored = scratch.0.join("restored");
+            cache::payload::restore(&entry.join(&binary.stored), &restored, binary).unwrap();
+            assert_eq!(fs::read(&restored).unwrap(), expected);
+            assert_eq!(
+                sys::lstat(&restored).unwrap().mode(),
+                sys::lstat(&rlib).unwrap().mode()
+            );
+            let dep = meta.files.iter().find(|file| file.name == "k.d").unwrap();
+            assert!(
+                fs::read_to_string(entry.join(&dep.stored))
+                    .unwrap()
+                    .contains(PROFILE_TOKEN)
+            );
+        }
+        assert_eq!(env::current_dir().unwrap(), cwd);
+        assert_eq!(
+            env::vars_os().collect::<std::collections::BTreeMap<_, _>>(),
+            environment
+        );
+    }
+
+    #[test]
+    fn frozen_compression_uses_the_captured_policy_and_absolute_inputs() {
+        let s = Scratch::new("context-freeze");
+        let (mut job, src, rlib) = relative_job(&s);
+        fs::write(&rlib, vec![b'f'; cache::payload::MIN_BYTES as usize * 2]).unwrap();
+        let cfg = Config::from_env();
+        let captured = ["k.d", "libk.rlib"]
+            .iter()
+            .map(|name| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"artifact": format!("target/debug/deps/{name}")})
+                )
+            })
+            .collect::<String>();
+        for compress in [false, true] {
+            job.context.compression_requested = compress;
+            let plan = Plan::from_job(&job, &cfg).unwrap();
+            fs::create_dir_all(plan.dirs.tmp()).unwrap();
+            let supported = cache::payload::compression_supported(&plan.dirs.tmp());
+            let profile = Stamp::read(&plan.profile_abs).unwrap();
+            if !plan.trust.volume_trusted(profile.dev, &plan.profile_abs)
+                || job
+                    .inputs
+                    .iter()
+                    .any(|(_, stamp)| stamp.stamp().unwrap().coarse())
+                || job
+                    .names
+                    .iter()
+                    .any(|name| Stamp::read(&rlib.with_file_name(name)).unwrap().coarse())
+            {
+                return;
+            }
+            let mut captures = 0;
+            let frozen = plan
+                .freeze_with_capture(
+                    captured.as_bytes(),
+                    job.spawned_ns.parse().unwrap(),
+                    &HashMap::new(),
+                    |path| {
+                        assert!(path.is_absolute());
+                        captures += 1;
+                        cache::payload::capture(path)
+                    },
+                )
+                .unwrap();
+            assert_eq!(captures, usize::from(compress && supported));
+            assert_eq!(frozen.commitments.len(), captures);
+            assert!(frozen.inputs.contains_key(&src));
+            assert!(frozen.inputs.keys().all(|path| path.is_absolute()));
+        }
+    }
+
+    #[test]
+    fn deferred_context_and_absolute_identities_are_required() {
+        let s = Scratch::new("context-required");
+        let (job, _, _) = fixture(&s);
+        let cfg = Config::from_env();
+        let mut encoded = serde_json::to_value(&job).unwrap();
+        encoded.as_object_mut().unwrap().remove("context");
+        assert!(serde_json::from_value::<StoreJob>(encoded).is_err());
+        let mut old = job.clone();
+        old.format = JOB_FORMAT - 1;
+        assert!(Plan::from_job(&old, &cfg).is_none());
+        let mut relative = job.clone();
+        relative.cwd = PathBuf::from("relative");
+        assert!(Plan::from_job(&relative, &cfg).is_none());
+        relative = job.clone();
+        relative.context.immutable_source_roots = vec![PathBuf::from("registry/src")];
+        assert!(Plan::from_job(&relative, &cfg).is_none());
+        relative = job.clone();
+        relative.inputs[0].0 = PathBuf::from("lib.rs");
+        assert!(Plan::from_job(&relative, &cfg).is_none());
+        let mut context = serde_json::to_value(&job).unwrap();
+        context["context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compression_requested");
+        assert!(serde_json::from_value::<StoreJob>(context).is_err());
+    }
+
+    #[test]
+    fn deferred_jobs_refresh_immutable_roots_and_quarantine_state() {
+        let s = Scratch::new("context-state");
+        let (mut job, src, _) = fixture(&s);
+        let cfg = Config::from_env();
+        job.context.immutable_source_roots = vec![s.0.clone()];
+        let first = Plan::from_job(&job, &cfg).unwrap();
+        assert!(first.hasher.in_immutable_root(&src));
+        let stamp = Stamp::read(&src).unwrap();
+        first.trust.volume_trusted(stamp.dev, &src);
+        assert_eq!(first.trust.volumes().len(), 1);
+        cache::quarantine(&first.dirs, stamp.dev);
+        job.context.immutable_source_roots.clear();
+        let second = Plan::from_job(&job, &cfg).unwrap();
+        assert!(!second.hasher.in_immutable_root(&src));
+        assert!(second.trust.volumes().is_empty());
+        assert!(!Arc::ptr_eq(&first.trust, &second.trust));
+        assert!(!second.trust.volume_trusted(stamp.dev, &src));
+        assert_eq!(
+            second.hasher.hash(&src, false).unwrap().hash,
+            cache::hash_file(&src).unwrap()
+        );
+    }
+
+    #[test]
+    fn relative_deferred_jobs_refuse_replaced_inputs_outputs_and_watched_files() {
+        let cfg = Config::from_env();
+        for changed in ["input", "output", "watched"] {
+            let s = Scratch::new(&format!("relative-replaced-{changed}"));
+            let (mut job, src, rlib) = relative_job(&s);
+            job.watched.push((src.clone(), wire(&src)));
+            let replaced = if changed == "output" { &rlib } else { &src };
+            if changed == "input" {
+                job.watched.clear();
+            }
+            let replacement = replaced.with_extension("replacement");
+            fs::write(&replacement, fs::read(replaced).unwrap()).unwrap();
+            sys::rename(&replacement, replaced).unwrap();
+            run_deferred_with(&job, &cfg);
+            assert_eq!(rows(&job), 0, "a replaced {changed} must not be published");
+        }
+    }
+
+    #[test]
+    fn deferred_input_hashing_stays_on_the_worker_without_global_detachment() {
+        assert!(!DETACHED_STORE.load(Ordering::Relaxed));
+        let s = Scratch::new("context-serial");
+        let (mut job, src, rlib) = relative_job(&s);
+        let mut paths = vec![src];
+        for i in 0..32 {
+            let path = s.0.join(format!("input-{i}.rs"));
+            fs::write(&path, vec![b'a'; 128 * 1024]).unwrap();
+            paths.push(path);
+        }
+        job.dep_text = format!(
+            "target/debug/deps/k.d: {}\n",
+            paths
+                .iter()
+                .map(|path| path.strip_prefix(&job.cwd).unwrap().display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        fs::write(rlib.with_file_name("k.d"), &job.dep_text).unwrap();
+        job.outputs[0].1 = wire(&rlib.with_file_name("k.d"));
+        job.inputs = paths
+            .iter()
+            .map(|path| (path.clone(), wire(path)))
+            .collect();
+        let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let caller = thread::current().id();
+        let checked = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&checked);
+        plan.hasher = Hasher::new(Some(plan.dirs.hashmemo()), vec![s.0.clone()]).with_stamp_trust(
+            Box::new(move |_, _| {
+                assert_eq!(thread::current().id(), caller);
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let frozen = Frozen::from_job(&job).unwrap();
+        plan.store_outputs(
+            job.captured.as_bytes(),
+            job.compile_ms,
+            job.spawned_ns.parse().unwrap(),
+            &job.names,
+            (&job.dep_name, &job.dep_text),
+            Some(&frozen),
+        )
+        .unwrap();
+        assert_eq!(rows(&job), 1);
+        if paths
+            .iter()
+            .any(|path| !Stamp::read(path).unwrap().coarse())
+        {
+            assert!(checked.load(Ordering::Relaxed) > 0);
+        }
+        assert!(!DETACHED_STORE.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -4091,7 +4686,7 @@ mod tests {
         let (job, _, rlib) = fixture(&s);
         let expected = vec![b'k'; 2 * 1024 * 1024 + 333];
         fs::write(&rlib, &expected).unwrap();
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         let staged = plan.cache.stage().unwrap();
         let meta = plan
             .stage_entry(
@@ -4171,7 +4766,7 @@ mod tests {
             .iter()
             .map(|name| sys::lstat(&rlib.with_file_name(name)).unwrap().mode())
             .collect();
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         let staged = plan.cache.stage().unwrap();
         let compressed =
             cache_compression_requested() && cache::payload::compression_supported(&staged);
@@ -4283,7 +4878,7 @@ mod tests {
     fn malformed_encoded_flags_reject_before_any_destination_is_changed() {
         let s = Scratch::new("payload-flags");
         let (job, _, rlib) = fixture(&s);
-        let mut plan = Plan::from_job(&job).unwrap();
+        let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         let staged = plan.cache.stage().unwrap();
         let mut meta = plan
             .stage_entry(
@@ -4601,7 +5196,7 @@ mod tests {
             "--crate-type=rlib".into(),
             "-Cextra-filename=-abc123".into(),
         ]);
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         let deps = rlib.parent().unwrap();
         for name in [
             "k-abc123.d",
@@ -4661,7 +5256,7 @@ mod tests {
         for extra in ["-abc123.part", "-", "-custom"] {
             let mut custom_job = job.clone();
             custom_job.args.push(format!("-Cextra-filename={extra}"));
-            let plan = Plan::from_job(&custom_job).unwrap();
+            let plan = Plan::from_job(&custom_job, &Config::from_env()).unwrap();
             let name = format!("k{extra}.d");
             fs::write(deps.join(&name), b"custom output").unwrap();
             assert!(
@@ -4682,7 +5277,7 @@ mod tests {
             }
         }
         job.args.push("--crate-type=lib".into());
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         let deps = rlib.parent().unwrap();
         fs::write(deps.join("libk.rmeta"), b"old metadata").unwrap();
         let before: HashMap<_, _> = plan
@@ -4753,7 +5348,7 @@ mod tests {
     fn unhashed_link_outputs_still_require_authoritative_artifact_notifications() {
         let s = Scratch::new("unhashed-link");
         let (job, _, _) = fixture(&s);
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         assert!(plan.prefixed_outputs(|_| true).is_empty());
         assert!(plan.output_files(&[], &HashMap::new()).is_empty());
         let captured =
@@ -4779,11 +5374,13 @@ mod tests {
             })
             .collect();
         let freeze = |job: &StoreJob| {
-            Plan::from_job(job).expect("plan").freeze(
-                captured.as_bytes(),
-                job.spawned_ns.parse().unwrap(),
-                &HashMap::new(),
-            )
+            Plan::from_job(job, &Config::from_env())
+                .expect("plan")
+                .freeze(
+                    captured.as_bytes(),
+                    job.spawned_ns.parse().unwrap(),
+                    &HashMap::new(),
+                )
         };
 
         let off = StoreJob {
@@ -4832,7 +5429,7 @@ mod tests {
         let s = Scratch::new("freeze-fresh-input");
         let (job, src, rlib) = fixture(&s);
         fs::write(&rlib, vec![b'o'; cache::payload::MIN_BYTES as usize]).unwrap();
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         fs::create_dir_all(plan.dirs.tmp()).unwrap();
         let deps = rlib.parent().unwrap();
         let captured = ["k.d", "libk.rlib"]
@@ -4940,7 +5537,7 @@ mod tests {
         let s = Scratch::new("freeze-slot");
         let (mut job, _, _) = fixture(&s);
         job.trust = "off".to_string();
-        let plan = Plan::from_job(&job).unwrap();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         assert!(
             !plan
                 .spawn_deferred(&[], 0, 0, &HashMap::new(), None)

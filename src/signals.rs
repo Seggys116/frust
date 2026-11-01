@@ -21,6 +21,7 @@ fn install(sig: signal::Signal, handler: signal::Handler) {
     let _ = signal::install(sig, handler);
 }
 
+// Absorb terminal INT/QUIT to avoid redelivering group signals; forward process-directed TERM/HUP where supported.
 pub fn supervise(child_pid: u32) {
     RECEIVED.store(0, Ordering::Relaxed);
     CHILD.store(child_pid as i32, Ordering::Relaxed);
