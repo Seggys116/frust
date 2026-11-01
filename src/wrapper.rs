@@ -6120,6 +6120,9 @@ mod tests {
 
     #[test]
     fn leased_jobs_protect_inputs_outputs_aliases_and_then_become_dead() {
+        if crate::isolated_test(module_path!(), "leased_jobs_protect_inputs_outputs_aliases_and_then_become_dead") {
+            return;
+        }
         let s = Scratch::new("job-protection");
         let (mut job, src, output) = fixture(&s);
         job.ownership_version = 1;
@@ -6161,31 +6164,51 @@ mod tests {
 
     #[test]
     fn legacy_and_uncertain_jobs_remain_protected_but_dead_junk_can_age_out() {
+        if crate::isolated_test(module_path!(), "legacy_and_uncertain_jobs_remain_protected_but_dead_junk_can_age_out") {
+            return;
+        }
         let s = Scratch::new("legacy-protection");
         let (job, _, output) = fixture(&s);
         let dirs = Dirs::at(&job.home);
         let path = write_job(&dirs.deferred(), &job).unwrap();
-        assert!(matches!(
-            deferred_retirement(&path).unwrap(),
-            DeferredRetirement::Legacy(_)
-        ));
+        let expect_retirement = |expected, tracked_leases| {
+            let length = fs::metadata(&path).unwrap().len();
+            let retired = deferred_retirement(&path).unwrap_or_else(|err| {
+                panic!("retirement error: {err}; tracked_lease_count={tracked_leases}, length={length}")
+            });
+            let (variant, guard) = match retired {
+                DeferredRetirement::Legacy(file) => ("Legacy", Some(file)),
+                DeferredRetirement::Busy => ("Busy", None),
+                DeferredRetirement::Dead(file) => ("Dead", Some(file)),
+            };
+            assert_eq!(
+                variant, expected,
+                "retirement variant={variant}, tracked_lease_count={tracked_leases}, returned_guard_count={}, length={length}",
+                usize::from(guard.is_some())
+            );
+            guard
+        };
+        drop(expect_retirement("Legacy", 0));
+        #[cfg(unix)]
+        {
+            let original = expect_retirement("Legacy", 0).unwrap();
+            let duplicate = original.try_clone().unwrap();
+            drop(original);
+            assert!(expect_retirement("Busy", 1).is_none());
+            drop(duplicate);
+            drop(expect_retirement("Legacy", 0));
+        }
         let legacy = deferred_protection(&dirs);
         assert!(legacy.is_complete() && legacy.protects(&output));
         drop(legacy);
         fs::write(&path, b"{invalid").unwrap();
         let uncertain = deferred_protection(&dirs);
         assert!(!uncertain.is_complete() && uncertain.protects(&s.0.join("unrelated")));
-        assert!(matches!(
-            deferred_retirement(&path).unwrap(),
-            DeferredRetirement::Legacy(_)
-        ));
+        drop(expect_retirement("Legacy", uncertain.leases.len()));
         let file = File::options().write(true).open(&path).unwrap();
         file.set_len(MAX_PROTECTION_JOB_BYTES + 1).unwrap();
         assert!(!deferred_protection(&dirs).is_complete());
-        assert!(matches!(
-            deferred_retirement(&path).unwrap(),
-            DeferredRetirement::Legacy(_)
-        ));
+        drop(expect_retirement("Legacy", uncertain.leases.len()));
     }
 
     #[test]
@@ -6208,6 +6231,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inherited_job_lease_checks_descriptor_identity_and_survives_producer_drop() {
+        if crate::isolated_test(module_path!(), "inherited_job_lease_checks_descriptor_identity_and_survives_producer_drop") {
+            return;
+        }
         let s = Scratch::new("inherited-lease");
         let (mut job, _, _) = fixture(&s);
         job.ownership_version = 1;
@@ -6234,6 +6260,9 @@ mod tests {
 
     #[test]
     fn published_job_roundtrip_retains_its_platform_ownership_lease() {
+        if crate::isolated_test(module_path!(), "published_job_roundtrip_retains_its_platform_ownership_lease") {
+            return;
+        }
         let s = Scratch::new("published-job-lease");
         let (mut job, _, _) = fixture(&s);
         job.ownership_version = u32::from(sys::INHERITS_DESCRIPTORS);

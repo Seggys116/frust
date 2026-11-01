@@ -1102,6 +1102,9 @@ mod tests {
 
     #[test]
     fn independent_marker_survives_producer_removal() {
+        if crate::isolated_test(module_path!(), "independent_marker_survives_producer_removal") {
+            return;
+        }
         let scratch = Scratch::new();
         let dirs = scratch.dirs();
         let producer = job_file(&dirs);

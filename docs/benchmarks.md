@@ -10,6 +10,8 @@ Matching canonical flags are LTO=false/16 codegen units/unwind, thin/16/unwind a
 
 Growth uses synchronous stores: 200 mixed body/signature/feature/revert edits across 12 libraries and the application. Source settling and allocation inspection are outside build clocks. Compaction **every build** is controlled maintenance. Concurrent default-dev groups use separate targets, independently warmed compiler-info, an empty shared cache and alternating tool/spawn order; peer reuse is expected.
 
+A separate five-pair comparison against official 0.2.0 uses an 11-package graph and two concurrent release builds (LTO=false, CGU=16, incremental=false, one Cargo job each). Both versions use the same paths and backend wrapper; order alternates and native compilation overlap is recorded.
+
 Use matching release-built siblings and an existing TMPDIR on the filesystem being measured:
 
 ```bash
@@ -21,73 +23,82 @@ frust bench --concurrent --quick --runs=7 --store=deferred --compression=auto --
 
 ## Results
 
-Measured 2026-11-01 on Core Ultra 7 255H, 16 logical CPUs, Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1 and Cargo 1.97.1. Reflinks were unavailable. One-minute load before/after was general 1.19/2.32, embedded profiles 2.36/2.36, growth 2.32/2.83, linking 2.83/2.76, concurrent 2.76/3.32.
+Measured 2026-11-01 on Core Ultra 7 255H, 16 logical CPUs, Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1 and Cargo 1.97.1. Reflinks were unavailable. One-minute load before/after was general 0.98/2.04, embedded profiles 2.27/2.54, growth 2.04/2.43, linking 2.47/2.47, concurrent 2.44/3.98.
 
 **Debug builds**
 
 | Operation | Cargo ms | frust ms |
 | --- | --- | --- |
-| Cold | 3395 [2840, 3584] | 3577 [3003, 3679] |
-| Second project | 3477 [2854, 3565] | 827 [710, 865] |
-| Clean restore | 3403 [2812, 3621] | 162 [157, 168] |
-| No-op | 18 [17, 19] | 19 [18, 22] |
-| First edit after restore | 93 [85, 115] | 99 [94, 107] |
-| Warm-session edit | 94 [85, 123] | 103 [97, 123] |
+| Cold | 3127 [2812, 3627] | 3316 [2892, 3471] |
+| Second project | 3279 [2786, 3483] | 814 [685, 833] |
+| Clean restore | 3311 [2776, 3443] | 157 [152, 162] |
+| No-op | 18 [17, 19] | 19 [18, 21] |
+| First edit after restore | 88 [86, 97] | 107 [93, 119] |
+| Warm-session edit | 89 [85, 92] | 102 [95, 109] |
 
-Warm-session edits: paired frust-minus-Cargo median 13 [-20, 25] ms; frust slower in 5/7 pairs, faster in 2/7, tied in 0/7.
+Warm-session edits: paired frust-minus-Cargo median 15 [3, 18] ms; frust slower in 7/7 pairs, faster in 0/7, tied in 0/7.
 
 **Canonical release profiles**
 
 | Profile | Operation | Cargo ms | frust ms |
 | --- | --- | --- | --- |
-| Defaults | Cold | 3623 [3539, 3772] | 3790 [3728, 3853] |
-| Defaults | Restore | 3717 [3674, 3814] | 142 [140, 146] |
-| Defaults | No-op | 18 [17, 20] | 20 [19, 20] |
-| Defaults | Body edit | 69 [66, 72] | 74 [73, 76] |
-| ThinLTO | Cold | 5081 [5027, 5166] | 5190 [5134, 5278] |
-| ThinLTO | Restore | 5070 [4940, 5235] | 150 [141, 168] |
-| ThinLTO | No-op | 18 [17, 19] | 19 [18, 20] |
-| ThinLTO | Body edit | 1794 [1761, 1825] | 1807 [1725, 1882] |
-| Full/fat LTO | Cold | 4990 [4941, 5026] | 5089 [5014, 5183] |
-| Full/fat LTO | Restore | 4994 [4875, 5127] | 144 [139, 149] |
-| Full/fat LTO | No-op | 19 [17, 19] | 20 [19, 21] |
-| Full/fat LTO | Body edit | 1664 [1652, 1755] | 1696 [1661, 1789] |
+| Defaults | Cold | 3701 [3491, 3870] | 3830 [3772, 4527] |
+| Defaults | Restore | 3691 [3531, 3902] | 146 [139, 159] |
+| Defaults | No-op | 18 [17, 19] | 20 [18, 24] |
+| Defaults | Body edit | 70 [68, 77] | 73 [71, 80] |
+| ThinLTO | Cold | 5040 [5000, 5191] | 5275 [5126, 5344] |
+| ThinLTO | Restore | 5138 [5068, 5180] | 143 [140, 149] |
+| ThinLTO | No-op | 18 [17, 19] | 20 [18, 20] |
+| ThinLTO | Body edit | 1751 [1715, 1932] | 1797 [1768, 1898] |
+| Full/fat LTO | Cold | 4996 [4959, 5068] | 5146 [5044, 5211] |
+| Full/fat LTO | Restore | 5060 [4872, 5122] | 144 [140, 155] |
+| Full/fat LTO | No-op | 18 [17, 19] | 20 [18, 22] |
+| Full/fat LTO | Body edit | 1688 [1663, 1734] | 1702 [1668, 1756] |
 
 Frust had positive paired cold overhead in all four graphs. Differences pair matching repetitions, frust minus Cargo:
 
 | Cold graph | Paired difference ms | Positive pairs |
 | --- | --- | --- |
-| Debug | 163 [-142, 287] | 5/7 |
-| Defaults | 150 [61, 286] | 7/7 |
-| ThinLTO | 112 [15, 203] | 7/7 |
-| Full/fat LTO | 128 [9, 198] | 7/7 |
+| Debug | 80 [-378, 377] | 5/7 |
+| Defaults | 149 [-31, 782] | 6/7 |
+| ThinLTO | 164 [39, 336] | 7/7 |
+| Full/fat LTO | 126 [78, 221] | 7/7 |
 
 **Deferred store completion**
 
-Foreground figures above exclude the remaining background store work. These are frust observations from the same seven samples.
+Frust observations from the same seven samples; foreground excludes remaining background work.
 
 | Operation | Store drain ms | Settled total ms |
 | --- | --- | --- |
-| Cold | 10 [10, 30] | 3587 [3013, 3709] |
-| Clean restore | 0 [0, 0] | 162 [157, 169] |
-| First edit after restore | 20 [0, 20] | 118 [95, 127] |
-| Warm-session edit | 10 [0, 20] | 116 [103, 134] |
+| Cold | 10 [10, 20] | 3326 [2902, 3491] |
+| Clean restore | 0 [0, 0] | 158 [152, 162] |
+| First edit after restore | 10 [0, 20] | 117 [93, 130] |
+| Warm-session edit | 10 [0, 20] | 113 [95, 129] |
 
 **Concurrent cold groups**
 
 | Measurement | Cargo ms | frust ms | Paired difference ms |
 | --- | --- | --- | --- |
-| Foreground group | 5091.110 [5041.489, 5202.440] | 3715.133 [3518.938, 3854.137] | -1439.871 [-1640.067, -1260.774] |
-| Settled group | 5091.150 [5041.523, 5202.476] | 3715.222 [3519.062, 3854.262] | -1439.793 [-1640.014, -1260.718] |
+| Foreground group | 5051.008 [4730.561, 5229.465] | 3703.126 [3469.977, 3830.437] | -1341.844 [-1562.016, -1085.113] |
+| Settled group | 5051.049 [4730.599, 5229.653] | 3703.262 [3470.079, 3830.573] | -1341.768 [-1562.074, -1085.140] |
 
-Frust foreground was faster in 7/7 pairs; settled was faster in 7/7. Actual Cargo-unit compilations per cold group were **40 Cargo / 20 frust**, with **14 shared identities** compiled once and corroborated by store/peer hits. Binary bytes/runtime output matched across tools/profiles. Unchanged groups had zero compiler calls, compilation notices and cache events. These measure concurrent peer reuse.
+Frust foreground was faster in 7/7 pairs; settled was faster in 7/7. Actual Cargo-unit compilations per cold group were **40 Cargo / 20 frust**, with **14 shared identities** compiled once and corroborated by store/peer hits. Binary bytes and runtime output matched between Cargo and frust. Unchanged groups had zero compiler calls, compilation notices and cache events. These measure concurrent peer reuse.
+
+**Release cold build cooperation**
+
+| Measurement | 0.2.0 ms | 0.3.0 ms | Paired 0.3.0-minus-0.2.0 ms |
+| --- | --- | --- | --- |
+| Foreground | 5427 [5385, 5614] | 4108 [4007, 4342] | -1314 [-1419, -1198] |
+| Settled | 5431 [5388, 5628] | 4110 [4010, 4346] | -1317 [-1420, -1207] |
+
+All five 0.3.0 pairs finished sooner; the paired median foreground reduction was **24.2%**. Independent compilation overlapped in all five groups. Owned CPU increased by a paired median **703 ms (12.9%)**. These results cover this concurrent fixture.
 
 **Storage after 200 settled edits**
 
 | Tool | Target MiB | Additional cache MiB | Other managed MiB | Full managed MiB |
 | --- | --- | --- | --- | --- |
 | Cargo | 371.2 | 0.0 | 0.0 | 371.2 |
-| frust + Auto | 174.2 | 48.6 | 3.1 | 225.8 |
+| frust + Auto | 174.2 | 48.6 | 3.0 | 225.8 |
 
 Full managed allocation was **39.2% smaller** with frust. Unique device/inode blocks include directories, excluding installed toolchains/registries. MiB components round independently; retired allocation is not added twice.
 
@@ -99,7 +110,7 @@ With FRUST_LINK=off and artifact caching off, every edit compiled one main binar
 
 | Measurement | ms median [min, max] |
 | --- | --- |
-| Total build wall | 87 [84, 90] |
-| Native link phase | 32 [30, 34] |
+| Total build wall | 86 [84, 100] |
+| Native link phase | 32 [30, 48] |
 
-Cohort: `07c77c1abcb91564c1bdb0948c7961c780b74fd5f00aef2695cc68ed21d90e70`.
+Cohort: `8199243f9160c65744f7285ae3fac0e0793beff0aee416cf7d2bab5f90147fe1`.

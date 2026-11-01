@@ -85,3 +85,30 @@ fn rustc_main(args: Vec<OsString>) -> i32 {
     full.extend(args);
     wrapper::run(full)
 }
+
+#[cfg(test)]
+pub(crate) fn isolated_test(module: &str, name: &str) -> bool {
+    const CHILD: &str = "FRUST_TEST_ISOLATED_CASE";
+    let full = match module.split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_string(),
+    };
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(&full)) {
+        return false;
+    }
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &full, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &full)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        result.status.success()
+            && stdout.contains(&format!("test {full} ..."))
+            && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated test {full} failed or did not run exactly one selected test ({:?}): {stdout}{stderr}",
+        result.status
+    );
+    true
+}

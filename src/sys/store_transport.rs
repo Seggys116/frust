@@ -989,6 +989,9 @@ mod imp {
 
         #[test]
         fn frames_preserve_order_zero_and_two_descriptors_and_lock_ownership() {
+            if crate::isolated_test(module_path!(), "frames_preserve_order_zero_and_two_descriptors_and_lock_ownership") {
+                return;
+            }
             let scratch = Scratch::new();
             let (key, path) = scratch.locked();
             let (sender, receiver) = pair().unwrap();
@@ -1019,6 +1022,9 @@ mod imp {
 
         #[test]
         fn oversize_frames_and_incomplete_headers_close_received_descriptors() {
+            if crate::isolated_test(module_path!(), "oversize_frames_and_incomplete_headers_close_received_descriptors") {
+                return;
+            }
             for incomplete in [false, true] {
                 let scratch = Scratch::new();
                 let (key, path) = scratch.locked();
@@ -1045,6 +1051,9 @@ mod imp {
 
         #[test]
         fn unexpected_descriptor_counts_and_truncation_close_every_received_fd() {
+            if crate::isolated_test(module_path!(), "unexpected_descriptor_counts_and_truncation_close_every_received_fd") {
+                return;
+            }
             // Linux closes truncated tails; Darwin must receive all rights before rejecting the count.
             for count in [1, 3, 100].into_iter().cycle().take(9) {
                 let scratch = Scratch::new();
@@ -1064,6 +1073,9 @@ mod imp {
 
         #[test]
         fn descriptors_hidden_in_length_are_rejected_and_closed() {
+            if crate::isolated_test(module_path!(), "descriptors_hidden_in_length_are_rejected_and_closed") {
+                return;
+            }
             let scratch = Scratch::new();
             let (key, path) = scratch.locked();
             let (sender, receiver) = pair().unwrap();
@@ -1245,6 +1257,9 @@ mod imp {
 
         #[test]
         fn broker_detachment_closes_unrelated_inherited_pipe_and_preserves_parent_and_whitelist() {
+            if crate::isolated_test(module_path!(), "broker_detachment_closes_unrelated_inherited_pipe_and_preserves_parent_and_whitelist") {
+                return;
+            }
             let scratch = Scratch::new();
             let (key, key_path) = scratch.locked();
             let key_status = unsafe { libc::fcntl(key.as_raw_fd(), libc::F_GETFL) };

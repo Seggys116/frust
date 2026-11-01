@@ -1805,6 +1805,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_old_live_lease_survives_planning_and_released_record_collects() {
+        if crate::isolated_test(module_path!(), "deferred_old_live_lease_survives_planning_and_released_record_collects") {
+            return;
+        }
         let root = home("deferred-live-age");
         let dirs = Dirs::at(&root);
         let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
@@ -1826,6 +1829,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_lease_acquired_after_planning_blocks_execution() {
+        if crate::isolated_test(module_path!(), "deferred_lease_acquired_after_planning_blocks_execution") {
+            return;
+        }
         let root = home("deferred-late-lease");
         let dirs = Dirs::at(&root);
         let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
@@ -1844,6 +1850,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_age_refresh_after_planning_declines_retirement() {
+        if crate::isolated_test(module_path!(), "deferred_age_refresh_after_planning_declines_retirement") {
+            return;
+        }
         let root = home("deferred-refreshed-age");
         let dirs = Dirs::at(&root);
         let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
@@ -1859,6 +1868,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_replacement_during_guard_acquisition_is_retained() {
+        if crate::isolated_test(module_path!(), "deferred_replacement_during_guard_acquisition_is_retained") {
+            return;
+        }
         let root = home("deferred-guard-replacement");
         let dirs = Dirs::at(&root);
         let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
@@ -1884,6 +1896,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_legacy_age_and_canonical_lock_policies_are_preserved() {
+        if crate::isolated_test(module_path!(), "deferred_legacy_age_and_canonical_lock_policies_are_preserved") {
+            return;
+        }
         let root = home("deferred-legacy-policy");
         let dirs = Dirs::at(&root);
         let path = deferred_job(&dirs, None, None, Duration::ZERO);
@@ -1954,6 +1969,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_target_snapshot_refresh_protects_descendants_and_inode_aliases() {
+        if crate::isolated_test(module_path!(), "deferred_target_snapshot_refresh_protects_descendants_and_inode_aliases") {
+            return;
+        }
         for alias in [false, true] {
             let (root, dirs, target, payloads) = aged_gc_target(if alias { "deferred-target-alias" } else { "deferred-target-descendant" });
             let selected = plan(&dirs, &GcOptions::new(u64::MAX));
@@ -1983,6 +2001,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deferred_cache_input_alias_is_refreshed_before_entry_retirement() {
+        if crate::isolated_test(module_path!(), "deferred_cache_input_alias_is_refreshed_before_entry_retirement") {
+            return;
+        }
         let root = home("deferred-cache-alias");
         let dirs = Dirs::at(&root);
         let protected = store_entry(&root, &"aa".repeat(20), &[("artifact", 16384)], 5000);

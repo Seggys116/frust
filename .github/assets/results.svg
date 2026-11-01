@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 650" width="960" height="650" role="img" aria-labelledby="title description">
 <title id="title">Debug build times</title>
 <desc id="description">Median foreground milliseconds from seven runs; ranges are observed minima/maxima, not confidence intervals. Artifact-cold/page-warm; audit included. Warm is warm-session edit. Release uses canonical two-library clean restores; original flags retained.</desc>
-<metadata id="original-cohort-evidence">Data cohort SHA256 07c77c1abcb91564c1bdb0948c7961c780b74fd5f00aef2695cc68ed21d90e70. 2026-11-01. Core Ultra 7 255H | Linux | ext4 | rustc 1.97.1. Median foreground milliseconds from seven runs; ranges are observed minima/maxima, not confidence intervals. Artifact-cold/page-warm; audit included. Warm is warm-session edit. Release uses canonical two-library clean restores; original flags retained. Concurrent paired differences are frust minus Cargo. Two concurrent separate targets, shared empty cache with intra-group peer reuse; paired differences are frust minus Cargo; not isolated cold builds.</metadata>
+<metadata id="original-cohort-evidence">Data cohort SHA256 8199243f9160c65744f7285ae3fac0e0793beff0aee416cf7d2bab5f90147fe1. 2026-11-01. Core Ultra 7 255H | Linux | ext4 | rustc 1.97.1. Median foreground milliseconds from seven runs; ranges are observed minima/maxima, not confidence intervals. Artifact-cold/page-warm; audit included. Warm is warm-session edit. Release uses canonical two-library clean restores; original flags retained. Concurrent paired differences are frust minus Cargo. Two concurrent separate targets, shared empty cache with intra-group peer reuse; paired differences are frust minus Cargo; not isolated cold builds.</metadata>
 <rect width="960" height="650" rx="16" fill="#0d1117"/>
 <g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
 <text x="32" y="46" font-size="30" fill="#e6edf3" font-weight="650" text-anchor="start">Build times</text>
@@ -10,40 +10,40 @@
 <text x="905" y="116" font-size="17" fill="#39d0c3" font-weight="600" text-anchor="end">frust</text>
 <path d="M32 130H928" stroke="#26313d"/>
 <text x="32" y="168" font-size="21" fill="#e6edf3" font-weight="550" text-anchor="start">Cold build</text>
-<text x="595" y="168" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">3395</text>
-<text x="595" y="194" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">2840–3584</text>
-<text x="905" y="168" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">3577</text>
-<text x="905" y="194" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">3003–3679</text>
+<text x="595" y="168" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">3127</text>
+<text x="595" y="194" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">2812–3627</text>
+<text x="905" y="168" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">3316</text>
+<text x="905" y="194" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">2892–3471</text>
 <text x="32" y="194" font-size="16" fill="#ffb089" font-weight="400" text-anchor="start">Slower from an empty cache</text>
 <path d="M32 212H928" stroke="#26313d"/>
 <text x="32" y="251" font-size="21" fill="#e6edf3" font-weight="550" text-anchor="start">Clean rebuild / restore</text>
-<text x="595" y="251" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">3403</text>
-<text x="595" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">2812–3621</text>
-<text x="905" y="251" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">162</text>
-<text x="905" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">157–168</text>
-<text x="32" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="start">21.0× faster</text>
+<text x="595" y="251" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">3311</text>
+<text x="595" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">2776–3443</text>
+<text x="905" y="251" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">157</text>
+<text x="905" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">152–162</text>
+<text x="32" y="277" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="start">21.1× faster</text>
 <path d="M32 295H928" stroke="#26313d"/>
 <text x="32" y="334" font-size="21" fill="#e6edf3" font-weight="550" text-anchor="start">No-op</text>
 <text x="595" y="334" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">18</text>
 <text x="595" y="360" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">17–19</text>
 <text x="905" y="334" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">19</text>
-<text x="905" y="360" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">18–22</text>
+<text x="905" y="360" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">18–21</text>
 <path d="M32 378H928" stroke="#26313d"/>
 <text x="32" y="417" font-size="21" fill="#e6edf3" font-weight="550" text-anchor="start">Warm-session edit</text>
-<text x="595" y="417" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">94</text>
-<text x="595" y="443" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">85–123</text>
-<text x="905" y="417" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">103</text>
-<text x="905" y="443" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">97–123</text>
+<text x="595" y="417" font-size="28" fill="#c2cad4" font-weight="600" text-anchor="end">89</text>
+<text x="595" y="443" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">85–92</text>
+<text x="905" y="417" font-size="28" fill="#39d0c3" font-weight="600" text-anchor="end">102</text>
+<text x="905" y="443" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">95–109</text>
 <path d="M32 461H928" stroke="#26313d"/>
 <text x="32" y="510" font-size="21" fill="#e6edf3" font-weight="550" text-anchor="start">Two concurrent cold builds</text>
 <text x="32" y="538" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="start">Separate targets · shared cache</text>
-<text x="595" y="510" font-size="26" fill="#c2cad4" font-weight="600" text-anchor="end">5091</text>
-<text x="595" y="536" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">5041–5202</text>
-<text x="905" y="510" font-size="26" fill="#39d0c3" font-weight="600" text-anchor="end">3715</text>
-<text x="905" y="536" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">3519–3854</text>
-<text x="32" y="580" font-size="17" fill="#39d0c3" font-weight="400" text-anchor="start">Paired difference: −1440 ms  [−1640, −1261]</text>
+<text x="595" y="510" font-size="26" fill="#c2cad4" font-weight="600" text-anchor="end">5051</text>
+<text x="595" y="536" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">4731–5229</text>
+<text x="905" y="510" font-size="26" fill="#39d0c3" font-weight="600" text-anchor="end">3703</text>
+<text x="905" y="536" font-size="16" fill="#9ba9b8" font-weight="400" text-anchor="end">3470–3830</text>
+<text x="32" y="580" font-size="17" fill="#39d0c3" font-weight="400" text-anchor="start">Paired difference: −1342 ms  [−1562, −1085]</text>
 <path d="M32 603H928" stroke="#26313d"/>
 <text x="32" y="625" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="start">2026-11-01 · Core Ultra 7 255H · Linux / ext4 · rustc 1.97.1</text>
-<text x="928" y="625" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="end">Data 07c77c1</text>
+<text x="928" y="625" font-size="14" fill="#9ba9b8" font-weight="400" text-anchor="end">Data 8199243</text>
 </g>
 </svg>
