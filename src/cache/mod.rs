@@ -7,7 +7,7 @@ pub mod payload;
 pub mod rustc_args;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -43,6 +43,8 @@ const MARK_USED_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Retry queue for retired entries whose immediate deletion failed.
 const EVICTED_DIR: &str = "evicted";
+
+const UNIT_RECORD_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredFile {
@@ -312,12 +314,41 @@ impl Cache {
         let proof = queue.child(&self.dirs, &doomed).ok_or_else(|| io::Error::other("retired child identity unavailable"))?;
         if proof.identity != (current.entry.dev, current.entry.ino) { return Err(io::Error::other("retired child identity changed")); }
         #[derive(Deserialize)]
-        struct Reference { prekey: Option<String> }
+        struct Reference { prekey: Option<serde_json::Value>, incremental_unit: Option<serde_json::Value> }
         if let Ok(bytes) = fs::read(doomed.join("meta.json"))
             && let Ok(reference) = serde_json::from_slice::<Reference>(&bytes)
-            && let Some(prekey) = reference.prekey.filter(|key| valid_key(key))
-        { self.prune_manifest_guarded(guard, &prekey); }
+        {
+            // A malformed ownership hint must not disable cleanup through the other hint.
+            if let Some(prekey) = reference.prekey.as_ref().and_then(|value| value.as_str()).filter(|key| valid_key(key)) {
+                self.prune_manifest_guarded(guard, prekey);
+            }
+            if let Some(unit) = reference.incremental_unit.as_ref().and_then(|value| value.as_str()).filter(|key| valid_key(key)) {
+                self.prune_unit_record_guarded(guard, unit, key);
+            }
+        }
         Ok(Some(RetiredEntry { path: doomed, proof }))
+    }
+
+    fn prune_unit_record_guarded(&self, guard: &UnitRecordsGuard, unit: &str, retired: &str) {
+        self.prune_unit_record_with(guard, unit, retired, |path, contents| match contents {
+            Some(contents) => crate::lock::write_shared(path, contents, crate::lock::shared_mode(&self.dirs)),
+            None => fs::remove_file(path),
+        });
+    }
+
+    fn prune_unit_record_with(
+        &self, _guard: &UnitRecordsGuard, unit: &str, retired: &str,
+        commit: impl FnOnce(&Path, Option<&[u8]>) -> io::Result<()>,
+    ) {
+        let Some(record) = UnitRecordSnapshot::read(&self.dirs, unit) else { return };
+        if !record.keys.iter().any(|key| key == retired) { return; }
+        let retained: Vec<_> = record.keys.iter().filter(|key| !self.unit_reference_absent(key)).collect();
+        if retained.len() == record.keys.len() { return; }
+        let mut seen = std::collections::HashSet::new();
+        let keys: Vec<_> = retained.into_iter().filter(|key| seen.insert(key.as_str())).map(String::as_str).collect();
+        let contents = (!keys.is_empty()).then(|| format!("{}\n", keys.join("\n")));
+        if !record.unchanged(&self.dirs) { return; }
+        let _ = commit(&record.path, contents.as_deref().map(str::as_bytes));
     }
 
     fn prune_manifest_guarded(&self, _guard: &UnitRecordsGuard, prekey: &str) {
@@ -353,6 +384,34 @@ impl Cache {
             }
         }
         // Recheck proven parent identities before treating portable NotFound as absence.
+        if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
+        parents.iter().all(|&(path, follow, dev, ino)| {
+            let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
+            meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
+        })
+    }
+
+    /// Unit records retain existing entry roots, including incomplete entries and uncertain filesystem states.
+    pub(crate) fn unit_reference_absent(&self, key: &str) -> bool {
+        if !valid_key(key) { return false; }
+        let entry = self.entry_dir(key);
+        let shard = entry.parent().unwrap();
+        let storage = shard.parent().unwrap();
+        let home = storage.parent().unwrap();
+        let Ok(meta) = sys::stat(home) else { return false };
+        if !meta.is_dir() { return false; }
+        let mut parents = vec![(home, true, meta.dev(), meta.ino())];
+        let mut absent = entry.as_path();
+        for path in [storage, shard] {
+            match sys::lstat(path) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                    parents.push((path, false, meta.dev(), meta.ino()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
+                _ => return false,
+            }
+        }
+        // Prove component types before interpreting portable NotFound, then recheck parent identities.
         if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
         parents.iter().all(|&(path, follow, dev, ino)| {
             let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
@@ -423,6 +482,48 @@ struct EntryIdentity {
 impl EntryIdentity {
     fn read(meta: &sys::Meta) -> Option<Self> {
         Some(Self { dev: meta.dev(), ino: meta.ino(), len: meta.len(), modified: meta.modified().ok()?, changed: meta.ctime() })
+    }
+}
+
+struct UnitRecordSnapshot {
+    path: PathBuf,
+    root: (u64, u64),
+    units: (u64, u64),
+    shard: (u64, u64),
+    identity: EntryIdentity,
+    keys: Vec<String>,
+}
+
+impl UnitRecordSnapshot {
+    fn read(dirs: &Dirs, unit: &str) -> Option<Self> {
+        if !valid_key(unit) { return None; }
+        let path = Cache::shard(dirs.root().join(UNITS_DIR), unit);
+        let root = sys::stat(dirs.root()).ok()?;
+        if !root.is_dir() { return None; }
+        let units = checked_directory(&dirs.root().join(UNITS_DIR)).ok()?;
+        let shard = checked_directory(path.parent()?).ok()?;
+        let meta = sys::lstat(&path).ok()?;
+        if !meta.is_file() || meta.file_type().is_symlink() { return None; }
+        let identity = EntryIdentity::read(&meta)?;
+        if identity.len > UNIT_RECORD_MAX_BYTES { return None; }
+        let mut file = File::open(&path).ok()?;
+        if EntryIdentity::read(&sys::fstat(&file).ok()?).as_ref() != Some(&identity) { return None; }
+        let mut contents = String::new();
+        (&mut file).take(UNIT_RECORD_MAX_BYTES + 1).read_to_string(&mut contents).ok()?;
+        if contents.len() as u64 > UNIT_RECORD_MAX_BYTES { return None; }
+        let keys: Vec<String> = if contents == "\n" { Vec::new() } else { contents.lines().map(str::to_owned).collect() };
+        if keys.iter().any(|key| !valid_key(key)) || contents != format!("{}\n", keys.join("\n")) { return None; }
+        let record = Self { path, root: (root.dev(), root.ino()), units, shard, identity, keys };
+        record.unchanged(dirs).then_some(record)
+    }
+
+    fn unchanged(&self, dirs: &Dirs) -> bool {
+        // The global guard serializes writers; these identities reject changed paths and unsafe boundaries.
+        sys::stat(dirs.root()).is_ok_and(|meta| meta.is_dir() && (meta.dev(), meta.ino()) == self.root)
+            && checked_directory(&dirs.root().join(UNITS_DIR)).ok() == Some(self.units)
+            && self.path.parent().and_then(|path| checked_directory(path).ok()) == Some(self.shard)
+            && sys::lstat(&self.path).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink()
+                && EntryIdentity::read(&meta).as_ref() == Some(&self.identity))
     }
 }
 
@@ -1039,6 +1140,220 @@ mod tests {
 
     fn empty_candidate(n: u8) -> Candidate {
         Candidate { inputs: Vec::new(), envs: Vec::new(), key: key(n) }
+    }
+
+    fn publish_unit_entry(cache: &Cache, n: u8, unit: &str) {
+        publish_entry(cache, n);
+        fs::write(cache.entry_dir(&key(n)).join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({"incremental_unit": unit})).unwrap()).unwrap();
+    }
+
+    fn write_unit_record(cache: &Cache, unit: &str, keys: &[u8]) -> PathBuf {
+        let path = Cache::shard(cache.units_dir(), unit);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{}\n", keys.iter().map(|n| key(*n)).collect::<Vec<_>>().join("\n"))).unwrap();
+        path
+    }
+
+    #[test]
+    fn retirement_prunes_owned_unit_references_in_order_and_deduplicates_live_keys() {
+        let (dir, cache) = scratch("prompt-unit");
+        let unit = key(0xa1);
+        for n in [1, 2, 3] { publish_unit_entry(&cache, n, &unit); }
+        let path = write_unit_record(&cache, &unit, &[3, 1, 4, 2, 3]);
+        cache.remove_entry_with(&key(1), |_| {
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n{}\n", key(3), key(2)));
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(!cache.has_entry(&key(1)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n{}\n", key(3), key(2)));
+        let before = EntryIdentity::read(&sys::lstat(&path).unwrap()).unwrap();
+        let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
+        cache.prune_unit_record_guarded(&guard, &unit, &key(4));
+        assert_eq!(EntryIdentity::read(&sys::lstat(&path).unwrap()), Some(before));
+        drop(guard);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retirement_removes_empty_unit_records_and_republication_recreates_them() {
+        let (dir, cache) = scratch("unit-republish");
+        let unit = key(0xa2);
+        publish_unit_entry(&cache, 1, &unit);
+        let path = write_unit_record(&cache, &unit, &[1]);
+        cache.remove_entry(&key(1));
+        assert!(!path.exists());
+        publish_unit_entry(&cache, 1, &unit);
+        assert!(cache.note_unit_entry(&unit, &key(1), 1).is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(1)));
+        publish_unit_entry(&cache, 2, &unit);
+        assert_eq!(cache.note_unit_entry(&unit, &key(2), 1), vec![key(1)]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(2)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retirement_leaves_wrong_unit_records_without_the_retired_key_unchanged() {
+        let (dir, cache) = scratch("unit-membership");
+        let unit = key(0xa3);
+        publish_unit_entry(&cache, 1, &unit);
+        for n in [2, 3] { publish_entry(&cache, n); }
+        let nominated = write_unit_record(&cache, &unit, &[2, 4]);
+        let actual = write_unit_record(&cache, &key(0xb3), &[3, 1]);
+        let bytes = [fs::read(&nominated).unwrap(), fs::read(&actual).unwrap()];
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read(nominated).unwrap(), bytes[0]);
+        assert_eq!(fs::read(actual).unwrap(), bytes[1]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retirement_retains_existing_incomplete_and_wrong_type_unit_references() {
+        let (dir, cache) = scratch("unit-incomplete");
+        let unit = key(0xa4);
+        publish_unit_entry(&cache, 1, &unit);
+        fs::create_dir_all(cache.entry_dir(&key(2))).unwrap();
+        fs::create_dir_all(cache.entry_dir(&key(3)).parent().unwrap()).unwrap();
+        fs::write(cache.entry_dir(&key(3)), b"not a directory").unwrap();
+        let path = write_unit_record(&cache, &unit, &[2, 1, 3]);
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read_to_string(path).unwrap(), format!("{}\n{}\n", key(2), key(3)));
+        assert!(!cache.unit_reference_absent(&key(2)));
+        assert!(!cache.unit_reference_absent(&key(3)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retirement_preserves_malformed_oversized_and_legacy_unit_records() {
+        let (dir, cache) = scratch("unit-invalid");
+        let unit = key(0xa5);
+        let path = write_unit_record(&cache, &unit, &[1]);
+        let valid = format!("{}\n", key(1));
+        for contents in [b"broken\n".to_vec(), key(1).into_bytes(), format!("{valid}\n").into_bytes(),
+            vec![0xff], valid.repeat(UNIT_RECORD_MAX_BYTES as usize / valid.len() + 1).into_bytes()] {
+            publish_unit_entry(&cache, 1, &unit);
+            fs::write(&path, &contents).unwrap();
+            cache.remove_entry(&key(1));
+            assert_eq!(fs::read(&path).unwrap(), contents);
+        }
+        publish_entry(&cache, 1);
+        fs::write(&path, &valid).unwrap();
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read(path).unwrap(), valid.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retirement_prunes_manifest_and_unit_hints_independently() {
+        let (dir, cache) = scratch("independent-hints");
+        let prekey = key(0x99);
+        for malformed in [serde_json::json!(17), serde_json::json!({"invalid": true}), serde_json::json!("../bad")] {
+            publish_referenced_entry(&cache, 1, &prekey);
+            cache.add_candidate(&prekey, empty_candidate(1));
+            fs::write(cache.entry_dir(&key(1)).join("meta.json"), serde_json::to_vec(
+                &serde_json::json!({"prekey": prekey, "incremental_unit": malformed})).unwrap()).unwrap();
+            cache.remove_entry(&key(1));
+            assert!(cache.candidates(&prekey).is_empty());
+        }
+        let unit = key(0xa6);
+        publish_unit_entry(&cache, 1, &unit);
+        let path = write_unit_record(&cache, &unit, &[1]);
+        fs::write(cache.entry_dir(&key(1)).join("meta.json"), serde_json::to_vec(
+            &serde_json::json!({"prekey": 17, "incremental_unit": unit})).unwrap()).unwrap();
+        cache.remove_entry(&key(1));
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unit_pruning_retains_records_on_commit_failure_or_identity_changes() {
+        let (dir, cache) = scratch("unit-commit-proof");
+        let unit = key(0xa7);
+        publish_entry(&cache, 2);
+        let path = write_unit_record(&cache, &unit, &[2, 1]);
+        let original = fs::read(&path).unwrap();
+        let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
+        let mut attempted = false;
+        cache.prune_unit_record_with(&guard, &unit, &key(1), |_, contents| {
+            attempted = true;
+            assert_eq!(contents.unwrap(), format!("{}\n", key(2)).as_bytes());
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(attempted);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let snapshot = UnitRecordSnapshot::read(&cache.dirs, &unit).unwrap();
+        crate::lock::write_shared(&path, &original, crate::lock::shared_mode(&cache.dirs)).unwrap();
+        assert!(!snapshot.unchanged(&cache.dirs));
+        let snapshot = UnitRecordSnapshot::read(&cache.dirs, &unit).unwrap();
+        let parent = path.parent().unwrap();
+        sys::rename(parent, &dir.join("previous-unit-shard")).unwrap();
+        fs::create_dir(parent).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(!snapshot.unchanged(&cache.dirs));
+        assert_eq!(fs::read(path).unwrap(), original);
+        drop(guard);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unit_pruning_waits_for_the_retirement_guard() {
+        let (dir, cache) = scratch("unit-prune-guard");
+        let unit = key(0xa9);
+        publish_unit_entry(&cache, 1, &unit);
+        let path = write_unit_record(&cache, &unit, &[1]);
+        let snapshot = cache.retirement_snapshot(&key(1)).unwrap();
+        let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
+        assert_eq!(cache.try_retire_entry(&snapshot).unwrap(), EntryRetirementOutcome::Busy);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(1)));
+        assert!(cache.has_entry(&key(1)));
+        drop(guard);
+        assert_eq!(cache.try_retire_entry(&snapshot).unwrap(), EntryRetirementOutcome::Retired);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_pruning_keeps_shared_cache_record_permissions() {
+        let (dir, cache) = scratch("unit-shared-mode");
+        sys::set_path_mode(&dir, 0o777).unwrap();
+        let unit = key(0xaa);
+        for n in [1, 2] { publish_unit_entry(&cache, n, &unit); }
+        let path = write_unit_record(&cache, &unit, &[2, 1]);
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(2)));
+        assert_eq!(sys::stat(&path).unwrap().mode() & 0o777, 0o664);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_pruning_preserves_symlink_references_and_record_boundaries() {
+        let (dir, cache) = scratch("unit-symlinks");
+        let unit = key(0xa8);
+        publish_unit_entry(&cache, 1, &unit);
+        fs::create_dir_all(cache.entry_dir(&key(2)).parent().unwrap()).unwrap();
+        sys::link_tool(&dir.join("absent"), &cache.entry_dir(&key(2))).unwrap();
+        let path = write_unit_record(&cache, &unit, &[2, 1]);
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(2)));
+        let outside = dir.join("outside-unit");
+        sys::rename(&path, &outside).unwrap();
+        sys::link_tool(&outside, &path).unwrap();
+        publish_unit_entry(&cache, 1, &unit);
+        fs::write(&outside, format!("{}\n", key(1))).unwrap();
+        cache.remove_entry(&key(1));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), format!("{}\n", key(1)));
+        let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
+        let parent = path.parent().unwrap();
+        let outside_parent = dir.join("outside-unit-shard");
+        sys::rename(parent, &outside_parent).unwrap();
+        sys::link_tool(&outside_parent, parent).unwrap();
+        assert!(UnitRecordSnapshot::read(&cache.dirs, &unit).is_none());
+        cache.prune_unit_record_guarded(&guard, &unit, &key(1));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), format!("{}\n", key(1)));
+        drop(guard);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

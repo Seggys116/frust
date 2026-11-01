@@ -1265,36 +1265,10 @@ fn unit_snapshot(store: &cache::Cache, path: &Path, max_idle: Duration) -> io::R
     Ok(snapshot)
 }
 
-fn unit_reference_absent(store: &cache::Cache, key: &str) -> bool {
-    let entry = store.entry_dir(key);
-    let Some(shard) = entry.parent() else { return false };
-    let Some(storage) = shard.parent() else { return false };
-    let Some(home) = storage.parent() else { return false };
-    let Ok(meta) = sys::stat(home) else { return false };
-    if !meta.is_dir() { return false; }
-    let mut parents = vec![(home, true, meta.dev(), meta.ino())];
-    let mut absent = entry.as_path();
-    for path in [storage, shard] {
-        match sys::lstat(path) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                parents.push((path, false, meta.dev(), meta.ino()));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
-            _ => return false,
-        }
-    }
-    // Prove component types before interpreting portable NotFound, then recheck parent identities.
-    if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
-    parents.iter().all(|&(path, follow, dev, ino)| {
-        let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
-        meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
-    })
-}
-
 impl UnitRetirement {
     fn references_absent(&self, store: &cache::Cache) -> bool {
         // Existing roots, unsafe parent types, and I/O uncertainty retain the record.
-        self.keys.iter().all(|key| unit_reference_absent(store, key))
+        self.keys.iter().all(|key| store.unit_reference_absent(key))
     }
 
     fn eligible(&self, store: &cache::Cache) -> bool {
@@ -1733,19 +1707,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_gc_retires_selected_states_and_prunes_their_manifest_immediately() {
+    fn cache_gc_retires_selected_states_and_prunes_their_manifest_and_unit_immediately() {
         let root = home("cache-manifest-retirement");
         let dirs = Dirs::at(&root);
         let store = cache::Cache::new(&dirs);
         let prekey = "ab".repeat(20);
+        let unit = "ac".repeat(20);
         let mut paths = Vec::new();
         for n in 1..=3 {
             let key = format!("{n:040x}");
             let path = store_entry(&root, &key, &[("libx-0123456789abcdef.rlib", 64), ("x-0123456789abcdef.c1.t1.rcgu.o", 64)], 0);
             let mut meta: cache::EntryMeta = serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
             meta.prekey = Some(prekey.clone());
+            meta.incremental_unit = Some(unit.clone());
             fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
-            store.add_candidate(&prekey, cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key });
+            store.add_candidate(&prekey, cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() });
+            store.note_unit_entry(&unit, &key, 3);
             File::options().write(true).open(path.join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs((4 - n) * 5000)).unwrap();
             paths.push(path);
         }
@@ -1762,6 +1739,8 @@ mod tests {
         assert!(failures.is_empty());
         assert!(!paths[1].exists());
         assert_eq!(store.candidates(&prekey).into_iter().map(|row| row.key).collect::<Vec<_>>(), vec![format!("{:040x}", 3), format!("{:040x}", 1)]);
+        let unit_path = store.units_dir().join(&unit[..2]).join(&unit);
+        assert_eq!(fs::read_to_string(unit_path).unwrap(), format!("{:040x}\n{:040x}\n", 3, 1));
         assert!(paths[0].exists() && paths[2].exists());
         fs::remove_dir_all(root).unwrap();
     }

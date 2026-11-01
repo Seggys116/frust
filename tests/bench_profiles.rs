@@ -76,7 +76,7 @@ fn growth_reports_fixed_maintenance_policy_despite_caller_overrides() {
 fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_fresh() {
     let sb = Sandbox::new("bench-growth-settled");
     let output = sb.bin("frust")
-        .args(["bench", "--growth", "--settle-edits", "--edits=13", "--every=1", "--libs=2", "--variants=cargo,frust", "--keep-scratch", "--json"])
+        .args(["bench", "--growth", "--settle-edits", "--edits=13", "--every=1", "--libs=2", "--variants=cargo,frust,auto", "--keep-scratch", "--json"])
         .env("TMPDIR", &sb.root).env("TMP", &sb.root).env("TEMP", &sb.root).output().unwrap();
     assert_success(&output);
     let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
@@ -108,6 +108,12 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
     let retained = String::from_utf8_lossy(&output.stderr).lines()
         .find_map(|line| line.strip_prefix("frust bench: retained scratch at ")).unwrap().to_string();
     let retained = std::path::Path::new(&retained);
+    assert!(retained.starts_with(&sb.root));
+    for (variant, name) in [("Frust", "growth-home-frust"), ("Auto", "growth-home-frust-auto")] {
+        let row = rows.iter().rfind(|row| row["variant"] == variant).unwrap();
+        assert_eq!(row["edits"], 13);
+        assert_retained_growth_snapshot(&retained.join(name), &row["cache_evidence"], variant == "Auto");
+    }
     let home = retained.join("growth-home-frust");
     let source = retained.join("growth/app/libs/lib0/src/lib.rs");
     let expected = frust::cache::hash_file(&source).unwrap();
@@ -141,6 +147,58 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
     assert!(retired.len() >= 2, "named versions observed during prior builds must no longer be live");
     for key in retired {
         assert!(!home.join("store").join(&key[..2]).join(key).exists(), "retired observed key {key} still has payload");
+    }
+}
+
+// Enumerate the retained fixture after the final no-op, independently of the collector's pre-pass history.
+fn assert_retained_growth_snapshot(home: &std::path::Path, evidence: &serde_json::Value, auto: bool) {
+    let mut complete = std::collections::HashSet::new();
+    let mut incremental_units = std::collections::HashMap::<String, usize>::new();
+    for shard in fs::read_dir(home.join("store")).unwrap() {
+        for entry in fs::read_dir(shard.unwrap().path()).unwrap() {
+            let entry = entry.unwrap().path();
+            let metadata: frust::cache::EntryMeta = serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+            assert!(entry.join(&metadata.stderr).is_file());
+            for group in frust::cache::metadata_slice::validate_groups(&metadata.files).unwrap() {
+                let backing = &metadata.files[group.base_index];
+                let path = entry.join(&backing.stored);
+                assert!(if backing.dir { path.is_dir() } else { path.is_file() });
+            }
+            if let Some(unit) = metadata.incremental_unit { *incremental_units.entry(unit).or_default() += 1; }
+            complete.insert(entry.file_name().unwrap().to_str().unwrap().to_owned());
+        }
+    }
+    let mut unit_records = 0;
+    let mut unit_keys = 0;
+    let mut missing = 0;
+    let mut maximum = 0;
+    for shard in fs::read_dir(home.join(frust::cache::UNITS_DIR)).unwrap() {
+        for record in fs::read_dir(shard.unwrap().path()).unwrap() {
+            let text = fs::read_to_string(record.unwrap().path()).unwrap();
+            let keys: Vec<_> = text.lines().collect();
+            assert!(keys.iter().all(|key| frust::cache::valid_key(key)));
+            unit_records += 1;
+            unit_keys += keys.len();
+            missing += keys.iter().filter(|key| !complete.contains(**key)).count();
+            maximum = maximum.max(keys.len());
+        }
+    }
+    let dirs = frust::paths::Dirs::at(home);
+    let retired = match fs::read_dir(frust::cache::evicted_dir(&dirs)) {
+        Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1)).unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("cannot inspect retained payload queue: {error}"),
+    };
+    for (field, expected) in [
+        ("retained_complete_entries", complete.len()), ("retained_unit_records", unit_records),
+        ("retained_unit_keys", unit_keys), ("retained_unit_missing_entries", missing),
+        ("max_retained_keys_per_unit", maximum), ("retained_keys_per_unit_limit", 4),
+        ("retired_payload_entries", retired),
+    ] { assert_eq!(evidence[field].as_u64().unwrap(), expected as u64, "{field}: {evidence}"); }
+    if auto {
+        assert!(!incremental_units.is_empty());
+        assert!(incremental_units.values().all(|count| *count <= 2), "Auto must retain at most two actual states per incremental unit");
+        assert!(evidence["observed_entry_keys"].as_u64().unwrap() > complete.len() as u64);
     }
 }
 

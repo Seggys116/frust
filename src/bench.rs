@@ -2107,6 +2107,37 @@ fn growth_store_records(dirs: &Dirs) -> Result<Vec<(String, crate::cache::EntryM
     Ok(records)
 }
 
+// Retention and allocation describe the same post-maintenance sampling point.
+fn growth_cache_retention(dirs: &Dirs, evidence: &mut GrowthCacheEvidence) -> Result<(), String> {
+    let records = growth_store_records(dirs)?;
+    let current: std::collections::HashSet<_> = records.iter().map(|(key, _)| key.as_str()).collect();
+    evidence.retained_complete_entries = records.len();
+    let mut unit_records = 0;
+    let mut unit_keys = 0;
+    let mut missing = 0;
+    let mut maximum = 0;
+    for shard in growth_directory_entries(&dirs.root().join(crate::cache::UNITS_DIR))? {
+        for path in growth_directory_entries(&shard)? {
+            if !sys::lstat(&path).is_ok_and(|meta| meta.is_file()) { return Err("invalid growth unit record".into()); }
+            let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            let keys: Vec<_> = text.lines().collect();
+            if keys.iter().any(|key| !crate::cache::valid_key(key)) { return Err("invalid growth unit entry key".into()); }
+            unit_records += 1;
+            unit_keys += keys.len();
+            missing += keys.iter().filter(|key| !current.contains(**key)).count();
+            maximum = maximum.max(keys.len());
+        }
+    }
+    if maximum > crate::wrapper::UNIT_VERSIONS { return Err("growth unit version retention exceeded its limit".into()); }
+    evidence.retained_unit_records = unit_records;
+    evidence.retained_unit_keys = unit_keys;
+    evidence.retained_unit_missing_entries = missing;
+    evidence.max_retained_keys_per_unit = maximum;
+    evidence.retained_keys_per_unit_limit = crate::wrapper::UNIT_VERSIONS;
+    evidence.retired_payload_entries = growth_directory_entries(&crate::cache::evicted_dir(dirs))?.len();
+    Ok(())
+}
+
 /// Every 40th step restores the snapshot taken 20 steps earlier; other steps edit `lib0`, `lib1` or the app in turn, alternating body and signature edits.
 struct GrowthScript {
     project: PathBuf,
@@ -2182,7 +2213,7 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool, k
         edit_policy: if settle_edits { "settled" } else { "immediate" },
         source_settle_timeout_ms: settle_edits.then_some(SOURCE_SETTLE_TIMEOUT.as_millis() as u64),
         source_settlements: Vec::new(),
-        cache_evidence_method: "Settled mode observes new entry keys after each synchronous build, validating descriptors and declared backing/stderr presence; this is not a full restore integrity test. Checked ledger append deltas count nonzero-byte and zero-byte misses without claiming publication from miss bytes; replacement or truncation fails the diagnostic. Unit records expose retained keys and missing entries. Other modes do not collect this diagnostic. Allocation and source-settle waiting are outside the build clock.",
+        cache_evidence_method: "Settled mode observes new entry keys after each synchronous build, validating descriptors and declared backing/stderr presence; this is not a full restore integrity test. Checked ledger append deltas count nonzero-byte and zero-byte misses without claiming publication from miss bytes; replacement or truncation fails the diagnostic. Cumulative key and miss observations precede automatic maintenance. Retention and allocation are sampled together after maintenance; the final snapshot includes the unchanged rebuild without adding its latency or compilation counters to the edit row. Unit records expose retained keys and missing entries. Other modes do not collect this diagnostic. Allocation and source-settle waiting are outside the build clock.",
         compiler_audit_available: audit.is_some(),
         auto_compaction_policy: AutoCompactionPolicy::from(&benchmark_auto_options(false)),
         libs: opts.libs,
@@ -2235,10 +2266,11 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool, k
         let mut step = 0;
         while outcome.is_ok() {
             if step % opts.every == 0 || step == opts.edits {
-                let row = run.row(step);
-                if !quiet {
-                    print_growth_row(&row);
-                }
+                let row = match run.row(step) {
+                    Ok(row) => row,
+                    Err(error) => { outcome = Err(error); break; }
+                };
+                if !quiet && step != opts.edits { print_growth_row(&row); }
                 report.rows.push(row);
             }
             if step == opts.edits {
@@ -2254,6 +2286,9 @@ fn growth_bench(scratch: &Path, opts: &GrowthOptions, s: &Styler, quiet: bool, k
         match outcome {
             Ok(()) => {
                 report.repeat_builds.push((variant, run.build(script.args())?));
+                let final_row = report.rows.last_mut().ok_or("growth benchmark is missing its final row")?;
+                run.refresh_row_storage(final_row)?;
+                if !quiet { print_growth_row(final_row); }
                 let bin = app_binary(&target.join("debug"));
                 report.outputs.push((variant, String::from_utf8_lossy(&run_output(&bin)?).trim().to_string()));
             }
@@ -2337,7 +2372,6 @@ impl<'a> GrowthRun<'a> {
             }
         }
         let records = growth_store_records(self.dirs)?;
-        let current: std::collections::HashSet<_> = records.iter().map(|(key, _)| key.as_str()).collect();
         for (key, record) in &records {
             if self.observed_entries.insert(key.clone()) {
                 *self.cache_evidence.observed_entries_by_crate.entry(record.crate_name.clone()).or_default() += 1;
@@ -2346,30 +2380,6 @@ impl<'a> GrowthRun<'a> {
         }
         for keys in self.cache_evidence.observed_entry_keys_by_crate.values_mut() { keys.sort(); }
         self.cache_evidence.observed_entry_keys = self.observed_entries.len();
-        self.cache_evidence.retained_complete_entries = records.len();
-        let mut unit_records = 0;
-        let mut unit_keys = 0;
-        let mut missing = 0;
-        let mut maximum = 0;
-        for shard in growth_directory_entries(&self.dirs.root().join(crate::cache::UNITS_DIR))? {
-            for path in growth_directory_entries(&shard)? {
-                if !sys::lstat(&path).is_ok_and(|meta| meta.is_file()) { return Err("invalid growth unit record".into()); }
-                let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-                let keys: Vec<_> = text.lines().collect();
-                if keys.iter().any(|key| !crate::cache::valid_key(key)) { return Err("invalid growth unit entry key".into()); }
-                unit_records += 1;
-                unit_keys += keys.len();
-                missing += keys.iter().filter(|key| !current.contains(**key)).count();
-                maximum = maximum.max(keys.len());
-            }
-        }
-        if maximum > crate::wrapper::UNIT_VERSIONS { return Err("growth unit version retention exceeded its limit".into()); }
-        self.cache_evidence.retained_unit_records = unit_records;
-        self.cache_evidence.retained_unit_keys = unit_keys;
-        self.cache_evidence.retained_unit_missing_entries = missing;
-        self.cache_evidence.max_retained_keys_per_unit = maximum;
-        self.cache_evidence.retained_keys_per_unit_limit = crate::wrapper::UNIT_VERSIONS;
-        self.cache_evidence.retired_payload_entries = growth_directory_entries(&crate::cache::evicted_dir(self.dirs))?.len();
         Ok(())
     }
 
@@ -2393,7 +2403,9 @@ impl<'a> GrowthRun<'a> {
         Ok(run)
     }
 
-    fn row(&self, edits: usize) -> GrowthRow {
+    fn row(&self, edits: usize) -> Result<GrowthRow, String> {
+        let mut cache_evidence = (self.settle_edits && self.variant != GrowthVariant::Cargo).then(|| self.cache_evidence.clone());
+        if let Some(evidence) = &mut cache_evidence { growth_cache_retention(self.dirs, evidence)?; }
         let profile = self.target.join("debug");
         let incremental = profile.join("incremental");
         let crate_dirs = ["lib0", "lib1", "app"]
@@ -2411,7 +2423,7 @@ impl<'a> GrowthRun<'a> {
             })
             .collect();
         let store = if self.variant == GrowthVariant::Cargo { 0 } else { compact::physical_size(&[&self.dirs.store()]) };
-        GrowthRow {
+        Ok(GrowthRow {
             variant: self.variant,
             edits,
             target: compact::physical_size(&[self.target]),
@@ -2420,13 +2432,27 @@ impl<'a> GrowthRun<'a> {
             managed_allocation: managed_allocation(self.target, (self.variant != GrowthVariant::Cargo).then_some(self.ctx.home.as_path())),
             rustc_compilations: self.rustc_compilations,
             source_settle_ms: self.source_settle_ms,
-            cache_evidence: (self.settle_edits && self.variant != GrowthVariant::Cargo).then(|| self.cache_evidence.clone()),
+            cache_evidence,
             incremental_dir: compact::physical_size(&[&incremental]),
             anatomy: compact::incremental_anatomy(&profile),
             crate_dirs,
             cargo_compile_notices: self.cargo_compile_notices,
             build_ms: self.build_ms,
-        }
+        })
+    }
+
+    // A no-op can finish maintenance; its storage snapshot must preserve the edit-build counters.
+    fn refresh_row_storage(&self, row: &mut GrowthRow) -> Result<(), String> {
+        let snapshot = self.row(row.edits)?;
+        row.target = snapshot.target;
+        row.store = snapshot.store;
+        row.target_plus_store = snapshot.target_plus_store;
+        row.managed_allocation = snapshot.managed_allocation;
+        row.cache_evidence = snapshot.cache_evidence;
+        row.incremental_dir = snapshot.incremental_dir;
+        row.anatomy = snapshot.anatomy;
+        row.crate_dirs = snapshot.crate_dirs;
+        Ok(())
     }
 }
 
@@ -4038,6 +4064,81 @@ mod tests {
     }
 
     #[test]
+    fn growth_retention_samples_after_maintenance_and_refreshes_final_noop_storage() {
+        for blocked in [false, true] {
+            let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-growth-retention-snapshot"));
+            let dirs = Dirs::at(root.join("home"));
+            let store = crate::cache::Cache::new(&dirs);
+            let project = root.join("app");
+            let target = dirs.targets().join("workspace/toolchain");
+            fs::create_dir_all(&target).unwrap();
+            let before = growth_ledger(&dirs).unwrap();
+            let unit = "ab".repeat(20);
+            for n in 1..=4 {
+                let key = format!("{n:040x}");
+                let staged = store.stage().unwrap();
+                // Legacy metadata deliberately leaves explicit unit references for the missing-entry diagnostic.
+                fs::write(staged.join("meta.json"), serde_json::to_vec(&serde_json::json!({
+                    "crate_name":"lib0", "version":"1", "compile_ms":1, "created_unix":1, "stderr":"stderr",
+                    "files":[
+                        {"name":"lib0-hash.0.tag.rcgu.o", "stored":"f0", "text":false, "bytes":32},
+                        {"name":"liblib0.rlib", "stored":"f1", "text":false, "bytes":32}
+                    ]
+                })).unwrap()).unwrap();
+                for name in ["f0", "f1"] { fs::write(staged.join(name), [n as u8; 32]).unwrap(); }
+                fs::write(staged.join("stderr"), b"").unwrap();
+                store.publish(&staged, &key).unwrap();
+                assert!(store.note_unit_entry(&unit, &key, crate::wrapper::UNIT_VERSIONS).is_empty());
+                fs::File::options().write(true).open(store.entry_dir(&key).join("meta.json")).unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs((5 - n) * 5000)).unwrap();
+            }
+            let event = |bytes| serde_json::json!({"type":"cache", "t":0, "result":"miss", "crate":"lib0",
+                "version":"1", "compile_ms":1, "saved_ms":0, "bytes":bytes}).to_string();
+            fs::write(dirs.ledger(), format!("{}\n{}\n", event(32), event(0))).unwrap();
+            let ctx = Ctx {
+                cargo: "cargo".into(), fcargo: "fcargo".into(), home: dirs.root().to_path_buf(),
+                probe_id: "test".into(), audit: None, compression: "off".into(), store: StorePolicy::Sync,
+            };
+            let mut run = GrowthRun::new(&ctx, GrowthVariant::Auto, &project, &target, &dirs);
+            run.settle_edits = true;
+            run.build_ms = 41;
+            run.cargo_compile_notices = 3;
+            run.rustc_compilations = Some(3);
+            run.source_settle_ms = 17;
+            run.observe_cache(&before).unwrap();
+            let guard = blocked.then(|| crate::cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap());
+            let first = compact::auto_compact_with(&dirs, &target, &run.auto);
+            assert!(first.errors.is_empty(), "{:?}", first.errors);
+            assert_eq!(first.removed.len(), if blocked { 0 } else { 2 });
+            let mut row = run.row(13).unwrap();
+            let evidence = row.cache_evidence.as_ref().unwrap();
+            assert_eq!(evidence.retained_complete_entries, if blocked { 4 } else { 2 });
+            assert_eq!(evidence.retained_unit_missing_entries, if blocked { 0 } else { 2 });
+            drop(guard);
+            let no_op_before = growth_ledger(&dirs).unwrap();
+            run.observe_cache(&no_op_before).unwrap();
+            let repeat = compact::auto_compact_with(&dirs, &target, &run.auto);
+            assert!(repeat.errors.is_empty(), "{:?}", repeat.errors);
+            assert_eq!(repeat.removed.len(), if blocked { 2 } else { 0 });
+            run.build_ms += 7;
+            run.refresh_row_storage(&mut row).unwrap();
+            let evidence = row.cache_evidence.as_ref().unwrap();
+            assert_eq!(evidence.observed_entry_keys, 4);
+            assert_eq!(evidence.observed_entries_by_crate["lib0"], 4);
+            assert_eq!((evidence.nonzero_byte_miss_records, evidence.zero_byte_miss_records), (1, 1));
+            assert_eq!(evidence.retained_complete_entries, growth_store_records(&dirs).unwrap().len());
+            assert_eq!((evidence.retained_complete_entries, evidence.retained_unit_records, evidence.retained_unit_keys), (2, 1, 4));
+            assert_eq!((evidence.retained_unit_missing_entries, evidence.max_retained_keys_per_unit), (2, 4));
+            assert_eq!(row.store, compact::physical_size(&[&dirs.store()]));
+            assert_eq!(serde_json::to_value(&row.managed_allocation).unwrap(),
+                serde_json::to_value(managed_allocation(&target, Some(dirs.root()))).unwrap());
+            assert_eq!((row.build_ms, row.cargo_compile_notices, row.rustc_compilations, row.source_settle_ms), (41, 3, Some(3), 17));
+            drop((before, no_op_before));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn growth_serializes_unavailable_compiler_evidence_as_null_and_audited_zero_as_zero() {
         let root = std::env::temp_dir().join(format!("frust-growth-audit-report-test-{}", std::process::id()));
         let project = root.join("app");
@@ -4048,13 +4149,13 @@ mod tests {
             probe_id: "test".into(), audit: None, compression: "auto".into(), store: StorePolicy::Sync,
         };
         let run = GrowthRun::new(&ctx, GrowthVariant::Cargo, &project, &target, &dirs);
-        let unknown = serde_json::to_value(run.row(0)).unwrap();
+        let unknown = serde_json::to_value(run.row(0).unwrap()).unwrap();
         assert!(unknown["rustc_compilations"].is_null());
         assert_eq!(unknown["cargo_compile_notices"], 0);
         assert!(unknown.get("compiled").is_none());
         ctx.audit = Some(CompilerAudit { compiler: root.join("rustc"), logs: root.join("logs") });
         let run = GrowthRun::new(&ctx, GrowthVariant::Cargo, &project, &target, &dirs);
-        let zero = serde_json::to_value(run.row(0)).unwrap();
+        let zero = serde_json::to_value(run.row(0).unwrap()).unwrap();
         assert_eq!(zero["rustc_compilations"], 0);
     }
 
