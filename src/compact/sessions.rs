@@ -803,6 +803,17 @@ impl RetirementGuard {
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         let whole_crate = candidate.parent() == Some(plan.root.as_path());
         if !whole_crate {
+            let Some(selection) = finalized_selection(candidate.parent().unwrap())? else {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            };
+            if !selection.older.contains(&candidate.to_path_buf()) || !self.locks_match() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            for (_, survivor) in selection.newest {
+                if !plan.observed.get(&survivor).is_some_and(|before| Stamp::read(&survivor).is_ok_and(|after| after == *before)) {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+            }
             return self.remove_payload(candidate, remove);
         }
         self.check_tree(candidate)?;
@@ -890,6 +901,64 @@ fn finalized_base(name: &str) -> Option<&str> {
     }
     let formatted = format!("{base}.lock");
     lock_base(&formatted).map(|_| base)
+}
+
+pub(super) struct FinalizedSelection {
+    pub(super) newest: Vec<(SystemTime, PathBuf)>,
+    pub(super) older: Vec<PathBuf>,
+}
+
+// Rank native creation timestamps; directory mtimes remain age evidence only.
+pub(super) fn finalized_selection(directory: &Path) -> io::Result<Option<FinalizedSelection>> {
+    let before = Stamp::read(directory)?;
+    if !before.directory {
+        return Ok(None);
+    }
+    let mut finalized = Vec::new();
+    for path in entries(directory)? {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let meta = sys::lstat(&path)?;
+        if meta.file_type().is_symlink() {
+            return Ok(None);
+        }
+        let modified = meta.modified()?;
+        if let Some(base) = finalized_base(name) {
+            if !meta.is_dir() {
+                return Ok(None);
+            }
+            let Some(timestamp) = base.split('-').nth(1).and_then(|part| u64::from_str_radix(part, 36).ok()) else {
+                return Ok(None);
+            };
+            finalized.push((timestamp, modified, path));
+        } else if working_base(name).is_some() {
+            if !meta.is_dir() {
+                return Ok(None);
+            }
+        } else if lock_base(name).is_some() {
+            if !valid_lock(&path, before.dev)? {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    if Stamp::read(directory)? != before {
+        return Ok(None);
+    }
+    let Some(maximum) = finalized.iter().map(|entry| entry.0).max() else {
+        return Ok(None);
+    };
+    let mut selection = FinalizedSelection { newest: Vec::new(), older: Vec::new() };
+    for (timestamp, modified, path) in finalized {
+        if timestamp == maximum {
+            selection.newest.push((modified, path));
+        } else {
+            selection.older.push(path);
+        }
+    }
+    Ok(Some(selection))
 }
 
 fn valid_lock(path: &Path, device: u64) -> io::Result<bool> {
@@ -986,6 +1055,24 @@ fn observe_retirement(
             else {
                 return Ok(None);
             };
+            let Some(selection) = finalized_selection(parent)? else {
+                return Ok(None);
+            };
+            if !selection.older.contains(&candidate) {
+                return Ok(None);
+            }
+            for (_, survivor) in selection.newest {
+                let Some(survivor_base) = survivor.file_name().and_then(|name| name.to_str()).and_then(finalized_base) else {
+                    return Ok(None);
+                };
+                let survivor_lock = parent.join(format!("{survivor_base}.lock"));
+                if !valid_lock(&survivor_lock, root_stamp.dev)? {
+                    return Ok(None);
+                }
+                observed.insert(survivor.clone(), Stamp::read(&survivor)?);
+                observed.insert(survivor_lock.clone(), Stamp::read(&survivor_lock)?);
+                lock_paths.push(survivor_lock);
+            }
             let container = Stamp::read(parent)?;
             if !container.directory || siblings(parent, base)? != [candidate.clone()] {
                 return Ok(None);
@@ -1009,6 +1096,8 @@ fn observe_retirement(
             }
         }
     }
+    lock_paths.sort();
+    lock_paths.dedup();
     Ok(Some((observed, lock_paths)))
 }
 

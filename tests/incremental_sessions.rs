@@ -718,6 +718,33 @@ fn process_record_session_guards_keep_serialization_and_protect_the_first_lock()
     }
 }
 
+#[test]
+fn finalized_retirement_preserves_busy_newest_survivor_for_every_native_protocol() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for protocol in protocols() {
+        let fixture = Fixture::new();
+        fixture.payload();
+        let (old, old_lock) = finalized(&fixture, 2);
+        let (newest, newest_lock) = finalized(&fixture, 3);
+        let root = fixture.profile.join("incremental");
+        let holder = Holder::start(&newest_lock, protocol);
+        assert!(sessions::try_retirement_guard(&root, &old).unwrap().is_none());
+        assert_eq!(fs::read(old.join("dep-graph.bin")).unwrap(), b"complete metadata");
+        assert_eq!(fs::read(newest.join("dep-graph.bin")).unwrap(), b"complete metadata");
+        drop(Holder::start(&old_lock, "file-write"));
+        drop(holder);
+        let mut guard = sessions::try_retirement_guard(&root, &old).unwrap().unwrap();
+        assert!(guard.revalidate().unwrap());
+        guard.remove(&old).unwrap();
+        assert!(!old.exists());
+        assert_eq!(fs::read(newest.join("dep-graph.bin")).unwrap(), b"complete metadata");
+        assert!(fixture.working.exists());
+        drop(guard);
+        drop(Holder::start(&old_lock, "file-write"));
+        drop(Holder::start(&newest_lock, protocol));
+    }
+}
+
 // Whole-profile admission must protect every selected crate before any profile is touched.
 #[test]
 fn retirement_sets_are_atomic_and_finalized_candidates_ignore_unrelated_working_sessions() {
@@ -727,6 +754,7 @@ fn retirement_sets_are_atomic_and_finalized_candidates_ignore_unrelated_working_
     let first = Fixture::new();
     let second = Fixture::new();
     let (old, old_lock) = finalized(&first, 2);
+    let (newest, newest_lock) = finalized(&first, 3);
     first.payload();
     let root = first.profile.join("incremental");
     let guard = sessions::try_retirement_guard(&root, &old)
@@ -734,6 +762,7 @@ fn retirement_sets_are_atomic_and_finalized_candidates_ignore_unrelated_working_
         .unwrap();
     assert!(guard.revalidate().unwrap());
     drop(guard);
+    assert!(newest.exists() && newest_lock.exists() && first.working.exists());
     assert!(
         sessions::try_retirement_guard(&root, &first.crate_dir)
             .unwrap()
@@ -751,6 +780,7 @@ fn retirement_sets_are_atomic_and_finalized_candidates_ignore_unrelated_working_
         let holder = Holder::start(&second.lock, protocol);
         assert!(sessions::try_retirement_sets(&sets).unwrap().is_none());
         drop(Holder::start(&old_lock, "file-write"));
+        drop(Holder::start(&newest_lock, "file-write"));
         drop(holder);
     }
     let guard = sessions::try_retirement_sets(&sets).unwrap().unwrap();

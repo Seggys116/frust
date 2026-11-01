@@ -4,7 +4,7 @@ mod sessions;
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, FileTimes};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -661,7 +661,7 @@ pub fn unit_paths(profile: &Path, units: &HashSet<String>) -> HashMap<String, Ve
     out
 }
 
-/// rustc loads only the newest session; in-progress `-working` ones are kept.
+/// Keep every newest native timestamp tie; uncertain crate listings are retained.
 pub fn stale_sessions(profile: &Path) -> Vec<(PathBuf, u64)> {
     let mut out = Vec::new();
     let Ok(crates) = fs::read_dir(profile.join("incremental")) else { return out };
@@ -669,39 +669,19 @@ pub fn stale_sessions(profile: &Path) -> Vec<(PathBuf, u64)> {
         if !krate.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let mut sessions: Vec<(SystemTime, PathBuf)> = fs::read_dir(krate.path())
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        name.starts_with("s-") && !name.ends_with("-working") && e.file_type().is_ok_and(|kind| kind.is_dir())
-                    })
-                    .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH), e.path()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
-        for (_, path) in sessions.into_iter().skip(1) {
-            let bytes = fsx::allocated_size(&path);
-            out.push((path, bytes));
+        if let Ok(Some(selection)) = sessions::finalized_selection(&krate.path()) {
+            out.extend(selection.older.into_iter().map(|path| {
+                let bytes = fsx::allocated_size(&path);
+                (path, bytes)
+            }));
         }
     }
     out
 }
 
 pub fn newest_session(krate: &Path) -> Option<(SystemTime, PathBuf)> {
-    if !sys::lstat(krate).ok()?.is_dir() {
-        return None;
-    }
-    fs::read_dir(krate)
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            name.starts_with("s-") && !name.ends_with("-working") && e.file_type().is_ok_and(|kind| kind.is_dir())
-        })
-        .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH), e.path()))
-        .max_by_key(|s| s.0)
+    let mut selection = sessions::finalized_selection(krate).ok()??;
+    if selection.newest.len() == 1 { selection.newest.pop() } else { None }
 }
 
 // Each incremental compile hard-links its objects into `deps/` under a new name and never removes older names; this is the dominant growth.
@@ -1082,6 +1062,7 @@ pub fn incremental_dirs(profile: &Path, analysis: &Analysis) -> Vec<IncrementalD
 
 // Only completed metadata-only caches qualify; any working state, object, symlink or unreadable entry declines reclamation.
 fn idle_unknown_incremental(path: &Path, now: SystemTime) -> Option<Duration> {
+    newest_session(path)?;
     let mut pending = vec![path.to_path_buf()];
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut completed = false;
@@ -1936,25 +1917,114 @@ fn sample_ratio(path: &Path, len: u64, encode: &dyn Fn(&[u8]) -> Option<usize>) 
     Some((kept * 100 / raw).min(100) as u8)
 }
 
-/// Directory times are restored after each rename so the rewrite is invisible to tools comparing directory mtimes.
 #[derive(Default)]
-struct DirTimes(HashMap<PathBuf, (i64, i64, i64, i64)>);
+struct DirTimes(HashMap<PathBuf, CachedParentTimes>);
 
-impl DirTimes {
-    fn capture(&mut self, file: &Path) -> Option<PathBuf> {
-        let dir = file.parent()?.to_path_buf();
-        if !self.0.contains_key(&dir) {
-            let m = sys::lstat(&dir).ok()?;
-            let (atime, mtime) = (m.atime(), m.mtime());
-            self.0.insert(dir.clone(), (atime.0, atime.1, mtime.0, mtime.1));
+#[derive(Clone, Copy)]
+struct CachedParentTimes {
+    identity: (u64, u64),
+    accessed: SystemTime,
+    modified: SystemTime,
+}
+
+struct ParentTimes {
+    path: PathBuf,
+    file: File,
+    identity: (u64, u64),
+    accessed: SystemTime,
+    modified: SystemTime,
+}
+
+impl ParentTimes {
+    fn matches_path(&self) -> io::Result<()> {
+        let named = sys::lstat(&self.path)?;
+        if !named.is_dir() || named.file_type().is_symlink() || (named.dev(), named.ino()) != self.identity {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        Some(dir)
+        Ok(())
     }
 
-    fn restore(&self, dir: &Path) {
-        if let Some(&(a, an, m, mn)) = self.0.get(dir) {
-            let _ = apfs::set_times(dir, (a, an), (m, mn));
+    fn restore(&self) -> io::Result<()> {
+        self.file.set_times(FileTimes::new().set_accessed(self.accessed).set_modified(self.modified))
+    }
+}
+
+// Cleanup precedes restoration; a retained handle never changes a replacement directory's times.
+struct ParentRewrite<'a> {
+    parent: &'a ParentTimes,
+    temporary: &'a Path,
+    restored: bool,
+}
+
+impl ParentRewrite<'_> {
+    fn cleanup(&self) -> io::Result<()> {
+        self.parent.matches_path()?;
+        match fsx::remove_any(self.temporary) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
         }
+    }
+
+    fn finish_with<T>(&mut self, result: io::Result<T>, restore: impl FnOnce(&ParentTimes) -> io::Result<()>) -> io::Result<T> {
+        let cleanup = self.cleanup();
+        let restoration = restore(self.parent);
+        self.restored = restoration.is_ok();
+        let mut result = result;
+        for (stage, outcome) in [("temporary cleanup", cleanup), ("parent timestamps", restoration)] {
+            if let Err(error) = outcome {
+                result = Err(match result {
+                    Ok(_) => error,
+                    Err(previous) => io::Error::new(previous.kind(), format!("{previous}; {stage}: {error}")),
+                });
+            }
+        }
+        result
+    }
+}
+
+impl Drop for ParentRewrite<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = self.cleanup();
+            let _ = self.parent.restore();
+        }
+    }
+}
+
+impl DirTimes {
+    fn parent(&mut self, file: &Path) -> io::Result<ParentTimes> {
+        let directory = file.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?.to_path_buf();
+        let handle = sys::open_directory_for_times(&directory)?;
+        let held = sys::fstat(&handle)?;
+        if !held.is_dir() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let current = CachedParentTimes {
+            identity: (held.dev(), held.ino()),
+            accessed: held.accessed()?,
+            modified: held.modified()?,
+        };
+        let saved = self.0.get(&directory).copied().unwrap_or(current);
+        if saved.identity != current.identity {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let parent = ParentTimes {
+            path: directory.clone(),
+            file: handle,
+            identity: saved.identity,
+            accessed: saved.accessed,
+            modified: saved.modified,
+        };
+        parent.matches_path()?;
+        self.0.entry(directory).or_insert(saved);
+        Ok(parent)
+    }
+
+    fn rewrite<T>(&mut self, file: &Path, temporary: &Path, operation: impl FnOnce(&ParentTimes) -> io::Result<T>) -> io::Result<T> {
+        let parent = self.parent(file)?;
+        let mut guard = ParentRewrite { parent: &parent, temporary, restored: false };
+        let result = operation(&parent);
+        guard.finish_with(result, ParentTimes::restore)
     }
 }
 
@@ -2001,7 +2071,7 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
         return;
     }
     let tmp = fsx::temp_sibling(&c.path);
-    let result = (|| -> io::Result<u64> {
+    let result = dir_times.rewrite(&c.path, &tmp, |parent| -> io::Result<u64> {
         apfs::write_compressed(&tmp, &c.path, &c.meta, &data, &fork)?;
         verify_same(&tmp, &data)?;
         apfs::set_times(&tmp, c.meta.atime(), c.meta.mtime())?;
@@ -2012,13 +2082,10 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
         if !unchanged(&c.path, &c.meta) {
             return Err(io::Error::other("file changed while compressing"));
         }
-        let dir = dir_times.capture(&c.path);
+        parent.matches_path()?;
         sys::rename(&tmp, &c.path)?;
-        if let Some(dir) = dir {
-            dir_times.restore(&dir);
-        }
         Ok(written.allocated())
-    })();
+    });
     match result {
         Ok(after) => {
             report.compressed_files += 1;
@@ -2026,7 +2093,6 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
             report.compress_after += after;
         }
         Err(err) => {
-            let _ = fsx::remove_any(&tmp);
             report.errors.push((c.path.clone(), err.to_string()));
         }
     }
@@ -2057,7 +2123,7 @@ pub fn rewrite_plain(path: &Path) -> io::Result<()> {
     let data = fs::read(path)?;
     let tmp = fsx::temp_sibling(path);
     let mut dir_times = DirTimes::default();
-    let result = (|| -> io::Result<()> {
+    dir_times.rewrite(path, &tmp, |parent| -> io::Result<()> {
         let mut file = sys::with_mode(File::options().write(true).create_new(true), meta.mode() & 0o7777).open(&tmp)?;
         file.write_all(&data)?;
         if !apfs::SUPPORTED {
@@ -2067,17 +2133,14 @@ pub fn rewrite_plain(path: &Path) -> io::Result<()> {
         if apfs::SUPPORTED {
             apfs::set_times(&tmp, meta.atime(), meta.mtime())?;
         }
-        let dir = dir_times.capture(path);
-        sys::rename(&tmp, path)?;
-        if let Some(dir) = dir {
-            dir_times.restore(&dir);
+        fs::set_permissions(&tmp, meta.permissions())?;
+        if !unchanged(path, &meta) || data.len() as u64 != meta.len() {
+            return Err(io::Error::other("file changed while rewriting"));
         }
+        parent.matches_path()?;
+        sys::rename(&tmp, path)?;
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fsx::remove_any(&tmp);
-    }
-    result
+    })
 }
 
 fn verify_same(path: &Path, expected: &[u8]) -> io::Result<()> {
@@ -2105,24 +2168,17 @@ fn replace_with_clone(canonical: &Path, canon_meta: &sys::Meta, m: &Candidate, d
         return Err(io::Error::other("canonical copy changed"));
     }
     let tmp = fsx::temp_sibling(&m.path);
-    let result = (|| -> io::Result<()> {
+    dir_times.rewrite(&m.path, &tmp, |parent| -> io::Result<()> {
         apfs::clone(canonical, &tmp)?;
         fs::set_permissions(&tmp, m.meta.permissions())?;
         apfs::set_times(&tmp, m.meta.atime(), m.meta.mtime())?;
         if fs::symlink_metadata(&tmp)?.len() != m.meta.len() || !unchanged(&m.path, &m.meta) {
             return Err(io::Error::other("file changed while deduplicating"));
         }
-        let dir = dir_times.capture(&m.path);
+        parent.matches_path()?;
         sys::rename(&tmp, &m.path)?;
-        if let Some(dir) = dir {
-            dir_times.restore(&dir);
-        }
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fsx::remove_any(&tmp);
-    }
-    result
+    })
 }
 
 pub type CompactReport = Report;
@@ -4144,13 +4200,301 @@ mod tests {
         assert!(!auto_pass_complete(&report));
     }
 
+    fn parent_time_fixture(path: &Path) -> (SystemTime, SystemTime) {
+        let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(86400);
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(172800);
+        sys::open_directory_for_times(path).unwrap().set_times(FileTimes::new().set_accessed(accessed).set_modified(modified)).unwrap();
+        (accessed, modified)
+    }
+
+    fn assert_parent_times(path: &Path, expected: (SystemTime, SystemTime)) {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!((metadata.accessed().unwrap(), metadata.modified().unwrap()), expected);
+    }
+
+    #[test]
+    fn parent_times_plain_rewrite_preserves_bytes_mode_and_both_directory_times() {
+        let root = scratch("parent-times-plain");
+        let file = root.join("output");
+        fs::write(&file, b"unchanged artifact bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let mode = sys::lstat(&file).unwrap().mode();
+        let expected = parent_time_fixture(&root);
+        rewrite_plain(&file).unwrap();
+        assert_parent_times(&root, expected);
+        assert_eq!(fs::read(&file).unwrap(), b"unchanged artifact bytes");
+        assert_eq!(sys::lstat(&file).unwrap().mode(), mode);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_times_error_cleanup_and_repeated_operations_restore_original_times() {
+        let root = scratch("parent-times-failures");
+        let file = root.join("output");
+        fs::write(&file, b"original bytes").unwrap();
+        let mode = sys::lstat(&file).unwrap().mode();
+        let expected = parent_time_fixture(&root);
+        let mut times = DirTimes::default();
+        for (index, fail_before_rename) in [true, false, true].into_iter().enumerate() {
+            if index != 0 {
+                sys::open_directory_for_times(&root).unwrap().set_times(FileTimes::new()
+                    .set_accessed(expected.0 + Duration::from_secs(60))
+                    .set_modified(expected.1 + Duration::from_secs(60))).unwrap();
+            }
+            let temporary = fsx::temp_sibling(&file);
+            let result = times.rewrite(&file, &temporary, |_| {
+                fs::write(&temporary, b"replacement bytes")?;
+                if fail_before_rename {
+                    Err(io::Error::other("injected verification failure"))
+                } else {
+                    sys::rename(&temporary, &root.join("absent/child"))
+                }
+            });
+            assert!(result.is_err());
+            assert!(!temporary.exists());
+            assert_parent_times(&root, expected);
+            assert_eq!(fs::read(&file).unwrap(), b"original bytes");
+            assert_eq!(sys::lstat(&file).unwrap().mode(), mode);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_times_replacement_directory_is_not_cleaned_or_retimestamped() {
+        let root = scratch("parent-times-replaced");
+        let parent = root.join("parent");
+        fs::create_dir(&parent).unwrap();
+        let file = parent.join("output");
+        fs::write(&file, b"original bytes").unwrap();
+        let expected = parent_time_fixture(&parent);
+        let temporary = parent.join("private-temp");
+        let moved = root.join("moved");
+        let mut times = DirTimes::default();
+        let mut replacement_times = None;
+        let result = times.rewrite(&file, &temporary, |_| {
+            fs::write(&temporary, b"owned temporary")?;
+            sys::rename(&parent, &moved)?;
+            fs::create_dir(&parent)?;
+            fs::write(&temporary, b"replacement sentinel")?;
+            replacement_times = Some(parent_time_fixture(&parent));
+            Err::<(), _>(io::Error::other("parent moved during operation"))
+        });
+        assert!(result.is_err());
+        assert_parent_times(&parent, replacement_times.unwrap());
+        assert_parent_times(&moved, expected);
+        assert_eq!(fs::read(&temporary).unwrap(), b"replacement sentinel");
+        assert_eq!(fs::read(moved.join("output")).unwrap(), b"original bytes");
+        assert_eq!(fs::read(moved.join("private-temp")).unwrap(), b"owned temporary");
+        assert!(times.rewrite(&file, &temporary, |_| Ok(())).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_times_restore_failure_is_reported_and_drop_retries_after_cleanup() {
+        let root = scratch("parent-times-restore-error");
+        let file = root.join("output");
+        fs::write(&file, b"original").unwrap();
+        let expected = parent_time_fixture(&root);
+        let temporary = fsx::temp_sibling(&file);
+        let mut times = DirTimes::default();
+        let parent = times.parent(&file).unwrap();
+        let mut guard = ParentRewrite { parent: &parent, temporary: &temporary, restored: false };
+        fs::write(&temporary, b"private").unwrap();
+        let result = guard.finish_with(Ok(()), |_| {
+            assert!(!temporary.exists());
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected timestamp failure"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(!guard.restored);
+        drop(guard);
+        assert_parent_times(&root, expected);
+        assert_eq!(fs::read(file).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_times_unwind_cleans_temporary_before_restoring() {
+        let root = scratch("parent-times-unwind");
+        let file = root.join("output");
+        fs::write(&file, b"original").unwrap();
+        let expected = parent_time_fixture(&root);
+        let temporary = fsx::temp_sibling(&file);
+        let mut times = DirTimes::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: io::Result<()> = times.rewrite(&file, &temporary, |_| {
+                fs::write(&temporary, b"private")?;
+                panic!("injected operation panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(!temporary.exists());
+        assert_parent_times(&root, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an APFS temporary directory with native compression and clone support"]
+    fn parent_times_native_apfs_compression_and_clone_preserve_artifacts() {
+        let root = scratch("parent-times-apfs");
+        let canonical = root.join("canonical");
+        let duplicate = root.join("duplicate");
+        let bytes = vec![b'x'; 256 * 1024];
+        fs::write(&canonical, &bytes).unwrap();
+        fs::write(&duplicate, &bytes).unwrap();
+        let original_mode = sys::lstat(&canonical).unwrap().mode();
+        let expected = parent_time_fixture(&root);
+        assert!(compress_file(&canonical).unwrap());
+        assert_parent_times(&root, expected);
+        assert!(apfs::is_compressed(&sys::lstat(&canonical).unwrap()));
+        assert_eq!(fs::read(&canonical).unwrap(), bytes);
+        assert_eq!(sys::lstat(&canonical).unwrap().mode(), original_mode);
+        let candidate = Candidate { path: duplicate.clone(), meta: sys::lstat(&duplicate).unwrap(), in_store: false };
+        replace_with_clone(&canonical, &sys::lstat(&canonical).unwrap(), &candidate, &mut DirTimes::default()).unwrap();
+        assert_parent_times(&root, expected);
+        assert_eq!(fs::read(&duplicate).unwrap(), bytes);
+        assert_eq!(sys::lstat(&duplicate).unwrap().mode(), candidate.meta.mode());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ordering_session(krate: &Path, timestamp: &str, nonce: &str, hash: &str, modified: u64) -> PathBuf {
+        let base = format!("s-{timestamp}-{nonce}");
+        let session = krate.join(format!("{base}-{hash}"));
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("query-cache.bin"), b"synthetic native metadata").unwrap();
+        fs::write(krate.join(format!("{base}.lock")), b"").unwrap();
+        sys::open_directory_for_times(&session).unwrap().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(modified)).unwrap();
+        session
+    }
+
+    #[test]
+    fn session_order_uses_native_timestamp_and_keeps_real_age() {
+        let root = scratch("session-order-timestamps");
+        let krate = root.join("incremental/app");
+        let hash = "0000000000000000000000000";
+        let old = ordering_session(&krate, "0000000001", "0000001", hash, 900);
+        let newest = ordering_session(&krate, "0000000002", "0000002", hash, 100);
+        assert_eq!(newest_session(&krate), Some((SystemTime::UNIX_EPOCH + Duration::from_secs(100), newest.clone())));
+        assert_eq!(stale_sessions(&root).into_iter().map(|row| row.0).collect::<Vec<_>>(), vec![old.clone()]);
+        sys::open_directory_for_times(&old).unwrap().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100)).unwrap();
+        assert_eq!(newest_session(&krate).unwrap().1, newest);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_order_ties_unknown_names_and_metadata_idle_are_conservative() {
+        let root = scratch("session-order-uncertain");
+        let krate = root.join("incremental/app");
+        let hash = "0000000000000000000000000";
+        let old = ordering_session(&krate, "0000000001", "0000001", hash, 100);
+        ordering_session(&krate, "0000000002", "0000002", hash, 200);
+        ordering_session(&krate, "0000000002", "0000003", "0000000000000000000000001", 300);
+        assert!(newest_session(&krate).is_none());
+        assert!(idle_unknown_incremental(&krate, SystemTime::now() + Duration::from_secs(30 * 86400)).is_none());
+        assert_eq!(stale_sessions(&root).into_iter().map(|row| row.0).collect::<Vec<_>>(), vec![old.clone()]);
+        for name in ["s-legacy", "s-000000000z-0000004-invalid", "unknown", "s-000000000z-0000004-0000000000000000000000000"] {
+            let path = krate.join(name);
+            let wrong_type = name == "s-000000000z-0000004-0000000000000000000000000";
+            if wrong_type { fs::write(&path, b"wrong type").unwrap(); } else { fs::create_dir(&path).unwrap(); }
+            assert!(stale_sessions(&root).is_empty());
+            assert!(newest_session(&krate).is_none());
+            assert!(idle_unknown_incremental(&krate, SystemTime::now() + Duration::from_secs(30 * 86400)).is_none());
+            if wrong_type { fs::remove_file(path).unwrap(); } else { fs::remove_dir(path).unwrap(); }
+        }
+        remove_incremental_payload(&root.join("incremental"), &old).unwrap();
+        assert!(newest_session(&krate).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_order_working_symlinks_and_unreadable_listings() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = scratch("session-order-listings");
+        let krate = root.join("incremental/app");
+        let newest = ordering_session(&krate, "0000000002", "0000002", "0000000000000000000000000", 100);
+        let working = krate.join("s-0000000003-0000003-working");
+        fs::create_dir(&working).unwrap();
+        assert_eq!(newest_session(&krate).unwrap().1, newest);
+        assert!(idle_unknown_incremental(&krate, SystemTime::now() + Duration::from_secs(30 * 86400)).is_none());
+        let alias = krate.join("s-0000000004-0000004-0000000000000000000000000");
+        symlink(&newest, &alias).unwrap();
+        assert!(newest_session(&krate).is_none());
+        assert!(stale_sessions(&root).is_empty());
+        fs::remove_file(alias).unwrap();
+        let permissions = fs::metadata(&krate).unwrap().permissions();
+        fs::set_permissions(&krate, fs::Permissions::from_mode(0o0)).unwrap();
+        if fs::read_dir(&krate).is_err() {
+            assert!(newest_session(&krate).is_none());
+            assert!(stale_sessions(&root).is_empty());
+        }
+        fs::set_permissions(&krate, permissions).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_order_retirement_rechecks_survivor_and_preserves_whole_crate_cleanup() {
+        let root = scratch("session-order-retirement");
+        let incremental = root.join("incremental");
+        let krate = incremental.join("app");
+        let hash = "0000000000000000000000000";
+        let old = ordering_session(&krate, "0000000001", "0000001", hash, 100);
+        let newest = ordering_session(&krate, "0000000002", "0000002", hash, 200);
+        let hidden = root.join("hidden");
+        sys::rename(&newest, &hidden).unwrap();
+        assert!(remove_incremental_payload(&incremental, &old).is_err());
+        assert!(old.exists());
+        sys::rename(&hidden, &newest).unwrap();
+        let mut guard = sessions::try_retirement_guard(&incremental, &old).unwrap().unwrap();
+        sys::rename(&newest, &hidden).unwrap();
+        assert!(guard.remove(&old).is_err());
+        assert!(old.exists());
+        drop(guard);
+        sys::rename(&hidden, &newest).unwrap();
+        remove_incremental_payload(&incremental, &old).unwrap();
+        assert!(newest.exists());
+        remove_incremental_payload(&incremental, &krate).unwrap();
+        assert!(!krate.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_order_busy_survivor_reader_retains_older_session() {
+        use std::os::fd::AsRawFd;
+        let root = scratch("session-order-reader");
+        let incremental = root.join("incremental");
+        let krate = incremental.join("app");
+        let hash = "0000000000000000000000000";
+        let old = ordering_session(&krate, "0000000001", "0000001", hash, 100);
+        let newest = ordering_session(&krate, "0000000002", "0000002", hash, 200);
+        let file = File::open(krate.join("s-0000000002-0000002.lock")).unwrap();
+        // SAFETY: fcntl reads this initialized whole-file record; the descriptor stays owned here.
+        let mut record: libc::flock = unsafe { std::mem::zeroed() };
+        record.l_type = libc::F_RDLCK as _;
+        record.l_whence = libc::SEEK_SET as _;
+        // SAFETY: the live descriptor and initialized record remain valid for this call.
+        assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &record) }, 0);
+        assert!(remove_incremental_payload(&incremental, &old).is_err());
+        assert!(old.exists() && newest.exists());
+        drop(file);
+        remove_incremental_payload(&incremental, &old).unwrap();
+        assert!(newest.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn unknown_idle_proof_declines_objects_working_links_unreadable_and_future_state() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let root = scratch("unknown-idle-proof");
         let cache = root.join("app-check");
-        let session = cache.join("s-complete");
+        let session = cache.join("s-0000000001-0000001-0000000000000000000000000");
         fs::create_dir_all(&session).unwrap();
         fs::write(session.join("query-cache.bin"), b"metadata reuse state").unwrap();
         let later = SystemTime::now() + Duration::from_secs(8 * 86400);
