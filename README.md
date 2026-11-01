@@ -103,7 +103,7 @@ builds of that profile.
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 20.3x faster; isolated cold paired differences reported separately" width="880"></p>
 
-Measured on Intel(R) Core(TM) Ultra 7 255H, ext4, rustc 1.97.1: median of 7 runs. A warm debug clean rebuild took 3,426 ms with Cargo and 169 ms with frust (20.3x faster). Positive paired median isolated-cold overhead remained for debug, ordinary release, ThinLTO, full/fat LTO. In the separate two-build concurrent cold workload, foreground group time was 4.917 s for Cargo and 3.676 s for frust, with intra-group peer reuse. Full managed allocation after 200 immediate edits was 371.1 MiB for Cargo versus 225.5 MiB for frust (39.2% smaller), including target, cache and other managed storage with compaction assessed after every build. Paired executable bytes and runtime outputs matched, and final unchanged builds made zero compiler calls. See the [method and complete results](docs/benchmarks.md).
+Warm debug restores were **20.3× faster**; managed storage was **39.2% smaller** after 200 edits. Cold builds still have overhead. [Method and results](docs/benchmarks.md).
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.8x faster, ThinLTO 34.5x, full/fat LTO 34.3x; median and observed range of seven runs" width="880"></p>
 
