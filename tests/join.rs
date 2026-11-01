@@ -232,6 +232,53 @@ fn millis_apart(a: Instant, b: Instant) -> u128 {
 }
 
 #[test]
+fn sandbox_failure_preservation_child() {
+    let Some(record) = std::env::var_os("FRUST_TEST_PANIC_SANDBOX_RECORD") else { return };
+    let sandbox = Sandbox::new("preservation-child");
+    fs::write(sandbox.root.join("failure-evidence"), b"original failed sandbox").unwrap();
+    fs::write(record, sandbox.root.as_os_str().as_encoded_bytes()).unwrap();
+    panic!("intentional sandbox preservation panic");
+}
+
+#[test]
+fn panicking_sandbox_exports_evidence_or_retains_the_original_on_export_error() {
+    let sandbox = Sandbox::new("preservation-parent");
+    for (index, valid_destination) in [true, false].into_iter().enumerate() {
+        let destination = sandbox.root.join(format!("failures-{index}"));
+        if valid_destination {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("unrelated"), b"preserve existing evidence").unwrap();
+        } else {
+            fs::write(&destination, b"not a directory").unwrap();
+        }
+        let record = sandbox.root.join(format!("child-root-{index}"));
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "sandbox_failure_preservation_child", "--nocapture"])
+            .env("FRUST_TEST_PANIC_SANDBOX_RECORD", &record)
+            .env("FRUST_TEST_FAILURE_DIR", &destination)
+            .stdout(Stdio::null()).stderr(Stdio::piped());
+        common::own_group(&mut command);
+        let child = finish_all(vec![Running::spawn(command)]).pop().unwrap();
+        assert!(!child.status.success(), "the child must panic");
+        assert!(child.stderr.contains("intentional sandbox preservation panic"), "{}", child.stderr);
+        assert!(!child.stderr.contains("panic in a destructor"), "{}", child.stderr);
+        let original = PathBuf::from(fs::read_to_string(record).unwrap());
+        if valid_destination {
+            let exported: Vec<_> = fs::read_dir(&destination).unwrap().map(Result::unwrap)
+                .filter(|entry| entry.file_type().unwrap().is_dir()).collect();
+            assert_eq!(exported.len(), 1, "each failure gets a unique export directory");
+            assert_eq!(fs::read(exported[0].path().join("sandbox/failure-evidence")).unwrap(), b"original failed sandbox");
+            assert_eq!(fs::read(destination.join("unrelated")).unwrap(), b"preserve existing evidence");
+            assert!(!original.exists(), "same-filesystem export should move the original sandbox");
+        } else {
+            assert_eq!(fs::read(original.join("failure-evidence")).unwrap(), b"original failed sandbox");
+            assert_eq!(fs::read(destination).unwrap(), b"not a directory");
+            frust::sys::rename(&original, &sandbox.root.join(format!("retained-original-{index}"))).unwrap();
+        }
+    }
+}
+
+#[test]
 fn identical_builds_share_one_compile_and_finish_together() {
     let scene = Scene::new("join-share", MAIN);
     let holder = scene.build("plain");

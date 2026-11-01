@@ -869,9 +869,11 @@ fn take_ownership(
     let records = &slot_dirs[0];
     let pid = std::process::id();
     let started_ns = now_ns();
-    // A crashed predecessor may have left its progress and log behind.
+    // All requested slot locks are held; no predecessor can still publish records there.
     let _ = fs::remove_file(records.join("progress.json"));
-    remove_logs(records);
+    for (index, slot) in slot_dirs.iter().enumerate() {
+        remove_predecessor_files(slot, index == 0);
+    }
     // Keeps the lock directory recent for `frust gc` while scoped builds hold level one shared, which its probe cannot see.
     let _ = sys::set_mtime_now(&dir.join("lock"));
     let log_name = format!("build-{pid}-{started_ns}.log");
@@ -904,12 +906,16 @@ fn take_ownership(
     BuildLock { _level: level, activity_path: dir.join("lock"), _slots: slot_files, slot_dirs, mode, holder, joined, last_publish: None, published: None, log }
 }
 
-fn remove_logs(dir: &Path) {
+fn remove_predecessor_files(dir: &Path, logs: bool) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("build-") && name.ends_with(".log") {
+        let record_temp = fsx::temp_owner(&name).is_some()
+            && name.rsplit_once(fsx::TEMP_MARKER).is_some_and(|(base, _)| matches!(base, ".progress.json" | ".owner.json" | ".last.json"));
+        if ((logs && name.starts_with("build-") && name.ends_with(".log")) || record_temp)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -1293,6 +1299,15 @@ pub(crate) fn ensure_dir(path: &Path, mode: Option<Mode>) -> io::Result<()> {
 }
 
 pub(crate) fn write_shared(path: &Path, contents: &[u8], mode: Option<Mode>) -> io::Result<()> {
+    write_shared_before_rename(path, contents, mode, |_| Ok(()))
+}
+
+fn write_shared_before_rename(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<Mode>,
+    before_rename: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let tmp = fsx::temp_sibling(path);
     let result = (|| {
         let mut options = File::options();
@@ -1312,6 +1327,7 @@ pub(crate) fn write_shared(path: &Path, contents: &[u8], mode: Option<Mode>) -> 
         }
         file.write_all(contents)?;
         file.flush()?;
+        before_rename(&tmp)?;
         sys::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -1845,6 +1861,140 @@ mod tests {
             assert_eq!(result.unwrap(), "lock None", "it builds itself");
         }
         assert_eq!(queue_len(&dirs, &target), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_record_writer_child() {
+        let Some(root) = std::env::var_os("FRUST_TEST_ATOMIC_RECORD_ROOT").map(PathBuf::from) else { return };
+        let dirs = Dirs::at(&root);
+        let target = root.join("target");
+        let scope = Scope::slots(["debug@host".to_string(), "debug@wasm32-unknown-unknown".to_string()]);
+        let held = take(&dirs, &target, Request { scope: &scope, timeout: Some(Duration::from_secs(5)), ..req("crashing writer", "") });
+        let contents = serde_json::to_vec(&Progress { pid: std::process::id(), done: 7, ..Progress::default() }).unwrap();
+        write_shared_before_rename(&held.records_dir().join("progress.json"), &contents, None, |temp| {
+            assert_eq!(fs::read(temp)?, contents);
+            fsx::write_atomic(&root.join("atomic-write-ready"), temp.as_os_str().as_encoded_bytes())?;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !root.join("atomic-write-resume").exists() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "parent did not kill the atomic writer"));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })
+        .unwrap();
+        panic!("atomic writer resumed instead of being killed");
+    }
+
+    #[test]
+    fn takeover_removes_killed_record_write_temps() {
+        let _serial = serial();
+        let (dirs, root) = temp_dirs("atomic-takeover");
+        let target = root.join("target");
+        let scope = Scope::slots(["debug@host".to_string(), "debug@wasm32-unknown-unknown".to_string()]);
+        let release_scope = Scope::slots(["release@host".to_string()]);
+        let mut release = take(&dirs, &target, Request { scope: &release_scope, ..req("other profile", "") });
+        release.publish(&Progress { done: 9, ..Progress::default() });
+        let other_progress = fs::read(release.records_dir().join("progress.json")).unwrap();
+        let other_temp = fsx::temp_sibling(&release.records_dir().join("owner.json"));
+        fs::write(&other_temp, b"other profile temp").unwrap();
+
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = KillOnDrop(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lock::tests::atomic_record_writer_child", "--nocapture"])
+                .env("FRUST_TEST_ATOMIC_RECORD_ROOT", &root)
+                .spawn()
+                .unwrap(),
+        );
+        let ready = root.join("atomic-write-ready");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "atomic writer exited before its pre-rename barrier");
+            assert!(Instant::now() < deadline, "atomic writer did not reach its pre-rename barrier");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let interrupted_temp = PathBuf::from(fs::read_to_string(&ready).unwrap());
+        assert_eq!(fsx::temp_owner(interrupted_temp.file_name().unwrap().to_str().unwrap()), Some(child.0.id()));
+        assert!(interrupted_temp.is_file(), "the child must have flushed a real atomic record temp");
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+
+        let mut removed = vec![interrupted_temp];
+        let mut preserved = vec![(other_temp.clone(), b"other profile temp".to_vec())];
+        let mut lock_identities = Vec::new();
+        let mut directories = Vec::new();
+        let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let last = serde_json::to_vec(&Finished {
+            pid: 1, user: String::new(), command: "previous".into(), fingerprint: String::new(),
+            success: false, units: 0, finished_ns: 0, code: Some(1),
+        })
+        .unwrap();
+        for slot in scope.names() {
+            let directory = slot_dir_for(&dirs, &target, &slot);
+            let lock_path = directory.join("lock");
+            let metadata = sys::stat(&lock_path).unwrap();
+            lock_identities.push((lock_path, metadata.dev(), metadata.ino()));
+            fs::write(directory.join("last.json"), &last).unwrap();
+            preserved.push((directory.join("last.json"), last.clone()));
+            for name in ["progress.json", "owner.json", "last.json"] {
+                let temp = fsx::temp_sibling(&directory.join(name));
+                fs::write(&temp, b"abandoned record").unwrap();
+                removed.push(temp);
+            }
+            for name in [
+                ".progress.json.frust-123-not-a-counter-1", ".owner.json.frust-123-1-1-extra",
+                ".other.json.frust-123-1-1", ".progress.json.extra.frust-123-1-1", "notes",
+            ] {
+                let path = directory.join(name);
+                fs::write(&path, b"preserve unrelated or malformed state").unwrap();
+                preserved.push((path, b"preserve unrelated or malformed state".to_vec()));
+            }
+            let nested = fsx::temp_sibling(&directory.join("last.json"));
+            fs::create_dir(&nested).unwrap();
+            directories.push(nested);
+            #[cfg(unix)]
+            {
+                let sentinel = root.join("symlink-target");
+                fs::write(&sentinel, b"preserve symlink target").unwrap();
+                let link = fsx::temp_sibling(&directory.join("owner.json"));
+                sys::link_tool(&sentinel, &link).unwrap();
+                symlinks.push((link, sentinel));
+            }
+        }
+        let level_path = dir_for(&dirs, &target).join("lock");
+        let metadata = sys::stat(&level_path).unwrap();
+        lock_identities.push((level_path, metadata.dev(), metadata.ino()));
+        let next = take(&dirs, &target, Request { scope: &scope, timeout: Some(Duration::from_secs(5)), ..req("takeover", "") });
+        for path in removed {
+            assert!(!path.exists(), "takeover left an abandoned atomic record: {}", path.display());
+        }
+        for (path, bytes) in preserved {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "takeover changed {}", path.display());
+        }
+        for path in directories {
+            assert!(path.is_dir(), "record-shaped directory removed: {}", path.display());
+        }
+        for (link, sentinel) in symlinks.drain(..) {
+            assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_link(&link).unwrap(), sentinel);
+            assert_eq!(fs::read(sentinel).unwrap(), b"preserve symlink target");
+        }
+        for (path, dev, ino) in lock_identities {
+            let metadata = sys::stat(&path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), (dev, ino), "takeover replaced {}", path.display());
+        }
+        assert_eq!(fs::read(release.records_dir().join("progress.json")).unwrap(), other_progress);
+        drop(next);
+        drop(release);
         fs::remove_dir_all(root).unwrap();
     }
 

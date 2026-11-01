@@ -1,8 +1,9 @@
-//! Each test runs in a [`Sandbox`] with isolated frust state and a vendored registry, removed on drop.
+//! Each test has isolated frust state and a vendored registry; CI can retain failed sandboxes.
 
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,15 +13,23 @@ const MIN_FREE: u64 = 4 * 1024 * 1024 * 1024;
 
 pub struct Sandbox {
     pub root: PathBuf,
+    identity: (u64, u64),
 }
 
 impl Sandbox {
     pub fn new(tag: &str) -> Sandbox {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("frust-test-{tag}-{}-{n}", std::process::id()));
         frust::fsx::require_free_space(&std::env::temp_dir(), MIN_FREE).expect("not enough free disk space for tests");
-        fs::create_dir_all(&root).unwrap();
-        let sandbox = Sandbox { root };
+        let root = loop {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!("frust-test-{tag}-{}-{n}", std::process::id()));
+            match fs::create_dir(&root) {
+                Ok(()) => break root,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create sandbox {}: {error}", root.display()),
+            }
+        };
+        let metadata = frust::sys::lstat(&root).unwrap();
+        let sandbox = Sandbox { root, identity: (metadata.dev(), metadata.ino()) };
         fs::create_dir_all(sandbox.home()).unwrap();
         sandbox.write_cargo_config();
         sandbox
@@ -151,15 +160,79 @@ impl Sandbox {
         assert!(out.status.success(), "frust where failed: {}", String::from_utf8_lossy(&out.stderr));
         PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
     }
+
+    fn owns_root(&self) -> bool {
+        self.root.starts_with(std::env::temp_dir())
+            && self.root.file_name().is_some_and(|n| n.to_string_lossy().starts_with("frust-test-"))
+            && frust::sys::lstat(&self.root).is_ok_and(|m| {
+                m.is_dir() && !m.file_type().is_symlink() && (m.dev(), m.ino()) == self.identity
+            })
+    }
+
+    fn preserve_failure(&self, parent: &Path) -> io::Result<PathBuf> {
+        fs::create_dir_all(parent)?;
+        let parent = parent.canonicalize()?;
+        if parent.starts_with(self.root.canonicalize()?) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "failure destination is inside its sandbox"));
+        }
+        for _ in 0..32 {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let destination = parent.join(format!("sandbox-{}-{n}", std::process::id()));
+            match fs::create_dir(&destination) {
+                Ok(()) => {
+                    let retained = destination.join("sandbox");
+                    if let Err(error) = frust::sys::rename(&self.root, &retained) {
+                        let _ = writeln!(io::stderr(), "sandbox rename failed ({error}); copying bounded evidence from {}", self.root.display());
+                        if !self.owns_root() {
+                            return Err(io::Error::other("sandbox identity changed before failure copy"));
+                        }
+                        copy_failure_evidence(&self.root, &retained, &mut (256 * 1024 * 1024, 16_384))?;
+                    }
+                    return Ok(retained);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, "no unique failure destination"))
+    }
+}
+
+fn copy_failure_evidence(source: &Path, destination: &Path, budget: &mut (u64, usize)) -> io::Result<()> {
+    budget.1 = budget.1.checked_sub(1).ok_or_else(|| io::Error::other("failure evidence entry limit exceeded"))?;
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_failure_evidence(&entry.path(), &destination.join(entry.file_name()), budget)?;
+        }
+    } else if metadata.is_file() {
+        let mut input = fs::File::open(source)?.take(budget.0.saturating_add(1));
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(destination)?;
+        let copied = io::copy(&mut input, &mut output)?;
+        budget.0 = budget.0.checked_sub(copied).ok_or_else(|| io::Error::other("failure evidence byte limit exceeded"))?;
+    } else {
+        return Err(io::Error::other(format!("nonregular failure evidence: {}", source.display())));
+    }
+    Ok(())
 }
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if self.root.starts_with(std::env::temp_dir())
-            && self.root.file_name().is_some_and(|n| n.to_string_lossy().starts_with("frust-test-"))
-        {
-            let _ = fs::remove_dir_all(&self.root);
+        if !self.owns_root() {
+            return;
         }
+        if std::thread::panicking()
+            && let Some(parent) = std::env::var_os("FRUST_TEST_FAILURE_DIR").filter(|value| !value.is_empty())
+        {
+            match self.preserve_failure(Path::new(&parent)) {
+                Ok(path) => { let _ = writeln!(io::stderr(), "failed sandbox retained at {}", path.display()); }
+                Err(error) => { let _ = writeln!(io::stderr(), "failure export failed ({error}); sandbox retained at {}", self.root.display()); }
+            }
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -193,7 +266,6 @@ pub fn run_binary(target: &Path, profile: &str, name: &str) -> Output {
     Command::new(target.join(profile).join(exe(name))).output().unwrap()
 }
 
-/// A binary's file name on this platform.
 pub fn exe(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
