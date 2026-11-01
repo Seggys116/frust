@@ -2848,7 +2848,8 @@ struct Captured {
 // The clock stops when the direct child exits; a grandchild still holding stderr only delays the read by DRAIN, outside the measurement.
 fn spawn_capture(cmd: &mut Command) -> Result<Captured, String> {
     let started = Instant::now();
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
+        .map_err(|e| format!("failed to launch {}: {e}", cmd.get_program().to_string_lossy()))?;
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     if let Some(mut pipe) = child.stderr.take() {
@@ -3652,6 +3653,49 @@ fn yes_no(v: bool) -> &'static str {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn isolated_compiler_audit_test(test_name: &str) -> bool {
+        const MARKER: &str = "FRUST_TEST_COMPILER_AUDIT";
+        if std::env::var(MARKER).is_ok_and(|value| value == test_name) {
+            return true;
+        }
+        struct OwnedChild(Option<std::process::Child>);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    if let Err(error) = sys::cancel_owned_process_group(child.id()) {
+                        eprintln!("isolated compiler audit cleanup failed: {error}");
+                    }
+                    let _ = child.wait();
+                }
+            }
+        }
+        // Create executable scripts after exec so unrelated parallel tests cannot inherit their writers.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(MARKER, test_name)
+            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        sys::own_process_group(&mut command);
+        let mut child = OwnedChild(Some(command.spawn()
+            .unwrap_or_else(|error| panic!("cannot launch isolated {test_name}: {error}"))));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pid = child.0.as_ref().unwrap().id();
+            if sys::observe_child_unreaped(pid, false)
+                .unwrap_or_else(|error| panic!("cannot observe isolated {test_name}: {}", error.message)).is_some()
+            {
+                sys::cancel_owned_process_group(pid)
+                    .unwrap_or_else(|error| panic!("cannot clean up isolated {test_name}: {error}"));
+                let status = child.0.as_mut().unwrap().wait().unwrap();
+                child.0 = None;
+                assert!(status.success(), "isolated {test_name} failed: {status}");
+                return false;
+            }
+            assert!(Instant::now() < deadline, "isolated {test_name} exceeded 30 seconds");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn store_policy_defaults_to_sync_and_accepts_general_and_profile_modes() {
         let flags = |values: &[&str]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>();
@@ -4200,6 +4244,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compiler_audit_records_real_compilations_and_separates_queries_including_emit() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if !isolated_compiler_audit_test("bench::tests::compiler_audit_records_real_compilations_and_separates_queries_including_emit") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("frust-bench-audit-test-{}", std::process::id()));
         let audit = CompilerAudit::create(&root).unwrap().unwrap();
         fs::create_dir_all(&audit.logs).unwrap();
@@ -4232,6 +4280,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compilation_prints_and_query_looking_operands_emit_objects_and_fail_restore_audit() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if !isolated_compiler_audit_test("bench::tests::compilation_prints_and_query_looking_operands_emit_objects_and_fail_restore_audit") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("frust-bench-print-work-test-{}", std::process::id()));
         let _scratch = Scratch(root.clone(), false);
         let source = root.join("probe.rs");

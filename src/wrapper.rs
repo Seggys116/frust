@@ -891,23 +891,30 @@ impl Plan {
     /// Catches outputs rustc writes without an artifact notification, such as split debuginfo objects; only names accepted by `wants_stamp` are stat'd.
     fn prefixed_outputs(&self, wants_stamp: impl Fn(&str) -> bool) -> Vec<(String, Option<Stamp>)> {
         let mut found = Vec::new();
-        if self.parsed.extra_filename.is_empty() {
-            if self.parsed.metadata_only_library {
-                for name in [
-                    format!("{}.d", self.parsed.crate_name),
-                    format!("lib{}.rmeta", self.parsed.crate_name),
-                ] {
-                    let path = self.parsed.out_dir.join(&name);
-                    if let Ok(meta) = sys::lstat(&path)
-                        && meta.is_file()
-                    {
-                        let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
-                        found.push((name, stamp));
-                    }
+        let extra = &self.parsed.extra_filename;
+        // Cargo's flat hash suffix gives metadata compiles two exact output names.
+        let cargo_hash = extra
+            .strip_prefix('-')
+            .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        if self.parsed.metadata_only_library && (extra.is_empty() || cargo_hash) {
+            for name in [
+                format!("{}{}.d", self.parsed.crate_name, extra),
+                format!("lib{}{}.rmeta", self.parsed.crate_name, extra),
+            ] {
+                let path = self.parsed.out_dir.join(&name);
+                if let Ok(meta) = sys::lstat(&path)
+                    && meta.is_file()
+                {
+                    let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
+                    found.push((name, stamp));
                 }
             }
             return found;
         }
+        if extra.is_empty() {
+            return found;
+        }
+        // Codegen and custom suffixes still need discovery of unannounced sibling outputs.
         let prefixes = [
             format!("{}{}", self.parsed.crate_name, self.parsed.extra_filename),
             format!(
@@ -4388,6 +4395,90 @@ mod tests {
         assert!(!frozen(fine, fine).has_coarse_stamp());
         assert!(frozen(coarse, fine).has_coarse_stamp(), "a coarse output");
         assert!(frozen(fine, coarse).has_coarse_stamp(), "a coarse input");
+    }
+
+    #[test]
+    fn hashed_metadata_discovery_excludes_siblings_and_preserves_output_provenance() {
+        let s = Scratch::new("hashed-metadata");
+        let (mut job, _, rlib) = fixture(&s);
+        for arg in &mut job.args {
+            if arg == "--emit=dep-info,link" {
+                *arg = "--emit=dep-info,metadata".into();
+            }
+        }
+        job.args.extend([
+            "--crate-type=rlib".into(),
+            "-Cextra-filename=-abc123".into(),
+        ]);
+        let plan = Plan::from_job(&job).unwrap();
+        let deps = rlib.parent().unwrap();
+        for name in [
+            "k-abc123.d",
+            "libk-abc123.rmeta",
+            "k-abc123.d.other",
+            "libk-abc1234.rmeta",
+            "k-abc123.old.rcgu.dwo",
+        ] {
+            fs::write(deps.join(name), b"earlier compile").unwrap();
+        }
+        let before: HashMap<_, _> = plan
+            .prefixed_outputs(|_| true)
+            .into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap()))
+            .collect();
+        assert_eq!(before.len(), 2);
+        assert!(plan.output_files(&[], &before).is_empty());
+        fs::write(deps.join("k-abc123.d"), b"new dependency information").unwrap();
+        let unstamped = plan.prefixed_outputs(|_| false);
+        assert_eq!(
+            unstamped,
+            [
+                ("k-abc123.d".to_string(), None),
+                ("libk-abc123.rmeta".to_string(), None),
+            ]
+        );
+        assert_eq!(plan.output_files(&[], &before), ["k-abc123.d"]);
+        let captured = ["libk-abc123.rmeta", "reported-output"]
+            .map(|name| serde_json::json!({ "artifact": deps.join(name) }).to_string())
+            .join("\n");
+        assert_eq!(
+            plan.output_files(captured.as_bytes(), &before),
+            ["k-abc123.d", "libk-abc123.rmeta", "reported-output"]
+        );
+        sys::rename(&deps.join("libk-abc123.rmeta"), &deps.join("previous-rmeta")).unwrap();
+        fs::create_dir(deps.join("libk-abc123.rmeta")).unwrap();
+        assert_eq!(plan.prefixed_outputs(|_| false), [unstamped[0].clone()]);
+        #[cfg(unix)]
+        {
+            sys::rename(&deps.join("libk-abc123.rmeta"), &deps.join("unrelated-directory")).unwrap();
+            sys::link_tool(&deps.join("previous-rmeta"), &deps.join("libk-abc123.rmeta")).unwrap();
+            assert_eq!(plan.prefixed_outputs(|_| false), [unstamped[0].clone()]);
+        }
+    }
+
+    #[test]
+    fn metadata_discovery_with_custom_suffix_keeps_prefix_scan() {
+        let s = Scratch::new("custom-suffix-metadata");
+        let (mut job, _, rlib) = fixture(&s);
+        for arg in &mut job.args {
+            if arg == "--emit=dep-info,link" {
+                *arg = "--emit=dep-info,metadata".into();
+            }
+        }
+        job.args.push("--crate-type=lib".into());
+        let deps = rlib.parent().unwrap();
+        for extra in ["-abc123.part", "-", "-custom"] {
+            let mut custom_job = job.clone();
+            custom_job.args.push(format!("-Cextra-filename={extra}"));
+            let plan = Plan::from_job(&custom_job).unwrap();
+            let name = format!("k{extra}.d");
+            fs::write(deps.join(&name), b"custom output").unwrap();
+            assert!(
+                plan.prefixed_outputs(|_| true)
+                    .iter()
+                    .any(|(found, stamp)| found == &name && stamp.is_some())
+            );
+        }
     }
 
     #[test]
