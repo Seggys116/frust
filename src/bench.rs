@@ -1044,19 +1044,35 @@ fn linking_build(ctx: &Ctx, wrapper: &Path, project: &Path, target: &Path, smart
     let started = Instant::now();
     let output = cmd.output().map_err(|e| e.to_string())?;
     let total_build_ms = started.elapsed().as_millis() as u64;
+    let observations = target.join("link-observations");
+    fs::create_dir_all(&observations)
+        .map_err(|e| format!("cannot create {}: {e}", observations.display()))?;
+    let stdout_path = observations.join(format!("edit-{edit}-order-{order}.stdout"));
+    let stderr_path = observations.join(format!("edit-{edit}-order-{order}.stderr"));
+    for (path, bytes) in [(&stdout_path, &output.stdout), (&stderr_path, &output.stderr)] {
+        fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
+    let raw_logs = format!("raw stdout: {}; raw stderr: {}", stdout_path.display(), stderr_path.display());
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return Err(format!("linking benchmark {} build failed:\n{}", if smart { "smart" } else { "off" }, failure_tail(&stderr)));
+        return Err(format!("linking benchmark {} build failed; {raw_logs}:\n{}", if smart { "smart" } else { "off" }, failure_tail(&stderr)));
     }
     let smart_policy_applied = stderr.lines().any(|l| l.starts_with("frust-wrap: smart link:"));
     if smart != smart_policy_applied {
-        return Err(format!("linking benchmark policy evidence missing or unexpected (FRUST_LINK={}); native macOS host linking must be eligible", if smart { "smart" } else { "off" }));
+        let mut diagnostics: Vec<String> = stderr.lines().rev()
+            .filter(|line| line.starts_with("frust-wrap: smart link:") || line.starts_with("frust-wrap: link policy skipped:"))
+            .take(8).map(|line| line.chars().take(512).collect()).collect();
+        diagnostics.reverse();
+        if diagnostics.is_empty() {
+            diagnostics.push("no frust-wrap link policy diagnostics were emitted".into());
+        }
+        return Err(format!("linking benchmark policy evidence missing or unexpected (FRUST_LINK={}); native macOS host linking must be eligible; {raw_logs}:\n{}", if smart { "smart" } else { "off" }, diagnostics.join("\n")));
     }
     let mut compiled_units = 0;
     let mut main_bin_compiled_units = 0;
     let mut binary = None;
     for line in output.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let message: serde_json::Value = serde_json::from_slice(line).map_err(|e| format!("invalid Cargo JSON in linking benchmark: {e}"))?;
+        let message: serde_json::Value = serde_json::from_slice(line).map_err(|e| format!("invalid Cargo JSON in linking benchmark: {e}; {raw_logs}"))?;
         if message["reason"] != "compiler-artifact" || message["fresh"] != false {
             continue;
         }
@@ -1070,17 +1086,17 @@ fn linking_build(ctx: &Ctx, wrapper: &Path, project: &Path, target: &Path, smart
         }
     }
     if main_bin_compiled_units == 0 {
-        return Err("linking benchmark edit compiled no main binary; refusing a fresh/no-op sample".into());
+        return Err(format!("linking benchmark edit compiled no main binary; refusing a fresh/no-op sample; {raw_logs}"));
     }
-    let binary = binary.ok_or("Cargo did not report the compiled main executable")?;
-    let native_link_ms = native_link_millis(&stderr)?;
-    let stdout = run_output(&binary)?;
+    let binary = binary.ok_or_else(|| format!("Cargo did not report the compiled main executable; {raw_logs}"))?;
+    let native_link_ms = native_link_millis(&stderr).map_err(|e| format!("{e}; {raw_logs}"))?;
+    let stdout = run_output(&binary).map_err(|e| format!("{e}; {raw_logs}"))?;
     let marker = format!("frust-link-edit {edit}");
     let expected_output_present = stdout.split(|b| *b == b'\n').any(|line| line == marker.as_bytes());
     if !expected_output_present {
-        return Err(format!("linking benchmark binary did not print expected edit {edit}"));
+        return Err(format!("linking benchmark binary did not print expected edit {edit}; {raw_logs}"));
     }
-    let binary_bytes = fs::metadata(&binary).map_err(|e| e.to_string())?.len();
+    let binary_bytes = fs::metadata(&binary).map_err(|e| format!("cannot inspect {}: {e}; {raw_logs}", binary.display()))?.len();
     Ok((LinkSample { edit, order_in_pair: order, total_build_ms, native_link_ms, compiled_units, main_bin_compiled_units, binary_bytes, smart_policy_applied, expected_output_present }, stdout))
 }
 

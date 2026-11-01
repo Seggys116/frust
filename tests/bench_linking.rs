@@ -134,8 +134,45 @@ fn public_linking_collector_profiles_real_edits_and_runs_both_native_modes() {
     );
 
     let mut outputs = Vec::new();
-    for mode in modes {
+    for (index, mode) in modes.iter().enumerate() {
         let name = mode["mode"].as_str().unwrap();
+        let observations = retained.join(format!("link-{name}-target/link-observations"));
+        let builds = report["runs"].as_u64().unwrap() as usize + 2;
+        assert_eq!(fs::read_dir(&observations).unwrap().count(), builds * 2);
+        for edit in 0..builds {
+            let order = if paired && edit % 2 != 0 {
+                2 - index
+            } else {
+                index + 1
+            };
+            let stdout_path = observations.join(format!("edit-{edit}-order-{order}.stdout"));
+            let stderr_path = observations.join(format!("edit-{edit}-order-{order}.stderr"));
+            assert!(
+                !fs::read(&stderr_path).unwrap().is_empty(),
+                "{}",
+                stderr_path.display()
+            );
+            let cargo_stdout = fs::read(&stdout_path).unwrap();
+            let messages: Vec<Value> = cargo_stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            let main_artifacts = messages
+                .iter()
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact"
+                        && message["fresh"] == false
+                        && message["target"]["name"] == "app"
+                        && message["target"]["kind"]
+                            .as_array()
+                            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+                        && message["profile"]["test"] == false
+                        && message["executable"].as_str().is_some()
+                })
+                .count();
+            assert_eq!(main_artifacts, 1, "{}", stdout_path.display());
+        }
         let binary = retained.join(format!("link-{name}-target/debug/app"));
         assert_eq!(
             fs::metadata(&binary).unwrap().len(),

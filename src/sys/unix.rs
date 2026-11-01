@@ -724,10 +724,29 @@ pub fn cancel_owned_process_group(pid: u32) -> Result<(), String> {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!("foreground group cancellation failed: {error}"))
+        return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM)
+        && observe_child_unreaped(pid as u32, false).is_ok_and(|state| state.is_some())
+    {
+        const PROC_PGRP_ONLY: u32 = 2; // Darwin sys/proc_info.h; libc exposes the function but not this constant.
+        let mut members = [0 as libc::pid_t; 2];
+        // SAFETY: libproc receives a writable two-pid buffer and its exact byte capacity; the owned leader stays unreaped.
+        let bytes = unsafe {
+            libc::proc_listpids(PROC_PGRP_ONLY, pid as u32, members.as_mut_ptr().cast(), std::mem::size_of_val(&members) as libc::c_int)
+        };
+        // Darwin can reject signalling a group whose only member is its zombie leader.
+        if group_list_contains_only_leader(pid, bytes, members) {
+            return Ok(());
+        }
+    }
+    Err(format!("foreground group cancellation failed: {error}"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn group_list_contains_only_leader(pid: libc::pid_t, bytes: libc::c_int, members: [libc::pid_t; 2]) -> bool {
+    pid > 0 && bytes == std::mem::size_of::<libc::pid_t>() as libc::c_int && members[0] == pid
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -746,6 +765,100 @@ mod tests {
     use crate::sys::{self, signal as sig};
     use std::io::Write;
     use std::sync::atomic::{AtomicI32, Ordering};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct OwnedTestGroup(Option<std::process::Child>);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl OwnedTestGroup {
+        fn spawn(script: &str) -> Self {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+            own_process_group(&mut command);
+            Self(Some(command.spawn().unwrap()))
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.as_ref().unwrap().id()
+        }
+
+        fn terminal(&self) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(success) = observe_child_unreaped(self.pid(), false).unwrap() {
+                    return success;
+                }
+                assert!(std::time::Instant::now() < deadline, "test group leader did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn reap(&mut self) -> ExitStatus {
+            let status = self.0.as_mut().unwrap().wait().unwrap();
+            self.0 = None;
+            status
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for OwnedTestGroup {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = cancel_owned_process_group(child.id());
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn group_list_accepts_only_one_exact_owned_leader() {
+        let pid = 123;
+        let one = std::mem::size_of::<libc::pid_t>() as libc::c_int;
+        assert!(group_list_contains_only_leader(pid, one, [pid, 0]));
+        for bytes in [-1, 0, 1, one - 1, one + 1, one * 2, one * 3] {
+            assert!(!group_list_contains_only_leader(pid, bytes, [pid, pid + 1]), "bytes={bytes}");
+        }
+        assert!(!group_list_contains_only_leader(pid, one, [pid + 1, 0]));
+        assert!(!group_list_contains_only_leader(pid, one, [0, 0]));
+        assert!(!group_list_contains_only_leader(0, one, [0, 0]));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_cancellation_preserves_sole_terminal_leader_status() {
+        let mut group = OwnedTestGroup::spawn("exit 7");
+        assert!(!group.terminal());
+        cancel_owned_process_group(group.pid()).unwrap();
+        assert_eq!(group.reap().code(), Some(7));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_cancellation_kills_live_descendant_after_leader_exit() {
+        let mut group = OwnedTestGroup::spawn("sleep 30 & printf ready; exit 9");
+        let mut pipe = sys::Pipe::from(group.0.as_mut().unwrap().stdout.take().unwrap());
+        assert!(!group.terminal());
+        let mut buffer = [0u8; 16];
+        assert_eq!(pipe.read(&mut buffer).unwrap(), 5);
+        assert_eq!(&buffer[..5], b"ready");
+        assert_eq!(pipe.read(&mut buffer).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        cancel_owned_process_group(group.pid()).unwrap();
+        assert!(sys::wait_readable([Some(&pipe), None], Duration::from_secs(5))[0]);
+        assert_eq!(pipe.read(&mut buffer).unwrap(), 0, "descendant must release its inherited pipe");
+        assert_eq!(group.reap().code(), Some(9));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_cancellation_rejects_lost_child_ownership() {
+        let mut group = OwnedTestGroup::spawn("exit 0");
+        assert!(group.terminal());
+        let pid = group.pid();
+        assert!(group.reap().success());
+        assert!(observe_child_unreaped(pid, false).unwrap_err().ownership_lost);
+        let error = cancel_owned_process_group(pid).unwrap_err();
+        assert!(error.contains("ownership unproven, group not signalled"), "{error}");
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("frust-sys-unix-{tag}-{}", std::process::id()));
