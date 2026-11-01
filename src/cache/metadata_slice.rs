@@ -555,6 +555,8 @@ struct SpoolStats {
     written: u64,
     #[cfg(test)]
     allocated: u64,
+    #[cfg(test)]
+    target_hashed_bytes: u64,
     fallback: bool,
 }
 
@@ -712,6 +714,8 @@ fn build_inner(
         SpoolOptions {
             sparse: true,
             stats: &mut SpoolStats::default(),
+            #[cfg(test)]
+            standalone_target_hash: false,
         },
     )
 }
@@ -719,6 +723,18 @@ fn build_inner(
 struct SpoolOptions<'a> {
     sparse: bool,
     stats: &'a mut SpoolStats,
+    #[cfg(test)]
+    standalone_target_hash: bool,
+}
+
+fn target_digest(target: &mut File, len: u64) -> io::Result<String> {
+    target.seek(SeekFrom::Start(0))?;
+    let mut output = hashing(io::sink());
+    io::copy(&mut target.take(len.saturating_add(1)), &mut output)?;
+    if output.bytes != len {
+        return Err(invalid("metadata differs from commitment"));
+    }
+    Ok(output.hash.finalize().to_hex().to_string())
 }
 
 fn build_inner_spool(
@@ -751,13 +767,20 @@ fn build_inner_spool(
     {
         return Err(invalid("metadata changed before range proof"));
     }
-    let mut target_hash = hashing(io::sink());
-    io::copy(
-        &mut (&mut target_file).take(before.len().saturating_add(1)),
-        &mut target_hash,
-    )?;
-    let target_digest = target_hash.hash.finalize().to_hex().to_string();
-    if target_hash.bytes != before.len() || commitment.is_some_and(|c| c.hash != target_digest) {
+    let standalone = commitment.is_none();
+    #[cfg(test)]
+    let standalone = standalone || spool.standalone_target_hash;
+    let digest = if standalone {
+        let digest = target_digest(&mut target_file, before.len())?;
+        #[cfg(test)]
+        {
+            spool.stats.target_hashed_bytes += before.len();
+        }
+        digest
+    } else {
+        commitment.expect("committed target").hash.clone()
+    };
+    if commitment.is_some_and(|c| c.hash != digest) {
         return Err(invalid("metadata differs from commitment"));
     }
     target_file.seek(SeekFrom::Start(0))?;
@@ -783,10 +806,21 @@ fn build_inner_spool(
             &mut target_file,
             &ranges,
             before.len(),
-            &target_digest,
+            &digest,
         )?,
         None => None,
     };
+    // A declined range must still reject changed committed bytes before falling back.
+    if !standalone && offset.is_none() {
+        let actual = target_digest(&mut target_file, before.len())?;
+        #[cfg(test)]
+        {
+            spool.stats.target_hashed_bytes += before.len();
+        }
+        if actual != digest {
+            return Err(invalid("metadata differs from commitment"));
+        }
+    }
     // Cargo may add a hardlink; committed bytes still must match exactly.
     let after = sys::fstat(&target_file)?;
     let path_after = sys::lstat(original)?;
@@ -804,7 +838,7 @@ fn build_inner_spool(
     result.encoding = Encoding::InlineMetadataSliceV1;
     result.stored_bytes = Some(0);
     result.decoded_bytes = Some(before.len());
-    result.content_hash = Some(target_digest);
+    result.content_hash = Some(digest);
     result.metadata_slice = Some(MetadataSlice {
         offset,
         source_encoding: if base.encoding.is_raw() {
@@ -1424,6 +1458,18 @@ mod tests {
     #[test]
     #[ignore = "manual real-input paired release profile; set FRUST_METADATA_PROFILE_RLIB/RMETA/COMPRESS"]
     fn profile_sparse_archive_spool_against_full_reference() {
+        profile_real_metadata(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual real-input paired release profile; set FRUST_METADATA_PROFILE_RLIB/RMETA/COMPRESS"]
+    fn profile_committed_range_against_standalone_hash() {
+        profile_real_metadata(true);
+    }
+
+    #[cfg(unix)]
+    fn profile_real_metadata(compare_target_hash: bool) {
         if cfg!(debug_assertions) {
             panic!("run this profile with --release");
         }
@@ -1457,6 +1503,7 @@ mod tests {
         fs::create_dir(&dest).unwrap();
         let mut times = [Vec::new(), Vec::new()];
         let mut disk = [(0, 0); 2];
+        let mut target_reads = [0; 2];
         let mut reference = None;
         // Alternate paired order; restoration and validation are outside the timer.
         for pair in 0..7usize {
@@ -1476,8 +1523,9 @@ mod tests {
                     Some(&commitment),
                     || {},
                     SpoolOptions {
-                        sparse: variant == 1,
+                        sparse: compare_target_hash || variant == 1,
                         stats: &mut stats,
+                        standalone_target_hash: !compare_target_hash || variant == 0,
                     },
                 )
                 .unwrap()
@@ -1497,6 +1545,8 @@ mod tests {
                     times[variant].push(elapsed);
                 }
                 disk[variant] = (stats.written, stats.allocated);
+                target_reads[variant] = stats.target_hashed_bytes;
+                assert_eq!(stats.target_hashed_bytes, if compare_target_hash && variant == 1 { 0 } else { target_meta.len() });
                 let files = vec![base.clone(), slice];
                 let group = validate_groups(&files).unwrap().remove(0);
                 verify_group(&scratch.0, &files, &group).unwrap();
@@ -1520,6 +1570,10 @@ mod tests {
                     assert!(proof.matches(&sys::lstat(original).unwrap()));
                 }
             }
+        }
+        if compare_target_hash {
+            eprintln!("committed_range standalone_ms={:?} proved_ms={:?} standalone_target_hash_bytes={} proved_target_hash_bytes={}", times[0], times[1], target_reads[0], target_reads[1]);
+            return;
         }
         eprintln!(
             "archive_spool rlib={} rmeta={} requested_compression={} encoding={:?} decoded_bytes={} store_ms={} full_ms={:?} sparse_ms={:?} full_written={} sparse_written={} full_allocated={} sparse_allocated={}",
@@ -1924,6 +1978,102 @@ mod tests {
                 .is_err()
             );
             assert!(!dest.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_range_declines_still_verify_the_complete_target() {
+        let scratch = Scratch::new();
+        let original = scratch.0.join("original");
+        let target = record("libdemo.rmeta", "f1");
+        let metadata = vec![0x37; 128 * 1024 + 17];
+        for case in 0..9 {
+            let bytes = if case == 8 { &[][..] } else { metadata.as_slice() };
+            fs::write(&original, bytes).unwrap();
+            let (_, commitment) = payload::capture(&original).unwrap();
+            let mut archive = b"!<arch>\n".to_vec();
+            match case {
+                0 => archive = b"unknown archive".to_vec(),
+                1 => archive = b"!<thin>\nexternal".to_vec(),
+                2 => {}
+                3 => archive_member(&mut archive, "code.o/", bytes),
+                4 => archive_member(&mut archive, "lib.rmeta/", b"short"),
+                5 | 6 => {
+                    let mut different = bytes.to_vec();
+                    let index = if case == 5 { 0 } else { different.len() - 1 };
+                    different[index] ^= 1;
+                    archive_member(&mut archive, "lib.rmeta/", &different);
+                }
+                7 => {
+                    archive_member(&mut archive, "lib.rmeta/", bytes);
+                    archive_member(&mut archive, "lib.rmeta/", bytes);
+                }
+                8 => archive_member(&mut archive, "lib.rmeta/", bytes),
+                _ => unreachable!(),
+            }
+            for compress in [false, true] {
+                let staged = scratch.0.join(format!("f0-{case}-{compress}"));
+                let raw = scratch.0.join("raw");
+                fs::write(&raw, &archive).unwrap();
+                let stored = payload::store(&raw, &staged, compress).unwrap();
+                let mut base = record("libdemo.rlib", "f0");
+                base.encoding = stored.encoding;
+                base.stored_bytes = stored.stored_bytes;
+                base.decoded_bytes = stored.decoded_bytes;
+                base.content_hash = stored.content_hash;
+                for forged in [false, true] {
+                    let mut proof = commitment.clone();
+                    if forged { proof.hash = "0".repeat(64); }
+                    let mut stats = SpoolStats::default();
+                    let result = build_inner_spool(&staged, &base, &original, &target, Some(&proof), || {}, SpoolOptions {
+                        sparse: true,
+                        stats: &mut stats,
+                        standalone_target_hash: false,
+                    });
+                    assert_eq!(stats.target_hashed_bytes, bytes.len() as u64, "case {case}");
+                    if forged {
+                        assert!(result.is_err(), "case {case}");
+                    } else {
+                        assert!(result.unwrap().is_none(), "case {case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_range_success_checks_hash_and_allows_only_hardlink_drift() {
+        for compress in [false, true] {
+            let scratch = Scratch::new();
+            let (files, archive, metadata) = fixture(&scratch, compress);
+            let original = scratch.0.join("original");
+            let (_, commitment) = payload::capture(&original).unwrap();
+            let target = record("libdemo-hash.rmeta", "f1");
+            let mut forged = commitment.clone();
+            forged.hash = "0".repeat(64);
+            assert!(build(&scratch.0.join("f0"), &files[0], &original, &target, Some(&forged)).is_err());
+            let slice = build_inner(&scratch.0.join("f0"), &files[0], &original, &target, Some(&commitment), || {
+                fs::hard_link(&original, scratch.0.join("uplift")).unwrap();
+            }).unwrap().unwrap();
+            assert_eq!(serde_json::to_value(&slice).unwrap(), serde_json::to_value(&files[1]).unwrap());
+            let group_files = vec![files[0].clone(), slice];
+            let group = validate_groups(&group_files).unwrap().remove(0);
+            let dest = scratch.0.join("restored");
+            fs::create_dir(&dest).unwrap();
+            restore_group(&scratch.0, &dest, &group_files, &group).unwrap();
+            assert_eq!(fs::read(dest.join(&files[0].name)).unwrap(), archive);
+            assert_eq!(fs::read(dest.join(&target.name)).unwrap(), metadata);
+            let modified = fs::metadata(&original).unwrap().modified().unwrap();
+            let result = build_inner(&scratch.0.join("f0"), &files[0], &original, &target, Some(&commitment), || {
+                let mut changed = metadata.clone();
+                *changed.last_mut().unwrap() ^= 1;
+                fs::write(&original, changed).unwrap();
+                File::options().write(true).open(&original).unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+            });
+            assert!(result.is_err());
         }
     }
 
