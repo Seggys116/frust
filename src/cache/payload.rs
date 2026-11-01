@@ -687,7 +687,7 @@ mod tests {
                 || {
                     fs::hard_link(&source, &alias).unwrap();
                     sys::rename(&source, &scratch.0.join("moved")).unwrap();
-                    std::os::unix::fs::symlink(&alias, &source).unwrap();
+                    sys::link_tool(&alias, &source).unwrap();
                 }
             )
             .is_err()

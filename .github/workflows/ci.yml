@@ -52,6 +52,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-targets
       - run: cargo test --locked --no-fail-fast
+        env:
+          FRUST_TEST_FAILURE_DIR: ${{ runner.temp }}/frust-test-failures
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: frust-test-failures-${{ matrix.os }}
+          path: ${{ runner.temp }}/frust-test-failures/
+          if-no-files-found: ignore
+          retention-days: 3
 
   # Every trusted stamp is compared with a fresh content hash, so a stamp that lies fails the suite.
   test-audit:
@@ -68,6 +77,14 @@ jobs:
       - run: cargo test --locked --no-fail-fast
         env:
           FRUST_CACHE_TRUST_STAMPS: audit
+          FRUST_TEST_FAILURE_DIR: ${{ runner.temp }}/frust-test-failures-audit
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: frust-test-failures-audit
+          path: ${{ runner.temp }}/frust-test-failures-audit/
+          if-no-files-found: ignore
+          retention-days: 3
 
   msrv:
     name: msrv 1.89

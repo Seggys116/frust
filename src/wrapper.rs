@@ -3773,11 +3773,13 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            plan.args = vec![
-                "cmd.exe".into(),
-                "/C".into(),
-                format!("echo launch>>\"{}\" & exit /B 1", counter.display()).into(),
-            ];
+            let compiler = s.0.join("compiler.cmd");
+            fs::write(
+                &compiler,
+                "@echo off\r\necho launch>>\"%~dp0compiler-launches\"\r\nexit /B 1\r\n",
+            )
+            .unwrap();
+            plan.args = vec![compiler.into_os_string()];
         }
         assert_eq!(plan.compile_and_store(None), 1);
         assert!(fs::metadata(&counter).unwrap().len() > 0);

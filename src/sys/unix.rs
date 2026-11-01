@@ -638,6 +638,67 @@ pub mod signal {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn observe_child_unreaped(pid: u32, blocking: bool) -> Result<Option<bool>, super::ChildObserveError> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let flags = libc::WEXITED | libc::WNOWAIT | if blocking { 0 } else { libc::WNOHANG };
+        // SAFETY: waitid writes initialized siginfo storage and WNOWAIT never releases the owned leader pin.
+        let result =
+            unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, info.as_mut_ptr(), flags) };
+        if result == 0 {
+            // SAFETY: successful waitid initializes siginfo; libc exposes child accessors on Linux and macOS.
+            let info = unsafe { info.assume_init() };
+            // SAFETY: WEXITED produces child-status information; zeroed si_pid means no terminal observation.
+            return Ok(unsafe {
+                (info.si_pid() != 0)
+                    .then(|| info.si_code == libc::CLD_EXITED && info.si_status() == 0)
+            });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(super::ChildObserveError {
+                ownership_lost: error.raw_os_error() == Some(libc::ECHILD),
+                message: format!(
+                    "foreground waitid failed: {error}{}",
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        "; child ownership lost; group will not be signalled"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn cancel_owned_process_group(pid: u32) -> Result<(), String> {
+    observe_child_unreaped(pid, false)
+        .map_err(|error| format!("{}; ownership unproven, group not signalled", error.message))?;
+    let pid = libc::pid_t::try_from(pid).map_err(|error| error.to_string())?;
+    // SAFETY: sole coordinator ownership and the nonreaping child check keep this fresh group's leader pinned.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("foreground group cancellation failed: {error}"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn own_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub fn was_force_killed(status: &ExitStatus) -> bool {
+    status.signal() == Some(libc::SIGKILL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

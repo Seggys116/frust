@@ -7,6 +7,19 @@ const ROLES: [&str; 2] = ["coldone", "coldtwo"];
 type Units = BTreeMap<String, usize>;
 
 #[derive(Serialize)]
+struct BinaryBaseline {
+    hash: String,
+    bytes: Option<u64>,
+    tool: &'static str,
+    phase: &'static str,
+    repetition: usize,
+    source_binary: PathBuf,
+    binary: PathBuf,
+    audit_directory: PathBuf,
+    command: String,
+}
+
+#[derive(Serialize)]
 struct Role {
     profile: String,
     target: PathBuf,
@@ -564,66 +577,11 @@ struct Foregrounds {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Debug)]
-struct ObserveError {
-    message: String,
-    ownership_lost: bool,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn child_state(pid: u32, blocking: bool) -> Result<Option<bool>, ObserveError> {
-    loop {
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let flags = libc::WEXITED | libc::WNOWAIT | if blocking { 0 } else { libc::WNOHANG };
-        // SAFETY: waitid writes initialized siginfo storage and WNOWAIT never releases the owned leader pin.
-        let result =
-            unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, info.as_mut_ptr(), flags) };
-        if result == 0 {
-            // SAFETY: successful waitid initializes siginfo; libc exposes child accessors on Linux and macOS.
-            let info = unsafe { info.assume_init() };
-            // SAFETY: WEXITED produces child-status information; zeroed si_pid means no terminal observation.
-            return Ok(unsafe {
-                (info.si_pid() != 0)
-                    .then(|| info.si_code == libc::CLD_EXITED && info.si_status() == 0)
-            });
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(ObserveError {
-                ownership_lost: error.raw_os_error() == Some(libc::ECHILD),
-                message: format!(
-                    "foreground waitid failed: {error}{}",
-                    if error.raw_os_error() == Some(libc::ECHILD) {
-                        "; child ownership lost; group will not be signalled"
-                    } else {
-                        ""
-                    }
-                ),
-            });
-        }
-    }
-}
+use crate::sys::{ChildObserveError as ObserveError, observe_child_unreaped as child_state};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn observe_exit(pid: u32) -> Result<Instant, ObserveError> {
     child_state(pid, true).map(|_| Instant::now())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn cancel_child(pid: u32) -> Result<(), String> {
-    child_state(pid, false)
-        .map_err(|error| format!("{}; ownership unproven, group not signalled", error.message))?;
-    let pid = libc::pid_t::try_from(pid).map_err(|error| error.to_string())?;
-    // SAFETY: sole coordinator ownership and the nonreaping child check keep this fresh group's leader pinned.
-    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!("foreground group cancellation failed: {error}"))
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -636,7 +594,7 @@ fn run_foregrounds(
         timeout,
         Duration::from_secs(5),
         observe_exit,
-        cancel_child,
+        crate::sys::cancel_owned_process_group,
     )
 }
 
@@ -648,15 +606,13 @@ fn run_foregrounds_with(
     observe: fn(u32) -> Result<Instant, ObserveError>,
     cancel: fn(u32) -> Result<(), String>,
 ) -> Result<Foregrounds, String> {
-    use std::os::unix::process::CommandExt as _;
-
     let started = Instant::now();
     let (sender, receiver) = mpsc::channel();
     let mut children = Vec::new();
     let mut spawned = Vec::new();
     let mut failure = None;
     for (role, mut command) in commands {
-        command.process_group(0);
+        crate::sys::own_process_group(&mut command);
         let rendered = format!("{command:?}");
         let spawn_begin_ns = started.elapsed().as_nanos() as u64;
         match command.spawn() {
@@ -825,6 +781,83 @@ fn run_foregrounds(
     Err("concurrent foreground audit requires Linux or macOS".into())
 }
 
+fn retain_binary(evidence: &BinaryBaseline) -> Result<(), String> {
+    let directory = evidence
+        .binary
+        .parent()
+        .ok_or("binary evidence directory missing")?;
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let bytes =
+        fs::copy(&evidence.source_binary, &evidence.binary).map_err(|error| error.to_string())?;
+    let hash = crate::cache::hash_file(&evidence.binary).map_err(|error| error.to_string())?;
+    if hash != evidence.hash || evidence.bytes.is_some_and(|expected| expected != bytes) {
+        return Err("binary changed while retaining correctness evidence".into());
+    }
+    let metadata = serde_json::to_vec_pretty(evidence).map_err(|error| error.to_string())?;
+    fs::write(directory.join("evidence.json"), metadata).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn native_binary_diagnostics(
+    baseline: &BinaryBaseline,
+    actual: &BinaryBaseline,
+) -> Result<(), String> {
+    let directory = actual
+        .binary
+        .parent()
+        .ok_or("binary evidence directory missing")?
+        .join("native");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let mut commands = Vec::new();
+    for (label, evidence) in [("baseline", baseline), ("actual", actual)] {
+        for (name, tool, args) in [
+            ("debug-map", "/usr/bin/dsymutil", vec!["--dump-debug-map"]),
+            ("load-commands", "/usr/bin/otool", vec!["-l"]),
+            ("uuid", "/usr/bin/dwarfdump", vec!["--uuid"]),
+            (
+                "signature",
+                "/usr/bin/codesign",
+                vec!["--display", "--verbose=4"],
+            ),
+        ] {
+            let mut command = Command::new(tool);
+            command
+                .args(args)
+                .arg(&evidence.binary)
+                .stdin(Stdio::null())
+                .stdout(
+                    fs::File::create(directory.join(format!("{label}-{name}.stdout")))
+                        .map_err(|error| error.to_string())?,
+                )
+                .stderr(
+                    fs::File::create(directory.join(format!("{label}-{name}.stderr")))
+                        .map_err(|error| error.to_string())?,
+                );
+            commands.push((commands.len(), command));
+        }
+    }
+    // Native inspection shares one bounded watchdog and never changes correctness acceptance.
+    let foreground = run_foregrounds(commands, Duration::from_secs(10))?;
+    let statuses: Vec<_> = foreground
+        .spawned
+        .iter()
+        .zip(&foreground.exits)
+        .map(|((_, command, pid, _, _), (status, _))| {
+            serde_json::json!({
+                "command": command, "pid": pid,
+                "exit_code": status.as_ref().ok().and_then(|status| status.code()),
+                "error": status.as_ref().err(),
+            })
+        })
+        .collect();
+    let metadata = serde_json::to_vec_pretty(&serde_json::json!({
+        "failure": &foreground.failure, "commands": statuses,
+    }))
+    .map_err(|error| error.to_string())?;
+    fs::write(directory.join("status.json"), metadata).map_err(|error| error.to_string())?;
+    foreground.failure.map_or(Ok(()), Err)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn group(
     ctx: &Ctx,
@@ -835,7 +868,7 @@ fn group(
     phase: &'static str,
     repetition: usize,
     cold_start: Option<serde_json::Value>,
-    expected: &mut BTreeMap<usize, String>,
+    expected: &mut BTreeMap<usize, BinaryBaseline>,
     expected_output: &mut Option<Vec<u8>>,
 ) -> Result<Group, String> {
     let tool = if frust { "frust" } else { "cargo" };
@@ -943,15 +976,76 @@ fn group(
         }
         let binary = app_binary(&targets[role].join(ROLES[role]));
         let binary_hash = crate::cache::hash_file(&binary).map_err(|error| error.to_string())?;
-        if let Some(hash) = expected.get(&role) {
-            if hash != &binary_hash {
-                return Err(format!(
-                    "same-path {tool}/{} binary differs from Cargo baseline",
-                    ROLES[role]
-                ));
+        if let Some(baseline) = expected.get(&role) {
+            if baseline.hash != binary_hash {
+                let bytes = fs::metadata(&binary).map(|metadata| metadata.len());
+                let retained = audit
+                    .logs
+                    .with_file_name("binary-diagnostics")
+                    .join(format!("mismatch-{}", ROLES[role]))
+                    .join("app");
+                let mut error = format!(
+                    "same-path {tool}/{} binary differs from Cargo baseline: phase={phase}, repetition={repetition}; baseline tool={}, phase={}, repetition={}, hash={}, bytes={}, retained={}; actual hash={binary_hash}, bytes={}, source={}, retained={}; audit={}",
+                    ROLES[role],
+                    baseline.tool,
+                    baseline.phase,
+                    baseline.repetition,
+                    baseline.hash,
+                    baseline
+                        .bytes
+                        .map(|bytes| bytes.to_string())
+                        .unwrap_or_else(|| "unavailable".into()),
+                    baseline.binary.display(),
+                    bytes
+                        .as_ref()
+                        .map(u64::to_string)
+                        .unwrap_or_else(|error| format!("unavailable ({error})")),
+                    binary.display(),
+                    retained.display(),
+                    directory.display()
+                );
+                let evidence = BinaryBaseline {
+                    hash: binary_hash.clone(),
+                    bytes: bytes.ok(),
+                    tool,
+                    phase,
+                    repetition,
+                    source_binary: binary.clone(),
+                    binary: retained,
+                    audit_directory: directory.clone(),
+                    command: command.clone(),
+                };
+                if let Err(diagnostic) = retain_binary(&evidence) {
+                    error.push_str(&format!("; mismatch retention failed: {diagnostic}"));
+                }
+                #[cfg(target_os = "macos")]
+                if let Err(diagnostic) = native_binary_diagnostics(baseline, &evidence) {
+                    error.push_str(&format!("; native diagnostics failed: {diagnostic}"));
+                }
+                return Err(error);
             }
         } else {
-            expected.insert(role, binary_hash.clone());
+            let baseline = BinaryBaseline {
+                hash: binary_hash.clone(),
+                bytes: Some(
+                    fs::metadata(&binary)
+                        .map_err(|error| error.to_string())?
+                        .len(),
+                ),
+                tool,
+                phase,
+                repetition,
+                source_binary: binary.clone(),
+                binary: audit
+                    .logs
+                    .with_file_name("binary-diagnostics")
+                    .join(format!("baseline-{}", ROLES[role]))
+                    .join("app"),
+                audit_directory: directory.clone(),
+                command: command.clone(),
+            };
+            retain_binary(&baseline)?;
+            expected.insert(role, baseline);
         }
         let runtime = Command::new(&binary)
             .stdin(Stdio::null())
@@ -1168,34 +1262,35 @@ mod tests {
 
     #[test]
     fn concurrent_normalization_accepts_only_known_output_operands_and_boundaries() {
-        let prefix = "/tmp/target/coldone";
-        let args = [
-            "--out-dir",
-            "/tmp/target/coldone/deps",
-            "--extern=x=/tmp/target/coldone/deps/x.rlib",
-            "-Ldependency=/tmp/target/coldone/deps",
-            "-C",
-            "incremental=/tmp/target/coldone/incremental",
+        let target = std::env::temp_dir().join("target");
+        let profile = target.join("coldone");
+        let prefix = profile.display().to_string();
+        let args = vec![
+            "--out-dir".into(),
+            profile.join("deps").display().to_string(),
+            format!(
+                "--extern=x={}",
+                profile.join("deps").join("x.rlib").display()
+            ),
+            format!("-Ldependency={}", profile.join("deps").display()),
+            "-C".into(),
+            format!("incremental={}", profile.join("incremental").display()),
         ];
-        let args = args.map(str::to_owned);
-        let normalized = normalize(&args, prefix).unwrap();
+        let normalized = normalize(&args, &prefix).unwrap();
         assert!(
             normalized
                 .iter()
                 .any(|arg| arg.contains("<PROFILE_OUTPUT>"))
         );
         for args in [
-            vec!["/tmp/target/coldone/source.rs"],
-            vec!["--cfg", "/tmp/target/coldone/x"],
-            vec!["--out-dir=/tmp/target/coldone-extra/deps"],
+            vec![profile.join("source.rs").display().to_string()],
+            vec!["--cfg".into(), profile.join("x").display().to_string()],
+            vec![format!(
+                "--out-dir={}",
+                target.join("coldone-extra").join("deps").display()
+            )],
         ] {
-            assert!(
-                normalize(
-                    &args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
-                    prefix
-                )
-                .is_err()
-            );
+            assert!(normalize(&args, &prefix).is_err());
         }
     }
 
@@ -1208,7 +1303,15 @@ mod tests {
         ] {
             let args = vec![
                 "--out-dir".into(),
-                format!("/tmp/t/{profile}/build/crate-12345678/out/probe"),
+                std::env::temp_dir()
+                    .join("t")
+                    .join(profile)
+                    .join("build")
+                    .join("crate-12345678")
+                    .join("out")
+                    .join("probe")
+                    .display()
+                    .to_string(),
                 "--crate-type=lib".into(),
                 "--emit=metadata".into(),
             ];
@@ -1257,7 +1360,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn concurrent_watchdog_cancels_and_reaps_stalled_groups() {
-        use std::os::unix::process::ExitStatusExt as _;
         let started = Instant::now();
         let foreground = run_foregrounds(
             vec![
@@ -1273,7 +1375,7 @@ mod tests {
             foreground
                 .exits
                 .iter()
-                .all(|(status, _)| status.as_ref().unwrap().signal() == Some(libc::SIGKILL))
+                .all(|(status, _)| crate::sys::was_force_killed(status.as_ref().unwrap()))
         );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1281,7 +1383,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn concurrent_second_spawn_failure_immediately_cancels_and_reaps_first() {
-        use std::os::unix::process::ExitStatusExt as _;
         let started = Instant::now();
         let foreground = run_foregrounds(
             vec![
@@ -1299,10 +1400,9 @@ mod tests {
                 .contains("spawn failed")
         );
         assert_eq!(foreground.exits.len(), 1);
-        assert_eq!(
-            foreground.exits[0].0.as_ref().unwrap().signal(),
-            Some(libc::SIGKILL)
-        );
+        assert!(crate::sys::was_force_killed(
+            foreground.exits[0].0.as_ref().unwrap()
+        ));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

@@ -2,6 +2,8 @@
 
 ## Method
 
+The measurements use release binaries built from the Rust sources in [0930886](https://github.com/Seggys116/frust/commit/09308869f003de7c360fcc453f45e1208888928f).
+
 Times are milliseconds, median [minimum, maximum] across seven repetitions unless stated otherwise. Observed ranges describe these runs; no confidence interval or runtime-throughput claim is inferred. Cold means an empty build target and frust cache, with the toolchain and registry dependencies already installed; the OS page cache was not cleared. The general graph has four local crates plus registry dependencies; the release-profile graph has two local crates plus registry dependencies.
 
 Build latency uses production deferred stores and automatic compression. Foreground wall time includes the frontend, Cargo and compiler audit. Store completion is measured separately: after child exit, the observer waits for no job files and holds every existing slot lock exclusively together. Settled time runs from child start through that proof; drain is the observed interval outside foreground. These observations establish completion coverage, not helper counts or fallback frequency. Growth uses synchronous stores and assesses automatic compaction after every build. Source-stamp settling and allocation inspection are outside growth build latency.

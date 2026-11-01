@@ -490,6 +490,38 @@ pub fn fs_type_name(path: &Path) -> Option<String> {
     imp::fs_type_name(path)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct ChildObserveError {
+    pub(crate) message: String,
+    pub(crate) ownership_lost: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn observe_child_unreaped(pid: u32, blocking: bool) -> Result<Option<bool>, ChildObserveError> {
+    imp::observe_child_unreaped(pid, blocking)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn cancel_owned_process_group(pid: u32) -> Result<(), String> {
+    imp::cancel_owned_process_group(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn own_process_group(command: &mut Command) {
+    imp::own_process_group(command);
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn was_force_killed(status: &ExitStatus) -> bool {
+    imp::was_force_killed(status)
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn open_read_without_delete(path: &Path) -> io::Result<File> {
+    imp::open_read_without_delete(path)
+}
+
 #[cfg(test)]
 pub(crate) fn non_utf8_os_string() -> OsString {
     imp::non_utf8_os_string()

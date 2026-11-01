@@ -7,6 +7,110 @@ mod common;
 use common::{Sandbox, assert_success, stdout};
 use serde_json::Value;
 
+fn copy_evidence(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    budget: &mut (u64, usize),
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    budget.1 = budget
+        .1
+        .checked_sub(1)
+        .ok_or_else(|| std::io::Error::other("failure export entry limit exceeded"))?;
+    if metadata.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_evidence(&entry.path(), &destination.join(entry.file_name()), budget)?;
+        }
+    } else if metadata.is_file() {
+        budget.0 = budget
+            .0
+            .checked_sub(metadata.len())
+            .ok_or_else(|| std::io::Error::other("failure export byte limit exceeded"))?;
+        std::fs::copy(source, destination)?;
+    } else {
+        return Err(std::io::Error::other(format!(
+            "nonregular failure evidence: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn export_failure(sandbox: &Sandbox, output: &std::process::Output) -> std::io::Result<()> {
+    let Some(root) = std::env::var_os("FRUST_TEST_FAILURE_DIR") else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    for attempt in 0..32 {
+        let destination = root.join(format!(
+            "bench-concurrent-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&destination) {
+            Ok(()) => {
+                let retained = destination.join("sandbox");
+                // A new destination owns this failure; cross-filesystem exports copy only bounded diagnostic inputs.
+                if let Err(error) = frust::sys::rename(&sandbox.root, &retained) {
+                    eprintln!(
+                        "concurrent failure rename {} -> {} failed: {error}; copying diagnostic evidence",
+                        sandbox.root.display(),
+                        retained.display()
+                    );
+                    std::fs::create_dir(&retained)?;
+                    let mut budget = (256 * 1024 * 1024, 16_384);
+                    for entry in std::fs::read_dir(&sandbox.root)? {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_dir()
+                            || !entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("frust-bench-")
+                        {
+                            continue;
+                        }
+                        let exported = retained.join(entry.file_name());
+                        std::fs::create_dir(&exported)?;
+                        // Targets and cache homes are unnecessary once both disputed binaries have been retained.
+                        for name in ["binary-diagnostics", "audit", "app", "audited-rustc"] {
+                            let source = entry.path().join(name);
+                            if source.try_exists()? {
+                                copy_evidence(&source, &exported.join(name), &mut budget)?;
+                            }
+                        }
+                    }
+                }
+                std::fs::write(destination.join("command.stdout"), &output.stdout)?;
+                std::fs::write(destination.join("command.stderr"), &output.stderr)?;
+                let paths =
+                    serde_json::json!({"original_root": sandbox.root, "exported_root": retained});
+                std::fs::write(
+                    destination.join("paths.json"),
+                    serde_json::to_vec_pretty(&paths).map_err(std::io::Error::other)?,
+                )?;
+                eprintln!(
+                    "concurrent failure exported: {} -> {}",
+                    sandbox.root.display(),
+                    destination.join("sandbox").display()
+                );
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unique concurrent failure directory",
+    ))
+}
+
 fn run(store: Option<&str>) -> Value {
     let sandbox = Sandbox::new(if store.is_some() {
         "concurrent-sync"
@@ -26,6 +130,11 @@ fn run(store: Option<&str>) -> Value {
         command.arg(format!("--store={store}"));
     }
     let output = command.output().unwrap();
+    if !output.status.success()
+        && let Err(error) = export_failure(&sandbox, &output)
+    {
+        eprintln!("concurrent failure export failed: {error}");
+    }
     assert_success(&output);
     serde_json::from_str(&stdout(&output)).unwrap()
 }

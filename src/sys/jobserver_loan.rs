@@ -137,6 +137,93 @@ mod native {
         Ok(unsafe { File::from_raw_fd(copy) })
     }
 
+    #[cfg(target_os = "macos")]
+    mod darwin_pipe {
+        use super::*;
+
+        const PROC_PIDFDPIPEINFO: i32 = 6;
+        const DTYPE_PIPE: i32 = 6;
+
+        #[repr(C)]
+        struct ProcFileInfo {
+            open_flags: u32,
+            status: u32,
+            offset: libc::off_t,
+            kind: i32,
+            guard_flags: u32,
+        }
+
+        #[repr(C)]
+        struct PipeInfo {
+            stat: libc::vinfo_stat,
+            handle: u64,
+            peer_handle: u64,
+            status: i32,
+            reserved: i32,
+        }
+
+        #[repr(C)]
+        struct PipeFdInfo {
+            file: ProcFileInfo,
+            pipe: PipeInfo,
+        }
+
+        // Darwin's public proc_info.h ABI includes the complete stat and file records.
+        const _: () = {
+            assert!(std::mem::size_of::<ProcFileInfo>() == 24);
+            assert!(std::mem::size_of::<PipeInfo>() == 160);
+            assert!(std::mem::size_of::<PipeFdInfo>() == 184);
+            assert!(std::mem::align_of::<PipeFdInfo>() == 8);
+            assert!(std::mem::offset_of!(ProcFileInfo, kind) == 16);
+            assert!(std::mem::offset_of!(PipeFdInfo, pipe) == 24);
+            assert!(std::mem::offset_of!(PipeInfo, handle) == 136);
+            assert!(std::mem::offset_of!(PipeInfo, peer_handle) == 144);
+        };
+
+        fn info(file: &File) -> io::Result<PipeInfo> {
+            let mut info = std::mem::MaybeUninit::<PipeFdInfo>::uninit();
+            let size = std::mem::size_of::<PipeFdInfo>() as i32;
+            // SAFETY: the owned descriptor stays live and the buffer matches the public pipe_fdinfo ABI.
+            let count = unsafe {
+                libc::proc_pidfdinfo(libc::getpid(), file.as_raw_fd(), PROC_PIDFDPIPEINFO, info.as_mut_ptr().cast(), size)
+            };
+            if count <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if count != size {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete Darwin pipe metadata"));
+            }
+            // SAFETY: the successful query returned the complete initialized record.
+            let info = unsafe { info.assume_init() };
+            if info.file.kind != DTYPE_PIPE {
+                return Err(invalid("jobserver descriptor is not a Darwin pipe"));
+            }
+            Ok(info.pipe)
+        }
+
+        pub(super) fn matching(read: &File, write: &File) -> io::Result<bool> {
+            let a = info(read)?;
+            let b = info(write)?;
+            Ok(a.handle != 0 && b.handle != 0 && a.handle != b.handle && a.handle == b.peer_handle && b.handle == a.peer_handle)
+        }
+    }
+
+    fn matching_pipe(read: &File, write: &File, a: &libc::stat, b: &libc::stat) -> io::Result<bool> {
+        if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) {
+            return Ok(true);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin anonymous ends have separate inode identities; owned duplicates pin both peers.
+            darwin_pipe::matching(read, write)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (read, write);
+            Ok(false)
+        }
+    }
+
     struct Endpoints {
         read: File,
         write: File,
@@ -150,11 +237,11 @@ mod native {
             let write_flags = flags(write.as_raw_fd())?;
             if a.st_mode & libc::S_IFMT != libc::S_IFIFO
                 || b.st_mode & libc::S_IFMT != libc::S_IFIFO
-                || (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino)
                 || read_flags & libc::O_ACCMODE != libc::O_RDONLY
                 || write_flags & libc::O_ACCMODE != libc::O_WRONLY
                 || read_flags & libc::O_NONBLOCK != 0
                 || write_flags & libc::O_NONBLOCK != 0
+                || !matching_pipe(&read, &write, &a, &b)?
             {
                 return Err(invalid("jobserver endpoints must be matching blocking readonly/writeonly pipes"));
             }
@@ -521,14 +608,56 @@ mod native {
 
         #[test]
         fn mismatched_reversed_and_regular_endpoints_are_rejected() {
-            let (read, write) = io::pipe().unwrap();
-            let (other, _) = io::pipe().unwrap();
+            let (mut read, mut write) = io::pipe().unwrap();
+            let (other, mut other_write) = io::pipe().unwrap();
+            write.write_all(b"+").unwrap();
+            other_write.write_all(b"*").unwrap();
+            let before = [flags(read.as_raw_fd()).unwrap(), flags(write.as_raw_fd()).unwrap()];
             assert!(Endpoints::pipe(read.as_raw_fd(), write.as_raw_fd()).is_ok());
             assert!(Endpoints::pipe(write.as_raw_fd(), read.as_raw_fd()).is_err());
             assert!(Endpoints::pipe(other.as_raw_fd(), write.as_raw_fd()).is_err());
             let file = File::open(env::current_exe().unwrap()).unwrap();
             assert!(Endpoints::pipe(file.as_raw_fd(), write.as_raw_fd()).is_err());
-            assert_eq!(flags(read.as_raw_fd()).unwrap() & libc::O_NONBLOCK, 0);
+            assert_eq!([flags(read.as_raw_fd()).unwrap(), flags(write.as_raw_fd()).unwrap()], before);
+            assert_eq!(available(read.as_raw_fd()), 1);
+            assert_eq!(available(other.as_raw_fd()), 1);
+            assert_eq!(byte(&mut read).unwrap(), b'+');
+        }
+
+        #[test]
+        fn owned_duplicates_preserve_pipe_identity_and_buffered_tokens() {
+            let (read, mut write) = io::pipe().unwrap();
+            write.write_all(b"+*").unwrap();
+            let read_copy = duplicate(read.as_raw_fd()).unwrap();
+            let write_copy = duplicate(write.as_raw_fd()).unwrap();
+            let before = [flags(read_copy.as_raw_fd()).unwrap(), flags(write_copy.as_raw_fd()).unwrap()];
+            drop((read, write));
+            let mut endpoints = Endpoints::checked(read_copy, write_copy).unwrap();
+            assert_eq!([flags(endpoints.read.as_raw_fd()).unwrap(), flags(endpoints.write.as_raw_fd()).unwrap()], before);
+            assert_eq!(available(endpoints.read.as_raw_fd()), 2);
+            let mut tokens = [0; 2];
+            endpoints.read.read_exact(&mut tokens).unwrap();
+            assert_eq!(&tokens, b"+*");
+            endpoints.write.write_all(b"-").unwrap();
+            assert_eq!(byte(&mut endpoints.read).unwrap(), b'-');
+        }
+
+        #[test]
+        fn nonblocking_endpoints_are_rejected_without_changing_flags_or_tokens() {
+            for nonblocking_write in [false, true] {
+                let (mut read, mut write) = io::pipe().unwrap();
+                write.write_all(b"+*").unwrap();
+                let fd = if nonblocking_write { write.as_raw_fd() } else { read.as_raw_fd() };
+                // SAFETY: this test owns the fresh pipe description whose flags it changes.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags(fd).unwrap() | libc::O_NONBLOCK) }, 0);
+                let before = [flags(read.as_raw_fd()).unwrap(), flags(write.as_raw_fd()).unwrap()];
+                assert!(Endpoints::pipe(read.as_raw_fd(), write.as_raw_fd()).is_err());
+                assert_eq!([flags(read.as_raw_fd()).unwrap(), flags(write.as_raw_fd()).unwrap()], before);
+                assert_eq!(available(read.as_raw_fd()), 2);
+                let mut tokens = [0; 2];
+                read.read_exact(&mut tokens).unwrap();
+                assert_eq!(&tokens, b"+*");
+            }
         }
 
         #[test]

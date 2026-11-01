@@ -1230,7 +1230,7 @@ mod tests {
         let prekey = key(0x96);
         publish_referenced_entry(&cache, 1, &prekey);
         fs::create_dir_all(cache.entry_dir(&key(2)).parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(dir.join("absent"), cache.entry_dir(&key(2))).unwrap();
+        sys::link_tool(&dir.join("absent"), &cache.entry_dir(&key(2))).unwrap();
         fs::create_dir_all(cache.entry_dir(&key(3)).parent().unwrap()).unwrap();
         fs::write(cache.entry_dir(&key(3)), b"wrong type").unwrap();
         let path = cache.manifest_path(&prekey);
@@ -1240,7 +1240,7 @@ mod tests {
         assert_eq!(cache.candidates(&prekey), vec![empty_candidate(2), empty_candidate(3)]);
         let outside = dir.join("outside-manifest");
         sys::rename(&path, &outside).unwrap();
-        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        sys::link_tool(&outside, &path).unwrap();
         let bytes = fs::read(&outside).unwrap();
         publish_referenced_entry(&cache, 1, &prekey);
         cache.remove_entry(&key(1));
@@ -1792,12 +1792,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_delete_denial_stays_queued_until_handle_closes() {
-        use std::os::windows::fs::OpenOptionsExt;
         let (dir, cache) = scratch("retire-denied-handle");
         publish_entry(&cache, 1);
         let mut reader = None;
         cache.remove_entry_with(&key(1), |retired| {
-            reader = Some(OpenOptions::new().read(true).share_mode(3).open(retired.join("f0")).unwrap());
+            reader = Some(sys::open_read_without_delete(&retired.join("f0")).unwrap());
             fsx::remove_any(retired)
         });
         let dirs = Dirs::at(&dir);

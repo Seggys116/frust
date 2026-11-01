@@ -1181,6 +1181,11 @@ pub mod signal {
 }
 
 #[cfg(test)]
+pub fn open_read_without_delete(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).share_mode(3).open(path)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
