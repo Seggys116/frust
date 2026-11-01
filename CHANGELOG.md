@@ -24,6 +24,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Garbage collection preserves execution-slot lock identities so concurrent stores retain their global worker bound.
 * Metadata proof generation reuses verified encoder input and avoids redundant archive scans and temporary writes.
 * Native linker diagnostics retain actual invocation evidence and reject unsupported or ambiguous measurements.
+* Windows MSVC cache hits restore unsuffixed PDB companions and bypass older incomplete entries.
+* macOS store transport validates inherited socket roles and closes every rejected transferred descriptor.
 
 ## [0.2.0]
 

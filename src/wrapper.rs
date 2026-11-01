@@ -969,6 +969,15 @@ impl Plan {
             return found;
         }
         if extra.is_empty() {
+            if self.parsed.unhashed_windows_pdb() {
+                let name = format!("{}.pdb", self.parsed.crate_name);
+                if let Ok(meta) = sys::lstat(&self.output_dir_abs.join(&name))
+                    && meta.is_file()
+                {
+                    let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
+                    found.push((name, stamp));
+                }
+            }
             return found;
         }
         // Codegen and custom suffixes still need discovery of unannounced sibling outputs.
@@ -999,6 +1008,9 @@ impl Plan {
     /// Incremental rustc never removes earlier per-compile names, so files unchanged since before rustc started are left out of the entry.
     fn output_files(&self, captured: &[u8], preexisting: &HashMap<String, Stamp>) -> Vec<String> {
         let mut names = BTreeSet::new();
+        let pdb = self.parsed.unhashed_windows_pdb().then(|| format!("{}.pdb", self.parsed.crate_name));
+        let mut changed_pdb = false;
+        let mut linked_output = false;
         // A file that did not exist before the compile cannot be a leftover, so only earlier names need a stamp.
         for (name, stamp) in self.prefixed_outputs(|name| preexisting.contains_key(name)) {
             let leftover = stamp.as_ref().is_some_and(|now| {
@@ -1007,7 +1019,8 @@ impl Plan {
                     .is_some_and(|before| same_file(before, now))
             });
             if !leftover {
-                names.insert(name);
+                if pdb.as_ref() == Some(&name) { changed_pdb = true; }
+                else { names.insert(name); }
             }
         }
         for line in String::from_utf8_lossy(captured).lines() {
@@ -1021,9 +1034,18 @@ impl Plan {
                 if (path.parent() == Some(self.parsed.out_dir.as_path()) || path.parent().is_none())
                     && let Some(name) = path.file_name()
                 {
+                    if pdb.is_some() && value.get("emit").and_then(|value| value.as_str()) == Some("link") {
+                        linked_output |= ["exe", "dll"].iter().any(|extension| {
+                            name == std::ffi::OsStr::new(&format!("{}.{}", self.parsed.crate_name, extension))
+                        });
+                    }
                     names.insert(name.to_string_lossy().into_owned());
                 }
             }
+        }
+        // An unchanged PDB can belong to an earlier compile; only a matching announced link output owns a changed companion.
+        if changed_pdb && linked_output {
+            names.insert(pdb.unwrap());
         }
         // An unhashed metadata entry is useful only when both of its mandatory outputs belong to this compile.
         if self.parsed.extra_filename.is_empty()
@@ -2580,6 +2602,9 @@ impl KeyContext<'_> {
         let mut tools = Vec::new();
         let mut hasher = Both(blake3::Hasher::new(), blake3::Hasher::new());
         hasher.update(b"frust-prekey-v2\0");
+        if parsed.unhashed_windows_pdb() {
+            hasher.update(b"unhashed-windows-pdb-v1\0");
+        }
         hasher.update(
             toolchain_id(tool, self.cwd)
                 .ok_or("cannot identify the compiler")?
@@ -5357,6 +5382,78 @@ mod tests {
             plan.output_files(captured.as_bytes(), &HashMap::new()),
             ["libk.rlib"]
         );
+    }
+
+    #[test]
+    fn unhashed_windows_pdb_discovery_requires_a_changed_exact_link_companion() {
+        let s = Scratch::new("unhashed-pdb");
+        let (mut job, _, rlib) = fixture(&s);
+        job.args.extend(["--target=x86_64-pc-windows-msvc".into(), "--crate-type=bin".into()]);
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let deps = rlib.parent().unwrap();
+        for name in ["k.pdb", "k_extra.pdb", "k-old.pdb", "libk.pdb", "k.notes"] {
+            fs::write(deps.join(name), b"earlier unrelated output").unwrap();
+        }
+        let before: HashMap<_, _> = plan.prefixed_outputs(|_| true).into_iter()
+            .map(|(name, stamp)| (name, stamp.unwrap())).collect();
+        assert_eq!(before.len(), 1);
+        assert!(before.contains_key("k.pdb"));
+        let announced = |name: &str, emit: &str| serde_json::json!({"artifact": deps.join(name), "emit": emit}).to_string();
+        let exe = announced("k.exe", "link");
+        assert_eq!(plan.output_files(exe.as_bytes(), &before), ["k.exe"]);
+        fs::write(deps.join("k.pdb"), b"newly linked matching debug information").unwrap();
+        assert!(plan.output_files(&[], &before).is_empty());
+        for captured in [announced("k_extra.exe", "link"), announced("libk.dll", "link"), announced("k.exe", "metadata")] {
+            assert!(!plan.output_files(captured.as_bytes(), &before).iter().any(|name| name.ends_with(".pdb")));
+        }
+        let outside = serde_json::json!({"artifact": s.0.join("k.exe"), "emit": "link"}).to_string();
+        assert!(plan.output_files(outside.as_bytes(), &before).is_empty());
+        assert_eq!(plan.output_files(exe.as_bytes(), &before), ["k.exe", "k.pdb"]);
+        assert_eq!(plan.output_files(announced("k.dll", "link").as_bytes(), &before), ["k.dll", "k.pdb"]);
+        assert_eq!(plan.output_files(exe.as_bytes(), &HashMap::new()), ["k.exe", "k.pdb"]);
+        sys::rename(&deps.join("k.pdb"), &deps.join("saved-pdb")).unwrap();
+        fs::create_dir(deps.join("k.pdb")).unwrap();
+        assert_eq!(plan.output_files(exe.as_bytes(), &before), ["k.exe"]);
+        #[cfg(unix)]
+        {
+            sys::rename(&deps.join("k.pdb"), &deps.join("unrelated-directory")).unwrap();
+            sys::link_tool(&deps.join("saved-pdb"), &deps.join("k.pdb")).unwrap();
+            assert_eq!(plan.output_files(exe.as_bytes(), &before), ["k.exe"]);
+        }
+        job.args.push("-Cextra-filename=-abcd".into());
+        let hashed = Plan::from_job(&job, &Config::from_env()).unwrap();
+        fs::write(deps.join("k-abcd.pdb"), b"hashed companion").unwrap();
+        assert!(hashed.output_files(&[], &HashMap::new()).iter().any(|name| name == "k-abcd.pdb"));
+    }
+
+    #[test]
+    fn windows_pdb_key_domain_changes_only_corrected_unhashed_link_invocations() {
+        let s = Scratch::new("pdb-key-domain");
+        let out = s.0.join("target/debug/deps");
+        for (flags, separates) in [
+            (vec!["--target=x86_64-pc-windows-msvc", "--emit=dep-info,link"], true),
+            (vec!["--target=x86_64-pc-windows-msvc", "--crate-type=dylib", "--emit=dep-info,link"], true),
+            (vec!["--target=x86_64-pc-windows-msvc", "--emit=dep-info,link", "--emit=dep-info,metadata"], true),
+            (vec!["--target=x86_64-pc-windows-msvc", "--emit=dep-info,metadata"], false),
+            (vec!["--target=x86_64-pc-windows-msvc", "--emit=dep-info,link", "-Cextra-filename=-abcd"], false),
+            (vec!["--target=x86_64-unknown-linux-gnu", "--emit=dep-info,link"], false),
+        ] {
+            let mut args: Vec<OsString> = ["--crate-name=k", "--out-dir"].into_iter().map(OsString::from).collect();
+            args.push(out.clone().into_os_string());
+            args.extend(flags.iter().map(OsString::from));
+            let parsed = rustc_args::parse(&args).unwrap();
+            let mut legacy = parsed.clone();
+            legacy.windows_pdb_output = false;
+            let profile = s.0.join("target/debug");
+            let profile_text = profile.to_string_lossy();
+            let hasher = Hasher::ephemeral();
+            let context = KeyContext { hasher: &hasher, cwd: &s.0, profile: &profile_text, profile_abs: &profile };
+            let tool = OsString::from("rustc");
+            let current = context.prekey(&tool, &args, &parsed).unwrap();
+            let old = context.prekey(&tool, &args, &legacy).unwrap();
+            assert_eq!(current.key != old.key, separates, "{flags:?}");
+            assert_eq!(current.unit != old.unit, separates, "{flags:?}");
+        }
     }
 
     #[test]

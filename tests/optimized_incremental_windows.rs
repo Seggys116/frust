@@ -210,6 +210,50 @@ fn artifacts(root: &Path) -> Files {
     files
 }
 
+fn inventory(project: &Path, phase: &str, files: &Files) {
+    assert!(
+        files.len() <= 256,
+        "fixture artifact inventory exceeded its bound"
+    );
+    let rows: Vec<_> = files.iter().map(|(path, (bytes, readonly))| {
+        let path = path.to_str().expect("fixture output name");
+        assert!(path.len() <= 1024);
+        serde_json::json!({"path": path, "bytes": bytes.len(), "blake3": blake3::hash(bytes).to_hex().as_str(), "readonly": readonly})
+    }).collect();
+    let encoded = serde_json::to_vec_pretty(&rows).unwrap();
+    assert!(
+        encoded.len() <= 256 * 1024,
+        "fixture artifact inventory exceeded its byte bound"
+    );
+    fs::write(project.join(format!("artifacts-{phase}.json")), encoded).unwrap();
+}
+
+fn assert_artifacts(original: &Files, restored: &Files, profile: &str) {
+    assert_eq!(
+        original.keys().collect::<Vec<_>>(),
+        restored.keys().collect::<Vec<_>>(),
+        "{profile}: artifact paths differ; see retained inventories"
+    );
+    for (path, (bytes, readonly)) in original {
+        let (other, other_readonly) = &restored[path];
+        assert_eq!(
+            readonly,
+            other_readonly,
+            "{profile}: {} read-only attribute differs",
+            path.display()
+        );
+        assert!(
+            bytes == other,
+            "{profile}: {} bytes differ: lengths {}/{}, BLAKE3 {}/{}",
+            path.display(),
+            bytes.len(),
+            other.len(),
+            blake3::hash(bytes),
+            blake3::hash(other)
+        );
+    }
+}
+
 fn run(
     sb: &Sandbox,
     auditor: &Auditor,
@@ -321,6 +365,7 @@ fn release_thin_and_fat_incremental_restore_all_windows_artifacts_then_compile_a
         }
         // Include every emitted PDB and import-library companion; fingerprints and native sessions are not restored outputs.
         let original = artifacts(&target.join("release"));
+        inventory(&project, "initial", &original);
         for extension in ["exe", "rlib", "rmeta"] {
             assert!(
                 original
@@ -344,10 +389,9 @@ fn release_thin_and_fat_incremental_restore_all_windows_artifacts_then_compile_a
             "{tag}: restored units must not compile"
         );
         runtime(&target, 41);
-        assert!(
-            artifacts(&target.join("release")) == original,
-            "{tag}: all original artifact bytes and read-only attributes must restore"
-        );
+        let restored = artifacts(&target.join("release"));
+        inventory(&project, "restored", &restored);
+        assert_artifacts(&original, &restored, tag);
         let events = sb.cache_events();
         assert_eq!(events.len() - before, 2, "{tag}: {events:#?}");
         assert!(

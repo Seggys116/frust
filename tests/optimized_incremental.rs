@@ -12,7 +12,12 @@ use std::path::{Path, PathBuf};
 use common::{Sandbox, assert_success, run_binary, settle};
 
 const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
-type Files = BTreeMap<PathBuf, (Vec<u8>, u32)>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Contents {
+    File(Vec<u8>),
+    Link(PathBuf),
+}
+type Files = BTreeMap<PathBuf, (Contents, u32)>;
 
 fn canonical_object_name(name: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(name).ok()?;
@@ -153,9 +158,13 @@ fn assert_files(expected: &Files, actual: &Files, native: bool, phase: &str) {
         expected_paths, actual_paths,
         "{phase}: artifact paths differ"
     );
-    for (path, (bytes, mode)) in expected {
-        let (other, other_mode) = &actual[path];
+    for (path, (contents, mode)) in expected {
+        let (other_contents, other_mode) = &actual[path];
         assert_eq!(mode, other_mode, "{phase}: {} mode differs", path.display());
+        let (Contents::File(bytes), Contents::File(other)) = (contents, other_contents) else {
+            assert_eq!(contents, other_contents, "{phase}: {} alias differs", path.display());
+            continue;
+        };
         if bytes == other {
             continue;
         }
@@ -320,18 +329,30 @@ fn files(root: &Path) -> Files {
                 continue;
             }
             let meta = fs::symlink_metadata(&path).unwrap();
-            assert!(
-                !meta.file_type().is_symlink(),
-                "unexpected output symlink: {}",
-                path.display()
-            );
-            if meta.is_dir() {
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                let resolved = path.parent().unwrap().join(&target).canonicalize().unwrap();
+                // Cargo publishes the packed-debug bundle through a top-level alias into deps.
+                assert!(
+                    path.parent() == Some(root)
+                        && path.extension().is_some_and(|ext| ext == "dSYM")
+                        && resolved.parent() == Some(root.join("deps").canonicalize().unwrap().as_path())
+                        && resolved.extension().is_some_and(|ext| ext == "dSYM")
+                        && resolved.is_dir(),
+                    "unexpected output symlink: {} -> {}",
+                    path.display(), target.display()
+                );
+                found.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    (Contents::Link(target), meta.permissions().mode() & 0o777),
+                );
+            } else if meta.is_dir() {
                 visit(root, &path, found);
             } else {
                 assert!(meta.is_file());
                 found.insert(
                     path.strip_prefix(root).unwrap().to_path_buf(),
-                    (fs::read(&path).unwrap(), meta.permissions().mode() & 0o777),
+                    (Contents::File(fs::read(&path).unwrap()), meta.permissions().mode() & 0o777),
                 );
             }
         }
@@ -339,6 +360,48 @@ fn files(root: &Path) -> Files {
     let mut found = BTreeMap::new();
     visit(root, root, &mut found);
     found
+}
+
+fn write_inventory(path: &Path, files: &Files) {
+    let rows: Vec<_> = files.iter().map(|(path, (contents, mode))| {
+        let mut row = serde_json::json!({"path": path, "mode": mode});
+        match contents {
+            Contents::File(bytes) => {
+                row["length"] = serde_json::json!(bytes.len());
+                row["blake3"] = serde_json::json!(blake3::hash(bytes).to_hex().as_str());
+            }
+            Contents::Link(target) => row["link"] = serde_json::json!(target),
+        }
+        row
+    }).collect();
+    fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
+#[test]
+fn packed_debug_inventory_preserves_alias_targets_and_real_bundle_contents() {
+    let sb = Sandbox::new("packed-debug-inventory");
+    let root = sb.root.join("release");
+    for name in ["app-first.dSYM", "app-second.dSYM"] {
+        let bundle = root.join("deps").join(name);
+        fs::create_dir_all(bundle.join("Contents")).unwrap();
+        fs::write(bundle.join("Contents/debug"), b"complete debug bytes").unwrap();
+    }
+    let alias = root.join("app.dSYM");
+    std::os::unix::fs::symlink("deps/app-first.dSYM", &alias).unwrap();
+    let first = files(&root);
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[Path::new("app.dSYM")].0, Contents::Link("deps/app-first.dSYM".into()));
+    assert!(matches!(&first[Path::new("deps/app-first.dSYM/Contents/debug")].0,
+        Contents::File(bytes) if bytes == b"complete debug bytes"));
+    frust::sys::rename(&alias, &sb.root.join("first-alias")).unwrap();
+    std::os::unix::fs::symlink("deps/app-second.dSYM", &alias).unwrap();
+    let second = files(&root);
+    assert_ne!(first, second, "equal bundle bytes cannot hide a changed Cargo alias");
+    fs::write(root.join("deps/app-first.dSYM/Contents/debug"), b"changed debug bytes").unwrap();
+    assert_ne!(second, files(&root), "the alias cannot hide changes in either real bundle");
+    write_inventory(&sb.root.join("inventory.json"), &first);
+    let inventory: serde_json::Value = serde_json::from_slice(&fs::read(sb.root.join("inventory.json")).unwrap()).unwrap();
+    assert_eq!(inventory.as_array().unwrap().len(), 3);
 }
 
 // The cached A restoration may not rewrite any file in the retained B session.
@@ -501,8 +564,10 @@ fn history(lto: &str, tag: &str) {
                 .as_ref()
                 .unwrap()
                 .iter()
-                .filter_map(|(path, (bytes, _))| {
-                    let other = &native_outputs[path].0;
+                .filter_map(|(path, (contents, _))| {
+                    let (Contents::File(bytes), Contents::File(other)) = (contents, &native_outputs[path].0) else {
+                        return None;
+                    };
                     (bytes != other).then(|| (path, blake3::hash(bytes), blake3::hash(other)))
                 })
                 .collect();
@@ -757,6 +822,7 @@ fn optimized_incremental_packed_debug_restores_the_complete_bundle() {
     fixture.run(13);
     // Restore the original packed-debug bytes; do not equate independent Mach-O debug compilations.
     let original = files(&fixture.target.join("release"));
+    write_inventory(&fixture.sb.root.join("packed-original.json"), &original);
     assert!(
         original.keys().any(|path| path
             .components()
@@ -766,9 +832,8 @@ fn optimized_incremental_packed_debug_restores_the_complete_bundle() {
     fixture.clean();
     assert!(fixture.build(true, &options).is_empty());
     fixture.run(13);
-    assert!(
-        files(&fixture.target.join("release")) == original,
-        "all executable and debug-companion bytes and modes must restore"
-    );
+    let restored = files(&fixture.target.join("release"));
+    write_inventory(&fixture.sb.root.join("packed-restored.json"), &restored);
+    assert_files(&original, &restored, false, "packed executable, bundle and alias restoration");
     assert_eq!(fixture.sb.count_cache("hit", "app"), 1);
 }

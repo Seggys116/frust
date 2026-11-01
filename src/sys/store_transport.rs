@@ -329,11 +329,111 @@ mod imp {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    fn listening(file: &File) -> io::Result<bool> {
+        Ok(option(file, libc::SO_ACCEPTCONN)? != 0)
+    }
+
+    #[cfg(target_os = "macos")]
+    mod darwin_socket_info {
+        use super::*;
+
+        // Public Darwin proc_info.h layout; the protocol union is not interpreted.
+        #[repr(C)]
+        struct ProcFileInfo {
+            open_flags: u32,
+            status: u32,
+            offset: i64,
+            kind: i32,
+            guard_flags: u32,
+        }
+
+        #[repr(C)]
+        struct VinfoStat {
+            dev: u32,
+            mode: u16,
+            nlink: u16,
+            ino: u64,
+            uid: u32,
+            gid: u32,
+            atime: i64,
+            atime_nsec: i64,
+            mtime: i64,
+            mtime_nsec: i64,
+            ctime: i64,
+            ctime_nsec: i64,
+            birthtime: i64,
+            birthtime_nsec: i64,
+            size: i64,
+            blocks: i64,
+            block_size: i32,
+            flags: u32,
+            generation: u32,
+            rdev: u32,
+            spare: [i64; 2],
+        }
+
+        #[repr(C)]
+        struct SocketPrefix {
+            file: ProcFileInfo,
+            stat: VinfoStat,
+            socket: u64,
+            pcb: u64,
+            kind: i32,
+            protocol: i32,
+            family: i32,
+            options: i16,
+            linger: i16,
+        }
+
+        #[repr(C)]
+        struct SocketFdInfo {
+            prefix: SocketPrefix,
+            tail: [u64; 75],
+        }
+
+        const _: () = {
+            assert!(size_of::<ProcFileInfo>() == 24);
+            assert!(size_of::<VinfoStat>() == 136);
+            assert!(size_of::<SocketPrefix>() == 192);
+            assert!(mem::offset_of!(SocketPrefix, options) == 188);
+            assert!(size_of::<SocketFdInfo>() == 792);
+        };
+
+        pub(super) fn listening(file: &File) -> io::Result<bool> {
+            // SAFETY: the zeroed public ABI record owns all 792 writable bytes; only our live fd is queried.
+            let (info, count) = unsafe {
+                let mut info: SocketFdInfo = mem::zeroed();
+                let count = libc::proc_pidfdinfo(
+                    libc::getpid(),
+                    file.as_raw_fd(),
+                    3,
+                    (&mut info as *mut SocketFdInfo).cast(),
+                    size_of::<SocketFdInfo>() as i32,
+                );
+                (info, count)
+            };
+            if count <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if count as usize != size_of::<SocketFdInfo>()
+                || info.prefix.kind != libc::SOCK_STREAM
+                || info.prefix.family != libc::AF_UNIX
+            {
+                return Err(invalid("invalid Darwin socket information"));
+            }
+            Ok(i32::from(info.prefix.options) & libc::SO_ACCEPTCONN != 0)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    use darwin_socket_info::listening;
+
     fn validate(file: &File, role: Role) -> io::Result<()> {
         if option(file, libc::SO_TYPE)? != libc::SOCK_STREAM {
             return Err(invalid("expected stream socket"));
         }
-        let listening = option(file, libc::SO_ACCEPTCONN)? != 0;
+        let listening = listening(file)?;
         if listening != matches!(role, Role::Listener) {
             return Err(invalid("incorrect socket role"));
         }
@@ -683,6 +783,18 @@ mod imp {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    const RECEIVE_CONTROL_WORDS: usize = 32;
+    // XNU installs rights before truncating copyout; one MCLBYTES cluster covers its admitted control record.
+    #[cfg(target_os = "macos")]
+    const RECEIVE_CONTROL_WORDS: usize = 2048 / size_of::<usize>();
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        // SAFETY: CMSG_SPACE only computes alignment for this bounded payload length.
+        let maximum = unsafe { libc::CMSG_SPACE((254 * size_of::<i32>()) as _) };
+        assert!(maximum as usize <= RECEIVE_CONTROL_WORDS * size_of::<usize>());
+    };
+
     fn receive_chunk(
         file: &File,
         bytes: &mut [u8],
@@ -690,7 +802,7 @@ mod imp {
     ) -> io::Result<(usize, Vec<File>)> {
         loop {
             ready(file, libc::POLLIN, deadline)?;
-            let mut ancillary = [0usize; 32];
+            let mut ancillary = [0usize; RECEIVE_CONTROL_WORDS];
             let mut received = Vec::new();
             // SAFETY: recvmsg uses bounded writable buffers; each received SCM_RIGHTS fd is adopted once.
             unsafe {
@@ -933,7 +1045,8 @@ mod imp {
 
         #[test]
         fn unexpected_descriptor_counts_and_truncation_close_every_received_fd() {
-            for count in [1, 3, 100] {
+            // Linux closes truncated tails; Darwin must receive all rights before rejecting the count.
+            for count in [1, 3, 100].into_iter().cycle().take(9) {
                 let scratch = Scratch::new();
                 let (key, path) = scratch.locked();
                 let (sender, receiver) = pair().unwrap();
@@ -943,7 +1056,9 @@ mod imp {
                     receive(&receiver, 16, deadline()).unwrap_err().kind(),
                     io::ErrorKind::InvalidData
                 );
-                assert_unlocked(&path);
+                File::open(&path).unwrap().try_lock().unwrap_or_else(|error| {
+                    panic!("received descriptors leaked for count {count}: {error}")
+                });
             }
         }
 
@@ -1005,6 +1120,50 @@ mod imp {
             );
             fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(Connection::connect_verified(&path, deadline()).is_err());
+        }
+
+        #[test]
+        fn socket_roles_require_listening_or_connected_state() {
+            let scratch = Scratch::new();
+            let listener = bind(&scratch.0.join("role-socket")).unwrap();
+            assert!(validate(&listener, Role::Listener).is_ok());
+            assert!(validate(&listener, Role::Connection).is_err());
+            let (connection, _peer) = pair().unwrap();
+            assert!(validate(&connection, Role::Connection).is_ok());
+            assert!(validate(&connection, Role::Control).is_ok());
+            assert!(validate(&connection, Role::Listener).is_err());
+            // SAFETY: socket returns a new owned descriptor, without a peer or listening state.
+            let unconnected = owned(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) }).unwrap();
+            assert!(validate(&unconnected, Role::Listener).is_err());
+            assert!(validate(&unconnected, Role::Connection).is_err());
+            assert!(validate(&unconnected, Role::Control).is_err());
+            let path = scratch.0.join("bound-not-listening");
+            // SAFETY: the address is initialized completely before bind reads it.
+            let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
+            address.sun_family = libc::AF_UNIX as _;
+            let bytes = path.as_os_str().as_bytes();
+            assert!(bytes.len() < address.sun_path.len());
+            for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+                *to = *from as _;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                address.sun_len = size_of::<libc::sockaddr_un>() as _;
+            }
+            // SAFETY: bind borrows the live descriptor and the initialized bounded address.
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        unconnected.as_raw_fd(),
+                        (&address as *const libc::sockaddr_un).cast(),
+                        size_of::<libc::sockaddr_un>() as _,
+                    )
+                },
+                0
+            );
+            assert!(validate(&unconnected, Role::Listener).is_err());
+            assert!(validate(&unconnected, Role::Connection).is_err());
+            assert!(validate(&unconnected, Role::Control).is_err());
         }
 
         #[test]

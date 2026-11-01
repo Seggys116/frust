@@ -10,6 +10,7 @@ pub struct RustcArgs {
     pub extra_filename: String,
     /// Without a disambiguating suffix, only explicit metadata-only libraries have a fixed output set.
     pub metadata_only_library: bool,
+    pub windows_pdb_output: bool,
     pub paths: Vec<(usize, PathArg)>,
     pub libs: Vec<NativeLib>,
     pub out_dir_args: Vec<usize>,
@@ -26,6 +27,10 @@ impl RustcArgs {
 
     pub fn unoptimised(&self) -> bool {
         self.opt_level.as_deref().is_none_or(|level| level == "0")
+    }
+
+    pub fn unhashed_windows_pdb(&self) -> bool {
+        self.windows_pdb_output && self.extra_filename.is_empty()
     }
 }
 
@@ -91,6 +96,8 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
     let mut extra_filename = String::new();
     let mut emit: Option<Vec<String>> = None;
     let mut emit_occurrences = 0;
+    let mut emits_link = false;
+    let mut target = None;
     let mut crate_types = Vec::new();
     let mut paths = Vec::new();
     let mut libs = Vec::new();
@@ -128,11 +135,13 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
             "--emit" => {
                 emit_occurrences += 1;
                 emit = next.map(split_list);
+                emits_link |= emit.as_ref().is_some_and(|values| values.iter().any(|value| value == "link"));
                 i += 1;
             }
             _ if arg.starts_with("--emit=") => {
                 emit_occurrences += 1;
                 emit = Some(split_list(&arg["--emit=".len()..]));
+                emits_link |= emit.as_ref().is_some_and(|values| values.iter().any(|value| value == "link"));
             }
             "--crate-type" => {
                 if let Some(value) = next {
@@ -197,11 +206,16 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
             _ if arg.starts_with("-Z") => push_option_paths(i, &arg[2..], &mut paths),
             "--target" => {
                 if let Some(value) = next {
+                    target = Some(value.to_string());
                     paths.push((i + 1, PathArg::Target(value.to_string())));
                 }
                 i += 1;
             }
-            _ if arg.starts_with("--target=") => paths.push((i, PathArg::Target(arg["--target=".len()..].to_string()))),
+            _ if arg.starts_with("--target=") => {
+                let value = arg["--target=".len()..].to_string();
+                target = Some(value.clone());
+                paths.push((i, PathArg::Target(value)));
+            }
             "--cfg"
             | "--check-cfg"
             | "--edition"
@@ -234,6 +248,11 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
         extra_filename,
         metadata_only_library: emit_occurrences == 1 && emit.len() == 2 && emit.iter().any(|e| e == "metadata")
             && !crate_types.is_empty() && crate_types.iter().all(|kind| matches!(kind.as_str(), "lib" | "rlib")),
+        windows_pdb_output: emits_link
+            && (crate_types.is_empty() || crate_types.iter().any(|kind| matches!(kind.as_str(), "bin" | "dylib" | "cdylib" | "proc-macro")))
+            && target.as_deref().map_or(cfg!(all(windows, target_env = "msvc")), |target| {
+                matches!(target, "i586-pc-windows-msvc" | "i686-pc-windows-msvc" | "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" | "arm64ec-pc-windows-msvc" | "thumbv7a-pc-windows-msvc")
+            }),
         paths,
         libs,
         out_dir_args,
@@ -372,6 +391,28 @@ mod tests {
         let mut args = BASE.to_vec();
         args.extend(extra);
         parse(&os(&args))
+    }
+
+    #[test]
+    fn windows_pdb_scope_covers_default_and_repeated_link_emits_only_for_known_msvc_targets() {
+        let msvc = ["--target=x86_64-pc-windows-msvc"];
+        assert!(with(&msvc).unwrap().unhashed_windows_pdb());
+        for kind in ["bin", "dylib", "cdylib", "proc-macro"] {
+            assert!(with(&[msvc[0], "--crate-type", kind]).unwrap().unhashed_windows_pdb());
+        }
+        assert!(with(&[msvc[0], "--emit=dep-info,metadata"]).unwrap().unhashed_windows_pdb());
+        assert_eq!(with(&[]).unwrap().unhashed_windows_pdb(), cfg!(all(windows, target_env = "msvc")));
+        for flags in [
+            vec![msvc[0], "--crate-type=rlib"],
+            vec![msvc[0], "-Cextra-filename=-abcd"],
+            vec!["--target=x86_64-unknown-linux-gnu"],
+            vec!["--target=x86_64-pc-windows-gnu"],
+            vec!["--target=custom-windows-msvc.json"],
+        ] {
+            assert!(!with(&flags).unwrap().unhashed_windows_pdb(), "{flags:?}");
+        }
+        let args = os(&["--crate-name=a", "--out-dir=/o", msvc[0], "--emit=dep-info,metadata"]);
+        assert!(!parse(&args).unwrap().unhashed_windows_pdb());
     }
 
     #[test]
