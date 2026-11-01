@@ -2,7 +2,7 @@
 
 ## Method
 
-The measurements use release binaries built from the Rust sources in [0930886](https://github.com/Seggys116/frust/commit/09308869f003de7c360fcc453f45e1208888928f).
+The measurements use release binaries built from the Rust sources in [321931e](https://github.com/Seggys116/frust/commit/321931ee0ebeaa02cd3177c18f12e5f002c56d17).
 
 Times are milliseconds, median [minimum, maximum] across seven repetitions unless stated otherwise. Observed ranges describe these runs; no confidence interval or runtime-throughput claim is inferred. Cold means an empty build target and frust cache, with the toolchain and registry dependencies already installed; the OS page cache was not cleared. The general graph has four local crates plus registry dependencies; the release-profile graph has two local crates plus registry dependencies.
 
@@ -16,7 +16,7 @@ Concurrent cold groups are a separate workload: two equivalent dev-inherited pro
 
 The fresh measurement cohort records each command, capture interval, report digest, frozen frontend/wrapper identities, original compiler and Cargo versions, native compiler identity, sysroot identity and hardware/filesystem context. Missing in-report metadata, including growth hardware/store policy, comes from this contemporaneous runner provenance; it is not inferred from earlier results. Raw reports and the cohort manifest remain outside the repository.
 
-Reproduce with the same release-built frust binary and at least 12 GiB free. Set TMPDIR to an existing scratch directory on the filesystem being measured; these results use ext4 rather than the system tmpfs. The general command includes the release-profile matrix. The standalone --profiles command below is an optional separate rerun. Raw JSON reports can remain under /tmp independently of the fixture TMPDIR; keep them outside the repository:
+Reproduce with the same release-built frust binary and at least 12 GiB free. Set TMPDIR to an existing scratch directory on the filesystem being measured. The general command includes the release-profile matrix. The standalone --profiles command below is an optional separate rerun. Raw JSON reports can remain under /tmp independently of the fixture TMPDIR; keep them outside the repository:
 
 ```bash
 export TMPDIR=/path/to/scratch-on-measured-filesystem
@@ -31,7 +31,7 @@ frust bench --concurrent --quick --runs 7 --store=deferred --compression=auto --
 
 ## Results
 
-Measured 2026-10-31–2026-11-01 UTC using Intel(R) Core(TM) Ultra 7 255H (16 logical CPUs), Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. General-suite load before/after: 2.59/2.60; profile-suite load: 2.47/2.80; linker-suite load: 2.74/2.68. Concurrent-suite load: 2.68/2.68; Cargo 1.97.1 (c980f4866 2026-06-30); concurrent compiler identity matches the profile suite. Reflinks supported: false.
+Measured on 2026-11-01 using Intel(R) Core(TM) Ultra 7 255H (16 logical CPUs), Linux 7.0.0-42-generic x86_64, ext4, rustc 1.97.1. General-suite load before/after: 0.20/2.32; profile-suite load: 3.10/1.87; immediate-growth load: 2.32/2.97; settled-growth load: 2.97/3.47; linker-suite load: 3.47/3.27. Concurrent-suite load: 3.27/4.69; Cargo 1.97.1 (c980f4866 2026-06-30); concurrent compiler identity matches the profile suite. Reflinks supported: false.
 
 ### Debug builds
 
@@ -39,12 +39,12 @@ Measured 2026-10-31–2026-11-01 UTC using Intel(R) Core(TM) Ultra 7 255H (16 lo
 
 | Operation | Cargo ms | frust ms |
 | --- | --- | --- |
-| Cold | 3301 [2853, 3525] | 3572 [2946, 3793] |
-| Second project | 3478 [2829, 3544] | 820 [710, 876] |
-| Clean rebuild / restore | 3483 [2867, 3592] | 162 [157, 186] |
-| No-op | 18 [17, 19] | 19 [19, 21] |
-| First edit after restore | 91 [82, 101] | 99 [91, 113] |
-| Warm-session edit | 87 [85, 105] | 105 [93, 114] |
+| Cold | 3271 [2780, 3488] | 3594 [2963, 3858] |
+| Second project | 3394 [2787, 3612] | 818 [696, 862] |
+| Clean rebuild / restore | 3426 [2782, 3560] | 169 [161, 189] |
+| No-op | 18 [17, 19] | 20 [19, 22] |
+| First edit after restore | 89 [84, 94] | 95 [90, 96] |
+| Warm-session edit | 87 [80, 99] | 96 [95, 101] |
 
 ### Concurrent cold groups
 
@@ -52,8 +52,8 @@ Each sample completes **two concurrent builds**, with intra-group peer reuse sta
 
 | Measurement | Cargo ms | frust ms | Paired difference ms | frust faster pairs |
 | --- | --- | --- | --- | --- |
-| Foreground group | 5089.434 [4768.562, 5213.963] | 3697.148 [3651.074, 3878.379] | -1312.618 [-1505.045, -1018.238] | 7/7 |
-| Settled group | 5089.667 [4768.636, 5214.087] | 3697.243 [3651.150, 3878.459] | -1312.708 [-1505.090, -1018.226] | 7/7 |
+| Foreground group | 4916.596 [4516.652, 5092.388] | 3676.050 [3388.185, 4335.736] | -1174.257 [-1496.962, -748.822] | 7/7 |
+| Settled group | 4916.630 [4516.686, 5092.451] | 3676.321 [3388.271, 4335.814] | -1174.212 [-1496.941, -748.793] | 7/7 |
 
 Observed Cargo-unit compilation totals across the seven Cargo/frust pairs were 40→20, 40→20, 40→20, 40→20, 40→20, 40→20, 40→20. Each pair proved 14 uniquely identified shared units compiled once with positive-byte store and peer-hit evidence. Those counts exclude separately retained inspection queries and build-script capability probes. Same-path executable bytes and runtime output matched across tools and profiles. All final unchanged groups executed zero compiler calls (including queries), zero Cargo compilation notices and zero cache events.
 
@@ -63,27 +63,27 @@ Observed Cargo-unit compilation totals across the seven Cargo/frust pairs were 4
 
 | Profile | Operation | Cargo ms | frust ms |
 | --- | --- | --- | --- |
-| Defaults | Cold | 3684 [3556, 3773] | 3936 [3845, 4026] |
-| Defaults | Clean rebuild / restore | 3698 [3618, 3820] | 146 [141, 169] |
-| Defaults | No-op | 20 [17, 20] | 21 [19, 24] |
-| Defaults | Body edit | 67 [65, 77] | 74 [68, 81] |
-| ThinLTO | Cold | 5129 [4956, 5209] | 5316 [5236, 5483] |
-| ThinLTO | Clean rebuild / restore | 5018 [4991, 5267] | 146 [142, 161] |
-| ThinLTO | No-op | 19 [19, 20] | 21 [19, 28] |
-| ThinLTO | Body edit | 1767 [1710, 1890] | 1785 [1736, 1863] |
-| Full/fat LTO | Cold | 4957 [4839, 4998] | 5242 [5039, 5416] |
-| Full/fat LTO | Clean rebuild / restore | 4960 [4832, 5088] | 143 [140, 145] |
-| Full/fat LTO | No-op | 19 [19, 20] | 21 [21, 21] |
-| Full/fat LTO | Body edit | 1712 [1641, 1760] | 1710 [1639, 1796] |
+| Defaults | Cold | 3663 [3535, 3800] | 3987 [3814, 4167] |
+| Defaults | Clean rebuild / restore | 3709 [3538, 3791] | 144 [141, 152] |
+| Defaults | No-op | 19 [18, 20] | 21 [20, 22] |
+| Defaults | Body edit | 67 [65, 68] | 72 [70, 81] |
+| ThinLTO | Cold | 5059 [4834, 5363] | 5250 [5185, 5415] |
+| ThinLTO | Clean rebuild / restore | 5031 [4828, 5272] | 146 [139, 157] |
+| ThinLTO | No-op | 19 [18, 27] | 21 [20, 22] |
+| ThinLTO | Body edit | 1809 [1730, 1874] | 1829 [1814, 1841] |
+| Full/fat LTO | Cold | 4938 [4835, 5155] | 5188 [5010, 5265] |
+| Full/fat LTO | Clean rebuild / restore | 4944 [4750, 5010] | 144 [136, 153] |
+| Full/fat LTO | No-op | 19 [18, 20] | 21 [20, 24] |
+| Full/fat LTO | Body edit | 1675 [1630, 1740] | 1689 [1654, 1722] |
 
 Frust retained a positive paired median isolated-cold overhead for debug, ordinary release, ThinLTO, full/fat LTO. The concurrent-group result does not remove those regressions. Cold rows above contain each tool’s own median. The following differences use matching repetition pairs (frust minus Cargo); their median need not equal the difference between tool medians. Cold pairs alternate tool order.
 
 | Cold comparison | Paired difference ms | Paired difference % | Positive differences |
 | --- | --- | --- | --- |
-| Debug general graph | 112 [-167, 492] | 3.3% [-5.2%, 14.9%] | 6/7 |
-| Defaults | 289 [96, 384] | 8.1% [2.5%, 10.6%] | 7/7 |
-| ThinLTO | 237 [27, 445] | 4.6% [0.5%, 8.8%] | 7/7 |
-| Full/fat LTO | 279 [82, 513] | 5.6% [1.7%, 10.6%] | 7/7 |
+| Debug general graph | 183 [142, 587] | 6.6% [4.5%, 17.9%] | 7/7 |
+| Defaults | 365 [151, 421] | 9.9% [4.1%, 11.6%] | 7/7 |
+| ThinLTO | 198 [-175, 416] | 3.9% [-3.3%, 8.6%] | 6/7 |
+| Full/fat LTO | 227 [45, 327] | 4.6% [0.9%, 6.6%] | 7/7 |
 
 Each debug cold sample compiled 22 Cargo units and ran 3 build-script capability probes with either tool. Cargo issued 8 queries and frust 10: two extra frust cold queries, retained in total latency. Warm restores require zero Cargo-unit and unknown compilations, positive cache hits and zero misses; any inspection queries or capability probes remain visible. Debug and release no-op samples made zero compiler calls, including queries.
 
@@ -93,35 +93,35 @@ All listed frust samples include the completion proof. Foreground values are in 
 
 | frust operation | Drain ms | Settled total ms |
 | --- | --- | --- |
-| Debug: cold | 20 [10, 20] | 3592 [2966, 3803] |
-| Debug: second project | 10 [10, 20] | 831 [720, 897] |
-| Debug: clean rebuild / restore | 0 [0, 0] | 162 [157, 186] |
-| Debug: no-op | 0 [0, 0] | 19 [19, 21] |
-| Debug: first edit after restore | 20 [0, 20] | 115 [91, 131] |
-| Debug: warm-session edit | 20 [0, 20] | 121 [93, 134] |
-| Defaults: cold | 0 [0, 0] | 3936 [3845, 4026] |
-| Defaults: clean rebuild / restore | 0 [0, 0] | 146 [141, 169] |
-| ThinLTO: cold | 0 [0, 0] | 5316 [5236, 5483] |
-| ThinLTO: clean rebuild / restore | 0 [0, 0] | 146 [142, 161] |
-| Full/fat LTO: cold | 0 [0, 0] | 5242 [5039, 5416] |
-| Full/fat LTO: clean rebuild / restore | 0 [0, 0] | 144 [140, 145] |
+| Debug: cold | 20 [10, 20] | 3604 [2983, 3878] |
+| Debug: second project | 20 [10, 20] | 839 [706, 883] |
+| Debug: clean rebuild / restore | 0 [0, 0] | 169 [161, 189] |
+| Debug: no-op | 0 [0, 0] | 20 [19, 22] |
+| Debug: first edit after restore | 20 [0, 20] | 114 [90, 117] |
+| Debug: warm-session edit | 20 [0, 20] | 116 [95, 122] |
+| Defaults: cold | 0 [0, 0] | 3987 [3814, 4167] |
+| Defaults: clean rebuild / restore | 0 [0, 0] | 144 [141, 152] |
+| ThinLTO: cold | 0 [0, 0] | 5250 [5185, 5415] |
+| ThinLTO: clean rebuild / restore | 0 [0, 0] | 146 [140, 158] |
+| Full/fat LTO: cold | 0 [0, 0] | 5188 [5010, 5265] |
+| Full/fat LTO: clean rebuild / restore | 0 [0, 0] | 144 [137, 153] |
 
 ### Managed allocation after 200 edits
 
 ![Managed allocation after 200 edits](../.github/assets/growth.svg)
 
-Both sequences use 12 local libraries, one application and registry dependencies. Each tool completed 200 steps of body/signature edits, feature changes and reverts, produced matching output throughout, recorded 1,542 compilations including the initial build, and made zero compiler calls on the final unchanged rebuild. These are single completed growth sequences, not seven-run latency distributions. Allocation counts unique device/inode blocks across managed roots. Toolchain and Cargo registry storage are excluded. Target plus store is a subset of full managed allocation. The cache column is the additional store allocation beyond the target; other managed allocation includes controls and other managed roots. Standalone retired payload may share inodes or extents with target/store and is annotated separately, never added to a stack.
+Both sequences use 12 local libraries, one application and registry dependencies. Each tool completed 200 steps of body/signature edits, feature changes and reverts, produced matching output throughout, recorded 1,542 compilations including the initial build, and made zero compiler calls on the final unchanged rebuild. These are single completed growth sequences, not seven-run latency distributions. Allocation counts unique device/inode blocks across managed roots. Toolchain and Cargo registry storage are excluded. Target plus store is a subset of full managed allocation. The cache column is the additional store allocation beyond the target; other managed allocation includes controls and other managed roots. Displayed MiB values are rounded independently, so components may not sum to the displayed total. Standalone retired payload may share inodes or extents with target/store and is annotated separately, never added to a stack.
 
 | Sequence | Tool | Target MiB | Cache (additional) MiB | Other managed MiB | Full managed MiB |
 | --- | --- | --- | --- | --- | --- |
 | Immediate edits | Cargo | 371.1 | 0.0 | 0.0 | 371.1 |
-| Immediate edits | frust | 174.4 | 48.1 | 3.0 | 225.5 |
+| Immediate edits | frust | 174.4 | 48.1 | 3.1 | 225.5 |
 | Settled source stamps | Cargo | 371.1 | 0.0 | 0.0 | 371.1 |
-| Settled source stamps | frust | 174.4 | 48.6 | 3.1 | 226.0 |
+| Settled source stamps | frust | 174.4 | 48.6 | 3.0 | 226.0 |
 
-Settled source checks waited 20.155 seconds for Cargo, 20.233 seconds for frust outside build latency. Neither frust replay retained queued payload allocation at its endpoint; this cache-home measure is not applicable to Cargo.
+Settled source checks waited 20.138 seconds for Cargo, 20.225 seconds for frust outside build latency. Neither frust replay retained queued payload allocation at its endpoint; this cache-home measure is not applicable to Cargo.
 
-At the final settled snapshot, the maximum retained keys per unit was 3, within the configured bound of 4; the retired queue contained 0 payload entries. The final unchanged build made zero compiler calls. Retention observations check descriptors and backing presence rather than full restore integrity.
+The settled replay's cache evidence was captured before the final build's compaction: 21 unit records contained 63 key references, including 8 stale references without current cache entries. The maximum retained keys per unit was 3, within the configured bound of 4; the retired queue contained 0 payload entries. Allocation was measured after maintenance. The final unchanged build made zero compiler calls. Retention observations check descriptors and backing presence rather than full restore integrity.
 
 ### Native linking baseline
 
@@ -129,5 +129,5 @@ With FRUST_LINK=off, the configured linker is preserved and the artifact cache i
 
 | Measurement | ms median [min, max] |
 | --- | --- |
-| Total build | 85 [78, 90] |
-| Native link phase | 31 [27, 37] |
+| Total build | 86 [82, 97] |
+| Native link phase | 34 [30, 45] |

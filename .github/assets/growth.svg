@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg role="img" aria-labelledby="figure-description" xmlns:xlink="http://www.w3.org/1999/xlink" width="697.747031pt" height="415.330031pt" viewBox="0 0 697.747031 415.330031" xmlns="http://www.w3.org/2000/svg" version="1.1"><desc id="figure-description">Intel(R) Core(TM) Ultra 7 255H | Linux 7.0.0-42-generic x86_64 | ext4 | rustc 1.97.1. Full managed allocation after edits; target plus additional unique cache allocation plus managed remainder. Retired paths lie beneath other managed roots. Standalone retired_payload_bytes may overlap target/store allocation through shared inodes or extents, is nonadditive, and is annotated separately rather than stacked. Checked unique device/inode allocated blocks; no confidence intervals or repeated-run distribution implied. Policy: {&quot;enabled&quot;: true, &quot;every_seconds&quot;: 0, &quot;min_growth_bytes&quot;: 0, &quot;keep_other_profile_seconds&quot;: 1209600, &quot;uncached_dead_grace_seconds&quot;: 86400, &quot;dead_incremental_grace_seconds&quot;: 3600, &quot;incremental_idle_seconds&quot;: 604800, &quot;max_target_bytes&quot;: 8589934592, &quot;current_window_seconds&quot;: 3600, &quot;hot_window_seconds&quot;: 3600, &quot;hot_categories&quot;: [&quot;Dylib&quot;, &quot;DepsExecutables&quot;, &quot;Examples&quot;], &quot;cache_enabled&quot;: true, &quot;compress&quot;: true, &quot;pass_budget_ms&quot;: 2000, &quot;pass_bytes&quot;: 536870912}. [[&quot;Cargo&quot;, [389156864, 0, 0], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, null], [&quot;Auto&quot;, [182833152, 50421760, 3162112], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, 0]]</desc>
+<svg role="img" aria-labelledby="figure-description" xmlns:xlink="http://www.w3.org/1999/xlink" width="697.747031pt" height="415.330031pt" viewBox="0 0 697.747031 415.330031" xmlns="http://www.w3.org/2000/svg" version="1.1"><desc id="figure-description">Measured source commit 321931ee0ebeaa02cd3177c18f12e5f002c56d17. Intel(R) Core(TM) Ultra 7 255H | Linux 7.0.0-42-generic x86_64 | ext4 | rustc 1.97.1. Full managed allocation after edits; target plus additional unique cache allocation plus managed remainder. Retired paths lie beneath other managed roots. Standalone retired_payload_bytes may overlap target/store allocation through shared inodes or extents, is nonadditive, and is annotated separately rather than stacked. Checked unique device/inode allocated blocks; no confidence intervals or repeated-run distribution implied. Policy: {&quot;enabled&quot;: true, &quot;every_seconds&quot;: 0, &quot;min_growth_bytes&quot;: 0, &quot;keep_other_profile_seconds&quot;: 1209600, &quot;uncached_dead_grace_seconds&quot;: 86400, &quot;dead_incremental_grace_seconds&quot;: 3600, &quot;incremental_idle_seconds&quot;: 604800, &quot;max_target_bytes&quot;: 8589934592, &quot;current_window_seconds&quot;: 3600, &quot;hot_window_seconds&quot;: 3600, &quot;hot_categories&quot;: [&quot;Dylib&quot;, &quot;DepsExecutables&quot;, &quot;Examples&quot;], &quot;cache_enabled&quot;: true, &quot;compress&quot;: true, &quot;pass_budget_ms&quot;: 2000, &quot;pass_bytes&quot;: 536870912}. [[&quot;Cargo&quot;, [389169152, 0, 0], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, null], [&quot;Auto&quot;, [182841344, 50421760, 3198976], &quot;Checked allocated blocks of unique device/inode entries, including directories and symlinks. Detected APFS clone sharing is estimated; unknown sharing is charged fully. All unions use one revalidated inventory. Other managed allocation is total minus selected target/store, including control files, temporary or retired payloads and other central targets. Retired payload is the standalone union of queued children, excluding the queue directory itself; it may share allocation with other roots, so do not add it to the total.&quot;, 0]]</desc>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
@@ -40,12 +40,12 @@ z
     <g id="xtick_1">
      <g id="line2d_1">
       <defs>
-       <path id="m4f7618495a" d="M 0 0
+       <path id="m2c8938e6de" d="M 0 0
 L 0 3.5
 " style="stroke: #8b949e; stroke-width: 0.8"/>
       </defs>
       <g>
-       <use xlink:href="#m4f7618495a" x="177.801098" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#m2c8938e6de" x="177.801098" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_1">
@@ -55,7 +55,7 @@ L 0 3.5
     <g id="xtick_2">
      <g id="line2d_2">
       <g>
-       <use xlink:href="#m4f7618495a" x="561.592964" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#m2c8938e6de" x="561.592964" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_2">
@@ -69,16 +69,16 @@ L 0 3.5
      <g id="line2d_3">
       <path d="M 48.847031 312.048
 L 690.547031 312.048
-" clip-path="url(#pe9d5556b61)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
+" clip-path="url(#pc709c189c6)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_4">
       <defs>
-       <path id="maf3779d155" d="M 0 0
+       <path id="mf413aa547f" d="M 0 0
 L -3.5 0
 " style="stroke: #8b949e; stroke-width: 0.8"/>
       </defs>
       <g>
-       <use xlink:href="#maf3779d155" x="48.847031" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#mf413aa547f" x="48.847031" y="312.048" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_3">
@@ -87,62 +87,62 @@ L -3.5 0
     </g>
     <g id="ytick_2">
      <g id="line2d_5">
-      <path d="M 48.847031 258.888212
-L 690.547031 258.888212
-" clip-path="url(#pe9d5556b61)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.847031 258.889891
+L 690.547031 258.889891
+" clip-path="url(#pc709c189c6)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_6">
       <g>
-       <use xlink:href="#maf3779d155" x="48.847031" y="258.888212" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#mf413aa547f" x="48.847031" y="258.889891" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_4">
-      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="263.096572" transform="rotate(-0 41.847031 263.096572)">100</text>
+      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="263.09825" transform="rotate(-0 41.847031 263.09825)">100</text>
      </g>
     </g>
     <g id="ytick_3">
      <g id="line2d_7">
-      <path d="M 48.847031 205.728425
-L 690.547031 205.728425
-" clip-path="url(#pe9d5556b61)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.847031 205.731782
+L 690.547031 205.731782
+" clip-path="url(#pc709c189c6)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_8">
       <g>
-       <use xlink:href="#maf3779d155" x="48.847031" y="205.728425" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#mf413aa547f" x="48.847031" y="205.731782" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_5">
-      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="209.936784" transform="rotate(-0 41.847031 209.936784)">200</text>
+      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="209.940141" transform="rotate(-0 41.847031 209.940141)">200</text>
      </g>
     </g>
     <g id="ytick_4">
      <g id="line2d_9">
-      <path d="M 48.847031 152.568637
-L 690.547031 152.568637
-" clip-path="url(#pe9d5556b61)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.847031 152.573673
+L 690.547031 152.573673
+" clip-path="url(#pc709c189c6)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_10">
       <g>
-       <use xlink:href="#maf3779d155" x="48.847031" y="152.568637" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#mf413aa547f" x="48.847031" y="152.573673" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_6">
-      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="156.776996" transform="rotate(-0 41.847031 156.776996)">300</text>
+      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="156.782032" transform="rotate(-0 41.847031 156.782032)">300</text>
      </g>
     </g>
     <g id="ytick_5">
      <g id="line2d_11">
-      <path d="M 48.847031 99.408849
-L 690.547031 99.408849
-" clip-path="url(#pe9d5556b61)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.847031 99.415563
+L 690.547031 99.415563
+" clip-path="url(#pc709c189c6)" style="fill: none; stroke: #30363d; stroke-opacity: 0.55; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_12">
       <g>
-       <use xlink:href="#maf3779d155" x="48.847031" y="99.408849" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
+       <use xlink:href="#mf413aa547f" x="48.847031" y="99.415563" style="fill: #8b949e; stroke: #8b949e; stroke-width: 0.8"/>
       </g>
      </g>
      <g id="text_7">
-      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="103.617209" transform="rotate(-0 41.847031 103.617209)">400</text>
+      <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: end; fill: #8b949e" x="41.847031" y="103.623923" transform="rotate(-0 41.847031 103.623923)">400</text>
      </g>
     </g>
     <g id="text_8">
@@ -155,15 +155,15 @@ L 277.586983 312.048
 L 277.586983 114.756661
 L 78.015213 114.756661
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #6e7681"/>
+" clip-path="url(#pc709c189c6)" style="fill: #6e7681"/>
    </g>
    <g id="patch_4">
     <path d="M 461.807079 312.048
 L 661.378849 312.048
-L 661.378849 219.35685
-L 461.807079 219.35685
+L 661.378849 219.355624
+L 461.807079 219.355624
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #6e7681"/>
+" clip-path="url(#pc709c189c6)" style="fill: #6e7681"/>
    </g>
    <g id="patch_5">
     <path d="M 78.015213 114.756661
@@ -171,15 +171,15 @@ L 277.586983 114.756661
 L 277.586983 114.756661
 L 78.015213 114.756661
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #39d0c3"/>
+" clip-path="url(#pc709c189c6)" style="fill: #39d0c3"/>
    </g>
    <g id="patch_6">
-    <path d="M 461.807079 219.35685
-L 661.378849 219.35685
-L 661.378849 193.794468
-L 461.807079 193.794468
+    <path d="M 461.807079 219.355624
+L 661.378849 219.355624
+L 661.378849 193.794048
+L 461.807079 193.794048
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #39d0c3"/>
+" clip-path="url(#pc709c189c6)" style="fill: #39d0c3"/>
    </g>
    <g id="patch_7">
     <path d="M 78.015213 114.756661
@@ -187,21 +187,21 @@ L 277.586983 114.756661
 L 277.586983 114.756661
 L 78.015213 114.756661
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #ce9178"/>
+" clip-path="url(#pc709c189c6)" style="fill: #ce9178"/>
    </g>
    <g id="patch_8">
-    <path d="M 461.807079 193.794468
-L 661.378849 193.794468
-L 661.378849 192.191368
-L 461.807079 192.191368
+    <path d="M 461.807079 193.794048
+L 661.378849 193.794048
+L 661.378849 192.172311
+L 461.807079 192.172311
 z
-" clip-path="url(#pe9d5556b61)" style="fill: #ce9178"/>
+" clip-path="url(#pc709c189c6)" style="fill: #ce9178"/>
    </g>
    <g id="text_9">
     <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: middle; fill: #c9d1d9" x="177.801098" y="109.824378" transform="rotate(-0 177.801098 109.824378)">371.1 MiB</text>
    </g>
    <g id="text_10">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: middle; fill: #c9d1d9" x="561.592964" y="187.259084" transform="rotate(-0 561.592964 187.259084)">225.5 MiB</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans Mono'; text-anchor: middle; fill: #c9d1d9" x="561.592964" y="187.240027" transform="rotate(-0 561.592964 187.240027)">225.5 MiB</text>
    </g>
    <g id="legend_1">
     <g id="patch_9">
@@ -256,7 +256,7 @@ z
   </g>
  </g>
  <defs>
-  <clipPath id="pe9d5556b61">
+  <clipPath id="pc709c189c6">
    <rect x="48.847031" y="61.488" width="641.7" height="250.56"/>
   </clipPath>
  </defs>

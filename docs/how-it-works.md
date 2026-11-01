@@ -263,7 +263,7 @@ keeps its lock identity so a later cleanup can validate and retry it safely.
 
 The [latest growth results](benchmarks.md) replay 200 edits across 12 local crates: Cargo used 371.1 MiB, while
 frust used 225.5 MiB in total: 174.4 MiB of target allocation, 48.1 MiB of additional cache allocation and
-3.0 MiB of other managed storage with automatic compression. That
+3.1 MiB of other managed storage with automatic compression; values are rounded independently. That
 experiment assessed compaction after every build, rather than the default ten-minute interval. Its final unchanged
 rebuilds made zero compiler calls and cache events. These workload measurements are not a bound on other projects.
 
