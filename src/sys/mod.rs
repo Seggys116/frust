@@ -112,6 +112,31 @@ pub enum LockKind {
     Exclusive,
 }
 
+pub(crate) fn open_existing_lock_file(path: &Path) -> io::Result<File> {
+    imp::open_session_lock(path)
+}
+
+#[cfg(unix)]
+pub(crate) fn inherited_file_tag(file: &File) -> String {
+    use std::os::fd::AsRawFd;
+    file.as_raw_fd().to_string()
+}
+
+#[cfg(unix)]
+pub(crate) fn clone_inherited_file(tag: &str) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    if tag.is_empty() || !tag.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other("invalid inherited file descriptor tag"));
+    }
+    let fd: i32 = tag.parse().ok().filter(|fd| *fd > 2)
+        .ok_or_else(|| io::Error::other("invalid inherited file descriptor"))?;
+    // SAFETY: fcntl atomically returns a new owned descriptor without borrowing the inherited one.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if copy < 0 { return Err(io::Error::last_os_error()); }
+    // SAFETY: the successful duplication returned this uniquely owned descriptor.
+    Ok(unsafe { File::from_raw_fd(copy) })
+}
+
 pub fn lock(file: &File, kind: LockKind) -> io::Result<()> {
     imp::lock(file, kind)
 }

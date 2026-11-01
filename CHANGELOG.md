@@ -26,6 +26,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Native linker diagnostics retain actual invocation evidence and reject unsupported or ambiguous measurements.
 * Windows MSVC cache hits restore unsuffixed PDB companions and bypass older incomplete entries.
 * macOS store transport validates inherited socket roles and closes every rejected transferred descriptor.
+* Target maintenance preserves files owned by pending stores and retries their cleanup after publication.
 
 ## [0.2.0]
 

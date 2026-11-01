@@ -292,6 +292,7 @@ fn broker_from_args(args: &[OsString]) -> io::Result<()> {
 }
 
 struct OwnedMarker {
+    _lease: File,
     path: PathBuf,
     dev: u64,
     ino: u64,
@@ -392,17 +393,37 @@ fn own_job_marker(dirs: &Dirs, path: &Path) -> io::Result<(Vec<u8>, OwnedMarker)
     if !path.is_absolute() || path.parent() != Some(dirs.deferred().as_path()) || !valid_job_name(path) {
         return Err(invalid("invalid producer job path"));
     }
-    if !sys::owned_by_me(path) { return Err(invalid("producer job belongs to another user")) }
+    if !sys::owned_by_me(path) {
+        return Err(invalid("producer job belongs to another user"));
+    }
+    let lease = wrapper::lease_deferred_job(path)?;
     let (bytes, identity) = read_regular(path, MAX_JOB, true)?;
-    let name = format!("job-{}-broker-{}.json", std::process::id(), store_transport::random_capability()?);
+    if !same_inode(&sys::fstat(&lease)?, &identity) {
+        return Err(invalid("job lease changed"));
+    }
+    let name = format!(
+        "job-{}-broker-{}.json",
+        std::process::id(),
+        store_transport::random_capability()?
+    );
     let owned = dirs.deferred().join(name);
     // Linking precedes queue admission and ACK, so producer cleanup cannot erase accepted work.
     fs::hard_link(path, &owned)?;
     let linked = sys::lstat(&owned)?;
-    let marker = OwnedMarker { path: owned, dev: linked.dev(), ino: linked.ino() };
-    if !linked.is_file() || !same_inode(&linked, &identity) || linked.len() != identity.len()
-        || linked.mtime() != identity.mtime() || !(1..=2).contains(&linked.nlink())
-    { return Err(invalid("producer job changed while linking")) }
+    let marker = OwnedMarker {
+        _lease: lease,
+        path: owned,
+        dev: linked.dev(),
+        ino: linked.ino(),
+    };
+    if !linked.is_file()
+        || !same_inode(&linked, &identity)
+        || linked.len() != identity.len()
+        || linked.mtime() != identity.mtime()
+        || !(1..=2).contains(&linked.nlink())
+    {
+        return Err(invalid("producer job changed while linking"));
+    }
     Ok((bytes, marker))
 }
 
@@ -1089,8 +1110,11 @@ mod tests {
         fs::remove_file(&producer).unwrap();
         assert_eq!(fs::read(&marker.path).unwrap(), bytes);
         let owned = marker.path.clone();
+        assert!(matches!(wrapper::deferred_retirement(&owned).unwrap(), wrapper::DeferredRetirement::Busy));
+        let observer = File::open(&owned).unwrap();
         drop(marker);
         assert!(!owned.exists());
+        assert!(sys::try_lock(&observer, LockKind::Exclusive).is_ok());
     }
 
     #[test]
@@ -1217,6 +1241,7 @@ mod tests {
         let marker = broker.join().unwrap();
         fs::remove_file(&producer).unwrap();
         assert!(marker.path.exists());
+        assert!(matches!(wrapper::deferred_retirement(&marker.path).unwrap(), wrapper::DeferredRetirement::Busy));
         drop(marker);
     }
 

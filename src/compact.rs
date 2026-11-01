@@ -1237,7 +1237,7 @@ impl ProfileLock {
     }
 }
 
-/// Caller holds ProfileLock; lock files and the profile directory retain their identities for waiting Cargo processes.
+/// Caller holds ProfileLock and excludes live deferred paths; lock files and profile identity remain stable for waiting Cargo processes.
 pub fn remove_profile_payload(profile: &Path) -> io::Result<()> {
     remove_profile_payloads_with(&[profile.to_path_buf()], |_, _| {})
 }
@@ -1272,7 +1272,7 @@ fn retained_root_time(path: &Path) -> io::Result<(File, SystemTime)> {
     Ok((file, held.modified()?))
 }
 
-/// Caller holds every ProfileLock; all incremental trees are admitted together before any profile payload is removed.
+/// Caller holds every ProfileLock and excludes live deferred paths; incremental trees are admitted together before any payload is removed.
 pub fn remove_profile_payloads_with(profiles: &[PathBuf], mut removed: impl FnMut(&Path, u64)) -> io::Result<()> {
     let mut payloads = Vec::new();
     let mut sets = Vec::new();
@@ -1386,6 +1386,7 @@ pub struct Report {
     pub retained_session_states: usize,
     pub retained_incremental: usize,
     pub retained_cache_entries: usize,
+    pub retained_deferred_paths: usize,
     pub empty_incremental_dirs: usize,
     pub stale_objects: usize,
     pub dead_incremental: usize,
@@ -1439,6 +1440,13 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
         }
     }
     report.profiles = profiles.len();
+    let protection = crate::wrapper::deferred_protection(dirs);
+    report.retained_deferred_paths += usize::from(!protection.is_complete());
+    for (profile, _) in &profiles {
+        if protection.protects(profile) {
+            report.retained_deferred_paths += 1;
+        }
+    }
 
     if opts.remove_superseded {
         for (profile, ours) in &profiles {
@@ -1467,10 +1475,12 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
                 stale_sessions(profile).into_iter().filter(|(s, _)| !doomed.iter().any(|(p, _)| s.starts_with(p))).collect();
             report.stale_sessions += sessions.len();
             doomed.extend(sessions);
+            retain_unprotected(&mut doomed, &protection, &mut report);
             remove_or_plan(doomed, opts.dry_run, &mut report);
             // After the sessions are gone, the aliases only they shared are single links.
-            let objects = stale_objects(profile);
+            let mut objects = stale_objects(profile);
             report.stale_objects += objects.len();
+            retain_unprotected(&mut objects, &protection, &mut report);
             remove_or_plan(objects, opts.dry_run, &mut report);
         }
     }
@@ -1483,6 +1493,7 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
         if opts.include_store && store.is_dir() {
             collect_candidates(&store, true, &mut candidates);
         }
+        retain_unprotected_candidates(&mut candidates, &protection, &mut report);
         shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report);
     }
 
@@ -2276,7 +2287,7 @@ fn complete_by_default() -> bool {
 }
 
 fn auto_pass_complete(report: &Report) -> bool {
-    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0 && report.retained_cache_entries == 0
+    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0 && report.retained_cache_entries == 0 && report.retained_deferred_paths == 0
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
@@ -2470,6 +2481,13 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         }
     }
     report.profiles = profiles.len();
+    let protection = crate::wrapper::deferred_protection(dirs);
+    report.retained_deferred_paths += usize::from(!protection.is_complete());
+    for profile in &profiles {
+        if protection.protects(profile) {
+            report.retained_deferred_paths += 1;
+        }
+    }
     let store = OnceCell::new();
     let store_index = || store.get_or_init(|| StoreIndex::new(&dirs.store()).with_budget(opts.pass_bytes, opts.pass_budget));
     let covered = |paths: &[(PathBuf, u64)]| opts.cache_enabled && store_index().covers(paths);
@@ -2490,8 +2508,8 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     let mut evictable: Vec<(SystemTime, Vec<(PathBuf, u64)>)> = Vec::new();
     for (profile, analysis, newest) in &built {
         let current = is_current(*newest);
-        if !current && older(*newest, opts.keep_other_profile) {
-            cleanup_session_leftovers(profile, opts.dead_incremental_grace, &mut report);
+        if !current && older(*newest, opts.keep_other_profile) && !protection.protects(profile) {
+            cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
             let result = remove_profile_payloads_with(std::slice::from_ref(profile), |path, bytes| {
                 report.removed_bytes += bytes;
                 report.removed.push((path.to_path_buf(), bytes));
@@ -2585,11 +2603,13 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         report.stale_sessions += sessions.len();
         doomed.extend(sessions);
         doomed.extend(crate::gc::profile_temp_files(profile));
+        retain_unprotected(&mut doomed, &protection, &mut report);
         remove_paths(&doomed, &mut report);
-        cleanup_session_leftovers(profile, opts.dead_incremental_grace, &mut report);
+        cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
         // After the sessions are gone, the aliases only they shared are single links.
-        let objects = stale_objects(profile);
+        let mut objects = stale_objects(profile);
         report.stale_objects += objects.len();
+        retain_unprotected(&mut objects, &protection, &mut report);
         remove_paths(&objects, &mut report);
     }
 
@@ -2605,7 +2625,8 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
             if size <= opts.max_target_bytes {
                 break;
             }
-            let live: Vec<(PathBuf, u64)> = paths.into_iter().filter(|(p, _)| p.exists()).collect();
+            let mut live: Vec<(PathBuf, u64)> = paths.into_iter().filter(|(p, _)| p.exists()).collect();
+            retain_unprotected(&mut live, &protection, &mut report);
             let before = report.removed_bytes;
             remove_paths(&live, &mut report);
             let freed = report.removed_bytes - before;
@@ -2653,6 +2674,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
             }
         }
         let mut ctx = ShrinkCtx::for_auto(dirs, target, opts);
+        retain_unprotected_candidates(&mut candidates, &protection, &mut report);
         shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
         report.budget_stopped = ctx.stopped;
         ctx.finish();
@@ -2676,10 +2698,16 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
 }
 
 fn retire_superseded_cache(dirs: &Dirs, report: &mut Report) {
+    let protection = crate::wrapper::deferred_protection(dirs);
+    report.retained_deferred_paths += usize::from(!protection.is_complete());
     let superseded = crate::gc::superseded_cache_retirements(dirs, crate::gc::INCREMENTAL_ENTRIES_KEPT);
     report.superseded_entries = superseded.len();
     let store = crate::cache::Cache::new(dirs);
     for (path, bytes, snapshot) in superseded {
+        if protection.protects(&path) {
+            report.retained_deferred_paths += 1;
+            continue;
+        }
         match store.try_retire_entry(&snapshot) {
             Ok(crate::cache::EntryRetirementOutcome::Retired) => { report.removed_bytes += bytes; report.removed.push((path, bytes)); }
             Ok(crate::cache::EntryRetirementOutcome::Busy) => report.retained_cache_entries += 1,
@@ -2714,6 +2742,31 @@ pub(crate) fn prune_expired_incremental(profile: &Path, ttl: Duration) -> Report
         errors: sessions.errors,
         ..Report::default()
     }
+}
+
+fn retain_unprotected(paths: &mut Vec<(PathBuf, u64)>, protection: &crate::wrapper::DeferredProtection, report: &mut Report) {
+    paths.retain(|(path, _)| {
+        let retained = protection.protects(path);
+        report.retained_deferred_paths += usize::from(retained);
+        !retained
+    });
+}
+
+fn retain_unprotected_candidates(candidates: &mut Vec<Candidate>, protection: &crate::wrapper::DeferredProtection, report: &mut Report) {
+    candidates.retain(|candidate| {
+        let retained = protection.protects_file(&candidate.path, &candidate.meta);
+        report.retained_deferred_paths += usize::from(retained);
+        !retained
+    });
+}
+
+fn cleanup_session_leftovers_unprotected(profile: &Path, grace: Duration, protection: &crate::wrapper::DeferredProtection, report: &mut Report) {
+    // Session cleanup removes trees internally, so admit its entire incremental subtree first.
+    if protection.protects(&profile.join("incremental")) {
+        report.retained_deferred_paths += 1;
+        return;
+    }
+    cleanup_session_leftovers(profile, grace, report);
 }
 
 fn cleanup_session_leftovers(profile: &Path, grace: Duration, report: &mut Report) {
@@ -4196,8 +4249,47 @@ mod tests {
         report.retained_cache_entries = 1;
         assert!(!auto_pass_complete(&report));
         report.retained_cache_entries = 0;
+        report.retained_deferred_paths = 1;
+        assert!(!auto_pass_complete(&report));
+        report.retained_deferred_paths = 0;
         report.errors.push((PathBuf::from("artifact"), "cannot remove".into()));
         assert!(!auto_pass_complete(&report));
+    }
+
+    #[test]
+    fn uncertain_deferred_metadata_preserves_outputs_and_retries_after_repair() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-compact-deferred-uncertain"));
+        let dirs = Dirs::at(&root);
+        let target = dirs.targets().join("workspace/toolchain");
+        let profile = target.join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(dirs.deferred()).unwrap();
+        let output = profile.join("deps/libpending-1111111111111111.rlib");
+        fs::write(&output, vec![b'x'; 64 * 1024]).unwrap();
+        let before = crate::cache::hashing::Stamp::read(&output).unwrap();
+        let job = dirs.deferred().join("job-1-uncertain.json");
+        fs::write(&job, b"{").unwrap();
+        let mut opts = AutoOptions::from_env(&Config::from_env());
+        opts.enabled = true;
+        opts.every = Duration::from_secs(600);
+        opts.min_growth = u64::MAX;
+        opts.cache_enabled = false;
+        let first = auto_compact_with(&dirs, &target, &opts);
+        assert!(first.retained_deferred_paths > 0 && first.errors.is_empty(), "{first:?}");
+        assert_eq!(crate::cache::hashing::Stamp::read(&output).unwrap(), before);
+        let marker_path = target.join(AUTO_MARKER);
+        let marker: AutoMarker = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert!(!marker.complete);
+        assert_eq!(marker.interval(&opts), AUTO_RETRY_EVERY);
+        sys::rename(&job, &root.join("retained-uncertain-job.json")).unwrap();
+        File::options().write(true).open(&marker_path).unwrap()
+            .set_modified(SystemTime::now() - AUTO_RETRY_EVERY - Duration::from_secs(1)).unwrap();
+        let retry = auto_compact_with(&dirs, &target, &opts);
+        assert!(retry.skipped.is_none() && retry.errors.is_empty(), "{retry:?}");
+        assert_eq!(retry.retained_deferred_paths, 0);
+        assert!(serde_json::from_slice::<AutoMarker>(&fs::read(marker_path).unwrap()).unwrap().complete);
+        assert_eq!(fs::read(output).unwrap(), vec![b'x'; 64 * 1024]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn parent_time_fixture(path: &Path) -> (SystemTime, SystemTime) {

@@ -299,6 +299,10 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
     let project = sb.project("app", &[("leaf", "1.0.0")], MAIN);
     fs::write(project.join("build.rs"), r#"fn main() {
         println!("cargo:rerun-if-changed=build.rs");
+        let generated = std::path::Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("generated.rs");
+        std::fs::write(&generated, format!("pub const GENERATED: &str = {:?};\n", "generated".repeat(8192))).unwrap();
+        let alias = generated.with_extension("alias");
+        if !alias.exists() { std::fs::hard_link(&generated, &alias).unwrap(); }
         let gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("broker-ready");
         let start = std::time::Instant::now();
         while !gate.exists() {
@@ -306,10 +310,11 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }"#).unwrap();
+    fs::write(project.join("src/main.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\nfn main() { assert_eq!(GENERATED, \"generated\".repeat(8192)); println!(\"{}\", leaf::value()); }\n").unwrap();
     common::settle(&project.join("build.rs"));
     let execution = hold_pool(&deferred_dir(&sb), "slot-", EXECUTION_SLOTS);
 
-    std::thread::scope(|scope| {
+    let build_output = std::thread::scope(|scope| {
         let build = scope.spawn(|| build_deferred(&sb, &project));
         let start = Instant::now();
         loop {
@@ -322,8 +327,15 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
             assert!(start.elapsed() < WAIT_CAP, "first real miss did not activate the broker");
             std::thread::sleep(Duration::from_millis(10));
         }
+        let generated = loop {
+            let paths = fs::read_dir(sb.central_target(&project).join("debug/build")).unwrap();
+            if let Some(path) = paths.flatten().map(|entry| entry.path().join("out/generated.rs")).find(|path| path.is_file()) { break path; }
+            assert!(start.elapsed() < WAIT_CAP, "build script did not produce its native compiler input");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        common::settle(&generated);
         fs::write(project.join("broker-ready"), b"ready").unwrap();
-        build.join().unwrap();
+        build.join().unwrap()
     });
 
     let early = stored(&sb);
@@ -368,11 +380,81 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
     let compiled = leaf_rlib(&sb, &project);
     assert_eq!(app_output(&sb, &project), "41");
 
+    let target = sb.central_target(&project);
+    let app_binary = target.join("debug/app");
+    let compiled_app = fs::read(&app_binary).unwrap();
+    let app_job: serde_json::Value = queued.iter().find_map(|path| {
+        let job: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        job["args"].as_array().unwrap().windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "app").then_some(job)
+    }).unwrap();
+    let generated = app_job["inputs"].as_array().unwrap().iter().filter_map(|row| row[0].as_str())
+        .map(PathBuf::from).find(|path| path.ends_with("generated.rs")).expect("the deferred proof owns the actual generated input");
+    let generated_stamp = frust::cache::hashing::Stamp::read(&generated).unwrap();
+    let original_input = app_job["inputs"].as_array().unwrap().iter().find(|row| row[0].as_str() == generated.to_str()).unwrap();
+    fs::write(sb.root.join("pending-before.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "generated": generated, "frozen": original_input[1], "observed": format!("{generated_stamp:?}"),
+        "stderr": stderr(&build_output).chars().take(32 * 1024).collect::<String>()
+    })).unwrap()).unwrap();
+    assert_eq!(original_input[1]["ino"].as_u64(), Some(generated_stamp.ino));
+    assert_eq!(original_input[1]["ctime_ns"].as_str(), Some(generated_stamp.ctime_ns.to_string().as_str()), "default maintenance must preserve the frozen input");
+    let generated_bytes = fs::read(&generated).unwrap();
+    let alias = generated.with_extension("alias");
+    assert_eq!(frust::cache::hashing::Stamp::read(&alias).unwrap(), generated_stamp);
+    let unrelated = target.join("unused-profile");
+    fs::create_dir_all(unrelated.join("deps")).unwrap();
+    let garbage = unrelated.join("deps/unrelated.bin");
+    fs::write(&garbage, b"unrelated retired output").unwrap();
+    let newest = target.join("newest-profile");
+    fs::create_dir_all(newest.join("deps")).unwrap();
+    fs::create_dir_all(newest.join(".fingerprint")).unwrap();
+    fs::write(newest.join(".fingerprint/current-stamp"), b"newer profile").unwrap();
+    let dirs = Dirs::at(sb.home());
+    let mut options = frust::compact::AutoOptions::from_env(&frust::config::Config::from_env());
+    options.every = Duration::ZERO;
+    options.min_growth = 0;
+    options.current_window = Duration::ZERO;
+    options.keep_other_profile = Duration::ZERO;
+    let maintenance = frust::compact::auto_compact_with(&dirs, &target, &options);
+    fs::write(sb.root.join("pending-after-auto.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "generated": generated, "before": format!("{generated_stamp:?}"),
+        "after": format!("{:?}", frust::cache::hashing::Stamp::read(&generated)),
+        "retained": maintenance.retained_deferred_paths, "unrelated_removed": !garbage.exists()
+    })).unwrap()).unwrap();
+    assert!(maintenance.errors.is_empty(), "{maintenance:?}");
+    assert!(maintenance.retained_deferred_paths > 0, "{maintenance:?}");
+    assert!(!garbage.exists(), "unrelated profile cleanup must proceed: {maintenance:?}");
+    assert_eq!(frust::cache::hashing::Stamp::read(&generated).unwrap(), generated_stamp);
+    assert_eq!(fs::read(&generated).unwrap(), generated_bytes);
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(target.join(frust::compact::AUTO_MARKER)).unwrap()).unwrap();
+    assert_eq!(marker["complete"], false, "protected work must receive the normal incomplete-pass retry");
+    let manual = frust::compact::compact(&dirs, std::slice::from_ref(&target), &frust::compact::CompactOptions::after_build());
+    assert!(manual.errors.is_empty(), "{manual:?}");
+    assert_eq!(frust::cache::hashing::Stamp::read(&generated).unwrap(), generated_stamp);
+    assert_eq!(frust::cache::hashing::Stamp::read(&alias).unwrap(), generated_stamp);
+    fs::write(sb.root.join("pending-maintenance.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "generated": generated, "before": format!("{generated_stamp:?}"),
+        "after": format!("{:?}", frust::cache::hashing::Stamp::read(&generated).unwrap()),
+        "blake3": blake3::hash(&generated_bytes).to_hex().as_str(),
+        "stderr": stderr(&build_output).chars().take(32 * 1024).collect::<String>(),
+        "retained": maintenance.retained_deferred_paths, "unrelated_removed": !garbage.exists()
+    })).unwrap()).unwrap();
+    assert_eq!(fs::read(&app_binary).unwrap(), compiled_app);
+
     drop(execution);
     wait_for_stores(&sb, 3);
     assert_eq!(published_entries(&sb), 3);
     assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
     assert!(!endpoint_dir.exists() && !run_dir.exists());
+    fs::remove_file(&alias).unwrap();
+    assert_eq!(frust::sys::lstat(&generated).unwrap().nlink(), 1);
+    options.current_window = Duration::from_secs(3600);
+    let resumed = frust::compact::auto_compact_with(&dirs, &target, &options);
+    assert!(resumed.errors.is_empty(), "{resumed:?}");
+    assert_eq!(resumed.retained_deferred_paths, 0, "{resumed:?}");
+    if cfg!(target_os = "macos") {
+        assert!(frust::compact::is_compressed(&fs::metadata(&generated).unwrap()), "completed jobs must not permanently exempt generated inputs: {resumed:?}");
+    }
+    assert_eq!(fs::read(&generated).unwrap(), generated_bytes);
 
     let events = sb.cache_events();
     let noop = sb
@@ -412,6 +494,7 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
         "the full restored leaf matches rustc's output"
     );
     assert_eq!(app_output(&sb, &project), "41");
+    assert_eq!(fs::read(&app_binary).unwrap(), compiled_app, "the restored executable keeps every original byte");
     assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
 }
 

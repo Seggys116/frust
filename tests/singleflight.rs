@@ -335,13 +335,17 @@ fn counted_profile_pair(tag: &str, deferred: bool, profiles: [&str; 2]) {
         expected = Some(output.stdout);
     }
     if deferred {
-        assert!(first_stderr.lines().any(|line| line.contains("compiled leaf ") && line.contains("store deferred")), "{first_stderr}");
         until("deferred stores to finish", || {
             fs::read_dir(Dirs::at(sb.home()).deferred()).is_ok_and(|mut entries| {
                 entries.all(|entry| entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with("job-")))
             })
         });
         frust::bench::drain_deferred_stores(&sb.home(), Duration::from_secs(60)).unwrap();
+        let leaf_deferred = |stderr: &str| stderr.lines().any(|line| line.contains("compiled leaf ") && line.contains("store deferred"));
+        // Independent keys can race for the sole deferred slot on small runners.
+        assert!(leaf_deferred(&first_stderr) || (different_flags
+            && first_stderr.contains("deferred store slots busy or unavailable for leaf; storing inline")
+            && leaf_deferred(&second_stderr)), "{first_stderr}\n{second_stderr}");
     }
 }
 

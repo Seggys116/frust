@@ -15,6 +15,7 @@ use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::stats;
 use crate::store_broker;
 use crate::sys::{self, LockKind, Meta};
+use crate::wrapper;
 
 /// Younger manifests and lock directories are left alone even if they look orphaned: a build may be writing them.
 const METADATA_GRACE: Duration = Duration::from_secs(3600);
@@ -117,6 +118,7 @@ pub struct Plan {
     unit_retirements: HashMap<PathBuf, UnitRetirement>,
     cache_retirements: HashMap<PathBuf, cache::EntryRetirementSnapshot>,
     broker_retirements: HashMap<PathBuf, store_broker::StaleRunProof>,
+    deferred_retirements: HashMap<PathBuf, DeferredMetadata>,
 }
 
 impl Plan {
@@ -285,8 +287,10 @@ fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)
 /// With `exact` false, sizes come from the recorded byte counts unless the cache is over its cap, when they are measured so eviction stays exact.
 fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> HashSet<String> {
     let mut evicted = HashSet::new();
+    let protection = wrapper::deferred_protection(dirs);
     let scanned = scan_entries(dirs);
-    let superseded = superseded_among(&scanned, INCREMENTAL_ENTRIES_KEPT);
+    let superseded: Vec<_> = superseded_among(&scanned, INCREMENTAL_ENTRIES_KEPT)
+        .into_iter().filter(|(path, _)| !protection.protects(path)).collect();
     let doomed: HashSet<&Path> = superseded.iter().map(|s| s.0.as_path()).collect();
     for (path, _) in &superseded {
         if let Some(key) = path.file_name() {
@@ -319,6 +323,7 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
         if total <= opts.max_cache_bytes {
             break;
         }
+        if protection.protects(&path) { continue; }
         total = total.saturating_sub(bytes);
         if let Some(key) = path.file_name() {
             evicted.insert(key.to_string_lossy().into_owned());
@@ -1220,11 +1225,62 @@ fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
         if matches!(name.strip_prefix(DEFERRED_SLOT_PREFIX), Some("0" | "1" | "2" | "3")) {
             continue;
         }
-        let is_slot = name.starts_with(DEFERRED_SLOT_PREFIX);
-        if is_slot && flock_held(&path) != Some(false) {
-            continue;
-        }
+        let guarded = name.starts_with(DEFERRED_SLOT_PREFIX)
+            || name.starts_with("job-") && name.ends_with(".json");
+        let Ok(meta) = sys::lstat(&path) else { continue };
+        let Ok(identity) = MetadataIdentity::read(&meta) else { continue };
+        let snapshot = DeferredMetadata { identity, guarded };
+        let guard = if guarded {
+            let Ok(Some(guard)) = deferred_file_guard(&path) else { continue };
+            Some(guard)
+        } else { None };
+        if !snapshot.matches(&path, guard.as_ref()) { continue; }
+        plan.deferred_retirements.insert(path.clone(), snapshot);
         push_metadata(plan, path);
+    }
+}
+
+#[derive(Debug)]
+struct DeferredMetadata {
+    identity: MetadataIdentity,
+    guarded: bool,
+}
+
+fn deferred_file_guard(path: &Path) -> io::Result<Option<File>> {
+    match wrapper::deferred_retirement(path)? {
+        wrapper::DeferredRetirement::Legacy(file) | wrapper::DeferredRetirement::Dead(file) => Ok(Some(file)),
+        wrapper::DeferredRetirement::Busy => Ok(None),
+    }
+}
+
+impl DeferredMetadata {
+    fn matches(&self, path: &Path, guard: Option<&File>) -> bool {
+        let Ok(named) = sys::lstat(path).and_then(|meta| MetadataIdentity::read(&meta)) else { return false };
+        if named != self.identity || !old_enough(named.modified, DEFERRED_MAX_AGE) { return false; }
+        if self.guarded {
+            let Some(guard) = guard else { return false };
+            if !sys::fstat(guard).and_then(|meta| MetadataIdentity::read(&meta)).is_ok_and(|opened| opened == named) { return false; }
+        }
+        true
+    }
+}
+
+fn retire_deferred_with(path: &Path, expected: &DeferredMetadata, acquire: impl FnOnce() -> io::Result<Option<File>>) -> io::Result<bool> {
+    let guard = if expected.guarded {
+        let guard = match acquire() {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let Some(guard) = guard else { return Ok(false) };
+        Some(guard)
+    } else { None };
+    // Both legacy and versioned jobs retain an exclusive inode lease through the final name check and unlink.
+    if !expected.matches(path, guard.as_ref()) { return Ok(false); }
+    match fsx::remove_any(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -1351,6 +1407,8 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
     for removal in &plan.removals {
         if removal.class == Class::CacheEntry {
             let Some(snapshot) = plan.cache_retirements.get(&removal.path) else { continue };
+            let protection = wrapper::deferred_protection(dirs);
+            if protection.protects(&removal.path) { continue; }
             match store.try_retire_entry(snapshot) {
                 Ok(cache::EntryRetirementOutcome::Retired) => freed += removal.bytes,
                 Ok(cache::EntryRetirementOutcome::Busy | cache::EntryRetirementOutcome::Stale) => {}
@@ -1375,6 +1433,15 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
     for removal in &plan.removals {
         if removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
             || plan.manifest_retirements.contains_key(&removal.path) { continue; }
+        if removal.path.parent() == Some(dirs.deferred().as_path()) {
+            let Some(expected) = plan.deferred_retirements.get(&removal.path) else { continue };
+            match retire_deferred_with(&removal.path, expected, || deferred_file_guard(&removal.path)) {
+                Ok(true) => freed += removal.bytes,
+                Ok(false) => {},
+                Err(error) => failures.push((removal.path.clone(), error)),
+            }
+            continue;
+        }
         if let Some(proof) = plan.broker_retirements.get(&removal.path) {
             if let Err(error) = store_broker::retire_stale_run(dirs, &removal.path, proof, &mut freed) {
                 failures.push((removal.path.clone(), error));
@@ -1391,6 +1458,7 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             continue;
         }
         let mut incremental_root = None;
+        let mut deferred_protection = None;
         if removal.class == Class::TargetDir {
             if let Some(snapshot) = plan.target_retirements.get(&removal.path) {
                 let mut bytes = 0;
@@ -1402,8 +1470,11 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             }
             continue;
         }
-        if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession) {
-            let Some(profile) = compact::profile_of(&removal.path) else { continue };
+        let profile = compact::profile_of(&removal.path);
+        if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession)
+            || removal.class == Class::Scratch && profile.is_some()
+        {
+            let Some(profile) = profile else { continue };
             let guard = profiles
                 .entry(profile.clone())
                 .or_insert_with(|| ProfileGuard::acquire(&profile));
@@ -1417,6 +1488,13 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
                 ));
                 continue;
             };
+            let protection = wrapper::deferred_protection(dirs);
+            let protected = match sys::lstat(&removal.path) {
+                Ok(meta) if meta.is_file() => protection.protects_file(&removal.path, &meta),
+                _ => protection.protects(&removal.path),
+            };
+            if protected { continue; }
+            deferred_protection = Some(protection);
             if removal.class == Class::StaleVariant && !guard.still_superseded(&removal.path) {
                 continue;
             }
@@ -1431,7 +1509,8 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
         // A build may have started using a lock directory since planning.
         if removal.class == Class::Metadata
             && removal.path.parent() == Some(locks.as_path())
-            && !lock_dir_stale(&removal.path, plan.lock_max_idle)
+            && (removal.path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b"store-queue-"))
+                || !lock_dir_stale(&removal.path, plan.lock_max_idle))
         {
             continue;
         }
@@ -1443,6 +1522,7 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             Ok(()) => freed += removal.bytes,
             Err(err) => failures.push((removal.path.clone(), err)),
         }
+        drop(deferred_protection);
     }
     drop(profiles);
     if plan.trim_ledger {
@@ -1482,7 +1562,9 @@ fn retire_target(dirs: &Dirs, target: &Path, expected: &TargetRetirement, freed:
     if &current != expected || guard.activity()? != expected.activity {
         return Ok(());
     }
+    let protection = wrapper::deferred_protection(dirs);
     for profile in &expected.profiles {
+        if protection.protects(&profile.join("incremental")) { continue; }
         let report = compact::prune_expired_incremental(profile, expected.idle);
         *freed = freed.saturating_add(report.removed_bytes).min(expected.bytes);
         if let Some((path, error)) = report.errors.first() {
@@ -1496,7 +1578,9 @@ fn retire_target(dirs: &Dirs, target: &Path, expected: &TargetRetirement, freed:
     {
         return Ok(());
     }
-    compact::remove_profile_payloads_with(&expected.profiles, |_, bytes| {
+    let protection = wrapper::deferred_protection(dirs);
+    let profiles: Vec<_> = expected.profiles.iter().filter(|profile| !protection.protects(profile)).cloned().collect();
+    compact::remove_profile_payloads_with(&profiles, |_, bytes| {
         *freed = freed.saturating_add(bytes).min(expected.bytes);
     })?;
     drop(profile_locks);
@@ -1684,6 +1768,240 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    fn deferred_job(dirs: &Dirs, output: Option<&Path>, ownership: Option<u32>, age: Duration) -> PathBuf {
+        let out = output.map_or_else(|| dirs.root().join("target/debug/deps"), |path| path.parent().unwrap().to_path_buf());
+        let outputs: Vec<_> = output.into_iter().map(|path| {
+            let meta = sys::lstat(path).unwrap();
+            let ns = |time: (i64, i64)| (time.0 as i128 * 1_000_000_000 + time.1 as i128).to_string();
+            serde_json::json!([path.file_name().unwrap().to_str().unwrap(), {
+                "dev": meta.dev(), "ino": meta.ino(), "size": meta.len(),
+                "mtime_ns": ns(meta.mtime()), "ctime_ns": ns(meta.ctime())
+            }])
+        }).collect();
+        let mut job = serde_json::json!({
+            "format": 3, "context": {"package_version":"test", "compression_requested":true, "immutable_source_roots":[]},
+            "home": dirs.root(), "cwd": dirs.root(), "args": ["rustc", "--crate-name", "pending", "--crate-type", "lib", "--emit=dep-info,link", "--out-dir", out, "input.rs"],
+            "prekey": "ab".repeat(20), "unit":null, "trust":"on", "compile_ms":1, "spawned_ns":"1", "captured":"",
+            "watched":[], "extern_hashes":[], "names":[], "dep_name":"pending.d", "dep_text":"", "outputs":outputs, "inputs":[], "slot_lock":null, "key_lock":null
+        });
+        if let Some(version) = ownership { job["ownership_version"] = version.into(); }
+        fs::create_dir_all(dirs.deferred()).unwrap();
+        let path = dirs.deferred().join("job-1-1.json");
+        fs::write(&path, serde_json::to_vec(&job).unwrap()).unwrap();
+        File::open(&path).unwrap().set_modified(SystemTime::now() - age).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn shared_job(path: &Path) -> File {
+        let file = File::open(path).unwrap();
+        sys::try_lock(&file, LockKind::Shared).unwrap();
+        file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_old_live_lease_survives_planning_and_released_record_collects() {
+        let root = home("deferred-live-age");
+        let dirs = Dirs::at(&root);
+        let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
+        assert!(matches!(wrapper::deferred_retirement(&path).unwrap(), wrapper::DeferredRetirement::Dead(_)));
+        let held = shared_job(&path);
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.removals.is_empty(), "an accepted job does not expire by elapsed age");
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(path.exists());
+        drop(held);
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.deferred_retirements.contains_key(&path));
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(!path.exists(), "an unowned old record remains collectible");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_lease_acquired_after_planning_blocks_execution() {
+        let root = home("deferred-late-lease");
+        let dirs = Dirs::at(&root);
+        let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.deferred_retirements.contains_key(&path));
+        let held = shared_job(&path);
+        assert_eq!(execute_removals(&dirs, &selected).0, 0);
+        assert!(path.exists());
+        drop(held);
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_age_refresh_after_planning_declines_retirement() {
+        let root = home("deferred-refreshed-age");
+        let dirs = Dirs::at(&root);
+        let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.deferred_retirements.contains_key(&path));
+        File::open(&path).unwrap().set_modified(SystemTime::now()).unwrap();
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(path.exists(), "planning does not authorize deleting a refreshed record");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_replacement_during_guard_acquisition_is_retained() {
+        let root = home("deferred-guard-replacement");
+        let dirs = Dirs::at(&root);
+        let path = deferred_job(&dirs, None, Some(1), DEFERRED_MAX_AGE * 2);
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        let expected = &selected.deferred_retirements[&path];
+        let parked = dirs.deferred().join("old-inode");
+        let removed = retire_deferred_with(&path, expected, || {
+            let guard = deferred_file_guard(&path)?.unwrap();
+            let contender = File::open(&path)?;
+            assert!(matches!(sys::try_lock(&contender, LockKind::Shared), Err(fs::TryLockError::WouldBlock)));
+            sys::rename(&path, &parked)?;
+            fs::write(&path, b"replacement")?;
+            File::open(&path)?.set_modified(expected.identity.modified)?;
+            Ok(Some(guard))
+        }).unwrap();
+        assert!(!removed);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert!(parked.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_legacy_age_and_canonical_lock_policies_are_preserved() {
+        let root = home("deferred-legacy-policy");
+        let dirs = Dirs::at(&root);
+        let path = deferred_job(&dirs, None, None, Duration::ZERO);
+        assert!(matches!(wrapper::deferred_retirement(&path).unwrap(), wrapper::DeferredRetirement::Legacy(_)));
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.removals.is_empty(), "an unlocked fresh legacy record is not dead");
+        File::open(&path).unwrap().set_modified(SystemTime::now() - DEFERRED_MAX_AGE * 2).unwrap();
+        let canonical = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}0"));
+        let noncanonical = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}9"));
+        let stray = dirs.deferred().join("orphan.tmp");
+        for file in [&canonical, &noncanonical, &stray] {
+            fs::write(file, []).unwrap();
+            File::open(file).unwrap().set_modified(SystemTime::now() - DEFERRED_MAX_AGE * 2).unwrap();
+        }
+        let held = shared_job(&noncanonical);
+        plan_deferred(&dirs, &mut selected);
+        assert!(selected.deferred_retirements.contains_key(&path));
+        assert!(!selected.deferred_retirements.contains_key(&canonical));
+        assert!(!selected.deferred_retirements.contains_key(&noncanonical));
+        fs::create_dir_all(dirs.locks()).unwrap();
+        let reservation = dirs.locks().join("store-queue-0");
+        fs::write(&reservation, []).unwrap();
+        selected.removals.push(Removal { class: Class::Metadata, path: reservation.clone(), bytes: 0 });
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(!path.exists() && !stray.exists());
+        assert!(canonical.exists() && noncanonical.exists() && reservation.exists());
+        drop(held);
+        fs::write(&path, b"malformed aged legacy metadata").unwrap();
+        File::open(&path).unwrap().set_modified(SystemTime::now() - DEFERRED_MAX_AGE * 2).unwrap();
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(!path.exists() && !noncanonical.exists() && canonical.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn aged_gc_target(tag: &str) -> (PathBuf, Dirs, PathBuf, Vec<PathBuf>) {
+        let root = home(tag);
+        let dirs = Dirs::at(&root);
+        let target = dirs.targets().join("workspace/toolchain");
+        let mut payloads = Vec::new();
+        for name in ["debug", "release"] {
+            let profile = target.join(name);
+            for child in ["deps", ".fingerprint/unit", "incremental"] { fs::create_dir_all(profile.join(child)).unwrap(); }
+            let payload = profile.join("deps/libunit-0123456789abcdef.rlib");
+            fs::write(&payload, vec![7; 16384]).unwrap();
+            fs::write(profile.join(".fingerprint/unit/lib-unit"), b"fingerprint").unwrap();
+            payloads.push(payload);
+        }
+        let scope = lock::Scope::All;
+        let request = lock::Request { command: "cargo build", fingerprint: "", scope: &scope, join: false, timeout: Some(Duration::from_secs(1)) };
+        match lock::acquire(&dirs, &target, request, &mut |_| {}).unwrap() {
+            lock::Acquired::Lock(guard) => drop(guard),
+            lock::Acquired::Failed(_) => panic!("unexpected build admission failure"),
+        }
+        age_gc_tree(&root);
+        (root, dirs, target, payloads)
+    }
+
+    #[cfg(unix)]
+    fn age_gc_tree(path: &Path) {
+        if path.is_dir() { for child in fs::read_dir(path).unwrap() { age_gc_tree(&child.unwrap().path()); } }
+        File::open(path).unwrap().set_modified(SystemTime::now() - Duration::from_secs(40 * 86_400)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_target_snapshot_refresh_protects_descendants_and_inode_aliases() {
+        for alias in [false, true] {
+            let (root, dirs, target, payloads) = aged_gc_target(if alias { "deferred-target-alias" } else { "deferred-target-descendant" });
+            let selected = plan(&dirs, &GcOptions::new(u64::MAX));
+            assert!(selected.target_retirements.contains_key(&target));
+            let output = if alias {
+                let path = root.join("external-pending.rlib");
+                fs::hard_link(&payloads[0], &path).unwrap();
+                path
+            } else { payloads[0].clone() };
+            // Publishing after planning exercises the execution snapshot under native profile admission.
+            let path = deferred_job(&dirs, Some(&output), Some(1), Duration::ZERO);
+            let held = shared_job(&path);
+            let (_, failures) = execute_removals(&dirs, &selected);
+            assert!(failures.is_empty(), "{failures:?}");
+            assert!(payloads[0].exists(), "a protected descendant or inode alias retains the profile payload");
+            assert!(!payloads[1].exists(), "an unrelated profile remains reclaimable");
+            assert!(path.exists());
+            drop(held);
+            age_gc_tree(&target);
+            let selected = plan(&dirs, &GcOptions::new(u64::MAX));
+            assert!(execute_removals(&dirs, &selected).1.is_empty());
+            assert!(!payloads[0].exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_cache_input_alias_is_refreshed_before_entry_retirement() {
+        let root = home("deferred-cache-alias");
+        let dirs = Dirs::at(&root);
+        let protected = store_entry(&root, &"aa".repeat(20), &[("artifact", 16384)], 5000);
+        let unrelated = store_entry(&root, &"bb".repeat(20), &[("artifact", 16384)], 5000);
+        let selected = plan(&dirs, &GcOptions::new(0));
+        assert_eq!(cache_removals(&selected).len(), 2);
+        let output = root.join("external-pending.rlib");
+        fs::hard_link(protected.join("artifact"), &output).unwrap();
+        let path = deferred_job(&dirs, Some(&output), Some(1), Duration::ZERO);
+        let held = shared_job(&path);
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(protected.exists() && !unrelated.exists());
+        let selected = plan(&dirs, &GcOptions::new(0));
+        assert!(cache_removals(&selected).is_empty(), "observed pending aliases also filter cache planning");
+        drop(held);
+        let selected = plan(&dirs, &GcOptions::new(0));
+        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(!protected.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn store_entry(home: &Path, key: &str, files: &[(&str, u64)], age_secs: u64) -> PathBuf {

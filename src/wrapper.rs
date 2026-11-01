@@ -1,10 +1,11 @@
 //! The `RUSTC_WRAPPER`: anything not understood or not cacheable is exec'd straight through, so new rustc flags cannot break a build.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -77,6 +78,7 @@ const ENV_AFFECTS_OUTPUT: &[&str] = &[
 
 /// First argument of the detached helper that finishes a store; a compiler command line never starts with it.
 const DEFERRED_ARG: &str = "--deferred-store";
+const JOB_LEASE_ENV: &str = "FRUST_DEFERRED_JOB_LEASE";
 
 // A lock held by a process that is working finishes within seconds, so the poll starts fast and settles at 40 ms.
 const KEY_POLL_START: Duration = Duration::from_millis(5);
@@ -782,6 +784,7 @@ impl Plan {
         };
         let job = StoreJob {
             format: JOB_FORMAT,
+            ownership_version: u32::from(sys::INHERITS_DESCRIPTORS),
             context: self.context.clone(),
             home: self.cwd.join(self.dirs.root()),
             cwd: self.cwd.clone(),
@@ -826,12 +829,13 @@ impl Plan {
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
-        let job_path = write_job(&deferred, &job)?;
+        let (job_path, job_lease) = write_leased_job(&deferred, &job)?;
+        keep.push(&job_lease);
         let handed_over = match broker {
             Some(permit) => submit_broker_job(&job_path, |path| {
                 permit.submit(&self.cwd.join(path), key_lock)
             }),
-            None => spawn_helper(&job_path, &self.cwd, &keep).map(|()| true),
+            None => spawn_helper(&job_path, &self.cwd, &keep, &job_lease).map(|()| true),
         };
         match handed_over {
             Ok(true) => {
@@ -1701,6 +1705,8 @@ impl StoreContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreJob {
     format: u32,
+    #[serde(default)]
+    ownership_version: u32,
     context: StoreContext,
     home: PathBuf,
     cwd: PathBuf,
@@ -1732,6 +1738,7 @@ impl BrokerJob {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid broker store job");
         let job: StoreJob = serde_json::from_slice(bytes).map_err(|_| invalid())?;
         if job.format != JOB_FORMAT
+            || job.ownership_version > 1
             || !job.cwd.is_absolute()
             || !job.home.is_absolute()
             || job.home != dirs.root()
@@ -2096,15 +2103,35 @@ fn acquire_slot(dir: &Path, count: usize) -> Option<(File, PathBuf)> {
     })
 }
 
+#[cfg(test)]
 fn write_job(dir: &Path, job: &StoreJob) -> io::Result<PathBuf> {
+    write_leased_job(dir, job).map(|(path, _)| path)
+}
+
+fn write_leased_job(dir: &Path, job: &StoreJob) -> io::Result<(PathBuf, File)> {
+    lock::ensure_dir(dir, None)?;
     let path = dir.join(format!(
         "job-{}-{}.json",
         std::process::id(),
         hashing::now_ns()
     ));
     let bytes = serde_json::to_vec(job).map_err(io::Error::other)?;
-    fsx::write_atomic(&path, &bytes)?;
-    Ok(path)
+    let tmp = fsx::temp_sibling(&path);
+    let result = (|| {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        sys::lock(&file, LockKind::Shared)?;
+        sys::rename(&tmp, &path)?;
+        Ok((path, file))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn submit_broker_job(
@@ -2119,6 +2146,330 @@ fn submit_broker_job(
 
 fn read_job(path: &Path) -> Option<StoreJob> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+const MAX_PROTECTION_JOB_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PROTECTION_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PROTECTION_PATHS: usize = 100_000;
+const PROTECTION_TIME: Duration = Duration::from_millis(250);
+
+fn job_identity(path: &Path, file: &File) -> io::Result<sys::Meta> {
+    let path_meta = sys::lstat(path)?;
+    let opened = sys::fstat(file)?;
+    if !path_meta.is_file()
+        || path_meta.file_type().is_symlink()
+        || !sys::owned_by_me(path)
+        || !opened.is_file()
+        || opened.ino() == 0
+        || (
+            path_meta.dev(),
+            path_meta.ino(),
+            path_meta.len(),
+            path_meta.mtime(),
+        ) != (opened.dev(), opened.ino(), opened.len(), opened.mtime())
+    {
+        return Err(io::Error::other("deferred job identity changed"));
+    }
+    Ok(opened)
+}
+
+pub(crate) fn lease_deferred_job(path: &Path) -> io::Result<File> {
+    let file = sys::open_existing_lock_file(path)?;
+    job_identity(path, &file)?;
+    sys::try_lock(&file, LockKind::Shared).map_err(io::Error::from)?;
+    job_identity(path, &file)?;
+    Ok(file)
+}
+
+fn read_owned_job(path: &Path, file: &File) -> io::Result<Vec<u8>> {
+    let before = job_identity(path, file)?;
+    if before.len() > MAX_PROTECTION_JOB_BYTES {
+        return Err(io::Error::other("deferred job exceeds metadata bound"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROTECTION_JOB_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let after = job_identity(path, file)?;
+    if before.len() != bytes.len() as u64
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.ctime() != after.ctime()
+    {
+        return Err(io::Error::other("deferred job changed while reading"));
+    }
+    Ok(bytes)
+}
+
+pub(crate) enum DeferredRetirement {
+    Legacy(File),
+    Busy,
+    Dead(File),
+}
+
+/// Both file variants retain the exclusive inode lease until the caller finishes rechecking and unlinking.
+pub(crate) fn deferred_retirement(path: &Path) -> io::Result<DeferredRetirement> {
+    let file = sys::open_existing_lock_file(path)?;
+    job_identity(path, &file)?;
+    match sys::try_lock(&file, LockKind::Exclusive) {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(DeferredRetirement::Busy),
+        Err(fs::TryLockError::Error(err)) => return Err(err),
+    }
+    if sys::fstat(&file)?.len() > MAX_PROTECTION_JOB_BYTES {
+        job_identity(path, &file)?;
+        return Ok(DeferredRetirement::Legacy(file));
+    }
+    let bytes = read_owned_job(path, &file)?;
+    let leased = serde_json::from_slice::<StoreJob>(&bytes)
+        .is_ok_and(|job| job.ownership_version == 1 && job.format == JOB_FORMAT);
+    Ok(if leased {
+        DeferredRetirement::Dead(file)
+    } else {
+        DeferredRetirement::Legacy(file)
+    })
+}
+
+fn helper_job_lease(path: &Path, version: u32) -> io::Result<File> {
+    if version == 0 {
+        return lease_deferred_job(path);
+    }
+    if version != 1 {
+        return Err(io::Error::other("unknown deferred ownership version"));
+    }
+    #[cfg(unix)]
+    {
+        inherited_job_lease(path, &env::var(JOB_LEASE_ENV).unwrap_or_default())
+    }
+    #[cfg(not(unix))]
+    Err(io::Error::other("inherited job leases are unsupported"))
+}
+
+#[cfg(unix)]
+fn inherited_job_lease(path: &Path, tag: &str) -> io::Result<File> {
+    let file = sys::clone_inherited_file(tag)?;
+    job_identity(path, &file)?;
+    sys::try_lock(&file, LockKind::Shared).map_err(io::Error::from)?;
+    Ok(file)
+}
+
+pub(crate) struct DeferredProtection {
+    paths: BTreeSet<PathBuf>,
+    identities: BTreeSet<(u64, u64)>,
+    leases: Vec<File>,
+    complete: Cell<bool>,
+    inspected: Cell<usize>,
+    spent: Cell<Duration>,
+}
+
+impl DeferredProtection {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete.get()
+    }
+
+    fn budget(&self) -> bool {
+        let n = self.inspected.get().saturating_add(1);
+        self.inspected.set(n);
+        if n > MAX_PROTECTION_PATHS || self.spent.get() > PROTECTION_TIME {
+            self.complete.set(false);
+        }
+        self.complete.get()
+    }
+
+    fn overlaps(&self, path: &Path) -> bool {
+        path.ancestors().any(|parent| self.paths.contains(parent))
+            || self.paths.range(path.to_path_buf()..).next().is_some_and(|child| child.starts_with(path))
+    }
+
+    pub(crate) fn protects_file(&self, path: &Path, meta: &sys::Meta) -> bool {
+        !self.is_complete() || !path.is_absolute() || !self.budget()
+            || self.overlaps(path) || self.identities.contains(&(meta.dev(), meta.ino()))
+    }
+
+    /// Ancestors and hardlink aliases are protected; uncertain subtree inspection declines the mutation.
+    pub(crate) fn protects(&self, path: &Path) -> bool {
+        let begun = Instant::now();
+        let protected = (|| {
+            if !self.is_complete() || !path.is_absolute() {
+                return true;
+            }
+            if self.overlaps(path) {
+                return true;
+            }
+            if self.paths.is_empty() {
+                return false;
+            }
+            let mut pending = vec![path.to_path_buf()];
+            while let Some(path) = pending.pop() {
+                if !self.budget() || begun.elapsed() > PROTECTION_TIME {
+                    self.complete.set(false);
+                    return true;
+                }
+                let meta = match sys::lstat(&path) {
+                    Ok(meta) => meta,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        self.complete.set(false);
+                        return true;
+                    }
+                };
+                if self.identities.contains(&(meta.dev(), meta.ino())) {
+                    return true;
+                }
+                if meta.file_type().is_symlink() {
+                    self.complete.set(false);
+                    return true;
+                }
+                if meta.is_dir() {
+                    let Ok(entries) = fs::read_dir(&path) else {
+                        self.complete.set(false);
+                        return true;
+                    };
+                    for entry in entries {
+                        if !self.budget() || begun.elapsed() > PROTECTION_TIME {
+                            self.complete.set(false);
+                            return true;
+                        }
+                        let Ok(entry) = entry else {
+                            self.complete.set(false);
+                            return true;
+                        };
+                        pending.push(entry.path());
+                    }
+                }
+            }
+            false
+        })();
+        self.spent
+            .set(self.spent.get().saturating_add(begun.elapsed()));
+        if self.spent.get() > PROTECTION_TIME {
+            self.complete.set(false);
+        }
+        protected || !self.is_complete()
+    }
+
+    fn add(&mut self, path: PathBuf, stamp: &StampWire) -> io::Result<()> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || !self.budget()
+        {
+            return Err(io::Error::other("invalid deferred protection path"));
+        }
+        let stamp = stamp
+            .stamp()
+            .ok_or_else(|| io::Error::other("invalid deferred stamp"))?;
+        self.identities.insert((stamp.dev, stamp.ino));
+        match sys::lstat(&path) {
+            Ok(meta) => { self.identities.insert((meta.dev(), meta.ino())); },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+            Err(err) => return Err(err),
+        }
+        self.paths.insert(path);
+        Ok(())
+    }
+}
+
+/// The snapshot is not an admission barrier; callers hold the relevant mutation locks through maintenance.
+pub(crate) fn deferred_protection(dirs: &Dirs) -> DeferredProtection {
+    let mut result = DeferredProtection {
+        paths: BTreeSet::new(),
+        identities: BTreeSet::new(),
+        leases: Vec::new(),
+        complete: Cell::new(true),
+        inspected: Cell::new(0),
+        spent: Cell::new(Duration::ZERO),
+    };
+    let begun = Instant::now();
+    let scan = (|| -> io::Result<()> {
+        let entries = match fs::read_dir(dirs.deferred()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut bytes_read = 0u64;
+        let mut jobs = 0usize;
+        for entry in entries {
+            if !result.budget() || begun.elapsed() > PROTECTION_TIME {
+                return Err(io::Error::other("deferred snapshot budget exhausted"));
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("job-") || !name.ends_with(".json") {
+                continue;
+            }
+            jobs += 1;
+            if jobs > 1024 {
+                return Err(io::Error::other("too many deferred jobs"));
+            }
+            let path = entry.path();
+            let file = match sys::open_existing_lock_file(&path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let identity = job_identity(&path, &file)?;
+            if bytes_read.saturating_add(identity.len()) > MAX_PROTECTION_BYTES {
+                return Err(io::Error::other("deferred metadata budget exhausted"));
+            }
+            let live = match sys::try_lock(&file, LockKind::Exclusive) {
+                Ok(()) => false,
+                Err(fs::TryLockError::WouldBlock) => true,
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            };
+            if live {
+                sys::try_lock(&file, LockKind::Shared).map_err(io::Error::from)?;
+            }
+            let bytes = read_owned_job(&path, &file)?;
+            bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+            if bytes_read > MAX_PROTECTION_BYTES {
+                return Err(io::Error::other("deferred metadata budget exhausted"));
+            }
+            let job: StoreJob = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if job.ownership_version > 1
+                || job.format != JOB_FORMAT
+                || !job.cwd.is_absolute()
+                || job.home != dirs.root()
+            {
+                return Err(io::Error::other("unknown deferred protection record"));
+            }
+            if job.ownership_version == 1 && !live {
+                continue;
+            }
+            let args: Vec<OsString> = job.args.iter().skip(1).map(OsString::from).collect();
+            let parsed = rustc_args::parse(&args)
+                .map_err(|reason| io::Error::other(format!("invalid deferred compiler arguments: {reason:?}")))?;
+            if job.outputs.is_empty() {
+                return Err(io::Error::other("missing deferred outputs"));
+            }
+            let out = job.cwd.join(&parsed.out_dir);
+            for (name, stamp) in &job.outputs {
+                if !cache::safe_file_name(name) {
+                    return Err(io::Error::other("unsafe deferred output"));
+                }
+                result.add(out.join(name), stamp)?;
+            }
+            for (path, stamp) in job.inputs.iter().chain(&job.watched) {
+                result.add(path.clone(), stamp)?;
+            }
+            if !live {
+                sys::unlock(&file)?;
+                sys::try_lock(&file, LockKind::Shared).map_err(io::Error::from)?;
+                job_identity(&path, &file)?;
+            }
+            if result.leases.len() >= 64 {
+                return Err(io::Error::other("too many live deferred leases"));
+            }
+            result.leases.push(file);
+        }
+        Ok(())
+    })();
+    result.spent.set(begun.elapsed());
+    if scan.is_err() || result.spent.get() > PROTECTION_TIME {
+        result.complete.set(false);
+    }
+    result
 }
 
 fn helper_exe() -> io::Result<PathBuf> {
@@ -2141,10 +2492,20 @@ fn helper_beside(exe: &Path) -> io::Result<PathBuf> {
 }
 
 /// Starts the detached helper. The `keep` files (the held locks) are inherited where the platform allows, so the locks outlive the wrapper.
-fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File]) -> io::Result<()> {
+fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File], lease: &File) -> io::Result<()> {
     let mut cmd = Command::new(helper_exe()?);
     // Preserve the producer directory for compatibility with one-shot helpers.
     cmd.arg(DEFERRED_ARG).arg(cwd.join(job)).current_dir(cwd);
+    cmd.env_remove(JOB_LEASE_ENV);
+    #[cfg(unix)]
+    {
+        if !sys::inheritable_clear_of_stdio(keep) {
+            return Err(io::Error::other("job lease overlaps standard streams"));
+        }
+        cmd.env(JOB_LEASE_ENV, sys::inherited_file_tag(lease));
+    }
+    #[cfg(not(unix))]
+    let _ = lease;
     sys::detach_command(&mut cmd, keep);
     cmd.spawn().map(drop)
 }
@@ -2192,6 +2553,9 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
         return 0;
     };
     if let Some(job) = read_job(&file.0) {
+        let Ok(_lease) = helper_job_lease(&file.0, job.ownership_version) else {
+            return 0;
+        };
         let _held = relock(&job);
         compact::at_background_priority(|| run_deferred(&job));
     }
@@ -4080,6 +4444,7 @@ mod tests {
         args.push(deps.display().to_string());
         let job = StoreJob {
             format: JOB_FORMAT,
+            ownership_version: 0,
             context: StoreContext::capture(&s.0),
             home: s.0.join("home"),
             cwd: s.0.clone(),
@@ -5751,6 +6116,140 @@ mod tests {
         fs::write(bin.join(&name), b"").unwrap();
         assert_eq!(helper_beside(&persona).unwrap(), bin.join(&name));
         assert_eq!(helper_beside(&bin.join(&name)).unwrap(), bin.join(&name));
+    }
+
+    #[test]
+    fn leased_jobs_protect_inputs_outputs_aliases_and_then_become_dead() {
+        let s = Scratch::new("job-protection");
+        let (mut job, src, output) = fixture(&s);
+        job.ownership_version = 1;
+        let watched = s.0.join("watched");
+        fs::write(&watched, b"generated input").unwrap();
+        job.watched.push((watched.clone(), wire(&watched)));
+        let dirs = Dirs::at(&job.home);
+        let (path, lease) = write_leased_job(&dirs.deferred(), &job).unwrap();
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Busy
+        ));
+        let aliases = s.0.join("aliases");
+        fs::create_dir(&aliases).unwrap();
+        fs::hard_link(&output, aliases.join("same-object")).unwrap();
+        let protection = deferred_protection(&dirs);
+        assert!(protection.is_complete() && !protection.leases.is_empty());
+        for path in [src.as_path(), watched.as_path(), output.as_path(), aliases.as_path(), output.parent().unwrap()] {
+            assert!(protection.protects(path), "{}", path.display());
+        }
+        let unrelated = s.0.join("unrelated");
+        fs::write(&unrelated, b"other").unwrap();
+        assert!(!protection.protects(&unrelated));
+        assert!(!protection.protects_file(&unrelated, &sys::lstat(&unrelated).unwrap()));
+        assert!(protection.protects_file(&aliases.join("same-object"), &sys::lstat(&output).unwrap()));
+        drop(lease);
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Busy
+        ));
+        drop(protection);
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Dead(_)
+        ));
+        let dead = deferred_protection(&dirs);
+        assert!(dead.is_complete() && dead.leases.is_empty() && !dead.protects(&output));
+    }
+
+    #[test]
+    fn legacy_and_uncertain_jobs_remain_protected_but_dead_junk_can_age_out() {
+        let s = Scratch::new("legacy-protection");
+        let (job, _, output) = fixture(&s);
+        let dirs = Dirs::at(&job.home);
+        let path = write_job(&dirs.deferred(), &job).unwrap();
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Legacy(_)
+        ));
+        let legacy = deferred_protection(&dirs);
+        assert!(legacy.is_complete() && legacy.protects(&output));
+        drop(legacy);
+        fs::write(&path, b"{invalid").unwrap();
+        let uncertain = deferred_protection(&dirs);
+        assert!(!uncertain.is_complete() && uncertain.protects(&s.0.join("unrelated")));
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Legacy(_)
+        ));
+        let file = File::options().write(true).open(&path).unwrap();
+        file.set_len(MAX_PROTECTION_JOB_BYTES + 1).unwrap();
+        assert!(!deferred_protection(&dirs).is_complete());
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Legacy(_)
+        ));
+    }
+
+    #[test]
+    fn protection_budget_failure_and_replaced_marker_are_conservative() {
+        let s = Scratch::new("protection-budget");
+        let (mut job, _, output) = fixture(&s);
+        job.ownership_version = 1;
+        let dirs = Dirs::at(&job.home);
+        let (path, lease) = write_leased_job(&dirs.deferred(), &job).unwrap();
+        let protection = deferred_protection(&dirs);
+        protection.inspected.set(MAX_PROTECTION_PATHS);
+        assert!(protection.protects(&s.0.join("unrelated")) && !protection.is_complete());
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, serde_json::to_vec(&job).unwrap()).unwrap();
+        sys::rename(&replacement, &path).unwrap();
+        assert!(job_identity(&path, &lease).is_err());
+        assert!(protection.protects(&output));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_job_lease_checks_descriptor_identity_and_survives_producer_drop() {
+        let s = Scratch::new("inherited-lease");
+        let (mut job, _, _) = fixture(&s);
+        job.ownership_version = 1;
+        let dirs = Dirs::at(&job.home);
+        let (path, producer) = write_leased_job(&dirs.deferred(), &job).unwrap();
+        let inherited = inherited_job_lease(&path, &sys::inherited_file_tag(&producer)).unwrap();
+        let other = File::open(&path).unwrap();
+        assert!(inherited_job_lease(&path, "1").is_err());
+        assert!(inherited_job_lease(&path, "invalid").is_err());
+        let foreign = s.0.join("foreign");
+        fs::write(&foreign, b"not job metadata").unwrap();
+        assert!(inherited_job_lease(&foreign, &sys::inherited_file_tag(&other)).is_err());
+        drop(producer);
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Busy
+        ));
+        drop(inherited);
+        assert!(matches!(
+            deferred_retirement(&path).unwrap(),
+            DeferredRetirement::Dead(_)
+        ));
+    }
+
+    #[test]
+    fn published_job_roundtrip_retains_its_platform_ownership_lease() {
+        let s = Scratch::new("published-job-lease");
+        let (mut job, _, _) = fixture(&s);
+        job.ownership_version = u32::from(sys::INHERITS_DESCRIPTORS);
+        let dir = Dirs::at(&job.home).deferred();
+        let (path, lease) = write_leased_job(&dir, &job).unwrap();
+        assert_eq!(read_job(&path), Some(job.clone()));
+        let published = job_identity(&path, &lease).unwrap();
+        assert_eq!(published.len(), serde_json::to_vec(&job).unwrap().len() as u64);
+        assert!(matches!(deferred_retirement(&path).unwrap(), DeferredRetirement::Busy));
+        drop(lease);
+        match deferred_retirement(&path).unwrap() {
+            DeferredRetirement::Dead(_) => assert_eq!(job.ownership_version, 1),
+            DeferredRetirement::Legacy(_) => assert_eq!(job.ownership_version, 0),
+            DeferredRetirement::Busy => panic!("the completed producer must release its lease"),
+        }
+        assert_eq!(read_job(&path), Some(job));
     }
 
     #[test]
