@@ -537,7 +537,7 @@ impl Pipe {
         Pipe { file: imp::pipe_prepare(File::from(owned)) }
     }
 
-    /// Reads never block: `WouldBlock` means no data yet; `Ok(0)` means EOF or an empty buffer.
+    /// Poll readiness before each read; nonblocking setup can fail. `Ok(0)` means EOF or an empty buffer.
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         imp::pipe_read(&mut self.file, buf)
     }

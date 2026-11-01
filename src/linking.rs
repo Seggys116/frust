@@ -28,7 +28,7 @@ pub fn supported() -> bool {
 
 /// Prepares compiler-first argv; unsupported invocations remain unchanged.
 pub fn prepare(args: &[OsString], debug: bool) -> Option<Vec<OsString>> {
-    prepare_with(args, debug, requested(), supported(), resolve_linker)
+    prepare_with(args, debug, requested(), supported(), || resolve_linker(debug))
 }
 
 fn is_requested(value: Option<&OsStr>) -> bool {
@@ -207,7 +207,7 @@ fn default_driver_is_system(found: Option<&Path>, canonicalize: impl Fn(&Path) -
     canonicalize(Path::new("/usr/bin/cc")).is_some_and(|system| found == system)
 }
 
-fn resolve_linker() -> Result<PathBuf, &'static str> {
+fn resolve_linker(debug: bool) -> Result<PathBuf, &'static str> {
     if !driver_environment_supported(|name| env::var_os(name)) {
         return Err("custom compiler driver environment");
     }
@@ -215,88 +215,468 @@ fn resolve_linker() -> Result<PathBuf, &'static str> {
     if !default_driver_is_system(driver.as_deref(), |path| sys::canonicalize(path).ok()) {
         return Err("default cc is not the system driver");
     }
-    discover_linker().ok_or("native linker discovery failed")
+    discover_linker(debug)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn discover_linker() -> Option<PathBuf> {
-    None
+fn discover_linker(_debug: bool) -> Result<PathBuf, &'static str> {
+    Err("native linker discovery failed")
 }
 
 #[cfg(target_os = "macos")]
-fn discover_linker() -> Option<PathBuf> {
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    let started = Instant::now();
-    let mut child = Command::new("/usr/bin/xcrun")
-        .args(["--find", "ld"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let output = child.stdout.take().and_then(|stdout| read_discovery(&mut child, &mut sys::Pipe::from(stdout), started));
-    if output.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    linker_path(&output?, |path| path.is_file())
+fn discover_linker(debug: bool) -> Result<PathBuf, &'static str> {
+    discovery::discover().map_err(|failure| {
+        if debug {
+            eprintln!("frust-wrap: native linker discovery: {}", failure.diagnostic());
+        }
+        "native linker discovery failed"
+    })
 }
 
-#[cfg(target_os = "macos")]
-fn read_discovery(child: &mut std::process::Child, stdout: &mut sys::Pipe, started: std::time::Instant) -> Option<Vec<u8>> {
+#[cfg(any(target_os = "macos", test))]
+mod discovery {
     use std::io;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_OUTPUT: usize = 64 * 1024;
-    let mut output = Vec::new();
-    let mut eof = false;
-    let mut chunk = [0; 4096];
-    loop {
-        if started.elapsed() >= TIMEOUT {
-            return None;
+    const STDERR_LIMIT: usize = 4 * 1024;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stage {
+        Spawn, MissingStdout, MissingStderr, ReadStdout, ReadStderr, TryWait,
+        Deadline, StdoutLimit, ExitStatus, InvalidUtf8, InvalidLine, NonAbsolute, NotRegularFile,
+    }
+
+    #[derive(Debug)]
+    struct IoFailure {
+        kind: io::ErrorKind,
+        errno: Option<i32>,
+    }
+
+    impl From<io::Error> for IoFailure {
+        fn from(error: io::Error) -> Self {
+            Self { kind: error.kind(), errno: error.raw_os_error() }
         }
-        if !eof {
-            match stdout.read(&mut chunk) {
-                Ok(0) => eof = true,
-                Ok(n) => {
-                    if output.len() + n > MAX_OUTPUT {
-                        return None;
+    }
+
+    #[derive(Clone, Debug)]
+    struct Status {
+        success: bool,
+        code: Option<i32>,
+        description: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl From<std::process::ExitStatus> for Status {
+        fn from(status: std::process::ExitStatus) -> Self {
+            Self { success: status.success(), code: status.code(), description: status.to_string() }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Evidence {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        bytes: [usize; 2],
+        eof: [bool; 2],
+        status: Option<Status>,
+        spawn_elapsed: Duration,
+        elapsed: Duration,
+    }
+
+    impl Evidence {
+        fn new(spawn_elapsed: Duration) -> Self {
+            Self { stdout: Vec::new(), stderr: Vec::new(), bytes: [0; 2], eof: [false; 2],
+                status: None, spawn_elapsed, elapsed: spawn_elapsed }
+        }
+
+        fn failed(mut self, stage: Stage, error: Option<io::Error>, elapsed: Duration) -> Box<Failure> {
+            self.elapsed = elapsed;
+            Box::new(Failure { stage, io: error.map(IoFailure::from), evidence: self, child_pid: None, total_elapsed: elapsed, cleanup: None })
+        }
+    }
+
+    #[derive(Debug)]
+    struct Cleanup {
+        already_reaped: bool,
+        kill_error: Option<IoFailure>,
+        wait_error: Option<IoFailure>,
+        status: Option<Status>,
+        elapsed: Duration,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Failure {
+        stage: Stage,
+        io: Option<IoFailure>,
+        evidence: Evidence,
+        child_pid: Option<u32>,
+        total_elapsed: Duration,
+        cleanup: Option<Cleanup>,
+    }
+
+    // Cap rendered bytes too: arbitrary xcrun output cannot inject lines or enlarge an escaped excerpt.
+    fn escaped(bytes: &[u8], limit: usize) -> (String, usize) {
+        let mut text = String::new();
+        let mut consumed = 0;
+        for &byte in bytes {
+            let escape = std::ascii::escape_default(byte);
+            if text.len() + escape.len() > limit { break; }
+            text.extend(escape.map(char::from));
+            consumed += 1;
+        }
+        (text, consumed)
+    }
+
+    fn status_text(status: Option<&Status>) -> String {
+        status.map_or_else(|| "unobserved".into(), |status| {
+            format!("success={},code={:?},description=\"{}\"", status.success, status.code, escaped(status.description.as_bytes(), 128).0)
+        })
+    }
+
+    fn error_text(error: Option<&IoFailure>) -> String {
+        error.map_or_else(|| "none".into(), |error| format!("kind={:?},errno={:?}", error.kind, error.errno))
+    }
+
+    impl Failure {
+        pub(super) fn diagnostic(&self) -> String {
+            let evidence = &self.evidence;
+            let (stdout, stdout_used) = escaped(&evidence.stdout, 256);
+            let (stderr, stderr_used) = escaped(&evidence.stderr, STDERR_LIMIT);
+            let cleanup = self.cleanup.as_ref().map_or_else(|| "not_attempted_no_child".into(), |cleanup| {
+                format!("already_reaped={},kill=({}),wait=({}),status=({}),elapsed_us={}",
+                    cleanup.already_reaped, error_text(cleanup.kill_error.as_ref()), error_text(cleanup.wait_error.as_ref()),
+                    status_text(cleanup.status.as_ref()), cleanup.elapsed.as_micros())
+            });
+            let pid = self.child_pid.map_or_else(|| "not_spawned".into(), |pid| pid.to_string());
+            format!("stage={:?} child_pid={} error=({}) total_us={} spawn_us={} decision_us={} eof={:?} observed_bytes={:?} status=({}) stdout_truncated={} stdout=\"{}\" stderr_truncated={} stderr=\"{}\" cleanup=({})",
+                self.stage, pid, error_text(self.io.as_ref()), self.total_elapsed.as_micros(), evidence.spawn_elapsed.as_micros(),
+                evidence.elapsed.as_micros(), evidence.eof, evidence.bytes, status_text(evidence.status.as_ref()),
+                stdout_used < evidence.bytes[0], stdout, stderr_used < evidence.bytes[1], stderr, cleanup)
+        }
+    }
+
+    // A small private seam keeps read/status/clock failures deterministic without invoking xcrun in unit tests.
+    trait DiscoveryIo {
+        fn elapsed(&self) -> Duration;
+        fn read(&mut self, stream: usize, buffer: &mut [u8]) -> io::Result<usize>;
+        fn status(&mut self) -> io::Result<Option<Status>>;
+        fn wait(&mut self, eof: [bool; 2], timeout: Duration) -> [bool; 2];
+    }
+
+    fn read_discovery(io: &mut impl DiscoveryIo, spawn_elapsed: Duration) -> Result<Evidence, Box<Failure>> {
+        let mut evidence = Evidence::new(spawn_elapsed);
+        let mut chunk = [0; 4096];
+        loop {
+            let elapsed = io.elapsed();
+            let unsuccessful = evidence.status.as_ref().is_some_and(|status| !status.success);
+            if elapsed >= TIMEOUT {
+                return Err(evidence.failed(if unsuccessful { Stage::ExitStatus } else { Stage::Deadline }, None, elapsed));
+            }
+            if evidence.status.is_none() {
+                evidence.status = match io.status() {
+                    Ok(status) => status,
+                    Err(error) => return Err(evidence.failed(Stage::TryWait, Some(error), io.elapsed())),
+                };
+            }
+            let unsuccessful = evidence.status.as_ref().is_some_and(|status| !status.success);
+            if evidence.eof[0] && evidence.status.is_some() && (!unsuccessful || evidence.eof[1]) {
+                if unsuccessful { return Err(evidence.failed(Stage::ExitStatus, None, io.elapsed())); }
+                evidence.elapsed = io.elapsed();
+                return Ok(evidence);
+            }
+            // After a failed exit, drain only immediately readable diagnostics; do not wait for descendants.
+            let wait = if unsuccessful { Duration::ZERO } else { TIMEOUT.saturating_sub(io.elapsed()).min(Duration::from_millis(10)) };
+            let ready = io.wait(evidence.eof, wait);
+            if unsuccessful && !ready.into_iter().any(|ready| ready) {
+                return Err(evidence.failed(Stage::ExitStatus, None, io.elapsed()));
+            }
+            for (stream, ready) in ready.into_iter().enumerate() {
+                // Successful discovery needs stdout only; descendants may retain stderr indefinitely.
+                if stream == 1 && evidence.eof[0] && evidence.status.as_ref().is_some_and(|status| status.success) { break; }
+                if !ready || evidence.eof[stream] { continue; }
+                // Read once after readiness, then poll again; a failed nonblocking setup cannot make a second read block.
+                match io.read(stream, &mut chunk) {
+                    Ok(0) => evidence.eof[stream] = true,
+                    Ok(size) => {
+                        evidence.bytes[stream] = evidence.bytes[stream].saturating_add(size);
+                        let (buffer, limit) = if stream == 0 { (&mut evidence.stdout, MAX_OUTPUT) } else { (&mut evidence.stderr, STDERR_LIMIT) };
+                        let retained = size.min(limit.saturating_sub(buffer.len()));
+                        buffer.extend_from_slice(&chunk[..retained]);
+                        if stream == 0 && evidence.bytes[0] > MAX_OUTPUT {
+                            return Err(evidence.failed(Stage::StdoutLimit, None, io.elapsed()));
+                        }
                     }
-                    output.extend_from_slice(&chunk[..n]);
-                    continue;
+                    Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
+                    Err(error) => return Err(evidence.failed(if stream == 0 { Stage::ReadStdout } else { Stage::ReadStderr }, Some(error), io.elapsed())),
                 }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => return None,
+            }
+            if evidence.eof[0] {
+                if evidence.status.is_none() {
+                    evidence.status = match io.status() {
+                        Ok(status) => status,
+                        Err(error) => return Err(evidence.failed(Stage::TryWait, Some(error), io.elapsed())),
+                    };
+                }
+                if let Some(status) = &evidence.status {
+                    if status.success {
+                        evidence.elapsed = io.elapsed();
+                        return Ok(evidence);
+                    }
+                    if evidence.eof[1] { return Err(evidence.failed(Stage::ExitStatus, None, io.elapsed())); }
+                }
             }
         }
-        match child.try_wait().ok()? {
-            Some(status) if !status.success() => return None,
-            Some(_) if eof => return Some(output),
-            _ => {}
+    }
+
+    pub(super) fn linker_path(output: &[u8], is_file: impl FnOnce(&Path) -> bool) -> Result<PathBuf, Stage> {
+        let output = std::str::from_utf8(output).map_err(|_| Stage::InvalidUtf8)?;
+        let line = output.strip_suffix('\n').unwrap_or(output);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() || line.contains(['\r', '\n', '\0']) { return Err(Stage::InvalidLine); }
+        let path = PathBuf::from(line);
+        if !path.is_absolute() { return Err(Stage::NonAbsolute); }
+        if !is_file(&path) { return Err(Stage::NotRegularFile); }
+        Ok(path)
+    }
+
+    #[cfg(target_os = "macos")]
+    struct NativeIo<'a> {
+        child: &'a mut std::process::Child,
+        pipes: [crate::sys::Pipe; 2],
+        started: std::time::Instant,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl DiscoveryIo for NativeIo<'_> {
+        fn elapsed(&self) -> Duration { self.started.elapsed() }
+        fn read(&mut self, stream: usize, buffer: &mut [u8]) -> io::Result<usize> { self.pipes[stream].read(buffer) }
+        fn status(&mut self) -> io::Result<Option<Status>> { self.child.try_wait().map(|status| status.map(Status::from)) }
+        fn wait(&mut self, eof: [bool; 2], timeout: Duration) -> [bool; 2] {
+            if eof == [true; 2] {
+                std::thread::sleep(timeout);
+                [false; 2]
+            } else {
+                crate::sys::wait_readable([(!eof[0]).then_some(&self.pipes[0]), (!eof[1]).then_some(&self.pipes[1])], timeout)
+            }
         }
-        let wait = TIMEOUT.saturating_sub(started.elapsed()).min(Duration::from_millis(10));
-        if eof {
-            std::thread::sleep(wait);
-        } else {
-            sys::wait_readable([Some(stdout), None], wait);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn discover() -> Result<PathBuf, Box<Failure>> {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let started = Instant::now();
+        let mut child = match Command::new("/usr/bin/xcrun").args(["--find", "ld"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(child) => child,
+            Err(error) => return Err(Evidence::new(started.elapsed()).failed(Stage::Spawn, Some(error), started.elapsed())),
+        };
+        let spawn_elapsed = started.elapsed();
+        let result = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => {
+                let mut io = NativeIo { child: &mut child, pipes: [crate::sys::Pipe::from(stdout), crate::sys::Pipe::from(stderr)], started };
+                read_discovery(&mut io, spawn_elapsed).and_then(|evidence| {
+                    linker_path(&evidence.stdout, |path| path.is_file()).map_err(|stage| evidence.failed(stage, None, started.elapsed()))
+                })
+            }
+            (None, _) => Err(Evidence::new(spawn_elapsed).failed(Stage::MissingStdout, None, started.elapsed())),
+            (_, None) => Err(Evidence::new(spawn_elapsed).failed(Stage::MissingStderr, None, started.elapsed())),
+        };
+        result.map_err(|mut failure| {
+            failure.child_pid = Some(child.id());
+            let cleanup_started = Instant::now();
+            let already_reaped = failure.evidence.status.is_some();
+            let kill_error = if already_reaped { None } else { child.kill().err().map(IoFailure::from) };
+            let waited = loop {
+                match child.wait() {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result,
+                }
+            };
+            let (status, wait_error) = match waited {
+                Ok(status) => (Some(Status::from(status)), None),
+                Err(error) => (None, Some(IoFailure::from(error))),
+            };
+            failure.cleanup = Some(Cleanup { already_reaped, kill_error, wait_error, status, elapsed: cleanup_started.elapsed() });
+            failure.total_elapsed = started.elapsed();
+            failure
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::VecDeque;
+
+        struct FakeIo {
+            streams: [VecDeque<io::Result<Vec<u8>>>; 2],
+            statuses: VecDeque<io::Result<Option<Status>>>,
+            default_status: Option<Status>,
+            elapsed: Duration,
+            read_elapsed: Duration,
+            waits: Vec<Duration>,
+        }
+
+        impl FakeIo {
+            fn new(stdout: &[u8], stderr: &[u8], code: i32) -> Self {
+                Self { streams: [VecDeque::from([Ok(stdout.to_vec()), Ok(Vec::new())]), VecDeque::from([Ok(stderr.to_vec()), Ok(Vec::new())])],
+                    statuses: VecDeque::new(), default_status: Some(Status { success: code == 0, code: Some(code), description: format!("exit {code}") }),
+                    elapsed: Duration::ZERO, read_elapsed: Duration::ZERO, waits: Vec::new() }
+            }
+        }
+
+        impl DiscoveryIo for FakeIo {
+            fn elapsed(&self) -> Duration { self.elapsed }
+            fn read(&mut self, stream: usize, buffer: &mut [u8]) -> io::Result<usize> {
+                self.elapsed += self.read_elapsed;
+                let mut bytes = self.streams[stream].pop_front().unwrap_or_else(|| Err(io::ErrorKind::WouldBlock.into()))?;
+                let size = bytes.len().min(buffer.len());
+                if bytes.len() > size {
+                    let tail = bytes.split_off(size);
+                    self.streams[stream].push_front(Ok(tail));
+                }
+                buffer[..size].copy_from_slice(&bytes);
+                Ok(size)
+            }
+            fn status(&mut self) -> io::Result<Option<Status>> { self.statuses.pop_front().unwrap_or_else(|| Ok(self.default_status.clone())) }
+            fn wait(&mut self, eof: [bool; 2], timeout: Duration) -> [bool; 2] {
+                self.waits.push(timeout);
+                let ready = [!eof[0] && !self.streams[0].is_empty(), !eof[1] && !self.streams[1].is_empty()];
+                if !ready.into_iter().any(|ready| ready) { self.elapsed += timeout; }
+                ready
+            }
+        }
+
+        #[test]
+        fn successful_discovery_drains_both_streams_and_retries_transient_reads() {
+            let mut io = FakeIo::new(b"/Developer Tools/ld\n", b"note\n", 0);
+            io.elapsed = Duration::from_millis(3);
+            io.streams[0].push_front(Err(io::ErrorKind::Interrupted.into()));
+            io.streams[1].push_front(Err(io::ErrorKind::WouldBlock.into()));
+            let result = read_discovery(&mut io, Duration::from_millis(3)).unwrap();
+            assert_eq!(result.stdout, b"/Developer Tools/ld\n");
+            assert_eq!(result.stderr, b"note\n");
+            assert_eq!(result.eof, [true, false]);
+            assert_eq!(result.spawn_elapsed, Duration::from_millis(3));
+            assert_eq!(result.status.unwrap().code, Some(0));
+        }
+
+        #[test]
+        fn successful_exit_does_not_wait_for_open_or_continuously_ready_stderr() {
+            for continuously_ready in [false, true] {
+                let mut io = FakeIo::new(b"/Developer Tools/ld\n", b"note", 0);
+                io.streams[1].pop_back();
+                if continuously_ready {
+                    io.streams[1].extend((0..8).map(|_| Ok(b"descendant".to_vec())));
+                    io.read_elapsed = TIMEOUT / 4;
+                }
+                let result = read_discovery(&mut io, Duration::ZERO).unwrap();
+                assert_eq!(result.stdout, b"/Developer Tools/ld\n");
+                assert_eq!(result.stderr, b"note");
+                assert_eq!(result.eof, [true, false]);
+                assert!(result.elapsed < TIMEOUT);
+                assert_eq!(io.streams[1].len(), if continuously_ready { 8 } else { 0 });
+                assert_eq!(io.waits.len(), 2);
+            }
+        }
+
+        #[test]
+        fn failed_exit_retains_bounded_stderr_and_does_not_wait_for_open_descendants() {
+            let stderr = vec![b'x'; STDERR_LIMIT * 3 + 17];
+            let mut io = FakeIo::new(b"", &stderr, 7);
+            io.streams[1].pop_back();
+            let failure = read_discovery(&mut io, Duration::ZERO).unwrap_err();
+            assert_eq!(failure.stage, Stage::ExitStatus);
+            assert_eq!(failure.evidence.status.as_ref().unwrap().code, Some(7));
+            assert_eq!(failure.evidence.stderr.len(), STDERR_LIMIT);
+            assert_eq!(failure.evidence.bytes[1], stderr.len());
+            assert!(!failure.evidence.eof[1]);
+            assert!(io.waits.iter().all(Duration::is_zero));
+            let diagnostic = failure.diagnostic();
+            assert!(diagnostic.contains("stderr_truncated=true"));
+            assert!(diagnostic.len() < STDERR_LIMIT + 1024);
+        }
+
+        #[test]
+        fn deadline_is_deterministic_and_includes_spawn_time() {
+            let mut io = FakeIo::new(b"", b"", 0);
+            io.elapsed = TIMEOUT;
+            let failure = read_discovery(&mut io, TIMEOUT).unwrap_err();
+            assert_eq!(failure.stage, Stage::Deadline);
+            assert_eq!(failure.evidence.spawn_elapsed, TIMEOUT);
+            assert!(io.waits.is_empty());
+
+            let mut io = FakeIo::new(b"", b"", 0);
+            io.streams = [VecDeque::new(), VecDeque::new()];
+            io.default_status = None;
+            let failure = read_discovery(&mut io, Duration::ZERO).unwrap_err();
+            assert_eq!(failure.stage, Stage::Deadline);
+            assert_eq!(failure.evidence.elapsed, TIMEOUT);
+        }
+
+        #[test]
+        fn read_and_wait_errors_keep_their_stage_and_errno() {
+            for (stream, stage) in [(0, Stage::ReadStdout), (1, Stage::ReadStderr)] {
+                let mut io = FakeIo::new(b"data", b"", 0);
+                io.streams[stream].push_front(Err(io::Error::from_raw_os_error(9)));
+                let failure = read_discovery(&mut io, Duration::ZERO).unwrap_err();
+                assert_eq!(failure.stage, stage);
+                assert_eq!(failure.io.unwrap().errno, Some(9));
+            }
+            let mut io = FakeIo::new(b"", b"", 0);
+            io.statuses.push_back(Err(io::Error::from_raw_os_error(10)));
+            let failure = read_discovery(&mut io, Duration::ZERO).unwrap_err();
+            assert_eq!(failure.stage, Stage::TryWait);
+            assert_eq!(failure.io.unwrap().errno, Some(10));
+        }
+
+        #[test]
+        fn stdout_limit_and_escaped_diagnostics_remain_bounded() {
+            let mut io = FakeIo::new(&vec![b'a'; MAX_OUTPUT + 1], b"", 0);
+            let failure = read_discovery(&mut io, Duration::ZERO).unwrap_err();
+            assert_eq!(failure.stage, Stage::StdoutLimit);
+            assert_eq!(failure.evidence.stdout.len(), MAX_OUTPUT);
+            assert_eq!(failure.evidence.bytes[0], MAX_OUTPUT + 1);
+            assert!(failure.diagnostic().contains("stdout_truncated=true"));
+            let (escaped, used) = escaped(&[0xff, b'\n', b'"'], 5);
+            assert_eq!(escaped, "\\xff");
+            assert_eq!(used, 1);
+        }
+
+        #[test]
+        fn path_and_pre_read_failures_have_distinct_diagnostics() {
+            for (bytes, stage) in [(b"\xff".as_slice(), Stage::InvalidUtf8), (b"/ld\n/other\n", Stage::InvalidLine),
+                                  (b"\n", Stage::InvalidLine), (b"ld\n", Stage::NonAbsolute)] {
+                assert_eq!(linker_path(bytes, |_| true), Err(stage));
+            }
+            let absolute = PathBuf::from(if cfg!(windows) { r"C:\Developer Tools\ld" } else { "/Developer Tools/ld" });
+            assert_eq!(linker_path(absolute.to_str().unwrap().as_bytes(), |_| false), Err(Stage::NotRegularFile));
+            for stage in [Stage::Spawn, Stage::MissingStdout, Stage::MissingStderr] {
+                let mut failure = Evidence::new(Duration::from_millis(2)).failed(stage, Some(io::Error::from_raw_os_error(2)), Duration::from_millis(3));
+                assert!(failure.diagnostic().contains("child_pid=not_spawned"));
+                failure.child_pid = Some(123);
+                failure.cleanup = Some(Cleanup { already_reaped: false, kill_error: Some(io::Error::from_raw_os_error(3).into()),
+                    wait_error: None, status: Some(Status { success: false, code: Some(7), description: "exit 7".into() }), elapsed: Duration::from_millis(1) });
+                failure.total_elapsed = Duration::from_millis(4);
+                let diagnostic = failure.diagnostic();
+                assert!(diagnostic.contains(&format!("stage={stage:?}")));
+                assert!(diagnostic.contains("child_pid=123"));
+                assert!(diagnostic.contains("errno=Some(2)"));
+                assert!(diagnostic.contains("spawn_us=2000 decision_us=3000"));
+                assert!(diagnostic.contains("total_us=4000"));
+                assert!(diagnostic.contains("kill=(kind="));
+            }
         }
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn linker_path(output: &[u8], is_file: impl FnOnce(&Path) -> bool) -> Option<PathBuf> {
-    let output = std::str::from_utf8(output).ok()?;
-    let line = output.strip_suffix('\n').unwrap_or(output);
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    if line.contains(['\r', '\n', '\0']) {
-        return None;
-    }
-    let path = PathBuf::from(line);
-    (path.is_absolute() && is_file(&path)).then_some(path)
+    discovery::linker_path(output, is_file).ok()
 }
 
 #[cfg(test)]
