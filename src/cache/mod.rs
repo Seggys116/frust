@@ -277,6 +277,14 @@ impl Cache {
         self.dirs.root().join(UNITS_DIR)
     }
 
+    /// The entry keys the unit record lists, newest first; empty when the record is missing or unreadable.
+    pub fn unit_keys(&self, unit: &str) -> Vec<String> {
+        if !valid_key(unit) { return Vec::new(); }
+        fs::read_to_string(Self::shard(self.units_dir(), unit))
+            .map(|text| text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     /// Serialize version commits and retirement renames; returned retired keys are for logging.
     pub fn note_unit_entry(&self, unit: &str, key: &str, keep: usize) -> Vec<String> {
         self.note_unit_entry_with(unit, key, keep, || {}, |_| {}, fsx::remove_any)
@@ -494,6 +502,13 @@ impl Cache {
         if let Some(entry) = retired && entry.proof.valid(&self.dirs, &entry.path) { let _ = delete(&entry.path); }
     }
 
+}
+
+/// True for an entry with linked files, every one of which has lost its target name, so the store holds the only copy.
+pub fn orphaned_linked(entry: &Path, meta: &EntryMeta) -> bool {
+    let mut linked = meta.files.iter().filter(|file| file.encoding == payload::Encoding::Linked && safe_file_name(&file.stored)).peekable();
+    linked.peek().is_some()
+        && linked.all(|file| sys::lstat(&entry.join(&file.stored)).is_ok_and(|stored| stored.is_file() && stored.nlink() == 1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,6 +1101,20 @@ mod tests {
         assert!(!cache.has_entry(&key(2)));
         assert!(fs::read_to_string(path).unwrap().trim().is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overlapping_stores_of_one_unit_leave_exactly_one_entry_in_either_order() {
+        for order in [[1u8, 2], [2, 1]] {
+            let (dir, cache) = scratch("overlap");
+            let unit = key(0xaa);
+            for n in order { publish_entry(&cache, n); }
+            for n in order { cache.note_unit_entry(&unit, &key(n), 1); }
+            let survivors: Vec<u8> = [1u8, 2].into_iter().filter(|n| cache.has_entry(&key(*n))).collect();
+            assert_eq!(survivors, vec![order[1]], "the entry recorded last is the head");
+            assert_eq!(cache.unit_keys(&unit), vec![key(order[1])]);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

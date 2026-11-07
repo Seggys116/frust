@@ -807,6 +807,10 @@ pub fn find_executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file()))
 }
 
+pub fn make_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn tool_name(argv0: &OsStr) -> String {
     let name = Path::new(argv0).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match name.len().checked_sub(4).and_then(|at| name.get(at..)) {

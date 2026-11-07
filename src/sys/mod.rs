@@ -526,6 +526,11 @@ pub fn find_executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
     imp::find_executable_in(dir, name)
 }
 
+/// Adds the execute bits on Unix; a no-op on Windows, where any file with a suitable extension runs.
+pub fn make_executable(path: &Path) -> io::Result<()> {
+    imp::make_executable(path)
+}
+
 pub fn tool_name(argv0: &OsStr) -> String {
     imp::tool_name(argv0)
 }

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,9 @@ pub const SETTLE_MARGIN_NS: i128 = 2_000_000_000;
 
 /// Reading a memo record costs about as much as hashing a smaller file.
 const PERSIST_MIN_BYTES: u64 = 32 * 1024;
+
+/// Smaller files are cheaper to read than to look up, so nothing records them.
+pub const ATTEST_MIN_BYTES: u64 = PERSIST_MIN_BYTES;
 
 /// Beyond these limits the invocation is not cached rather than keyed by an incomplete hash.
 pub const DIR_MAX_FILES: usize = 20_000;
@@ -282,11 +286,19 @@ fn hash_sized(reader: &mut impl Read, size: u64) -> io::Result<String> {
 /// Says whether a stamp on `path`, which lies on volume `dev`, may be believed.
 pub type StampTrust = Box<dyn Fn(u64, &Path) -> bool + Send + Sync>;
 
+/// Told of a file whose stamp matched a record while its content did not: path, device, recorded hash, fresh hash.
+pub type ViolationSink = Box<dyn Fn(&Path, u64, &str, &str) + Send + Sync>;
+
 pub struct Hasher {
+    on_violation: Option<ViolationSink>,
     memo: Mutex<HashMap<PathBuf, Hashed>>,
     persist_dir: Option<PathBuf>,
     immutable_roots: Vec<PathBuf>,
     stamp_trust: Option<StampTrust>,
+    /// Attested records are proven by content on every use instead of being believed.
+    audit_attested: bool,
+    read_bytes: AtomicU64,
+    memo_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,7 +309,41 @@ pub enum DirHash {
 
 impl Hasher {
     pub fn new(persist_dir: Option<PathBuf>, immutable_roots: Vec<PathBuf>) -> Hasher {
-        Hasher { memo: Mutex::new(HashMap::new()), persist_dir, immutable_roots, stamp_trust: None }
+        Hasher {
+            on_violation: None,
+            memo: Mutex::new(HashMap::new()),
+            persist_dir,
+            immutable_roots,
+            stamp_trust: None,
+            audit_attested: false,
+            read_bytes: AtomicU64::new(0),
+            memo_bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn audit_attested(mut self, audit: bool) -> Hasher {
+        self.audit_attested = audit;
+        self
+    }
+
+    pub fn with_violation_sink(mut self, sink: ViolationSink) -> Hasher {
+        self.on_violation = Some(sink);
+        self
+    }
+
+    /// Bytes read and hashed so far, and bytes served from a memo instead.
+    pub fn tally(&self) -> (u64, u64) {
+        (self.read_bytes.load(Ordering::Relaxed), self.memo_bytes.load(Ordering::Relaxed))
+    }
+
+    fn read(&self, path: &Path, immutable: bool) -> io::Result<Hashed> {
+        let hashed = hash_with_stamp_in(path, immutable)?;
+        self.read_bytes.fetch_add(hashed.stamp.size, Ordering::Relaxed);
+        Ok(hashed)
+    }
+
+    fn served(&self, size: u64) {
+        self.memo_bytes.fetch_add(size, Ordering::Relaxed);
     }
 
     /// Where the policy answers no, or the stamp is coarse, the content is read and neither memo is consulted or written.
@@ -328,7 +374,7 @@ impl Hasher {
         let persist_ok = persist && self.persist_dir.is_some();
         if !persist_ok && !self.memo().contains_key(path) {
             // Nothing to validate against, so the handle's own fstat is the only stat needed.
-            let hashed = hash_with_stamp_in(path, immutable)?;
+            let hashed = self.read(path, immutable)?;
             self.memo().insert(path.to_path_buf(), hashed.clone());
             return Ok(hashed);
         }
@@ -338,23 +384,43 @@ impl Hasher {
     fn hash_observed(&self, path: &Path, persist: bool, current: Stamp) -> io::Result<Hashed> {
         let immutable = self.in_immutable_root(path);
         if !self.believes(path, &current) {
-            return hash_with_stamp_in(path, immutable);
+            return self.read(path, immutable);
         }
         if let Some(known) = self.memo().get(path)
             && known.stamp == current
             && known.reusable()
         {
+            self.served(current.size);
             return Ok(known.clone());
         }
         let persist = persist && self.persist_dir.is_some() && current.size >= PERSIST_MIN_BYTES;
-        if persist && let Some(hash) = self.persisted(path, &current) {
+        if persist && let Some((hash, attested)) = self.persisted(path, &current) {
+            if attested && self.audit_attested {
+                let fresh = self.read(path, immutable)?;
+                if fresh.hash != hash || !fresh.stable || fresh.stamp != current {
+                    if let Some(record) = self.record_path(path) {
+                        let _ = fs::remove_file(record);
+                    }
+                    // Only a file that still carries the recorded stamp proves the stamp lied; a changed stamp is an ordinary edit.
+                    if fresh.hash != hash
+                        && fresh.stable
+                        && fresh.stamp == current
+                        && let Some(report) = &self.on_violation
+                    {
+                        report(path, current.dev, &hash, &fresh.hash);
+                    }
+                    self.memo().insert(path.to_path_buf(), fresh.clone());
+                    return Ok(fresh);
+                }
+            }
+            self.served(current.size);
             // Recorded only after settling, so date it just past the settle margin to keep it reusable.
             let at_ns = current.mtime_ns.max(current.ctime_ns) + SETTLE_MARGIN_NS + 1;
             let hashed = Hashed { hash, stamp: current, stable: true, at_ns, birth_ns: None };
             self.memo().insert(path.to_path_buf(), hashed.clone());
             return Ok(hashed);
         }
-        let hashed = hash_with_stamp_in(path, immutable)?;
+        let hashed = self.read(path, immutable)?;
         if persist && hashed.reusable() {
             self.remember(path, &hashed);
         }
@@ -368,7 +434,8 @@ impl Hasher {
         Some(dir.join(&key[..2]).join(&key[2..34]))
     }
 
-    fn persisted(&self, path: &Path, stamp: &Stamp) -> Option<String> {
+    /// The hash and whether the record was attested by the process that produced the file.
+    fn persisted(&self, path: &Path, stamp: &Stamp) -> Option<(String, bool)> {
         let text = fs::read_to_string(self.record_path(path)?).ok()?;
         let mut lines = text.lines();
         if lines.next()? != "frust-hashmemo-v1" || lines.next()? != path.to_str()? {
@@ -382,20 +449,37 @@ impl Hasher {
             _ => return None,
         };
         let hash = lines.next()?;
+        let attested = lines.next() == Some("attested");
         (recorded == *stamp && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| hash.to_string())
+            .then(|| (hash.to_string(), attested))
     }
 
     fn remember(&self, path: &Path, hashed: &Hashed) {
+        self.write_record(path, &hashed.stamp, &hashed.hash, false);
+    }
+
+    fn write_record(&self, path: &Path, s: &Stamp, hash: &str, attested: bool) -> bool {
         let (Some(record), Some(text_path)) = (self.record_path(path), path.to_str()) else {
-            return;
+            return false;
         };
-        let s = &hashed.stamp;
-        let body = format!(
-            "frust-hashmemo-v1\n{text_path}\n{} {} {} {} {}\n{}\n",
-            s.dev, s.ino, s.size, s.mtime_ns, s.ctime_ns, hashed.hash
+        let mut body = format!(
+            "frust-hashmemo-v1\n{text_path}\n{} {} {} {} {}\n{hash}\n",
+            s.dev, s.ino, s.size, s.mtime_ns, s.ctime_ns
         );
-        let _ = fsx::write_atomic(&record, body.as_bytes());
+        if attested {
+            body.push_str("attested\n");
+        }
+        fsx::write_atomic(&record, body.as_bytes()).is_ok()
+    }
+
+    /// Records the hash of a file this process just produced or restored, skipping the settle rule (see "Stamp trust and audits" in the docs).
+    pub fn attest(&self, path: &Path, hash: &str, stamp: &Stamp) -> bool {
+        // The file must still carry the stamp it had while hashed, on a believed volume with fine timestamps.
+        let sound = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !sound || self.persist_dir.is_none() || stamp.size < PERSIST_MIN_BYTES || stamp.ctime_ns <= 0 || !self.believes(path, stamp) {
+            return false;
+        }
+        Stamp::read(path).is_ok_and(|now| now == *stamp) && self.write_record(path, stamp, hash, true)
     }
 
     /// Linkers read only the top level and `*.framework` bundles, so other sub-directories count by name unless `recursive`.
@@ -952,6 +1036,131 @@ mod tests {
         for (i, f) in files.iter().enumerate() {
             assert_eq!(hasher.hash(f, false).unwrap().hash, plain(&pattern(100 + i)));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const ATTESTED_LEN: usize = 64 * 1024;
+
+    // A file written just now, so it is inside the settle margin; `None` where stamps are whole seconds.
+    fn fresh_output(dir: &Path, name: &str) -> Option<(PathBuf, Vec<u8>, Stamp)> {
+        let file = dir.join(name);
+        let bytes = pattern(ATTESTED_LEN);
+        fs::write(&file, &bytes).unwrap();
+        let stamp = Stamp::read(&file).unwrap();
+        (!stamp.coarse()).then_some((file, bytes, stamp))
+    }
+
+    fn dependent(memo: &Path) -> Hasher {
+        Hasher::new(Some(memo.to_path_buf()), Vec::new())
+    }
+
+    #[test]
+    fn a_producer_attested_file_is_not_hashed_again_by_a_dependent() {
+        let dir = scratch("attest-use");
+        let Some((file, bytes, stamp)) = fresh_output(&dir, "libk.rlib") else { return };
+        let memo = dir.join("memo");
+        assert!(Hasher::new(Some(memo.clone()), Vec::new()).attest(&file, &plain(&bytes), &stamp));
+        let user = dependent(&memo);
+        assert_eq!(user.hash(&file, true).unwrap().hash, plain(&bytes));
+        assert_eq!(user.tally(), (0, ATTESTED_LEN as u64));
+
+        let (other, other_bytes, _) = fresh_output(&dir, "libother.rlib").unwrap();
+        let unattested = dependent(&memo);
+        assert_eq!(unattested.hash(&other, true).unwrap().hash, plain(&other_bytes));
+        assert_eq!(unattested.tally(), (ATTESTED_LEN as u64, 0), "an unsettled, unattested file is read");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_attestation_is_void_once_size_mtime_or_inode_differs() {
+        let dir = scratch("attest-void");
+        let memo = dir.join("memo");
+        for change in ["size", "mtime", "inode"] {
+            let Some((file, bytes, stamp)) = fresh_output(&dir, &format!("{change}.rlib")) else { return };
+            let producer = Hasher::new(Some(memo.clone()), Vec::new());
+            assert!(producer.attest(&file, &plain(&bytes), &stamp));
+            let mut current = bytes.clone();
+            match change {
+                "size" => {
+                    current.push(7);
+                    fs::write(&file, &current).unwrap();
+                }
+                "mtime" => {
+                    let later = SystemTime::now() + std::time::Duration::from_secs(5);
+                    fs::OpenOptions::new().write(true).open(&file).unwrap().set_modified(later).unwrap();
+                }
+                _ => {
+                    let sibling = dir.join("replacement.rlib");
+                    fs::write(&sibling, &current).unwrap();
+                    sys::rename(&sibling, &file).unwrap();
+                }
+            }
+            let user = dependent(&memo);
+            assert_eq!(user.hash(&file, true).unwrap().hash, plain(&current), "{change}");
+            assert_eq!(user.tally().0, current.len() as u64, "{change}: the dependent must read the file");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attestation_is_refused_for_a_changed_file_a_small_file_and_an_unbelieved_volume() {
+        let dir = scratch("attest-refused");
+        let Some((file, bytes, stamp)) = fresh_output(&dir, "libk.rlib") else { return };
+        let memo = dir.join("memo");
+        let producer = Hasher::new(Some(memo.clone()), Vec::new());
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        fs::OpenOptions::new().write(true).open(&file).unwrap().set_modified(later).unwrap();
+        assert!(!producer.attest(&file, &plain(&bytes), &stamp), "the file changed after it was hashed");
+
+        let small = dir.join("small.rlib");
+        fs::write(&small, b"tiny").unwrap();
+        let small_stamp = Stamp::read(&small).unwrap();
+        assert!(!producer.attest(&small, &plain(b"tiny"), &small_stamp));
+
+        let (untrusted, bytes, stamp) = fresh_output(&dir, "libu.rlib").unwrap();
+        let distrusting = Hasher::new(Some(memo), Vec::new()).with_stamp_trust(Box::new(|_, _| false));
+        assert!(!distrusting.attest(&untrusted, &plain(&bytes), &stamp), "off mode never records attestations");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_distrusting_dependent_ignores_attestations() {
+        let dir = scratch("attest-off");
+        let Some((file, bytes, stamp)) = fresh_output(&dir, "libk.rlib") else { return };
+        let memo = dir.join("memo");
+        assert!(Hasher::new(Some(memo.clone()), Vec::new()).attest(&file, &plain(&bytes), &stamp));
+        let off = Hasher::new(Some(memo), Vec::new()).with_stamp_trust(Box::new(|_, _| false));
+        assert_eq!(off.hash(&file, true).unwrap().hash, plain(&bytes));
+        assert_eq!(off.tally(), (ATTESTED_LEN as u64, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_mode_proves_attested_records_by_content_and_discards_a_false_one() {
+        let dir = scratch("attest-audit");
+        let Some((file, bytes, stamp)) = fresh_output(&dir, "libk.rlib") else { return };
+        let memo = dir.join("memo");
+        let producer = Hasher::new(Some(memo.clone()), Vec::new());
+        assert!(producer.attest(&file, &plain(&bytes), &stamp));
+        let audited = dependent(&memo).audit_attested(true);
+        assert_eq!(audited.hash(&file, true).unwrap().hash, plain(&bytes));
+        assert_eq!(audited.tally(), (ATTESTED_LEN as u64, ATTESTED_LEN as u64), "a true record is read once to prove it");
+
+        assert!(producer.attest(&file, &plain(b"not the content"), &stamp));
+        let reports = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&reports);
+        let forged = dependent(&memo).audit_attested(true).with_violation_sink(Box::new(move |path, dev, recorded, fresh| {
+            sink.lock().unwrap().push((path.to_path_buf(), dev, recorded.to_string(), fresh.to_string()));
+        }));
+        assert_eq!(forged.hash(&file, true).unwrap().hash, plain(&bytes), "the audit returns the real content hash");
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![(file.clone(), stamp.dev, plain(b"not the content"), plain(&bytes))],
+            "a record that matched the stamp but not the content is reported as a violation"
+        );
+        let later = dependent(&memo);
+        assert_eq!(later.hash(&file, true).unwrap().hash, plain(&bytes));
+        assert_eq!(later.tally().0, ATTESTED_LEN as u64, "the false record was discarded");
         let _ = fs::remove_dir_all(&dir);
     }
 }

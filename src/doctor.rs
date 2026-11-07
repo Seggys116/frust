@@ -303,11 +303,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let lld = bin.join(format!("frust-test-rust-lld{}", env::consts::EXE_SUFFIX));
         std::fs::write(&lld, b"lld").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&lld, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::sys::make_executable(&lld).unwrap();
         let sysroot = Some((root.as_path(), "x86_64-test"));
         let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 

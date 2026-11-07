@@ -211,7 +211,12 @@ struct ScannedEntry {
     link: LinkState,
     /// The prekey, which names a unit across every state of its inputs.
     group: Option<String>,
+    /// A path-crate entry that no unit record lists: nothing will ever supersede or retire it.
+    unreferenced_path: bool,
 }
+
+/// How long an unreferenced store-only path entry is left alone, so a store that is still being recorded is never raced.
+const ORPHAN_GRACE: Duration = Duration::from_secs(600);
 
 /// How an entry's linked files relate to target names: a file still shared with one frees nothing when the entry goes.
 #[derive(Debug, Default, Clone, Copy)]
@@ -327,7 +332,9 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
                 .or_else(|| meta.as_ref().and_then(|meta| meta.prekey.clone()));
             let retirement = retirement.filter(|snapshot| snapshot.used() == used
                 && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
-            out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group });
+            let unreferenced_path = !records.contains_key(key)
+                && meta.as_ref().is_some_and(|meta| meta.source.as_deref() == Some(cache::clean::SOURCE_PATH));
+            out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group, unreferenced_path });
         }
     }
     out
@@ -357,6 +364,12 @@ fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)
     for (_, mut entries) in groups {
         entries.sort_by_key(|e| std::cmp::Reverse(e.used));
         for entry in entries.into_iter().skip(1).filter(|e| e.link.orphaned) {
+            out.push((entry.path.clone(), fsx::allocated_size(&entry.path)));
+        }
+    }
+    // Entries only the store holds and no unit record lists (a lost record write) would otherwise wait for the age limit.
+    for entry in scanned.iter().filter(|e| e.link.orphaned && e.unreferenced_path && old_enough(e.used, ORPHAN_GRACE)) {
+        if !out.iter().any(|(path, _)| path == &entry.path) {
             out.push((entry.path.clone(), fsx::allocated_size(&entry.path)));
         }
     }
@@ -2552,6 +2565,33 @@ mod tests {
         let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
         assert_eq!(dropped, vec![entries[0].clone()], "only older orphaned entries go, never the newest of the unit");
         assert!(cache_removals(&plan(&dirs, &GcOptions::new(u64::MAX))).contains(&entries[0]));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn store_only_path_entries_no_unit_record_lists_are_swept_after_the_grace() {
+        let home = home("linked-unreferenced");
+        let dirs = Dirs::at(&home);
+        let mut entries = Vec::new();
+        for (i, age) in [(1u8, 3000u64), (2, 30)] {
+            let target = home.join(format!("target-{i}"));
+            fs::write(&target, vec![i; 8192]).unwrap();
+            let entry = linked_entry_of(&home, &format!("{i:02x}{}", "1".repeat(38)), &target, age, &format!("{i:02x}").repeat(20));
+            fs::remove_file(&target).unwrap();
+            let meta_path = entry.join("meta.json");
+            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            value["source"] = serde_json::json!("path");
+            fs::write(&meta_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            File::options().write(true).open(&meta_path).unwrap().set_modified(SystemTime::now() - Duration::from_secs(age)).unwrap();
+            entries.push(entry);
+        }
+        let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
+        assert_eq!(dropped, vec![entries[0].clone()], "only the entry past the grace goes");
+        let unit = "cd".repeat(20);
+        let record = cache::Cache::new(&dirs).units_dir().join(&unit[..2]).join(&unit);
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, format!("{}\n", entries[0].file_name().unwrap().to_string_lossy())).unwrap();
+        assert!(superseded_incremental_entries(&dirs, 2).is_empty(), "a listed entry is the unit's head and stays");
         let _ = fs::remove_dir_all(&home);
     }
 

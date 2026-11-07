@@ -501,6 +501,10 @@ pub fn find_executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
     runnable.then_some(candidate)
 }
 
+pub fn make_executable(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
 pub fn tool_name(argv0: &OsStr) -> String {
     Path::new(argv0).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }

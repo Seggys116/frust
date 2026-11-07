@@ -82,6 +82,8 @@ const DEFERRED_ARG: &str = "--deferred-store";
 /// Sole argument of a helper that finds a slot itself and drains queued job files.
 const DRAIN_ARG: &str = "--deferred-drain";
 const CLAIMED_PREFIX: &str = "claimed-";
+/// An unleased job file younger than this may belong to a helper that has not started yet.
+const ORPHAN_AGE: Duration = Duration::from_secs(30);
 const JOB_LEASE_ENV: &str = "FRUST_DEFERRED_JOB_LEASE";
 
 // A lock held by a process that is working finishes within seconds, so the poll starts fast and settles at 40 ms.
@@ -238,7 +240,9 @@ impl Plan {
             Some(dirs.hashmemo()),
             context.immutable_source_roots.clone(),
         )
-        .with_stamp_trust(stamp_policy(&trust));
+        .with_stamp_trust(stamp_policy(&trust))
+        .audit_attested(trust.mode == TrustMode::Audit)
+        .with_violation_sink(violation_sink(&trust, &dirs, &parsed.crate_name));
         let key = KeyContext {
             hasher: &hasher,
             cwd: &cwd,
@@ -251,6 +255,7 @@ impl Plan {
             unit,
             watched,
             extern_hashes,
+            stats,
         } = match key.prekey(&args[0], &args[1..], &parsed) {
             Ok(found) => found,
             Err(reason) => {
@@ -275,6 +280,10 @@ impl Plan {
             let mut record =
                 timings::Record::new(&parsed.crate_name, unit.is_some(), primary, parsed.incremental());
             record.prekey_ms = timings::ms(keyed);
+            record.extern_files = stats.extern_files;
+            record.extern_bytes_hashed = stats.extern_hashed;
+            record.extern_bytes_memo = stats.extern_memo;
+            record.native_dir_bytes_hashed = stats.native_dir_hashed;
             record
         });
         Some(Plan {
@@ -675,6 +684,7 @@ impl Plan {
             let dst = out_dir.join(&file.name);
             if file.encoding == cache::payload::Encoding::Linked {
                 self.restore_linked(entry, file, &dst)?;
+                self.attest_restored(&dst, file.bytes);
                 return Ok(file.bytes);
             }
             if file.text {
@@ -685,6 +695,7 @@ impl Plan {
                 // Clones keep the old mtime, but cargo treats outputs older than their dependencies' outputs as stale.
                 if !file.dir {
                     fsx::touch(&dst);
+                    self.attest_restored(&dst, file.bytes);
                 }
             }
             Ok(file.bytes)
@@ -820,7 +831,7 @@ impl Plan {
     /// Jobs queued while every slot was busy are picked up here when a slot has freed since, so a quiet build still stores them.
     fn wake_queue(&self) {
         let deferred = self.dirs.deferred();
-        if self.cfg.store_sync || queued_jobs(&deferred).is_empty() {
+        if self.cfg.store_sync || (queued_jobs(&deferred).is_empty() && orphaned_jobs(&deferred).is_empty()) {
             return;
         }
         // The probe only shows whether a slot is free; the drain helper takes its own.
@@ -1087,7 +1098,7 @@ impl Plan {
             if meta.is_dir() {
                 return None;
             }
-            // Linked outputs are hashed by the store, off this path; only the stat identity in `outputs` is recorded here.
+            // Without a commitment the store hashes outputs later; libraries that dependents may use are read once below to attest their hash.
             if !linked && compress && !name.ends_with(".d") && meta.is_file() && meta.len() >= cache::payload::MIN_BYTES {
                 let (committed_meta, commitment) = capture(&path).ok()?;
                 if Stamp::of(&meta) != Stamp::of(&committed_meta)
@@ -1097,6 +1108,9 @@ impl Plan {
                 }
                 meta = committed_meta;
                 commitments.insert(name.clone(), commitment);
+            }
+            if is_dependency_artifact(name) && meta.is_file() && self.may_have_dependents() {
+                self.attest_output(&path, &meta, commitments.get(name));
             }
             outputs.push((name.clone(), Stamp::of(&meta)));
         }
@@ -1109,6 +1123,52 @@ impl Plan {
             commitments,
         };
         (!frozen.has_coarse_stamp()).then_some(frozen)
+    }
+
+    /// Test harnesses and binary-only crates are leaves of the build graph, so reading their outputs to attest them would be wasted.
+    fn may_have_dependents(&self) -> bool {
+        let mut kinds = Vec::new();
+        let mut args = self.args.iter().map(|arg| arg.to_string_lossy());
+        while let Some(arg) = args.next() {
+            if arg == "--crate-type" {
+                kinds.extend(args.next().map(|value| value.into_owned()));
+            } else if let Some(value) = arg.strip_prefix("--crate-type=") {
+                kinds.push(value.to_string());
+            }
+        }
+        let binary_only = !kinds.is_empty() && kinds.iter().all(|kind| kind == "bin");
+        !(self.parsed.test_harness || binary_only)
+    }
+
+    /// Dependents of a freshly produced library look its hash up by stamp; the commitment already holds it when the store needed one.
+    fn attest_output(&self, path: &Path, meta: &sys::Meta, commitment: Option<&cache::payload::Commitment>) {
+        let stamp = Stamp::of(meta);
+        match commitment {
+            Some(commitment) => {
+                self.hasher.attest(path, commitment.hash(), &stamp);
+            }
+            None => self.attest_by_reading(path, &stamp),
+        }
+    }
+
+    /// A restored library is hashed once here instead of once by every dependent; `bytes` skips files too small to be attested.
+    fn attest_restored(&self, path: &Path, bytes: u64) {
+        if bytes >= hashing::ATTEST_MIN_BYTES
+            && is_dependency_artifact(&path.to_string_lossy())
+            && let Ok(stamp) = Stamp::read(path)
+        {
+            self.attest_by_reading(path, &stamp);
+        }
+    }
+
+    fn attest_by_reading(&self, path: &Path, stamp: &Stamp) {
+        if stamp.size >= hashing::ATTEST_MIN_BYTES
+            && let Ok(hashed) = hashing::hash_with_stamp(path)
+            && hashed.stable
+            && hashed.stamp == *stamp
+        {
+            self.hasher.attest(path, &hashed.hash, stamp);
+        }
     }
 
     /// Session-directory warnings describe this target directory, not the crate, so hits elsewhere must not replay them.
@@ -1361,6 +1421,7 @@ impl Plan {
 
         if !self.cache.has_entry(&key) {
             if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) {
+                self.retire_superseded_orphans();
                 return self.skip_store("an output changed after the compile", compile_ms);
             }
             let staged = self.cache.stage()?;
@@ -1376,6 +1437,7 @@ impl Plan {
                 // Checked again once cloned: an output replaced while being cloned must not be published.
                 Ok(_) if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) => {
                     let _ = fsx::remove_any(&staged);
+                    self.retire_superseded_orphans();
                     return self.skip_store("an output changed while being stored", compile_ms);
                 }
                 Ok(meta) => {
@@ -1666,6 +1728,20 @@ impl Plan {
 
     fn note_workspace(&self, key: &str) {
         self.cache.note_workspace(key, &self.user_id());
+    }
+
+    /// A store whose outputs were replaced by a newer compile proves the unit's earlier entries that no target name shares are superseded; with no later store to retire them they would stay as store-only copies.
+    fn retire_superseded_orphans(&self) {
+        let Some(unit) = &self.unit else { return };
+        let protection = deferred_protection(&self.dirs);
+        for key in self.cache.unit_keys(unit) {
+            let Some((dir, meta)) = self.cache.load_entry(&key) else { continue };
+            if !cache::orphaned_linked(&dir, &meta) || protection.protects(&dir) {
+                continue;
+            }
+            self.debug(&format!("retired superseded store-only entry {key} of {}", self.parsed.crate_name));
+            self.cache.remove_entry(&key);
+        }
     }
 
     fn note_unit(&self, key: &str) {
@@ -2807,7 +2883,7 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
         let _held = relock(&job);
         compact::at_background_priority(|| run_deferred(&job));
         // The slot is still held, so queued jobs are finished before it is given back.
-        drain_queue(deferred, run_queued);
+        drain_all(deferred);
     }
     0
 }
@@ -2826,7 +2902,7 @@ fn drain_main() -> i32 {
     let Some(_slot) = acquire_slot(&deferred, slot_count()) else {
         return 0;
     };
-    drain_queue(&deferred, run_queued);
+    drain_all(&deferred);
     0
 }
 
@@ -2897,6 +2973,78 @@ fn drain_queue(deferred: &Path, mut run: impl FnMut(&JobFile)) {
             return;
         }
     }
+}
+
+/// Queued jobs, then job files whose owner died, until neither remains.
+fn drain_all(deferred: &Path) {
+    loop {
+        drain_queue(deferred, run_queued);
+        let mut adopted = false;
+        for path in orphaned_jobs(deferred) {
+            let Some(file) = adopt_orphan(&path) else {
+                continue;
+            };
+            adopted = true;
+            run_adopted(&file);
+        }
+        if !adopted {
+            return;
+        }
+    }
+}
+
+/// Job files nobody can finish: a claimed file of a dead process, or a spawned helper's or broker's file that no one leases and that has sat for a while.
+fn orphaned_jobs(deferred: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(deferred) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".json")?;
+            if let Some(rest) = stem.strip_prefix(CLAIMED_PREFIX) {
+                let pid: u32 = rest.split_once('-')?.0.parse().ok()?;
+                return (pid != std::process::id() && !sys::pid_alive(pid)).then(|| entry.path());
+            }
+            let rest = stem.strip_prefix("job-")?;
+            let queued = rest
+                .split_once('-')
+                .and_then(|(_, tail)| tail.split_once("-q"))
+                .is_some_and(|(_, key)| cache::valid_key(key));
+            let aged = entry.metadata().ok()?.modified().ok()?.elapsed().ok()? > ORPHAN_AGE;
+            (!queued && aged).then(|| entry.path())
+        })
+        .collect()
+}
+
+/// An exclusive probe succeeds only when no owner leases the file; the rename then makes this process its sole owner.
+fn adopt_orphan(path: &Path) -> Option<JobFile> {
+    match deferred_retirement(path) {
+        Ok(DeferredRetirement::Legacy(probe) | DeferredRetirement::Dead(probe)) => drop(probe),
+        _ => return None,
+    }
+    let name = path.file_name()?.to_str()?;
+    let original = match name.strip_prefix(CLAIMED_PREFIX) {
+        Some(rest) => rest.split_once('-')?.1,
+        None => name.strip_prefix("job-")?,
+    };
+    let claimed = path.with_file_name(format!("{CLAIMED_PREFIX}{}-{original}", std::process::id()));
+    sys::rename(path, &claimed).ok()?;
+    Some(JobFile(claimed))
+}
+
+/// The slot is this helper's own, so the slot lock a dead producer recorded is never taken again.
+fn run_adopted(file: &JobFile) {
+    let Some(mut job) = read_job(&file.0) else {
+        return;
+    };
+    job.slot_lock = None;
+    let Ok(_lease) = lease_deferred_job(&file.0) else {
+        return;
+    };
+    let _held = relock(&job);
+    compact::at_background_priority(|| run_deferred(&job));
 }
 
 /// Queued jobs hold no inherited lease and their key lock, if any, is taken again by path.
@@ -3065,6 +3213,18 @@ fn stamp_policy(gate: &Arc<TrustGate>) -> StampTrust {
     Box::new(move |dev, path| gate.volume_trusted(dev, path))
 }
 
+/// Files the hasher finds lying about their stamp are reported and quarantined exactly like a lying input stamp.
+fn violation_sink(gate: &Arc<TrustGate>, dirs: &Dirs, krate: &str) -> hashing::ViolationSink {
+    let (gate, dirs, krate) = (Arc::clone(gate), dirs.clone(), krate.to_string());
+    Box::new(move |path, dev, recorded, fresh| {
+        if gate.debug {
+            eprintln!("frust-wrap: stamp violation in {krate}: {} matched its attested stamp but its content changed", path.display());
+        }
+        cache::report_violation(&dirs, &krate, &path.to_string_lossy(), recorded, fresh, dev);
+        gate.volumes().insert(dev, false);
+    })
+}
+
 /// A recorded stamp that still matches proves the file unchanged since its hash was taken; anything else is decided by content.
 fn input_matches(
     hasher: &Hasher,
@@ -3226,6 +3386,29 @@ struct PreKey {
     unit: String,
     watched: Vec<(PathBuf, Stamp)>,
     extern_hashes: HashMap<PathBuf, String>,
+    stats: PrekeyStats,
+}
+
+/// What hashing the externs and native directories cost this process, for `FRUST_TIMINGS`.
+#[derive(Default, Clone, Copy)]
+struct PrekeyStats {
+    extern_files: u64,
+    extern_hashed: u64,
+    extern_memo: u64,
+    native_dir_hashed: u64,
+}
+
+impl PrekeyStats {
+    fn externs(&mut self, files: usize, before: (u64, u64), after: (u64, u64)) {
+        self.extern_files += files as u64;
+        self.extern_hashed += after.0 - before.0;
+        self.extern_memo += after.1 - before.1;
+    }
+}
+
+/// Outputs that dependents take as `--extern` inputs and hash into their own keys.
+fn is_dependency_artifact(name: &str) -> bool {
+    [".rlib", ".rmeta", ".so", ".dylib", ".dll"].iter().any(|suffix| name.ends_with(suffix))
 }
 
 fn immutable_source_roots() -> Vec<PathBuf> {
@@ -3343,6 +3526,7 @@ impl KeyContext<'_> {
     ) -> Result<PreKey, String> {
         let mut watched = Vec::new();
         let mut extern_hashes = HashMap::new();
+        let mut stats = PrekeyStats::default();
         let mut tools = Vec::new();
         let mut hasher = Both(blake3::Hasher::new(), blake3::Hasher::new());
         hasher.update(b"frust-prekey-v2\0");
@@ -3370,14 +3554,14 @@ impl KeyContext<'_> {
                     })
                 })
                 .collect();
+            let before = self.hasher.tally();
             // Keep errors with their argument so an earlier native input failure still takes precedence.
-            Some(
-                parallel_with_threads(&paths, threads, |_, path| {
-                    Ok(self.hasher.hash(path, path.starts_with(self.profile_abs)))
-                })
-                .map_err(|e| format!("cannot hash --extern inputs: {e}"))?
-                .into_iter(),
-            )
+            let hashed = parallel_with_threads(&paths, threads, |_, path| {
+                Ok(self.hasher.hash(path, path.starts_with(self.profile_abs)))
+            })
+            .map_err(|e| format!("cannot hash --extern inputs: {e}"))?;
+            stats.externs(paths.len(), before, self.hasher.tally());
+            Some(hashed.into_iter())
         } else {
             None
         };
@@ -3406,7 +3590,12 @@ impl KeyContext<'_> {
                 let path = self.cwd.join(path);
                 let hashed = match &mut externs {
                     Some(externs) => externs.next().expect("one hash per extern argument"),
-                    None => self.hasher.hash(&path, path.starts_with(self.profile_abs)),
+                    None => {
+                        let before = self.hasher.tally();
+                        let hashed = self.hasher.hash(&path, path.starts_with(self.profile_abs));
+                        stats.externs(1, before, self.hasher.tally());
+                        hashed
+                    }
                 }
                 .map_err(|e| format!("cannot read --extern {}: {e}", path.display()))?;
                 hasher.update(name.as_bytes());
@@ -3451,7 +3640,9 @@ impl KeyContext<'_> {
                     PathArg::NativeDir(dir) => {
                         let dir = self.cwd.join(dir);
                         hasher.update(b"\0d");
+                        let before = self.hasher.tally();
                         hasher.content(self.dir_hash(&dir, &mut watched)?.as_bytes());
+                        stats.native_dir_hashed += self.hasher.tally().0 - before.0;
                         native_dirs.push(dir);
                     }
                     PathArg::MaybeFiles(files) => {
@@ -3510,6 +3701,7 @@ impl KeyContext<'_> {
             unit: unit.finalize().to_hex()[..40].to_string(),
             watched,
             extern_hashes,
+            stats,
         })
     }
 
@@ -3763,18 +3955,15 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let lld = bin.join(format!("frust-test-rust-lld{suffix}"));
         fs::write(&lld, b"lld").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&lld, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::sys::make_executable(&lld).unwrap();
         let hasher = Hasher::ephemeral();
         let profile = s.0.join("target").join("debug");
         let profile_text = profile.to_string_lossy().into_owned();
         let ctx = KeyContext { hasher: &hasher, cwd: &s.0, profile: &profile_text, profile_abs: &profile };
         let sysroot = s.0.join("sysroot");
         let resolve = |name: &str| crate::toolchain::resolve_linker(name, Some((sysroot.as_path(), "x86_64-test")));
-        assert_eq!(ctx.linker_tool_in(Path::new("frust-test-rust-lld"), resolve).unwrap(), lld);
+        let found = ctx.linker_tool_in(Path::new("frust-test-rust-lld"), resolve).unwrap();
+        assert_eq!(found.to_string_lossy().to_lowercase(), lld.to_string_lossy().to_lowercase());
         let err = ctx.linker_tool_in(Path::new("frust-test-absent-lld"), resolve).unwrap_err();
         assert!(err.starts_with(crate::toolchain::LINKER_UNRESOLVED) && err.contains("sysroot"), "{err}");
     }
@@ -5360,6 +5549,24 @@ mod tests {
     }
 
     #[test]
+    fn a_store_dropped_for_a_newer_compile_retires_the_orphaned_entry_of_its_unit() {
+        let s = Scratch::new("linked-orphan");
+        let (mut job, rlib) = linked_job(&s);
+        let unit = "ef".repeat(20);
+        job.unit = Some(unit.clone());
+        run_deferred(&job);
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let key = plan.cache.candidates(&job.prekey)[0].key.clone();
+        assert_eq!(plan.cache.unit_keys(&unit), vec![key.clone()]);
+        plan.retire_superseded_orphans();
+        assert!(plan.cache.has_entry(&key), "an entry a target name still shares is not orphaned");
+        fs::remove_file(&rlib).unwrap();
+        fs::write(&rlib, b"the newer compile").unwrap();
+        plan.retire_superseded_orphans();
+        assert!(!plan.cache.has_entry(&key), "once the target name is gone the superseded entry holds the only copy");
+    }
+
+    #[test]
     fn linked_stores_reject_later_edits_like_raw_ones() {
         let s = Scratch::new("linked-edits");
         let (job, _) = linked_job(&s);
@@ -6800,6 +7007,79 @@ mod tests {
         drain_queue(&deferred, run_queued);
         drop(lease);
         assert_eq!(rows(&job), 0);
+        assert!(file_names(&deferred).is_empty());
+    }
+
+    fn dead_pid() -> u32 {
+        #[cfg(unix)]
+        let mut child = Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = Command::new("cmd").args(["/c", "exit", "0"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn claimed_by(deferred: &Path, pid: u32, job_path: &Path) -> PathBuf {
+        let name = job_path.file_name().unwrap().to_str().unwrap().strip_prefix("job-").unwrap().to_string();
+        let claimed = deferred.join(format!("{CLAIMED_PREFIX}{pid}-{name}"));
+        sys::rename(job_path, &claimed).unwrap();
+        claimed
+    }
+
+    #[test]
+    fn a_claimed_job_of_a_dead_process_is_adopted_and_stored() {
+        let s = Scratch::new("adopt-dead");
+        let (job, _, _) = fixture(&s);
+        let deferred = s.0.join("deferred");
+        let (path, lease) = write_queued_job(&deferred, &job).unwrap();
+        drop(lease);
+        claimed_by(&deferred, dead_pid(), &path);
+        drain_all(&deferred);
+        assert_eq!(rows(&job), 1);
+        assert!(file_names(&deferred).is_empty());
+    }
+
+    #[test]
+    fn a_claimed_job_of_a_live_process_and_a_leased_job_are_left_alone() {
+        let s = Scratch::new("adopt-live");
+        let (job, _, _) = fixture(&s);
+        let deferred = s.0.join("deferred");
+        #[cfg(unix)]
+        {
+            let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
+            let (path, lease) = write_queued_job(&deferred, &job).unwrap();
+            drop(lease);
+            let claimed = claimed_by(&deferred, owner.id(), &path);
+            assert!(orphaned_jobs(&deferred).is_empty());
+            drain_all(&deferred);
+            assert!(claimed.exists());
+            assert_eq!(rows(&job), 0);
+            owner.kill().unwrap();
+            owner.wait().unwrap();
+            fs::remove_file(claimed).unwrap();
+        }
+        let plain = deferred.join("job-1-5.json");
+        let (_, held) = write_leased_job(&deferred, &job).unwrap();
+        let leased = fs::read_dir(&deferred).unwrap().next().unwrap().unwrap().path();
+        sys::rename(&leased, &plain).unwrap();
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)).unwrap();
+        assert_eq!(orphaned_jobs(&deferred), std::slice::from_ref(&plain),"old enough to be a candidate");
+        assert!(adopt_orphan(&plain).is_none(), "a lease holder keeps it");
+        drain_all(&deferred);
+        assert!(plain.exists());
+        assert_eq!(rows(&job), 0);
+        drop(held);
+    }
+
+    #[test]
+    fn an_adopted_job_that_cannot_be_used_is_deleted_not_left_claimed() {
+        let s = Scratch::new("adopt-unusable");
+        let deferred = s.0.join("deferred");
+        fs::create_dir_all(&deferred).unwrap();
+        let claimed = deferred.join(format!("{CLAIMED_PREFIX}{}-1-2-q{}.json", dead_pid(), "ab".repeat(20)));
+        fs::write(&claimed, b"{ not a job").unwrap();
+        drain_all(&deferred);
         assert!(file_names(&deferred).is_empty());
     }
 

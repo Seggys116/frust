@@ -49,7 +49,7 @@ jobs:
         run: |
           EXE=""
           if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
-          args=()
+          args=(--runs 5)
           if [ -n "$PACKAGE" ]; then args+=(--package "$PACKAGE"); fi
           if [ -n "$FEATURES" ]; then args+=(--features "$FEATURES"); fi
           status=0

@@ -92,6 +92,10 @@ impl Commitment {
             && (0..1_000_000_000).contains(&self.mtime.1)
     }
 
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
     pub fn matches_identity(&self, dev: u64, ino: u64, len: u64, mtime_ns: i128) -> bool {
         self.dev == dev
             && self.ino == ino
@@ -786,6 +790,9 @@ pub fn verify_in_place(path: &Path, file: &StoredFile) -> io::Result<()> {
 /// Copies the store file to `dst` (never a link) and publishes it only if the bytes copied hash to the recorded content hash; the mode is the recorded one, since a chmod through any name changes them all.
 pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::Result<()> {
     let (len, expected, mode) = linked_expectation(file)?;
+    if restore_by_link(store_file, dst, len, expected, mode)? {
+        return Ok(());
+    }
     // Only the bytes copied count: a touch or an adopt during the copy may move mtime or the name, so a copy that hashes right is published, and one that does not is retried once before it is called unstable.
     for _ in 0..2 {
         let source = lost(File::open(store_file))?;
@@ -815,6 +822,43 @@ pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::R
     Err(io::Error::other(Unstable("the store file kept changing during the copy")))
 }
 
+/// Moves the store file's only name-free inode into the target through a private temporary link, so nothing is copied; `false` means the caller must copy instead.
+fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode: u32) -> io::Result<bool> {
+    let source = lost(File::open(store_file))?;
+    let before = lost(sys::fstat(&source))?;
+    if !before.is_file() || before.nlink() != 1 || before.len() != len {
+        return Ok(false);
+    }
+    // The bytes are read once and must match the record: an in-place writer may have changed them.
+    let (read, hash) = hash_open(&source, len)?;
+    let after = lost(sys::fstat(&source))?;
+    if read != len || hash != expected {
+        if after.len() == before.len() && after.mtime() == before.mtime() {
+            return Err(unbacked("stored bytes differ from the record"));
+        }
+        return Ok(false);
+    }
+    let tmp = Temporary(fsx::temp_sibling(dst));
+    if fs::hard_link(store_file, &tmp.0).is_err() {
+        return Ok(false);
+    }
+    // Exactly the store name and our temporary: any other restorer or target that holds a name makes this a copy case, so no two targets share an inode.
+    let linked = sys::lstat(store_file);
+    let private = linked.as_ref().is_ok_and(|now| {
+        now.is_file() && now.nlink() == 2 && now.ino() == before.ino() && now.dev() == before.dev() && now.len() == len && now.mtime() == before.mtime()
+    });
+    if !private || !sys::lstat(&tmp.0).is_ok_and(|held| held.ino() == before.ino() && held.dev() == before.dev()) {
+        return Ok(false);
+    }
+    if before.mode() != mode {
+        sys::set_path_mode(&tmp.0, mode & 0o7777)?;
+    }
+    if fs::symlink_metadata(dst).is_ok_and(|m| m.is_dir()) {
+        fs::remove_dir_all(dst)?;
+    }
+    Ok(sys::rename(&tmp.0, dst).is_ok())
+}
+
 /// Best effort: when no target name shares the store file any more, the freshly verified destination replaces it, so the store and that one target keep a single copy.
 pub fn adopt(store_file: &Path, dst: &Path) {
     let (Ok(stored), Ok(placed)) = (sys::lstat(store_file), sys::lstat(dst)) else { return };
@@ -825,7 +869,15 @@ pub fn adopt(store_file: &Path, dst: &Path) {
     if fs::hard_link(dst, &tmp.0).is_err() || !sys::lstat(&tmp.0).is_ok_and(|linked| same_content(&linked, &placed)) {
         return;
     }
-    let _ = sys::rename(&tmp.0, store_file);
+    // A sharing violation on Windows (a scanner holding the store file) usually passes within moments; giving up only leaves a copy.
+    for attempt in 0..3 {
+        if sys::rename(&tmp.0, store_file).is_ok() {
+            return;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,6 +1038,66 @@ mod tests {
         assert!(is_unbacked(&restore_linked(&staged, &other, &file).unwrap_err()));
         let plain = StoredFile { encoding: Encoding::Raw, ..file };
         assert!(!is_unbacked(&restore_linked(&staged, &other, &plain).unwrap_err()));
+    }
+
+    // A linked store file whose target name is gone, so the store holds the only name.
+    fn exclusive(scratch: &Path, bytes: &[u8]) -> (PathBuf, StoredFile) {
+        let source = scratch.join("source");
+        fs::write(&source, bytes).unwrap();
+        let (staged, file) = linked(scratch, &source);
+        fs::remove_file(source).unwrap();
+        assert_eq!(sys::lstat(&staged).unwrap().nlink(), 1);
+        (staged, file)
+    }
+
+    #[test]
+    fn an_exclusive_store_file_is_restored_by_link_without_copying() {
+        let scratch = Scratch::new();
+        let bytes = pattern(300_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let before = sys::lstat(&staged).unwrap();
+        let dst = scratch.0.join("dst");
+        restore_linked(&staged, &dst, &file).unwrap();
+        let after = sys::lstat(&staged).unwrap();
+        assert_eq!(sys::lstat(&dst).unwrap().ino(), before.ino(), "the destination is the store inode");
+        assert_eq!((after.len(), after.mtime(), after.nlink()), (before.len(), before.mtime(), 2), "no data was written");
+        assert_eq!(fs::read(&dst).unwrap(), bytes);
+        let other = scratch.0.join("other");
+        restore_linked(&staged, &other, &file).unwrap();
+        assert_ne!(sys::lstat(&other).unwrap().ino(), before.ino(), "a store file that already has a target name is copied");
+        assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)));
+    }
+
+    #[test]
+    fn a_tampered_exclusive_store_file_is_rejected_before_any_link() {
+        let scratch = Scratch::new();
+        let bytes = pattern(70_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let mut changed = bytes.clone();
+        changed[100] ^= 1;
+        fs::write(&staged, &changed).unwrap();
+        let dst = scratch.0.join("dst");
+        assert!(is_unbacked(&restore_linked(&staged, &dst, &file).unwrap_err()));
+        assert!(!dst.exists());
+        assert_eq!(sys::lstat(&staged).unwrap().nlink(), 1, "no link was left behind");
+    }
+
+    #[test]
+    fn two_concurrent_restorers_never_end_up_sharing_an_inode() {
+        let bytes = pattern(200_000);
+        for round in 0..20 {
+            let scratch = Scratch::new();
+            let (staged, file) = exclusive(&scratch.0, &bytes);
+            let first = scratch.0.join("first");
+            let second = scratch.0.join("second");
+            std::thread::scope(|scope| {
+                scope.spawn(|| restore_linked(&staged, &first, &file).unwrap());
+                restore_linked(&staged, &second, &file).unwrap();
+            });
+            assert_eq!(fs::read(&first).unwrap(), bytes, "round {round}");
+            assert_eq!(fs::read(&second).unwrap(), bytes, "round {round}");
+            assert_ne!(sys::lstat(&first).unwrap().ino(), sys::lstat(&second).unwrap().ino(), "round {round}");
+        }
     }
 
     fn pattern(len: usize) -> Vec<u8> {

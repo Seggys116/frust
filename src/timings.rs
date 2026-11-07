@@ -19,6 +19,10 @@ pub struct Record {
     pub primary: bool,
     pub incremental: bool,
     pub prekey_ms: u64,
+    pub extern_files: u64,
+    pub extern_bytes_hashed: u64,
+    pub extern_bytes_memo: u64,
+    pub native_dir_bytes_hashed: u64,
     pub lookup_ms: u64,
     pub keywait_ms: u64,
     pub restore_ms: u64,
@@ -39,6 +43,10 @@ impl Record {
             primary,
             incremental,
             prekey_ms: 0,
+            extern_files: 0,
+            extern_bytes_hashed: 0,
+            extern_bytes_memo: 0,
+            native_dir_bytes_hashed: 0,
             lookup_ms: 0,
             keywait_ms: 0,
             restore_ms: 0,
@@ -157,6 +165,10 @@ mod tests {
         record.store_mode = "inline:slots-busy".to_string();
         record.inline_store_ms = 8;
         record.total_ms = 9;
+        record.extern_files = 10;
+        record.extern_bytes_hashed = 11;
+        record.extern_bytes_memo = 12;
+        record.native_dir_bytes_hashed = 13;
         record
     }
 
@@ -168,12 +180,13 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         let object = value.as_object().unwrap();
         for name in [
-            "crate", "path_unit", "primary", "incremental", "prekey_ms", "lookup_ms", "keywait_ms", "restore_ms",
-            "rustc_ms", "freeze_ms", "spawn_ms", "store_mode", "inline_store_ms", "total_ms",
+            "crate", "path_unit", "primary", "incremental", "prekey_ms", "extern_files", "extern_bytes_hashed",
+            "extern_bytes_memo", "native_dir_bytes_hashed", "lookup_ms", "keywait_ms", "restore_ms", "rustc_ms",
+            "freeze_ms", "spawn_ms", "store_mode", "inline_store_ms", "total_ms",
         ] {
             assert!(object.contains_key(name), "missing {name}");
         }
-        assert_eq!(object.len(), 14);
+        assert_eq!(object.len(), 18);
         assert_eq!(object["crate"], "serde");
         assert_eq!(object["path_unit"], true);
         assert_eq!(serde_json::from_str::<Record>(line.trim_end()).unwrap(), record);

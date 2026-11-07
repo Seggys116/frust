@@ -66,6 +66,24 @@ not trusted: network filesystems, shared folders of virtual machines, the FAT fa
 filesystems and any filesystem whose type cannot be determined. On Windows they are trusted only on NTFS and ReFS.
 Whole-second timestamps are never trusted either.
 
+Libraries that frust itself produced or restored are *attested*: right after rustc exits (deferred stores) or a
+restore finishes, the wrapper records the file's content hash in the persistent hash memo, keyed by the exact
+identity (device, inode, size, modification and change times) and marked as attested, for files of 32 KiB or more on
+a believed volume. Dependents then take the hash of an `--extern` library from the memo after a stat instead of
+reading it, which removes the cost of every dependent re-hashing a library written seconds earlier. This skips the
+2 second settle rule on purpose: the file is written once, by rustc through a temporary file and rename or by one
+linker run, and nothing writes it in place after its producer is done, so any later rewrite changes the inode or
+the timestamps the record is keyed on. The residual risk has two forms, both inside one timestamp tick of the
+attestation and both undetectable by stamps alone: an in-place rewrite of the same size, and an unlink followed by a
+new file of the same size that reuses the inode and gets an equal change time. The tick is one jiffy (1 to 10 ms) on
+Linux before kernel 6.13, whose multigrain timestamps close the window. A settled record cannot hit either case
+because its stamp must already be 2 seconds old, so attested records are weaker than settled ones only by that
+tick. A record is written only if the file still has the stamp it had while it was hashed. Attestations follow the
+trust mode: `off` neither writes nor uses them, `audit` re-reads the file on every use of an attested record, so it
+proves them, and discards a record that does not match; a mismatch under an unchanged stamp is reported and
+quarantines the volume like any other stamp violation. `on` uses them like any other settled record. Test harnesses
+and binary-only crates are not attested, since nothing depends on them.
+
 Related lookup behaviour:
 
 * Candidates are verified newest first: inputs without a recorded stamp, then by descending recorded modification
@@ -151,7 +169,9 @@ misses or waits on the key lock.
 With `FRUST_TIMINGS=<file>` set, each wrapper that handles a cacheable compile appends one JSON line to the file
 in a single write as it exits; passthrough invocations write nothing, and with the variable unset no file is
 touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans describe the unit), `prekey_ms`,
-`lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
+`extern_files` (`--extern` inputs hashed for the key), `extern_bytes_hashed` (bytes of them actually read),
+`extern_bytes_memo` (bytes served from a hash memo, attested records included), `native_dir_bytes_hashed` (bytes read
+for `-L` directories), `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
 `spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
 `hit`, `deferred` (helper), `queued` (broker), `queued:slots` (job file waiting for a helper),
 `inline:<reason>` or `skip:<reason>`; `skip:linker` marks a unit that ran uncached because its explicit linker could
@@ -192,8 +212,14 @@ clones, and `FRUST_CACHE_BACKED=off` or `FRUST_CACHE_COMPRESSION=off` disables l
 The guarantee: a restore writes bytes only if they hash to the recorded content hash. A destination that already
 holds them is kept; otherwise the store file is copied (never linked, so no two targets share an inode) to a
 temporary sibling of the destination while hashing, the length, hash and file identity must agree before and after,
-the recorded mode is applied, and the copy is renamed into place. If the store file's only remaining name is the
-store (the target was deleted), the verified destination then replaces it, so the store shares that one output.
+the recorded mode is applied, and the copy is renamed into place. If the store file has no other name (the target was
+deleted), nothing is copied: the store file is hashed once, a private temporary link is made next to the destination,
+and the link is renamed into place only when the store file then has exactly two names; a concurrent restorer or a
+target that already holds a name makes it a copy instead, so no two targets share an inode. A copied destination is
+offered to the store the same way (the store file is replaced by the verified destination, retrying briefly on
+Windows sharing violations and otherwise leaving the copy). A store whose outputs were already replaced by a newer
+compile retires the unit's earlier entries that no target name shares, and gc sweeps unreferenced store-only path
+entries after ten minutes.
 A writer that changed the shared file in place (a linker that rewrites without unlinking, `strip` or `objcopy` on a
 file with several names) makes the entry unusable: it is dropped, rustc runs, and `FRUST_DEBUG` logs the drop.
 

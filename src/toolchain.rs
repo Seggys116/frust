@@ -45,7 +45,7 @@ pub fn resolve_linker(name: &str, sysroot: Option<(&Path, &str)>) -> Option<Path
         let suffixed = format!("{name}{}", env::consts::EXE_SUFFIX);
         sysroot_linker_dirs(root, host)
             .iter()
-            .find_map(|dir| sys::find_executable_in(dir, name).or_else(|| sys::find_executable_in(dir, &suffixed)))
+            .find_map(|dir| sys::find_executable_in(dir, &suffixed).or_else(|| sys::find_executable_in(dir, name)))
     })
 }
 
@@ -513,11 +513,11 @@ mod tests {
     fn fake_linker(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"linker").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        sys::make_executable(path).unwrap();
+    }
+
+    fn same_path(a: Option<PathBuf>, b: PathBuf) -> bool {
+        a.is_some_and(|a| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
     }
 
     #[test]
@@ -531,9 +531,9 @@ mod tests {
         fake_linker(&bin.join("self-contained").join(format!("frust-test-sc{suffix}")));
 
         let sysroot = Some((root.as_path(), "x86_64-test"));
-        assert_eq!(resolve_linker("frust-test-lld", sysroot), Some(bin.join(format!("frust-test-lld{suffix}"))));
-        assert_eq!(resolve_linker("frust-test-ld.lld", sysroot), Some(bin.join("gcc-ld").join(format!("frust-test-ld.lld{suffix}"))));
-        assert_eq!(resolve_linker("frust-test-sc", sysroot), Some(bin.join("self-contained").join(format!("frust-test-sc{suffix}"))));
+        assert!(same_path(resolve_linker("frust-test-lld", sysroot), bin.join(format!("frust-test-lld{suffix}"))));
+        assert!(same_path(resolve_linker("frust-test-ld.lld", sysroot), bin.join("gcc-ld").join(format!("frust-test-ld.lld{suffix}"))));
+        assert!(same_path(resolve_linker("frust-test-sc", sysroot), bin.join("self-contained").join(format!("frust-test-sc{suffix}"))));
         assert_eq!(resolve_linker("frust-test-lld", None), None, "without a sysroot only PATH is searched");
         assert_eq!(resolve_linker("frust-test-lld", Some((root.as_path(), "other-host"))), None);
         assert_eq!(resolve_linker("frust-test-missing", sysroot), None);

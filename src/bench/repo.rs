@@ -2,9 +2,8 @@
 
 use super::*;
 use crate::cache::EntryMeta;
-use crate::timings::Record as TimingRecord;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 const MAX_EDIT_FILES: usize = 8;
 const STORE_TOP_JSON: usize = 20;
@@ -32,10 +31,13 @@ const GATE_CLEAN_SLACK_MS: f64 = 100.0;
 const CLASSES: [&str; 5] = ["registry-git", "path", "unknown", "build-script", "proc-macro"];
 const EXTENSIONS: [&str; 6] = ["rlib", "rmeta", "dylib", "bin", "d", "other"];
 const TIMING_ROWS: [(&str, &str); 4] = [("cold", "cold"), ("clean rebuild", "clean_rebuild"), ("no-op", "noop"), ("first edit", "edit_first")];
-const TIMING_HEADER: [&str; 14] = [
+const TIMING_HEADER: [&str; 19] = [
     "row", "builds", "units", "total ms", "rustc ms", "overhead ms", "prekey", "lookup", "keywait", "restore",
-    "freeze", "spawn", "inline store", "store modes",
+    "freeze", "spawn", "inline store", "drain ms", "extern files", "extern hashed", "extern memo", "native hashed",
+    "store modes",
 ];
+const MISS_TOP_JSON: usize = 20;
+const MISS_TOP_MARKDOWN: usize = 10;
 
 const TABLE_HEADER: [&str; 8] = ["tool", "cold", "clean rebuild", "no-op", "first edit", "warm edit", "edit p90", "disk"];
 const EDIT_NOTE: &str = "First edit is the first touch of a crate after a restore (no incremental session); warm edit and p90 cover later edits. The ratio row is the median of per-pair frust/cargo ratios.";
@@ -485,6 +487,58 @@ fn scan_store(dirs: &Dirs) -> StoreOnly {
     }
 }
 
+// Read with defaults on every field so records from older and newer wrappers both parse.
+#[derive(Debug, Default, serde::Deserialize)]
+struct TimingLine {
+    #[serde(rename = "crate", default)]
+    krate: String,
+    #[serde(default)]
+    path_unit: bool,
+    #[serde(default)]
+    primary: bool,
+    #[serde(default)]
+    incremental: bool,
+    #[serde(default)]
+    prekey_ms: u64,
+    #[serde(default)]
+    lookup_ms: u64,
+    #[serde(default)]
+    keywait_ms: u64,
+    #[serde(default)]
+    restore_ms: u64,
+    #[serde(default)]
+    rustc_ms: u64,
+    #[serde(default)]
+    freeze_ms: u64,
+    #[serde(default)]
+    spawn_ms: u64,
+    #[serde(default)]
+    store_mode: String,
+    #[serde(default)]
+    inline_store_ms: u64,
+    #[serde(default)]
+    total_ms: u64,
+    #[serde(default)]
+    extern_files: u64,
+    #[serde(default)]
+    extern_bytes_hashed: u64,
+    #[serde(default)]
+    extern_bytes_memo: u64,
+    #[serde(default)]
+    native_dir_bytes_hashed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct MissUnit {
+    #[serde(rename = "crate")]
+    krate: String,
+    path_unit: bool,
+    primary: bool,
+    incremental: bool,
+    rustc_ms: u64,
+    store_mode: String,
+}
+
 #[derive(Debug, Default, PartialEq, Serialize)]
 struct TimingSummary {
     builds: usize,
@@ -499,12 +553,24 @@ struct TimingSummary {
     freeze_ms: u64,
     spawn_ms: u64,
     inline_store_ms: u64,
+    // Time between each frust build's exit and its stores finishing, which the timed rows exclude.
+    drain_ms: u64,
+    extern_files: u64,
+    extern_bytes_hashed: u64,
+    extern_bytes_memo: u64,
+    native_dir_bytes_hashed: u64,
     store_modes: BTreeMap<String, usize>,
+    miss_units: usize,
+    miss_crates: usize,
+    misses: Vec<MissUnit>,
+    #[serde(skip)]
+    miss_crate_set: BTreeSet<String>,
 }
 
 impl TimingSummary {
-    fn add_build(&mut self, records: &[TimingRecord]) {
+    fn add_build(&mut self, records: &[TimingLine], drain_ms: u64) {
         self.builds += 1;
+        self.drain_ms += drain_ms;
         for r in records {
             self.units += 1;
             self.total_ms += r.total_ms;
@@ -517,13 +583,56 @@ impl TimingSummary {
             self.freeze_ms += r.freeze_ms;
             self.spawn_ms += r.spawn_ms;
             self.inline_store_ms += r.inline_store_ms;
+            self.extern_files += r.extern_files;
+            self.extern_bytes_hashed += r.extern_bytes_hashed;
+            self.extern_bytes_memo += r.extern_bytes_memo;
+            self.native_dir_bytes_hashed += r.native_dir_bytes_hashed;
             *self.store_modes.entry(r.store_mode.clone()).or_default() += 1;
+            if r.store_mode != "hit" {
+                self.miss_units += 1;
+                self.miss_crate_set.insert(r.krate.clone());
+                self.misses.push(MissUnit {
+                    krate: r.krate.clone(),
+                    path_unit: r.path_unit,
+                    primary: r.primary,
+                    incremental: r.incremental,
+                    rustc_ms: r.rustc_ms,
+                    store_mode: r.store_mode.clone(),
+                });
+            }
         }
+        self.misses.sort_by(|a, b| b.rustc_ms.cmp(&a.rustc_ms).then_with(|| a.krate.cmp(&b.krate)));
+        self.misses.truncate(MISS_TOP_JSON);
+        self.miss_crates = self.miss_crate_set.len();
     }
 }
 
-fn parse_timings(text: &str) -> Vec<TimingRecord> {
+fn parse_timings(text: &str) -> Vec<TimingLine> {
     text.lines().filter_map(|line| serde_json::from_str(line.trim()).ok()).collect()
+}
+
+fn miss_rows(summary: &TimingSummary, limit: usize) -> Vec<Vec<String>> {
+    let mut rows = vec![["crate", "path unit", "primary", "incremental", "rustc ms", "store mode"].iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    for m in summary.misses.iter().take(limit) {
+        rows.push(vec![
+            m.krate.clone(), m.path_unit.to_string(), m.primary.to_string(), m.incremental.to_string(),
+            m.rustc_ms.to_string(), m.store_mode.clone(),
+        ]);
+    }
+    rows
+}
+
+// Store modes collapse to their kind, so `inline:slots-busy` and `inline:error` count together.
+fn store_mode_line(os: &str, cold: Option<&TimingSummary>) -> String {
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    for (mode, count) in cold.iter().flat_map(|c| c.store_modes.iter()) {
+        *kinds.entry(mode.split(':').next().unwrap_or("")).or_default() += count;
+    }
+    if kinds.is_empty() {
+        return format!("Cold row store modes on {os}: no records.");
+    }
+    let parts: Vec<String> = kinds.iter().map(|(kind, count)| format!("{kind} {count}")).collect();
+    format!("Cold row store modes on {os}: {}.", parts.join(", "))
 }
 
 fn markdown_table(rows: &[Vec<String>]) -> String {
@@ -548,6 +657,8 @@ fn timing_rows(timings: &BTreeMap<String, TimingSummary>) -> Vec<Vec<String>> {
             label.to_string(), t.builds.to_string(), t.units.to_string(), t.total_ms.to_string(), t.rustc_ms.to_string(),
             t.overhead_ms.to_string(), t.prekey_ms.to_string(), t.lookup_ms.to_string(), t.keywait_ms.to_string(),
             t.restore_ms.to_string(), t.freeze_ms.to_string(), t.spawn_ms.to_string(), t.inline_store_ms.to_string(),
+            t.drain_ms.to_string(), t.extern_files.to_string(), human_bytes(t.extern_bytes_hashed),
+            human_bytes(t.extern_bytes_memo), human_bytes(t.native_dir_bytes_hashed),
             if modes.is_empty() { "none".to_string() } else { modes.join(", ") },
         ]);
     }
@@ -589,6 +700,8 @@ struct GateCheck {
     frust_ms: f64,
     limit: String,
     pass: bool,
+    ratio_min: Option<f64>,
+    ratio_max: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -631,9 +744,20 @@ fn percentile(values: &[f64], p: f64) -> Option<f64> {
     Some(sorted[rank.clamp(1, sorted.len()) - 1])
 }
 
+fn pair_ratios(cargo: &[f64], frust: &[f64]) -> Vec<f64> {
+    cargo.iter().zip(frust).filter(|(c, _)| **c > 0.0).map(|(c, f)| f / c).collect()
+}
+
 fn median_ratio(cargo: &[f64], frust: &[f64]) -> Option<f64> {
-    let ratios: Vec<f64> = cargo.iter().zip(frust).filter(|(c, _)| **c > 0.0).map(|(c, f)| f / c).collect();
-    median_of(&ratios)
+    median_of(&pair_ratios(cargo, frust))
+}
+
+// Shows how noisy the paired runs were next to the median the gate uses.
+fn with_spread(mut check: GateCheck, cargo: &[f64], frust: &[f64]) -> GateCheck {
+    let ratios = pair_ratios(cargo, frust);
+    check.ratio_min = ratios.iter().copied().min_by(f64::total_cmp);
+    check.ratio_max = ratios.iter().copied().max_by(f64::total_cmp);
+    check
 }
 
 fn ratio_check(name: &str, ratio: f64, cargo_ms: f64, factor: f64, slack_ms: f64) -> GateCheck {
@@ -645,6 +769,8 @@ fn ratio_check(name: &str, ratio: f64, cargo_ms: f64, factor: f64, slack_ms: f64
         frust_ms: ratio * cargo_ms,
         limit,
         pass: (ratio - factor) * cargo_ms <= slack_ms,
+        ratio_min: None,
+        ratio_max: None,
     }
 }
 
@@ -656,18 +782,18 @@ fn evaluate_gate_for(cargo: &Samples, frust: &Samples, windows: bool) -> Vec<Gat
     let mut checks = Vec::new();
     let paired = |c: &[f64], f: &[f64]| median_ratio(c, f).zip(median_of(c));
     if let Some((ratio, base)) = paired(&cargo.cold, &frust.cold) {
-        checks.push(ratio_check("cold", ratio, base, GATE_COLD_RATIO, GATE_COLD_SLACK_MS));
+        checks.push(with_spread(ratio_check("cold", ratio, base, GATE_COLD_RATIO, GATE_COLD_SLACK_MS), &cargo.cold, &frust.cold));
     }
     if let Some((ratio, base)) = paired(&cargo.clean, &frust.clean) {
-        checks.push(ratio_check("clean-rebuild", ratio, base, GATE_CLEAN_RATIO, GATE_CLEAN_SLACK_MS));
+        checks.push(with_spread(ratio_check("clean-rebuild", ratio, base, GATE_CLEAN_RATIO, GATE_CLEAN_SLACK_MS), &cargo.clean, &frust.clean));
     }
     if let Some((ratio, base)) = paired(&cargo.noop, &frust.noop) {
         let slack = if windows { GATE_NOOP_SLACK_WINDOWS_MS } else { GATE_NOOP_SLACK_MS };
-        checks.push(ratio_check("noop-slack", ratio, base, 1.0, slack));
-        checks.push(ratio_check("noop-ratio", ratio, base, GATE_NOOP_RATIO, 0.0));
+        checks.push(with_spread(ratio_check("noop-slack", ratio, base, 1.0, slack), &cargo.noop, &frust.noop));
+        checks.push(with_spread(ratio_check("noop-ratio", ratio, base, GATE_NOOP_RATIO, 0.0), &cargo.noop, &frust.noop));
     }
     if let Some((ratio, base)) = paired(&cargo.warm, &frust.warm) {
-        checks.push(ratio_check("edit-median", ratio, base, GATE_EDIT_RATIO, GATE_EDIT_SLACK_MS));
+        checks.push(with_spread(ratio_check("edit-median", ratio, base, GATE_EDIT_RATIO, GATE_EDIT_SLACK_MS), &cargo.warm, &frust.warm));
     }
     if let (Some(base), Some(measured)) = (percentile(&cargo.warm, 90.0), percentile(&frust.warm, 90.0))
         && base > 0.0
@@ -820,6 +946,7 @@ fn repo_markdown(report: &RepoReport) -> String {
         out.push_str(&markdown_row(row));
         out.push('\n');
     }
+    out.push_str(&format!("\n{}\n", store_mode_line(std::env::consts::OS, report.frust_timings.get("cold"))));
     out.push_str(&format!("\n{EDIT_NOTE}\n"));
     for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         out.push_str(&format!("\n- {line}"));
@@ -833,6 +960,14 @@ fn repo_markdown(report: &RepoReport) -> String {
     if timing.len() > 1 {
         out.push_str("\n#### Where the time goes (frust wrapper records, summed over the builds in each row, ms)\n\n");
         out.push_str(&markdown_table(&timing));
+    }
+    for (label, key) in [("clean rebuild", "clean_rebuild"), ("no-op", "noop")] {
+        let Some(summary) = report.frust_timings.get(key).filter(|s| s.miss_units > 0) else { continue };
+        out.push_str(&format!(
+            "\n#### Units that compiled in the {label} row ({} units, {} distinct crates, top {MISS_TOP_MARKDOWN} by rustc ms)\n\n",
+            summary.miss_units, summary.miss_crates
+        ));
+        out.push_str(&markdown_table(&miss_rows(summary, MISS_TOP_MARKDOWN)));
     }
     if let Some(message) = &report.disk.message {
         out.push_str(&format!("\n{message}\n"));
@@ -859,6 +994,7 @@ fn print_repo(report: &RepoReport) {
         println!("  {line}");
     }
     println!("{EDIT_NOTE}");
+    println!("{}", store_mode_line(std::env::consts::OS, report.frust_timings.get("cold")));
     for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         println!("{line}");
     }
@@ -1085,11 +1221,14 @@ impl Rig<'_> {
             cmd.env(crate::timings::ENV, file);
         }
         let tool = if frust { "frust" } else { "cargo" };
-        let ms = timed(self.ctx, frust, &mut cmd).map(|run| run.millis as f64).map_err(|e| format!("{row} build with {tool}: {e}"))?;
+        // timed() waits for the deferred stores before returning, so the next row starts quiet; the wait is recorded as drain.
+        let (ms, drain_ms) = timed(self.ctx, frust, &mut cmd)
+            .map(|run| (run.millis as f64, run.store_drain_millis.unwrap_or(0)))
+            .map_err(|e| format!("{row} build with {tool}: {e}"))?;
         if let Some(file) = timing_file {
             let text = fs::read_to_string(&file).unwrap_or_default();
             let _ = fs::remove_file(&file);
-            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&parse_timings(&text));
+            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&parse_timings(&text), drain_ms);
         }
         Ok(ms)
     }
@@ -1280,6 +1419,7 @@ pub(super) fn run(flags: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timings::Record as TimingRecord;
 
     fn flags(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -1554,7 +1694,7 @@ mod tests {
         assert!(!drainer_needed(&paths), "a held slot means a helper is draining");
         let _ = sys::unlock(&slot);
         let (other, claimed_only) = deferred_dir("needed-claimed", &["claimed-9-1-2-qabc.json", "slot-0"]);
-        assert!(!drainer_needed(&claimed_only), "claimed files belong to their claimer, not to a new helper");
+        assert!(drainer_needed(&claimed_only), "a claimed file with no slot holder is adopted by the drain helper");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&other);
     }
@@ -1593,27 +1733,95 @@ mod tests {
         let records = parse_timings(&text);
         assert_eq!(records.len(), 2);
         let mut summary = TimingSummary::default();
-        summary.add_build(&records);
+        summary.add_build(&records, 0);
         assert_eq!((summary.builds, summary.units, summary.total_ms, summary.rustc_ms, summary.overhead_ms), (1, 2, 14, 6, 8));
         assert_eq!((summary.prekey_ms, summary.lookup_ms, summary.keywait_ms, summary.restore_ms), (1, 2, 1, 3));
         assert_eq!((summary.freeze_ms, summary.spawn_ms, summary.inline_store_ms), (1, 1, 0));
         assert_eq!(summary.store_modes.get("hit"), Some(&1));
-        summary.add_build(&[]);
+        assert_eq!((summary.extern_files, summary.extern_bytes_hashed, summary.native_dir_bytes_hashed), (0, 0, 0));
+        summary.add_build(&[], 0);
         assert_eq!((summary.builds, summary.units), (2, 2));
+    }
+
+    fn line(krate: &str, rustc_ms: u64, mode: &str) -> TimingLine {
+        TimingLine { krate: krate.into(), rustc_ms, store_mode: mode.into(), ..TimingLine::default() }
+    }
+
+    #[test]
+    fn new_wrapper_fields_are_summed_and_missing_ones_default_to_zero() {
+        let text = concat!(
+            r#"{"crate":"a","store_mode":"hit","extern_files":4,"extern_bytes_hashed":1000,"extern_bytes_memo":300,"native_dir_bytes_hashed":50}"#, "\n",
+            r#"{"crate":"b","store_mode":"hit","extern_files":1,"extern_bytes_hashed":24}"#, "\n",
+            r#"{"crate":"c","store_mode":"hit"}"#, "\n",
+        );
+        let records = parse_timings(text);
+        assert_eq!(records.len(), 3);
+        let mut summary = TimingSummary::default();
+        summary.add_build(&records, 0);
+        assert_eq!(
+            (summary.extern_files, summary.extern_bytes_hashed, summary.extern_bytes_memo, summary.native_dir_bytes_hashed),
+            (5, 1024, 300, 50)
+        );
+        let rows = timing_rows(&BTreeMap::from([("cold".to_string(), summary)]));
+        assert_eq!(rows[1][14..18], ["5", "1.0 KiB", "300 B", "50 B"]);
+    }
+
+    #[test]
+    fn drain_time_accumulates_per_build() {
+        let mut summary = TimingSummary::default();
+        summary.add_build(&[], 7);
+        summary.add_build(&[], 5);
+        assert_eq!((summary.builds, summary.drain_ms), (2, 12));
+    }
+
+    #[test]
+    fn units_that_did_not_hit_are_listed_by_rustc_time_with_distinct_crates() {
+        let mut summary = TimingSummary::default();
+        summary.add_build(&[line("app", 0, "hit"), line("serde", 600, "deferred"), line("regex", 900, "inline:error"), line("serde", 50, "deferred")], 0);
+        let listed: Vec<(&str, u64)> = summary.misses.iter().map(|m| (m.krate.as_str(), m.rustc_ms)).collect();
+        assert_eq!(listed, [("regex", 900), ("serde", 600), ("serde", 50)]);
+        assert_eq!((summary.miss_units, summary.miss_crates), (3, 2));
+        let rows = miss_rows(&summary, 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], ["regex", "false", "false", "false", "900", "inline:error"]);
+        let many: Vec<TimingLine> = (0..25).map(|i| line(&format!("c{i}"), i, "deferred")).collect();
+        let mut capped = TimingSummary::default();
+        capped.add_build(&many, 0);
+        assert_eq!((capped.misses.len(), capped.miss_units, capped.miss_crates), (MISS_TOP_JSON, 25, 25));
+        assert_eq!(capped.misses[0].krate, "c24");
+    }
+
+    #[test]
+    fn cold_store_mode_line_groups_reasons_by_kind() {
+        let mut cold = TimingSummary::default();
+        cold.add_build(&[
+            line("a", 1, "deferred"), line("b", 1, "deferred"), line("c", 1, "deferred"), line("d", 1, "inline:error"),
+            line("e", 1, "inline:slots-busy"), line("f", 1, "inline:slots-busy"), line("g", 1, "queued"), line("h", 1, "hit"),
+        ], 0);
+        assert_eq!(store_mode_line("linux", Some(&cold)), "Cold row store modes on linux: deferred 3, hit 1, inline 3, queued 1.");
+        assert_eq!(store_mode_line("windows", None), "Cold row store modes on windows: no records.");
+    }
+
+    #[test]
+    fn gate_checks_report_the_spread_of_per_pair_ratios() {
+        let cargo = Samples { cold: vec![100.0; 3], clean: vec![100.0], noop: vec![20.0], first: vec![], warm: vec![] };
+        let frust = Samples { cold: vec![90.0, 100.0, 130.0], clean: vec![40.0], noop: vec![20.0], first: vec![], warm: vec![] };
+        let cold = evaluate_gate_for(&cargo, &frust, false).into_iter().find(|c| c.name == "cold").unwrap();
+        assert_eq!((cold.ratio, cold.ratio_min, cold.ratio_max), (1.0, Some(0.9), Some(1.3)));
     }
 
     #[test]
     fn timing_table_lists_only_recorded_frust_rows_in_display_order() {
         let mut timings = BTreeMap::new();
         let mut cold = TimingSummary::default();
-        cold.add_build(&[]);
+        cold.add_build(&[], 0);
         timings.insert("cold".to_string(), cold);
         timings.insert("edit_warm".to_string(), TimingSummary::default());
         let rows = timing_rows(&timings);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].len(), TIMING_HEADER.len());
         assert_eq!(rows[1][0], "cold");
-        assert_eq!(rows[1][13], "none");
+        assert_eq!(rows[1][18], "none");
         assert_eq!(timing_rows(&BTreeMap::new()).len(), 1);
         assert!(markdown_table(&rows).lines().nth(1).unwrap().starts_with("| --- |"));
     }

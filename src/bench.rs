@@ -3378,7 +3378,7 @@ fn any_slot_held(paths: &[PathBuf]) -> bool {
 
 /// Queued jobs with nobody draining them: nothing but a helper will ever store them.
 fn drainer_needed(paths: &[PathBuf]) -> bool {
-    paths.iter().any(|path| json_file_named(path, b"job-")) && !any_slot_held(paths)
+    paths.iter().any(|path| json_file_named(path, b"job-") || json_file_named(path, b"claimed-")) && !any_slot_held(paths)
 }
 
 fn start_drainer(home: &Path, envs: &[(&str, &str)]) -> Result<std::process::Child, String> {
@@ -3438,7 +3438,7 @@ fn drain_deferred_for(ctx: &Ctx, timeout: Duration) -> Result<(), String> {
     drain_deferred_with(&ctx.home, timeout, &[("FRUST_CACHE_COMPRESSION", ctx.compression.as_str())])
 }
 
-// Queued jobs left with no slot holder are drained by a helper started here; leftover claimed files of dead helpers only end the wait at the timeout.
+// Job files left with no slot holder are drained by a helper started here, which also adopts claimed files of dead helpers.
 fn drain_deferred_with(home: &Path, timeout: Duration, envs: &[(&str, &str)]) -> Result<(), String> {
     let started = Instant::now();
     let directory = Dirs::at(home).deferred();
