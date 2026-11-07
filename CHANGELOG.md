@@ -14,6 +14,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * `fcargo clean` of a whole central target also retires the path-crate cache entries only that workspace used. Registry and git entries stay in the shared store; `--frust-evict-registry` also retires the ones only that workspace used.
 * Linked cache entries: on volumes without block cloning (ext4, NTFS), a large output is stored as a hard link to the target file, so the cache no longer keeps a second copy of it; a failed link falls back to a copy. A restore always copies, and publishes only bytes that hash to the entry's recorded content hash with the recorded mode; a file rewritten in place makes the entry a miss. `FRUST_CACHE_BACKED=off|auto|force` (default `auto`) controls it.
 * `frust gc` counts a linked file that another name still shares as zero bytes and drops older orphaned linked entries of a unit at once.
+* `FRUST_CACHE_UNIT_VERSIONS` (default 1, at most 4) sets how many entries of a path unit stay in the store; a newer state retires older ones immediately instead of keeping four, so edit loops no longer leave store-only copies of every rebuilt unit.
+* Linked outputs are no longer hashed before the wrapper returns to cargo; the store hashes them and checks the file's identity around the hash and before the link.
 * Manifest format 6 is written only for manifests that list a linked entry, and linked entries use their own key domain, so earlier versions treat them as misses. Formats 3, 4 and 5 stay readable.
 
 ### Changed

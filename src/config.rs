@@ -85,6 +85,15 @@ impl Config {
     }
 }
 
+/// `FRUST_CACHE_UNIT_VERSIONS`: entries of one path unit that stay in the store; defaults to 1 and is capped at `wrapper::UNIT_VERSIONS`.
+pub fn unit_versions() -> usize {
+    env::var("FRUST_CACHE_UNIT_VERSIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, crate::wrapper::UNIT_VERSIONS)
+}
+
 /// Days (fractional allowed) as a duration; negative or non-numeric input is rejected and huge values saturate.
 pub fn days_to_duration(days: f64) -> Option<Duration> {
     (days >= 0.0).then(|| Duration::from_secs_f64((days * 86_400.0).min(u32::MAX as f64 * 86_400.0)))

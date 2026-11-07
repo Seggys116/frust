@@ -137,6 +137,8 @@ impl Sandbox {
             .env("FRUST_GC_SYNC", "1")
             // Backed entries die with a deleted target, so only tests written for them (tests/backed.rs) switch them on.
             .env("FRUST_CACHE_BACKED", "off")
+            // Tests written before the default dropped to one version per unit keep the old bound; tests of the default set it themselves.
+            .env("FRUST_CACHE_UNIT_VERSIONS", "4")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CI")

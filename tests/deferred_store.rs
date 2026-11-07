@@ -339,11 +339,23 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
         build.join().unwrap()
     });
 
-    let early = stored(&sb);
+    // Whether an early unit beats the broker's activation depends on compile speed; the inline fallback itself is covered by the lock-off test.
+    let timings = fs::read_to_string(sb.root.join("timings.jsonl")).unwrap_or_default();
+    let modes: Vec<String> = timings
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record["store_mode"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(modes.len(), 3, "one record per compiled unit: {timings}");
     assert!(
-        (1..3).contains(&early),
-        "early units store inline, but the gated app stays queued: {early}\n{}",
-        fs::read_to_string(sb.root.join("timings.jsonl")).unwrap_or_default()
+        modes.iter().all(|mode| mode == "queued" || mode.starts_with("inline:")),
+        "every unit stores inline or through the broker, never skipped: {timings}"
+    );
+    let early = stored(&sb);
+    assert_eq!(
+        early,
+        modes.iter().filter(|mode| mode.starts_with("inline:")).count(),
+        "exactly the inline units are stored before the drain: {timings}"
     );
     assert_eq!(published_entries(&sb), early);
     let queued = job_markers(&sb);

@@ -14,7 +14,11 @@ const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
 
 // Enough code that the library and its metadata exceed the smallest size worth linking.
 fn leaf_source() -> String {
-    let mut text = String::from("pub fn value() -> u32 { 41 }\n");
+    leaf_source_with(41)
+}
+
+fn leaf_source_with(value: u32) -> String {
+    let mut text = format!("pub fn value() -> u32 {{ {value} }}\n");
     for n in 0..300u32 {
         text.push_str(&format!("pub fn filler_{n}(x: u32) -> u32 {{ x.wrapping_mul({}).wrapping_add({n}) }}\n", n + 3));
     }
@@ -100,6 +104,80 @@ fn rlib_record(meta: &EntryMeta) -> &frust::cache::StoredFile {
 
 fn ino(path: &Path) -> u64 {
     frust::sys::lstat(path).unwrap().ino()
+}
+
+// A workspace of path crates (leaf, mid depends on leaf, app depends on mid), whose units are versioned across edits.
+fn path_workspace(sb: &Sandbox) -> PathBuf {
+    let root = sb.root.join("ws");
+    let members = [
+        ("leaf", "", leaf_source_with(0)),
+        ("mid", "leaf = { path = \"../leaf\" }\n", "pub fn value() -> u32 { leaf::value() + 1 }\n".to_string()),
+        ("app", "mid = { path = \"../mid\" }\n", "fn main() { println!(\"{}\", mid::value()); }\n".to_string()),
+    ];
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"leaf\", \"mid\", \"app\"]\nresolver = \"2\"\n").unwrap();
+    for (name, deps, source) in members {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}")).unwrap();
+        let file = if name == "app" { "main.rs" } else { "lib.rs" };
+        fs::write(dir.join("src").join(file), source).unwrap();
+    }
+    root
+}
+
+fn edit_leaf(root: &Path, value: u32) {
+    let path = root.join("leaf").join("src").join("lib.rs");
+    fs::write(&path, leaf_source_with(value)).unwrap();
+    common::settle(&path);
+}
+
+fn build_with(sb: &Sandbox, project: &Path, envs: &[(&str, &str)]) {
+    let mut command = sb.bin("fcargo");
+    command.arg("build").current_dir(project);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    assert_success(&command.output().unwrap());
+}
+
+fn store_only_linked_files(sb: &Sandbox, krates: &[&str]) -> usize {
+    krates
+        .iter()
+        .flat_map(|krate| entries(sb, krate))
+        .flat_map(|(dir, meta)| {
+            meta.files
+                .into_iter()
+                .filter(|file| file.encoding == Encoding::Linked)
+                .filter(|file| frust::sys::lstat(&dir.join(&file.stored)).unwrap().nlink() == 1)
+                .collect::<Vec<_>>()
+        })
+        .count()
+}
+
+#[test]
+fn edits_keep_one_version_per_unit_and_leave_no_store_only_linked_bytes() {
+    let sb = Sandbox::new("lk-versions");
+    let ws = path_workspace(&sb);
+    for value in 1..=4 {
+        edit_leaf(&ws, value);
+        build_with(&sb, &ws, &[("FRUST_CACHE_BACKED", "force"), ("FRUST_CACHE_UNIT_VERSIONS", "1")]);
+    }
+    assert_eq!(entries(&sb, "leaf").len(), 1, "the edited unit keeps only its newest state");
+    assert_eq!(entries(&sb, "mid").len(), 1, "a downstream unit keeps one state too");
+    assert!(entries(&sb, "app").len() <= 1);
+    assert_eq!(store_only_linked_files(&sb, &["leaf", "mid", "app"]), 0, "every kept linked file is still a name of a live target file");
+}
+
+#[test]
+fn the_unit_versions_setting_keeps_that_many_states() {
+    let sb = Sandbox::new("lk-versions-two");
+    let ws = path_workspace(&sb);
+    for value in 1..=4 {
+        edit_leaf(&ws, value);
+        build_with(&sb, &ws, &[("FRUST_CACHE_BACKED", "force"), ("FRUST_CACHE_UNIT_VERSIONS", "2")]);
+    }
+    assert_eq!(entries(&sb, "leaf").len(), 2);
 }
 
 #[test]

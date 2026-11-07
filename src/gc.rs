@@ -47,6 +47,8 @@ pub struct GcOptions {
     pub temp_min_age: Duration,
     /// Older temp files go even if their creator's pid exists, because pids are reused.
     pub temp_max_age: Duration,
+    /// Incremental states kept per unit, never more than `INCREMENTAL_ENTRIES_KEPT`; `FRUST_CACHE_UNIT_VERSIONS`.
+    pub unit_versions: usize,
 }
 
 impl GcOptions {
@@ -64,12 +66,13 @@ impl GcOptions {
             startup_memo_max_age: Duration::from_secs(30 * 86_400),
             temp_min_age: Duration::from_secs(3600),
             temp_max_age: Duration::from_secs(86_400),
+            unit_versions: INCREMENTAL_ENTRIES_KEPT,
         }
     }
 
-    /// The configured size cap plus `FRUST_CACHE_MAX_AGE_DAYS`.
+    /// The configured size cap plus `FRUST_CACHE_MAX_AGE_DAYS` and `FRUST_CACHE_UNIT_VERSIONS`.
     pub fn from_config(cfg: &Config) -> GcOptions {
-        GcOptions { cache_max_age: config::cache_max_age(), ..GcOptions::new(cfg.cache_max_bytes) }
+        GcOptions { cache_max_age: config::cache_max_age(), unit_versions: config::unit_versions(), ..GcOptions::new(cfg.cache_max_bytes) }
     }
 }
 
@@ -228,7 +231,8 @@ fn link_state(entry: &Path, meta: &cache::EntryMeta) -> LinkState {
             && stored.is_file()
             && stored.nlink() > 1
         {
-            state.orphaned = false;
+            // A stale incremental object name left in a target must not keep a superseded entry from being orphaned.
+            state.orphaned &= is_incremental_object(&file.name);
             state.shared_alloc += stored.allocated();
             state.shared_estimate += file.stored_bytes.unwrap_or(file.bytes).div_ceil(4096) * 4096;
         }
@@ -275,9 +279,27 @@ fn unit_identity(meta: &cache::EntryMeta) -> Option<IncrementalUnit> {
     (!unit.is_empty()).then_some(IncrementalUnit::Legacy(unit))
 }
 
+/// Entry key to unit key from the `units/` records, the authoritative grouping of a unit's versions.
+fn unit_records(dirs: &Dirs) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(shards) = fs::read_dir(cache::Cache::new(dirs).units_dir()) else { return map };
+    for shard in shards.flatten() {
+        let Ok(files) = fs::read_dir(shard.path()) else { continue };
+        for file in files.flatten() {
+            let Some(unit) = file.file_name().to_str().filter(|name| cache::valid_key(name)).map(str::to_owned) else { continue };
+            let Ok(text) = fs::read_to_string(file.path()) else { continue };
+            for line in text.lines().filter(|line| cache::valid_key(line)) {
+                map.insert(line.to_owned(), unit.clone());
+            }
+        }
+    }
+    map
+}
+
 fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
     let mut out = Vec::new();
     let store = cache::Cache::new(dirs);
+    let records = unit_records(dirs);
     let Ok(shards) = fs::read_dir(dirs.store()) else { return out };
     for shard in shards.flatten() {
         let Ok(entries) = fs::read_dir(shard.path()) else { continue };
@@ -298,7 +320,11 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
             let unit = meta.as_ref().and_then(unit_identity);
             let link = meta.as_ref().map(|meta| link_state(&path, meta)).unwrap_or_default();
             let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| bytes.saturating_sub(link.shared_estimate));
-            let group = meta.as_ref().and_then(|meta| meta.prekey.clone());
+            let group = meta
+                .as_ref()
+                .and_then(|meta| meta.incremental_unit.clone().filter(|unit| cache::valid_key(unit)))
+                .or_else(|| records.get(key).cloned())
+                .or_else(|| meta.as_ref().and_then(|meta| meta.prekey.clone()));
             let retirement = retirement.filter(|snapshot| snapshot.used() == used
                 && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
             out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group });
@@ -310,9 +336,7 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
 fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)> {
     let mut units: HashMap<&IncrementalUnit, Vec<(SystemTime, &Path)>> = HashMap::new();
     for entry in scanned {
-        if let Some(unit) = &entry.unit
-            && !entry.link.any
-        {
+        if let Some(unit) = &entry.unit {
             units.entry(unit).or_default().push((entry.used, entry.path.as_path()));
         }
     }
@@ -380,7 +404,7 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
     let mut evicted = HashSet::new();
     let mut protection = EntryGuard::new(dirs);
     let scanned = scan_entries(dirs);
-    let superseded: Vec<_> = superseded_among(&scanned, INCREMENTAL_ENTRIES_KEPT)
+    let superseded: Vec<_> = superseded_among(&scanned, opts.unit_versions.clamp(1, INCREMENTAL_ENTRIES_KEPT))
         .into_iter().filter(|(path, _)| !protection.protects(path)).collect();
     let doomed: HashSet<&Path> = superseded.iter().map(|s| s.0.as_path()).collect();
     for (path, _) in &superseded {
@@ -2430,12 +2454,16 @@ mod tests {
     }
 
     fn linked_entry(home: &Path, key: &str, target: &Path, age_secs: u64) -> PathBuf {
+        linked_entry_of(home, key, target, age_secs, &"ab".repeat(20))
+    }
+
+    fn linked_entry_of(home: &Path, key: &str, target: &Path, age_secs: u64, prekey: &str) -> PathBuf {
         let dir = home.join("store").join(&key[..2]).join(key);
         fs::create_dir_all(&dir).unwrap();
         fs::hard_link(target, dir.join("f0")).unwrap();
         let len = fs::metadata(target).unwrap().len();
         let meta = serde_json::json!({
-            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "prekey": "ab".repeat(20), "stderr": "",
+            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "prekey": prekey, "stderr": "",
             "files": [{"name": "libx.rlib", "stored": "f0", "text": false, "bytes": len, "encoding": "linked",
                        "stored_bytes": len, "decoded_bytes": len, "content_hash": "ab".repeat(32), "mode": 0o100644}],
         });
@@ -2454,7 +2482,7 @@ mod tests {
         let shared = scan_entries(&dirs);
         assert_eq!(shared[0].estimate, Some(ENTRY_OVERHEAD_BYTES), "a file shared with a target name frees nothing");
         assert!(!shared[0].link.orphaned);
-        fs::remove_file(&target).unwrap();
+        fs::remove_file(target).unwrap();
         let orphaned = scan_entries(&dirs);
         assert_eq!(orphaned[0].estimate, Some(ENTRY_OVERHEAD_BYTES + 65_536));
         assert!(orphaned[0].link.orphaned);
@@ -2479,6 +2507,39 @@ mod tests {
         let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
         assert_eq!(dropped, vec![entries[0].clone()], "only older orphaned entries go, never the newest of the unit");
         assert!(cache_removals(&plan(&dirs, &GcOptions::new(u64::MAX))).contains(&entries[0]));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn linked_entries_group_by_the_unit_record_and_a_stale_object_name_does_not_pin_them() {
+        let home = home("linked-unit-records");
+        let dirs = Dirs::at(&home);
+        let unit = "cd".repeat(20);
+        let mut entries = Vec::new();
+        let mut targets = Vec::new();
+        for (i, age) in [(1u8, 2000u64), (2, 1000)] {
+            let target = home.join(format!("target-{i}"));
+            fs::write(&target, vec![i; 8192]).unwrap();
+            // A different prekey per state: only the unit record ties them together.
+            entries.push(linked_entry_of(&home, &format!("{i:02x}{}", "1".repeat(38)), &target, age, &format!("{i:02x}").repeat(20)));
+            targets.push(target);
+        }
+        let record = cache::Cache::new(&dirs).units_dir().join(&unit[..2]).join(&unit);
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, format!("{}\n{}\n", entries[1].file_name().unwrap().to_string_lossy(), entries[0].file_name().unwrap().to_string_lossy())).unwrap();
+        fs::remove_file(&targets[0]).unwrap();
+        let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
+        assert_eq!(dropped, vec![entries[0].clone()]);
+
+        let meta_path = entries[0].join("meta.json");
+        let mut meta: cache::EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta.files[0].name = "x-0123456789abcdef.c1.t1.rcgu.o".into();
+        let modified = fs::metadata(&meta_path).unwrap().modified().unwrap();
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        File::options().write(true).open(&meta_path).unwrap().set_modified(modified).unwrap();
+        fs::hard_link(entries[0].join("f0"), home.join("stale-object")).unwrap();
+        let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
+        assert_eq!(dropped, vec![entries[0].clone()], "a leftover object name in a target does not keep a superseded entry");
         let _ = fs::remove_dir_all(&home);
     }
 

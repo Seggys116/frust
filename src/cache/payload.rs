@@ -680,6 +680,21 @@ fn same_content(a: &sys::Meta, b: &sys::Meta) -> bool {
         && a.mode() == b.mode()
 }
 
+/// Like `capture`, but ctime is ignored: Cargo's uplift adds names to the inode, which moves ctime and never the bytes.
+fn capture_content(src: &Path) -> io::Result<Commitment> {
+    let source = File::open(src)?;
+    let before = sys::fstat(&source)?;
+    if !before.is_file() {
+        return Err(invalid("artifact is not a regular file"));
+    }
+    let (len, hash) = hash_open(&source, before.len())?;
+    let after = sys::fstat(&source)?;
+    if len != before.len() || !same_content(&before, &after) {
+        return Err(invalid("artifact changed while committing"));
+    }
+    Ok(Commitment { hash, mode: before.mode(), dev: before.dev(), ino: before.ino(), len, mtime: before.mtime() })
+}
+
 fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> io::Result<StoredPayload> {
     let meta = sys::lstat(src)?;
     if !meta.is_file() || meta.len() < LINKED_MIN_BYTES {
@@ -689,13 +704,14 @@ fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> i
     let commitment = match commitment {
         Some(commitment) => commitment,
         None => {
-            captured = capture(src)?.1;
+            captured = capture_content(src)?;
             &captured
         }
     };
-    if !commitment.valid() || !commitment.matches(&meta) {
+    if !commitment.valid() || !commitment.matches(&meta) || !commitment.matches(&sys::lstat(src)?) {
         return Err(invalid("artifact changed after commitment"));
     }
+    // The link adds a name to the inode just hashed and checked, and Cargo's uplift only adds names, so the bytes it exposes are the hashed ones.
     fs::hard_link(src, dst)?;
     if !commitment.matches(&sys::lstat(dst)?) {
         return Err(invalid("linked artifact differs from commitment"));
@@ -918,6 +934,9 @@ mod tests {
         fs::write(&big, vec![b'c'; 8193]).unwrap();
         let stale = store_linked(&big, &scratch.0.join("g1"), false, Some(&commitment), false);
         assert!(stale.is_err(), "a rewritten output no longer matches its commitment");
+        let (hashed, _) = store_linked(&big, &scratch.0.join("g2"), false, None, false).unwrap();
+        assert_eq!(hashed.encoding, Encoding::Linked, "the store step hashes an uncommitted output itself");
+        assert_eq!(hashed.content_hash.as_deref(), Some(blake3::hash(&vec![b'c'; 8193]).to_hex().as_str()));
     }
 
     #[test]
@@ -937,7 +956,7 @@ mod tests {
 
         adopt(&staged, &first);
         assert_ne!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "the store is still shared with the source name");
-        fs::remove_file(&source).unwrap();
+        fs::remove_file(source).unwrap();
         adopt(&staged, &first);
         assert_eq!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "an orphaned store file is replaced by the verified destination");
         let second = scratch.0.join("second");
@@ -1011,7 +1030,7 @@ mod tests {
         let bytes = pattern(16 * 1024 * 1024);
         fs::write(&source, &bytes).unwrap();
         let (staged, file) = linked(&scratch.0, &source);
-        fs::remove_file(&source).unwrap();
+        fs::remove_file(source).unwrap();
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {

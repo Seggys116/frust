@@ -17,7 +17,7 @@ The cache uses a two-step key, the same idea as ccache's direct mode.
 So an edited dependency, a changed `option_env!` value, a different feature set, profile, flag or compiler
 all miss. Nothing is cached when it cannot be done safely:
 
-* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (at most 4 entries per unit, reduced to the newest 2 by maintenance on every platform; a hit creates no native incremental session, so the first edit after a clean artifact-only restore rebuilds that crate and its dependents; existing sessions remain available to rustc; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
+* incremental compiles keep rustc's own incremental behaviour: on a cache miss the original incremental compile runs unchanged, and its result is then stored (one entry per unit by default, so a recorded newer state retires the older one at once; `FRUST_CACHE_UNIT_VERSIONS` raises that to at most 4, and maintenance reduces incremental units to the newest 2; a hit creates no native incremental session, so the first edit after a clean artifact-only restore rebuilds that crate and its dependents; existing sessions remain available to rustc; `FRUST_CACHE_PRIMARY_INCREMENTAL=off` disables caching of the packages you are building),
 * anything with `--print`, unknown `--emit` kinds, stdin input, response files or non-UTF-8 arguments,
 * tool chains such as `clippy-driver rustc ...`,
 * (workspace packages you are building are cached too when non-incremental, i.e. release builds; `FRUST_CACHE_PRIMARY=off` disables this.)
@@ -183,8 +183,10 @@ file with several names) makes the entry unusable: it is dropped, rustc runs, an
 
 The cost and sizing: deleting or replacing the target name leaves the store file as the only copy, so entries
 survive `cargo clean`. `frust gc` counts a linked file that still has another name as zero bytes and an orphaned one
-in full, and drops every orphaned linked entry older than the newest of its unit at once, so frust never holds more
-than cargo does. Compaction treats a linked store file as covering a target file only while it hashes to the
+in full, and drops every orphaned linked entry older than the newest of its unit (grouped by the unit records, not by
+prekey) at once, so frust never holds more than cargo does. A stale incremental object name left in a target does not
+keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path, with its
+identity checked around the hash and again before the link. Compaction treats a linked store file as covering a target file only while it hashes to the
 recorded content, so it cannot delete the only copy. Manifests that list a linked entry use format 6 and linked
 entries use their own key domain, so older versions treat them as misses.
 

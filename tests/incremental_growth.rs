@@ -143,7 +143,7 @@ impl Chain {
 }
 
 fn build(sb: &Sandbox, app: &Path, args: &[&str]) -> Vec<String> {
-    let out = sb.bin("fcargo").arg("build").arg("-v").args(args).env("FRUST_AUTO_COMPACT", "off").current_dir(app).output().unwrap();
+    let out = sb.bin("fcargo").arg("build").arg("-v").args(args).env("FRUST_AUTO_COMPACT", "off").env("FRUST_CACHE_UNIT_VERSIONS", "2").current_dir(app).output().unwrap();
     assert_success(&out);
     let mut compiled: Vec<String> = stderr(&out)
         .lines()

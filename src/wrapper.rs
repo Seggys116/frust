@@ -1037,11 +1037,8 @@ impl Plan {
             if meta.is_dir() {
                 return None;
             }
-            if !name.ends_with(".d")
-                && meta.is_file()
-                && ((compress && meta.len() >= cache::payload::MIN_BYTES)
-                    || (linked && meta.len() >= cache::payload::LINKED_MIN_BYTES))
-            {
+            // Linked outputs are hashed by the store, off this path; only the stat identity in `outputs` is recorded here.
+            if !linked && compress && !name.ends_with(".d") && meta.is_file() && meta.len() >= cache::payload::MIN_BYTES {
                 let (committed_meta, commitment) = capture(&path).ok()?;
                 if Stamp::of(&meta) != Stamp::of(&committed_meta)
                     || meta.mode() != committed_meta.mode()
@@ -1408,14 +1405,13 @@ impl Plan {
             .enumerate()
             .map(|(i, name)| (name.as_str(), i))
             .collect();
-        // Linked files need a commitment taken before Cargo's handoff; an inline store takes its own.
+        // A linked file is hashed here, in the store step, with its identity checked around the hash and again before the link.
         let linked = self.linked_storage();
         let wants_linked: Vec<bool> = names
             .iter()
             .map(|name| {
                 linked
                     && !name.ends_with(".d")
-                    && commitments.is_none_or(|committed| committed.contains_key(name))
                     && fs::symlink_metadata(out_dir.join(name)).is_ok_and(|m| m.is_file() && m.len() >= cache::payload::LINKED_MIN_BYTES)
             })
             .collect();
@@ -1624,7 +1620,7 @@ impl Plan {
 
     fn note_unit(&self, key: &str) {
         let Some(unit) = &self.unit else { return };
-        for old in self.cache.note_unit_entry(unit, key, UNIT_VERSIONS) {
+        for old in self.cache.note_unit_entry(unit, key, self.context.unit_versions.clamp(1, UNIT_VERSIONS)) {
             self.debug(&format!(
                 "retired superseded entry {old} of {}",
                 self.parsed.crate_name
@@ -1862,7 +1858,14 @@ struct StoreContext {
     compression_requested: bool,
     #[serde(default)]
     backed: cache::payload::BackedMode,
+    /// Entries kept per path unit, captured so the helper and the broker apply the producer's setting.
+    #[serde(default = "default_unit_versions")]
+    unit_versions: usize,
     immutable_source_roots: Vec<PathBuf>,
+}
+
+fn default_unit_versions() -> usize {
+    1
 }
 
 impl StoreContext {
@@ -1871,6 +1874,7 @@ impl StoreContext {
             package_version: env::var("CARGO_PKG_VERSION").unwrap_or_default(),
             compression_requested: cache_compression_requested(),
             backed: cache::payload::BackedMode::from_env(),
+            unit_versions: crate::config::unit_versions(),
             immutable_source_roots: immutable_source_roots()
                 .iter()
                 .map(|root| cwd.join(root))
@@ -4653,7 +4657,8 @@ mod tests {
         let job = StoreJob {
             format: JOB_FORMAT,
             ownership_version: 0,
-            context: StoreContext::capture(&s.0),
+            // Pinned, not inherited: these tests name the payload path they exercise.
+            context: StoreContext { backed: cache::payload::BackedMode::Off, unit_versions: 1, ..StoreContext::capture(&s.0) },
             home: s.0.join("home"),
             cwd: s.0.clone(),
             args,
@@ -5010,7 +5015,8 @@ mod tests {
             job.context = StoreContext {
                 package_version: version.to_string(),
                 compression_requested: compress,
-                backed: cache::payload::BackedMode::default(),
+                backed: cache::payload::BackedMode::Off,
+                unit_versions: 1,
                 immutable_source_roots: vec![job.cwd.join("immutable")],
             };
             let plan = Plan::from_job(&job, &worker_config).unwrap();
@@ -5110,14 +5116,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn freezing_linked_outputs_hashes_nothing_on_the_critical_path() {
+        let s = Scratch::new("freeze-linked");
+        let (mut job, _, rlib) = relative_job(&s);
+        fs::write(&rlib, vec![b'f'; cache::payload::MIN_BYTES as usize * 2]).unwrap();
+        job.context.compression_requested = true;
+        job.context.backed = cache::payload::BackedMode::Force;
+        let captured = ["k.d", "libk.rlib"]
+            .iter()
+            .map(|name| format!("{}\n", serde_json::json!({"artifact": format!("target/debug/deps/{name}")})))
+            .collect::<String>();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        fs::create_dir_all(plan.dirs.tmp()).unwrap();
+        let frozen = plan.freeze_with_capture(
+            captured.as_bytes(),
+            job.spawned_ns.parse().unwrap(),
+            &HashMap::new(),
+            |_path: &Path| -> io::Result<(sys::Meta, cache::payload::Commitment)> {
+                panic!("freeze must not read linked outputs")
+            },
+        );
+        // Untrusted volumes and coarse stamps decline the freeze, which proves nothing either way.
+        if let Some(frozen) = frozen {
+            assert!(frozen.commitments.is_empty());
+            assert!(frozen.outputs.iter().any(|(name, stamp)| name == "libk.rlib" && stamp.size == cache::payload::MIN_BYTES * 2));
+        }
+    }
+
+    #[test]
+    fn linked_stores_reject_later_edits_like_raw_ones() {
+        let s = Scratch::new("linked-edits");
+        let (job, _) = linked_job(&s);
+        fs::write(s.0.join("lib.rs"), b"pub fn changed() {}").unwrap();
+        run_deferred(&job);
+        assert_eq!(rows(&job), 0, "an input edited after the compile");
+
+        let s = Scratch::new("linked-output-edit");
+        let (job, rlib) = linked_job(&s);
+        fs::write(&rlib, b"rebuilt by the next build").unwrap();
+        run_deferred(&job);
+        assert_eq!(rows(&job), 0, "an output replaced after the compile");
+    }
+
     // A finished compile whose library is large enough to be linked, with the commitment the wrapper would have frozen.
     fn linked_job(s: &Scratch) -> (StoreJob, PathBuf) {
         let (mut job, _, rlib) = fixture(s);
         fs::write(&rlib, vec![b'r'; 3 * 4096 + 5]).unwrap();
         job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
+        // No commitment: linked mode leaves the hash to the store step.
         job.context.backed = cache::payload::BackedMode::Force;
-        let (_, commitment) = cache::payload::capture(&rlib).unwrap();
-        job.commitments.insert("libk.rlib".to_string(), commitment);
         (job, rlib)
     }
 
