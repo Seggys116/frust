@@ -1,0 +1,69 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/bench.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: bench (${{ matrix.os }}, ${{ matrix.repo.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        repo:
+          - { name: ripgrep, slug: BurntSushi/ripgrep, tag: "14.1.1", package: "" }
+          - { name: bat, slug: sharkdp/bat, tag: v0.24.0, package: "" }
+          - { name: tokio, slug: tokio-rs/tokio, tag: tokio-1.40.0, package: tokio }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: clone ${{ matrix.repo.slug }} at ${{ matrix.repo.tag }}
+        shell: bash
+        run: git clone --depth 1 --branch "${{ matrix.repo.tag }}" "https://github.com/${{ matrix.repo.slug }}.git" "$RUNNER_TEMP/bench-repo"
+      - name: benchmark
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PACKAGE: ${{ matrix.repo.package }}
+        run: |
+          EXE=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
+          args=()
+          if [ -n "$PACKAGE" ]; then args+=(--package "$PACKAGE"); fi
+          status=0
+          "$GITHUB_WORKSPACE/target/release/frust$EXE" bench --repo "$RUNNER_TEMP/bench-repo" "${args[@]}" \
+            --gate --markdown --out "$RUNNER_TEMP/bench-${{ matrix.os }}-${{ matrix.repo.name }}.json" \
+            > "$RUNNER_TEMP/bench-summary.md" || status=$?
+          cat "$RUNNER_TEMP/bench-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.repo.name }}
+          path: ${{ runner.temp }}/bench-${{ matrix.os }}-${{ matrix.repo.name }}.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: clean up clone and scratch state
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/bench-repo" "$RUNNER_TEMP"/frust-bench-* "$RUNNER_TEMP/bench-summary.md"

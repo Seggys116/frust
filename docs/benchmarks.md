@@ -114,3 +114,32 @@ With FRUST_LINK=off and artifact caching off, every edit compiled one main binar
 | Native link phase | 32 [30, 48] |
 
 Cohort: `8199243f9160c65744f7285ae3fac0e0793beff0aee416cf7d2bab5f90147fe1`.
+
+## Real repositories and CI
+
+`frust bench --repo PATH` builds an existing checkout with plain Cargo (isolated `CARGO_TARGET_DIR`) and with frust (isolated `FRUST_HOME` and central target), using deferred stores and automatic compression. Dependencies are fetched once before timing.
+
+```bash
+frust bench --repo ~/src/ripgrep --runs 3 --edits 20 --gate --markdown --out ripgrep.json
+frust bench --repo ~/src/tokio --package tokio --json
+```
+
+Flags: `--repo PATH`, `--edits N` (default 20), `--runs N` (default 3), `--package P` (edit and build only that workspace member), `--json`, `--markdown`, `--out FILE`, `--gate`.
+
+Each run times, for both tools in alternating order: cold build (empty target and cache), clean rebuild (cache kept, target removed), no-op (median of three builds), then N edits. Edits append a marker constant to up to eight `.rs` files, taken round-robin from the entry points and sources of the workspace default members (`cargo metadata --no-deps`), each followed by a debug build. The first edit that touches a crate after a restore has no incremental session; it is reported separately (`edit_first`) and excluded from the edit median and p90 (`edit_warm`). Original file bytes are saved in scratch and written back after every run and on every error path; git is never used.
+
+Before each timed frust build the harness waits up to 60 s for deferred stores to finish (no pending job files, every slot lock held exclusively), so background storage never lands in the next row.
+
+Disk compares the physical size of Cargo's target directory with the physical size of all of `FRUST_HOME` (store, targets, manifests, tmp), counting each inode and clone extent once. The exit code is 1 when frust is larger, a build fails, or the report cannot be written. With `--gate` the exit code is 2 when a time threshold fails, using the median of per-pair frust/Cargo ratios:
+
+| Row | Limit |
+| --- | --- |
+| No-op | at most Cargo + 15 ms and at most 1.25x |
+| Warm-session edit median | at most 1.05x + 10 ms |
+| Edit p90 | at most 1.15x |
+| Cold | at most 1.05x |
+| Clean rebuild from cache | at most 0.5x |
+
+`--markdown` prints a table for `$GITHUB_STEP_SUMMARY`; `--json` prints a versioned report; `--out FILE` always writes the JSON to the file while stdout carries the markdown (or the JSON when only `--json` is given). The thresholds are constants in `src/bench/repo.rs`.
+
+`.github/workflows/bench.yml` runs this gate on ubuntu, macOS and Windows free runners against ripgrep 14.1.1, bat v0.24.0 and tokio 1.40.0 (package `tokio`), on manual dispatch, weekly, and on pull requests touching `src/**`, `Cargo.toml` or the workflow. Each job uploads its JSON as an artifact and removes the clone and scratch state at the end.

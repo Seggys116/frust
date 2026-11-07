@@ -2,6 +2,25 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+* `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's. `--gate` also fails on time regressions against cargo.
+* `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
+* `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
+* `frust gc --max-age-days N` and `FRUST_CACHE_MAX_AGE_DAYS` (default 14) set how long an unused cache entry is kept.
+
+### Changed
+
+* Cache entries are evicted by age, not by size. `FRUST_CACHE_MAX_GIB` and `FRUST_TARGET_MAX_GIB` are unlimited unless set.
+* Path-unit deferred stores no longer hold the unit key lock, so the next edit does not wait for the previous store.
+* Detached helpers on Windows are created without inheriting handles.
+
+### Fixed
+
+* A pending deferred store no longer protects the rest of the cache from eviction once its scan budget is exhausted.
+
 ## [0.3.0]
 
 ### Changed

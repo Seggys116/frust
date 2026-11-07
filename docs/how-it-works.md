@@ -98,7 +98,7 @@ dependency), only one should compile it.
   the fallback on unsupported platforms, watcher errors and missed notifications.
   This is fail-open: if the lock file cannot be opened or locked, or the wait runs out, the wrapper compiles
   anyway. Every acquired key lock triggers another lookup, including an immediate acquisition. The lock is
-  held until the entry is published. Matching compiler units can share results across profile and target
+  held until the entry is published (for workspace units, until the store is queued). Matching compiler units can share results across profile and target
   directories; different compiler flags keep separate identities.
 * Publication, manifest updates, usage refreshes, version-record updates and retirement renames share a short
   cache-wide metadata lock. Compilation, hashing and payload deletion happen outside it. Retirement prunes
@@ -118,7 +118,9 @@ dependency), only one should compile it.
   writes a job file under `tmp/deferred` and hands it to a background worker. On Linux and macOS, an observed second
   eligible compile attempt starts broker setup while Cargo is active. The broker admits up to eight jobs per shared
   cache home, retaining job metadata without queued output copies. Single-unit builds use the detached helper.
-  Workers store an entry only if its files still match and hold the unit key lock until completion. The wrapper
+  Workers store an entry only if its files still match. Workers of registry and git units hold the unit key lock
+  until completion; a workspace unit releases it once its job is queued, so the next edit's build never waits for
+  the previous store. The wrapper
   records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4.
 * Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
 * The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
@@ -128,6 +130,16 @@ dependency), only one should compile it.
 
 So the entry for a crate can appear a moment after cargo has moved on. A build started in that moment simply
 misses or waits on the key lock.
+
+### Timing records
+
+With `FRUST_TIMINGS=<file>` set, each wrapper that handles a cacheable compile appends one JSON line to the file
+in a single write as it exits; passthrough invocations write nothing, and with the variable unset no file is
+touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans describe the unit), `prekey_ms`,
+`lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
+`spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
+`hit`, `deferred` (helper), `queued` (broker), `inline:<reason>` or `skip:<reason>`. Stages a run did not
+reach are 0.
 
 ## Cache payload storage
 
@@ -155,8 +167,9 @@ encoded entries use a separate key domain from the keys older writers compute.
 * Raw artifacts are restored as copy-on-write clones where supported, including APFS (macOS), btrfs and XFS
   (Linux) and ReFS, including Dev Drive (Windows). Elsewhere they are copied. Encoded payloads are restored to
   ordinary compiler artifacts with their original bytes and permissions.
-* Cache and target budgets are separate. The cache budget counts the allocation of stored payloads, while the
-  target budget counts the restored target tree. Consider both when comparing disk use; shared reflink blocks
+* Cache and target size caps are opt-in and separate; by default neither is set and eviction follows age and liveness.
+  The cache cap counts the allocation of stored payloads, while
+  the target cap counts the restored target tree. Consider both when comparing disk use; shared reflink blocks
   can be counted in both trees when their reported allocations are added.
 * Automatic compaction (after successful builds, `FRUST_AUTO_COMPACT`) reclaims superseded artifacts and completed
   stale incremental sessions while preserving current outputs and fresh incremental state. Other profiles stay
@@ -189,10 +202,11 @@ encoded entries use a separate key domain from the keys older writers compute.
   units they hold. Besides rlib members and object files, frust reads the DWARF string tables of ELF binaries
   (Linux) for rustc's `<source>/@/<codegen unit>` names, so binaries whose objects are gone are still matched.
 * `frust gc` removes superseded artifact variants, stale incremental sessions, eligible idle central-target
-  payloads and entries over the cache budget (`FRUST_CACHE_MAX_GIB`, default 16). Daily automatic GC covers the
-  cache budget, scratch and temporary files, metadata and central-target retirement. It sizes cache entries from
-  recorded stored allocations (legacy entries use their existing byte counts), measuring them only when the
-  cache is over its budget. An explicit `frust gc` measures every entry.
+  payloads and cache entries unused for longer than `FRUST_CACHE_MAX_AGE_DAYS` (default 14), plus entries over an
+  opt-in `FRUST_CACHE_MAX_GIB` cap. Daily automatic GC covers the
+  same cache rules, scratch and temporary files, metadata and central-target retirement. When a cap is set it sizes
+  cache entries from recorded stored allocations (legacy entries use their existing byte counts), measuring them
+  only when the cache is over that cap. An explicit `frust gc` measures every entry.
 * A manifest expires only when it and its surviving entries have been idle past the retention period.
   Manifest identity, contents and entry usage are checked again before removal, so activity after planning
   preserves the lookup route to a reused entry.
@@ -246,10 +260,10 @@ proof, so their ownership remains unknown. Their completed reuse data can still 
 unknown directory has no permanent exemption. All entries and modification times must be readable and settled;
 working state, object files, symlinks and uncertain timestamps decline this expiry path.
 
-With the defaults, target-budget pressure can reclaim safe metadata-only reuse state after one hour rather than
-waiting seven days. Fresh sessions and necessary live outputs remain protected. Cache coverage can permit earlier
+When `FRUST_TARGET_MAX_GIB` is set, target-budget pressure can reclaim safe metadata-only reuse state after one hour
+rather than waiting seven days. Fresh sessions and necessary live outputs remain protected. Cache coverage can permit earlier
 reclamation of known superseded outputs, but missing or corrupt cache entries do not disable the ordinary age rules.
-The 8 GiB target budget is soft: current outputs, fresh or uncertain state and busy profiles can leave a target
+An opt-in target budget is soft: current outputs, fresh or uncertain state and busy profiles can leave a target
 above it. No cleanup policy here imposes a universal hard disk cap, and no work runs while frust is not invoked.
 
 Abandoned `-working` sessions and orphan session lock files have a separate one-hour grace for both modification

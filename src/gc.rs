@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache;
 use crate::compact::{self, Category};
-use crate::config::Config;
+use crate::config::{self, Config, DEFAULT_CACHE_MAX_AGE};
 use crate::fsx;
 use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
@@ -32,7 +32,10 @@ const TARGET_SCAN_NODES: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct GcOptions {
+    /// Opt-in cap: `u64::MAX` means unlimited, and zero evicts every unprotected entry.
     pub max_cache_bytes: u64,
+    /// Cache entries unused for longer than this are evicted.
+    pub cache_max_age: Duration,
     pub target_max_idle: Duration,
     pub variant_max_age: Duration,
     pub variants_to_keep: usize,
@@ -50,6 +53,7 @@ impl GcOptions {
     pub fn new(max_cache_bytes: u64) -> GcOptions {
         GcOptions {
             max_cache_bytes,
+            cache_max_age: DEFAULT_CACHE_MAX_AGE,
             target_max_idle: Duration::from_secs(30 * 86_400),
             variant_max_age: Duration::from_secs(7 * 86_400),
             variants_to_keep: 2,
@@ -61,6 +65,11 @@ impl GcOptions {
             temp_min_age: Duration::from_secs(3600),
             temp_max_age: Duration::from_secs(86_400),
         }
+    }
+
+    /// The configured size cap plus `FRUST_CACHE_MAX_AGE_DAYS`.
+    pub fn from_config(cfg: &Config) -> GcOptions {
+        GcOptions { cache_max_age: config::cache_max_age(), ..GcOptions::new(cfg.cache_max_bytes) }
     }
 }
 
@@ -88,7 +97,7 @@ impl Class {
 
     pub fn label(self) -> &'static str {
         match self {
-            Class::CacheEntry => "cache entries over budget or superseded",
+            Class::CacheEntry => "cache entries expired, superseded or over a set size cap",
             Class::TargetDir => "idle or orphaned target directories",
             Class::StaleVariant => "superseded build artifacts",
             Class::IncrementalSession => "stale incremental state",
@@ -284,10 +293,45 @@ fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)
     out
 }
 
-/// With `exact` false, sizes come from the recorded byte counts unless the cache is over its cap, when they are measured so eviction stays exact.
+/// The protection check shares one inspection budget, so exhausting it must not shield every later entry: refresh the snapshot and ask again.
+struct EntryGuard<'a> {
+    dirs: &'a Dirs,
+    protection: wrapper::DeferredProtection,
+    // A snapshot that is incomplete from the start cannot be repaired by rescanning, so everything stays protected.
+    unrecoverable: bool,
+}
+
+impl<'a> EntryGuard<'a> {
+    fn new(dirs: &'a Dirs) -> Self {
+        let protection = wrapper::deferred_protection(dirs);
+        EntryGuard { dirs, unrecoverable: !protection.is_complete(), protection }
+    }
+
+    fn protects(&mut self, path: &Path) -> bool {
+        if !self.protection.protects(path) {
+            return false;
+        }
+        if self.protection.is_complete() || self.unrecoverable {
+            return true;
+        }
+        self.protection = wrapper::deferred_protection(self.dirs);
+        if !self.protection.is_complete() {
+            self.unrecoverable = true;
+            return true;
+        }
+        self.protection.protects(path)
+    }
+}
+
+/// Unused for longer than the age limit; an entry whose `meta.json` is unreadable has no known last use and is left to the size cap.
+fn expired(used: SystemTime, max_age: Duration) -> bool {
+    used != SystemTime::UNIX_EPOCH && old_enough(used, max_age)
+}
+
+/// With `exact` false, sizes come from the recorded byte counts unless an explicit size cap is exceeded, when they are measured so eviction stays exact.
 fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> HashSet<String> {
     let mut evicted = HashSet::new();
-    let protection = wrapper::deferred_protection(dirs);
+    let mut protection = EntryGuard::new(dirs);
     let scanned = scan_entries(dirs);
     let superseded: Vec<_> = superseded_among(&scanned, INCREMENTAL_ENTRIES_KEPT)
         .into_iter().filter(|(path, _)| !protection.protects(path)).collect();
@@ -297,7 +341,7 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
             evicted.insert(key.to_string_lossy().into_owned());
         }
     }
-    let mut entries: Vec<(SystemTime, PathBuf, u64)> = scanned
+    let entries: Vec<(SystemTime, PathBuf, u64)> = scanned
         .iter()
         .filter(|e| !doomed.contains(e.path.as_path()))
         .map(|e| {
@@ -311,12 +355,25 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
     for (path, bytes) in superseded.iter().cloned() {
         plan.removals.push(Removal { class: Class::CacheEntry, path, bytes });
     }
-    let mut total: u64 = entries.iter().map(|e| e.2).sum();
+    let mut live = Vec::with_capacity(entries.len());
+    for (used, path, bytes) in entries {
+        if expired(used, opts.cache_max_age) && !protection.protects(&path) {
+            if let Some(key) = path.file_name() {
+                evicted.insert(key.to_string_lossy().into_owned());
+            }
+            plan.removals.push(Removal { class: Class::CacheEntry, path, bytes });
+        } else {
+            live.push((used, path, bytes));
+        }
+    }
+    let mut entries = live;
+    let sum = |entries: &[(SystemTime, PathBuf, u64)]| entries.iter().fold(0u64, |total, e| total.saturating_add(e.2));
+    let mut total = sum(&entries);
     if !exact && total > opts.max_cache_bytes {
         for entry in &mut entries {
             entry.2 = fsx::allocated_size(&entry.1);
         }
-        total = entries.iter().map(|e| e.2).sum();
+        total = sum(&entries);
     }
     entries.sort_by_key(|e| e.0);
     for (_, path, bytes) in entries {
@@ -1683,7 +1740,7 @@ fn drain_idle_targets(dirs: &Dirs, opts: &GcOptions) {
 }
 
 fn run_maintenance(dirs: &Dirs, cfg: &Config, drain: bool) {
-    let opts = GcOptions::new(cfg.cache_max_bytes);
+    let opts = GcOptions::from_config(cfg);
     let plan = plan_maintenance(dirs, &opts);
     let _ = execute_removals(dirs, &plan);
     if drain {
@@ -1716,11 +1773,15 @@ fn collector_binary() -> Option<PathBuf> {
 fn spawn_collector(dirs: &Dirs, cfg: &Config) -> bool {
     use std::process::Command;
     let Some(exe) = collector_binary() else { return false };
-    let gib = cfg.cache_max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let mut cmd = Command::new(exe);
-    cmd.args(["gc", AUTO_CHILD_FLAG]).env("FRUST_HOME", dirs.root()).env("FRUST_CACHE_MAX_GIB", gib.to_string());
-    sys::detach_command(&mut cmd, &[]);
-    cmd.spawn().is_ok()
+    cmd.args(["gc", AUTO_CHILD_FLAG]).env("FRUST_HOME", dirs.root());
+    if cfg.cache_max_bytes == u64::MAX {
+        cmd.env_remove("FRUST_CACHE_MAX_GIB");
+    } else {
+        cmd.env("FRUST_CACHE_MAX_GIB", (cfg.cache_max_bytes as f64 / (1024.0 * 1024.0 * 1024.0)).to_string());
+    }
+    cmd.env("FRUST_CACHE_MAX_AGE_DAYS", (config::cache_max_age().as_secs_f64() / 86_400.0).to_string());
+    sys::spawn_detached(&mut cmd, &[]).is_ok()
 }
 
 fn prune_empty_workspaces(dirs: &Dirs) {
@@ -2117,7 +2178,7 @@ mod tests {
         let path = dirs.manifests().join("bb").join(format!("{prekey}.json"));
         let old = SystemTime::now() - Duration::from_secs(60 * 86_400);
         for path in [&path, &entry.join("meta.json")] { File::options().write(true).open(path).unwrap().set_modified(old).unwrap(); }
-        let selected = plan(&dirs, &GcOptions::new(u64::MAX));
+        let selected = plan(&dirs, &GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) });
         assert!(selected.manifest_retirements.contains_key(&path));
         let guard = cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap();
         assert!(execute_removals(&dirs, &selected).1.is_empty());
@@ -2137,6 +2198,96 @@ mod tests {
 
     fn cache_removals(plan: &Plan) -> Vec<PathBuf> {
         plan.removals.iter().filter(|r| r.class == Class::CacheEntry).map(|r| r.path.clone()).collect()
+    }
+
+    const FIFTEEN_DAYS: u64 = 15 * 86_400;
+
+    #[test]
+    fn entries_unused_past_the_age_limit_are_expired_by_both_planners() {
+        let home = home("expiry");
+        let dirs = Dirs::at(&home);
+        let stale = store_entry(&home, &format!("aa{}", "1".repeat(38)), &[("f0", 64)], FIFTEEN_DAYS);
+        let fresh = store_entry(&home, &format!("bb{}", "2".repeat(38)), &[("f0", 64)], 86_400);
+        let opts = GcOptions::new(u64::MAX);
+        assert_eq!(cache_removals(&plan(&dirs, &opts)), vec![stale.clone()]);
+        assert_eq!(cache_removals(&plan_maintenance(&dirs, &opts)), vec![stale]);
+        let short = GcOptions { cache_max_age: Duration::from_secs(3600), ..GcOptions::new(u64::MAX) };
+        assert_eq!(cache_removals(&plan(&dirs, &short)).len(), 2);
+        assert_eq!(cache_removals(&plan_maintenance(&dirs, &short)).len(), 2);
+        assert!(fresh.exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn entries_without_readable_metadata_are_not_aged_out() {
+        let home = home("expiry-no-meta");
+        let dirs = Dirs::at(&home);
+        let bare = home.join("store").join("aa").join("aa".repeat(20));
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join("f0"), [1u8; 64]).unwrap();
+        let opts = GcOptions::new(u64::MAX);
+        assert!(cache_removals(&plan(&dirs, &opts)).is_empty());
+        assert!(cache_removals(&plan_maintenance(&dirs, &opts)).is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_options_never_evict_fresh_entries_by_size() {
+        let home = home("no-size-cap");
+        let dirs = Dirs::at(&home);
+        for n in 0..3 {
+            store_entry(&home, &format!("{n:02x}{}", "4".repeat(38)), &[("f0", 1 << 20)], 100 * (n + 1));
+        }
+        let opts = GcOptions::new(u64::MAX);
+        assert!(cache_removals(&plan(&dirs, &opts)).is_empty());
+        assert!(cache_removals(&plan_maintenance(&dirs, &opts)).is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_explicit_cap_still_evicts_oldest_first() {
+        let home = home("explicit-cap");
+        let dirs = Dirs::at(&home);
+        let oldest = store_entry(&home, &format!("aa{}", "1".repeat(38)), &[("f0", 65_536)], 3000);
+        let middle = store_entry(&home, &format!("bb{}", "2".repeat(38)), &[("f0", 65_536)], 2000);
+        let newest = store_entry(&home, &format!("cc{}", "3".repeat(38)), &[("f0", 65_536)], 1000);
+        let cap = fsx::allocated_size(&middle) + fsx::allocated_size(&newest);
+        let opts = GcOptions::new(cap);
+        assert_eq!(cache_removals(&plan(&dirs, &opts)), vec![oldest.clone()]);
+        assert_eq!(cache_removals(&plan_maintenance(&dirs, &opts)), vec![oldest]);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn age_limits_parse_without_panicking() {
+        assert_eq!(config::days_to_duration(0.5), Some(Duration::from_secs(43_200)));
+        assert_eq!(config::days_to_duration(0.0), Some(Duration::ZERO));
+        assert_eq!(config::days_to_duration(-1.0), None);
+        assert_eq!(config::days_to_duration(f64::NAN), None);
+        assert!(config::days_to_duration(f64::INFINITY).is_some());
+        assert!(config::days_to_duration(1e300).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_store_keeps_its_expired_entry_until_released() {
+        if crate::isolated_test(module_path!(), "a_pending_store_keeps_its_expired_entry_until_released") {
+            return;
+        }
+        let root = home("expiry-protected");
+        let dirs = Dirs::at(&root);
+        let protected = store_entry(&root, &"aa".repeat(20), &[("artifact", 16384)], FIFTEEN_DAYS);
+        let unrelated = store_entry(&root, &"bb".repeat(20), &[("artifact", 16384)], FIFTEEN_DAYS);
+        let output = root.join("external-pending.rlib");
+        fs::hard_link(protected.join("artifact"), &output).unwrap();
+        let path = deferred_job(&dirs, Some(&output), Some(1), Duration::ZERO);
+        let held = shared_job(&path);
+        let opts = GcOptions::new(u64::MAX);
+        assert_eq!(cache_removals(&plan(&dirs, &opts)), vec![unrelated.clone()]);
+        assert_eq!(cache_removals(&plan_maintenance(&dirs, &opts)), vec![unrelated]);
+        drop(held);
+        assert_eq!(cache_removals(&plan(&dirs, &opts)).len(), 2);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2175,7 +2326,7 @@ mod tests {
         let dirs = Dirs::at(&home);
         let old = store_entry(&home, &format!("aa{}", "1".repeat(38)), &[("f0", 65_536)], 5000);
         let new = store_entry(&home, &format!("bb{}", "2".repeat(38)), &[("f0", 65_536)], 10);
-        let tight = GcOptions::new(100 * 1024);
+        let tight = GcOptions::new(fsx::allocated_size(&old).max(fsx::allocated_size(&new)));
         let exact = cache_removals(&plan(&dirs, &tight));
         assert_eq!(exact, vec![old.clone()]);
         assert_eq!(cache_removals(&plan_maintenance(&dirs, &tight)), exact, "over the cap, sizes are measured and the choice is the same");

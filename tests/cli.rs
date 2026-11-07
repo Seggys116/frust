@@ -146,7 +146,7 @@ fn stats_gc_doctor_and_locks_commands_work() {
 
     let dry = sb.bin("frust").args(["gc", "--max-gib", "0", "--dry-run"]).output().unwrap();
     assert_success(&dry);
-    assert!(stdout(&dry).contains("cache entries over budget"), "{}", stdout(&dry));
+    assert!(stdout(&dry).contains("cache entries expired, superseded or over a set size cap"), "{}", stdout(&dry));
     assert!(sb.count_cache("miss", "leaf") == 1);
 }
 

@@ -245,6 +245,11 @@ fn fake_manifest(home: &Path, prekey: &str, keys: &[&str]) -> PathBuf {
     path
 }
 
+/// Options under which entries aged for the metadata tests are not themselves expired.
+fn keep_aged_entries() -> GcOptions {
+    GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) }
+}
+
 fn plan_has(plan: &gc::Plan, class: Class, path: &Path) -> bool {
     plan.removals.iter().any(|r| r.class == class && r.path == path)
 }
@@ -395,7 +400,7 @@ fn gc_expires_idle_manifests_and_rechecks_usage_replacement_and_republication() 
         age(&manifest, Duration::from_secs(40 * 86_400));
         fixtures.push((key, prekey, manifest));
     }
-    let plan = gc::plan(&dirs, &GcOptions::new(u64::MAX));
+    let plan = gc::plan(&dirs, &keep_aged_entries());
     for (_, _, path) in &fixtures {
         assert!(plan_has(&plan, Class::Metadata, path));
     }
@@ -712,10 +717,10 @@ fn gc_keeps_aged_unit_records_while_any_referenced_entry_root_exists() {
     let live = fake_entry(&sb.home(), key);
     age(&live.join("meta.json"), Duration::from_secs(80 * 86_400));
     let record = unit_record(&dirs, unit, &[key]);
-    let plan = gc::plan_maintenance(&dirs, &GcOptions::new(u64::MAX));
+    let plan = gc::plan_maintenance(&dirs, &keep_aged_entries());
     assert!(!plan_has(&plan, Class::Metadata, &record));
     fs::remove_file(live.join("meta.json")).unwrap();
-    let incomplete = gc::plan_maintenance(&dirs, &GcOptions::new(u64::MAX));
+    let incomplete = gc::plan_maintenance(&dirs, &keep_aged_entries());
     assert!(!plan_has(&incomplete, Class::Metadata, &record), "an existing root with missing metadata is uncertain, not absent");
     assert!(record.is_file());
 }

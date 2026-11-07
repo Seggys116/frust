@@ -30,7 +30,10 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
+    WaitForSingleObject,
+};
 
 use super::{LockKind, StdStream};
 
@@ -880,6 +883,107 @@ pub fn detach_command(cmd: &mut Command, _inherit: &[&File]) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+// std always creates processes with bInheritHandles set, which would hand every inheritable handle of the wrapper (cargo's stderr pipe) to a detached child.
+pub fn spawn_detached(cmd: &mut Command, _inherit: &[&File]) -> io::Result<()> {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    let mut line = Vec::new();
+    push_quoted(&mut line, cmd.get_program())?;
+    for arg in cmd.get_args() {
+        line.push(u16::from(b' '));
+        push_quoted(&mut line, arg)?;
+    }
+    line.push(0);
+    let environment = environment_block(cmd)?;
+    let dir = cmd.get_current_dir().map(wide);
+    // SAFETY: all-zero STARTUPINFOW with `cb` set requests no standard handles and no special window state.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = size_of::<STARTUPINFOW>() as u32;
+    // SAFETY: PROCESS_INFORMATION is plain data that CreateProcessW fills in.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `line` and `environment` are NUL-terminated buffers that outlive the call, `dir` is null or NUL-terminated, and the structs are valid.
+    let created = unsafe {
+        CreateProcessW(
+            null(),
+            line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            dir.as_ref().map_or(null(), |dir| dir.as_ptr()),
+            &startup,
+            &mut info,
+        )
+    };
+    if created == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both handles were just returned to this process and are closed once.
+    unsafe {
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+    }
+    Ok(())
+}
+
+fn units(text: &OsStr) -> io::Result<Vec<u16>> {
+    let units: Vec<u16> = text.encode_wide().collect();
+    if units.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "nul character in process argument or environment"));
+    }
+    Ok(units)
+}
+
+/// Quotes one argument by the rules every C runtime and CommandLineToArgvW parse back.
+fn push_quoted(line: &mut Vec<u16>, arg: &OsStr) -> io::Result<()> {
+    let text = units(arg)?;
+    let (space, tab, quote, slash) = (u16::from(b' '), u16::from(b'\t'), u16::from(b'"'), u16::from(b'\\'));
+    if !text.is_empty() && !text.iter().any(|&unit| unit == space || unit == tab || unit == quote || unit == 0x0A || unit == 0x0B) {
+        line.extend(text);
+        return Ok(());
+    }
+    line.push(quote);
+    let mut slashes = 0;
+    for unit in text {
+        if unit == slash {
+            slashes += 1;
+            continue;
+        }
+        let escaped = if unit == quote { slashes * 2 + 1 } else { slashes };
+        line.extend(std::iter::repeat_n(slash, escaped));
+        slashes = 0;
+        line.push(unit);
+    }
+    line.extend(std::iter::repeat_n(slash, slashes * 2));
+    line.push(quote);
+    Ok(())
+}
+
+/// The parent's environment with the command's own changes applied; names compare case-insensitively as the OS does.
+fn environment_block(cmd: &Command) -> io::Result<Vec<u16>> {
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (key, value) in cmd.get_envs() {
+        vars.retain(|(name, _)| !name.eq_ignore_ascii_case(key));
+        if let Some(value) = value {
+            vars.push((key.to_os_string(), value.to_os_string()));
+        }
+    }
+    let mut block = Vec::new();
+    for (name, value) in vars {
+        block.extend(units(&name)?);
+        block.push(u16::from(b'='));
+        block.extend(units(&value)?);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
 }
 
 pub fn exec_replace(cmd: &mut Command) -> io::Error {

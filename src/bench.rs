@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 mod concurrent;
+mod repo;
 
 use crate::compact::{self, AutoOptions, Category, CompactOptions};
 use crate::config::Config as FrustConfig;
@@ -179,6 +180,9 @@ pub struct BinaryDiff {
 }
 
 pub fn run(_dirs: &Dirs, flags: &[String]) -> i32 {
+    if flags.iter().any(|flag| flag == "--repo" || flag.starts_with("--repo=")) {
+        return repo::run(flags);
+    }
     if flags.iter().any(|flag| flag == "--concurrent" || flag.starts_with("--concurrent=")) {
         return concurrent::run(flags);
     }

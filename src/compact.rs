@@ -2230,7 +2230,10 @@ impl AutoOptions {
         let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_ascii_lowercase());
         let enabled = !matches!(var("FRUST_AUTO_COMPACT").as_deref(), Some("off" | "0" | "false" | "no"));
         let days = var("FRUST_COMPACT_KEEP_DAYS").and_then(|v| v.parse::<f64>().ok()).filter(|d| *d >= 0.0).unwrap_or(14.0);
-        let gib = var("FRUST_TARGET_MAX_GIB").and_then(|v| v.parse::<f64>().ok()).filter(|g| *g > 0.0).unwrap_or(8.0);
+        let max_target_bytes = var("FRUST_TARGET_MAX_GIB")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|g| *g > 0.0)
+            .map_or(u64::MAX, |gib| (gib * 1024.0 * 1024.0 * 1024.0) as u64);
         let idle_days =
             var("FRUST_COMPACT_INCREMENTAL_IDLE_DAYS").and_then(|v| v.parse::<f64>().ok()).filter(|d| *d >= 0.0).unwrap_or(7.0);
         AutoOptions {
@@ -2241,7 +2244,7 @@ impl AutoOptions {
             uncached_dead_grace: Duration::from_secs(86_400),
             dead_incremental_grace: Duration::from_secs(3600),
             incremental_idle: Duration::from_secs_f64(idle_days * 86_400.0),
-            max_target_bytes: (gib * 1024.0 * 1024.0 * 1024.0) as u64,
+            max_target_bytes,
             current_window: Duration::from_secs(3600),
             hot_window: Duration::from_secs(3600),
             hot_categories: HOT_CATEGORIES.to_vec(),

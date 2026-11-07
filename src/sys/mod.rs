@@ -546,6 +546,11 @@ pub fn detach_command(cmd: &mut Command, inherit: &[&File]) {
     imp::detach_command(cmd, inherit)
 }
 
+/// Starts `cmd` detached with null stdio; on Windows the child inherits no handles at all, so nothing of the parent's stays open in it.
+pub fn spawn_detached(cmd: &mut Command, inherit: &[&File]) -> io::Result<()> {
+    imp::spawn_detached(cmd, inherit)
+}
+
 /// When false, `detach_command` cannot pass files to the child, which must re-acquire their locks.
 pub const INHERITS_DESCRIPTORS: bool = imp::INHERITS_DESCRIPTORS;
 

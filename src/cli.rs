@@ -87,13 +87,13 @@ fn print_help() {
     println!("{}", s.bold("Commands"));
     for (name, text) in [
         ("stats", "cache hit rate, time saved, disk use, target directories"),
-        ("gc", "prune the cache and target directories  [--dry-run] [--yes] [--max-gib N] [--max-idle-days N]"),
+        ("gc", "prune the cache and target directories  [--dry-run] [--yes] [--max-age-days N] [--max-gib N] [--max-idle-days N]"),
         ("compact", "shrink target directories: drop superseded variants, compress, dedupe  [--dry-run] [--yes] [--no-compress] [--no-dedupe] [--keep-variants]"),
         ("doctor", "check the environment frust depends on"),
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
         ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
-        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent [--concurrent-profile=dev|release|thin|fat] [--concurrent-incremental=on|off]] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking]"),
+        ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent [--concurrent-profile=dev|release|thin|fat] [--concurrent-incremental=on|off]] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking] [--repo PATH [--edits N] [--package P] [--markdown] [--out FILE] [--gate]]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
         ("tool", "run any toolchain tool unchanged: frust tool rustfmt --version"),
@@ -102,7 +102,7 @@ fn print_help() {
         println!("  {:<9} {}", s.cyan(name), text);
     }
     println!("\nAnything else is passed to cargo untouched, including +toolchain and future subcommands.");
-    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_LINK FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_GIB FRUST_UPDATE_CHECK");
+    println!("Environment: FRUST_HOME FRUST_CACHE FRUST_TARGET FRUST_TUNE FRUST_LINK FRUST_RENDER FRUST_OSC FRUST_LOCK_TIMEOUT_SECS FRUST_CACHE_MAX_AGE_DAYS FRUST_CACHE_MAX_GIB FRUST_TARGET_MAX_GIB FRUST_UPDATE_CHECK");
 }
 
 fn flag_value(flags: &[String], name: &str) -> Option<String> {
@@ -247,9 +247,12 @@ fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
         return gc::run_auto_child(dirs, cfg);
     }
     let s = Styler::detect();
-    let mut opts = GcOptions::new(cfg.cache_max_bytes);
-    if let Some(gib) = flag_value(flags, "--max-gib").and_then(|v| v.parse::<f64>().ok()) {
+    let mut opts = GcOptions::from_config(cfg);
+    if let Some(gib) = flag_value(flags, "--max-gib").and_then(|v| v.parse::<f64>().ok()).filter(|gib| *gib >= 0.0) {
         opts.max_cache_bytes = (gib * 1024.0 * 1024.0 * 1024.0) as u64;
+    }
+    if let Some(age) = flag_value(flags, "--max-age-days").and_then(|v| v.parse::<f64>().ok()).and_then(crate::config::days_to_duration) {
+        opts.cache_max_age = age;
     }
     if let Some(days) = flag_value(flags, "--max-idle-days").and_then(|v| v.parse::<u64>().ok()) {
         opts.target_max_idle = Duration::from_secs(days * 86_400);

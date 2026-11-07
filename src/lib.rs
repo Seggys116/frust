@@ -20,6 +20,7 @@ pub mod stats;
 pub(crate) mod store_broker;
 pub mod style;
 pub mod sys;
+pub mod timings;
 pub mod toolchain;
 pub mod unit_graph;
 pub mod ui;

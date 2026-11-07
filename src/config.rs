@@ -52,9 +52,9 @@ impl Config {
             cache_primary: flag("FRUST_CACHE_PRIMARY", true),
             cache_max_bytes: env::var("FRUST_CACHE_MAX_GIB")
                 .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .map(|gib| (gib * 1024.0 * 1024.0 * 1024.0) as u64)
-                .unwrap_or(16 * 1024 * 1024 * 1024),
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|gib| *gib >= 0.0)
+                .map_or(u64::MAX, |gib| (gib * 1024.0 * 1024.0 * 1024.0) as u64),
             target: match env::var("FRUST_TARGET").as_deref() {
                 Ok("local") | Ok("off") => TargetMode::Local,
                 _ => TargetMode::Central,
@@ -84,6 +84,22 @@ impl Config {
         }
     }
 }
+
+/// Days (fractional allowed) as a duration; negative or non-numeric input is rejected and huge values saturate.
+pub fn days_to_duration(days: f64) -> Option<Duration> {
+    (days >= 0.0).then(|| Duration::from_secs_f64((days * 86_400.0).min(u32::MAX as f64 * 86_400.0)))
+}
+
+/// `FRUST_CACHE_MAX_AGE_DAYS`: cache entries unused for longer are evicted; defaults to 14 days.
+pub fn cache_max_age() -> Duration {
+    env::var("FRUST_CACHE_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .and_then(days_to_duration)
+        .unwrap_or(DEFAULT_CACHE_MAX_AGE)
+}
+
+pub const DEFAULT_CACHE_MAX_AGE: Duration = Duration::from_secs(14 * 86_400);
 
 fn flag(name: &str, default: bool) -> bool {
     match env::var(name).as_deref() {

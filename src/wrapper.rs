@@ -27,6 +27,7 @@ use crate::fsx;
 use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
 use crate::sys::{self, LockKind};
+use crate::timings;
 
 const ENV_DENY_PREFIXES: &[&str] = &[
     "CARGO_TERM_",
@@ -166,10 +167,13 @@ struct Plan {
     waited_ms: AtomicU64,
     /// A helper finishing a store for a wrapper that has already returned; the wrapper recorded the cache event, so the helper records none.
     deferred: bool,
+    /// Stage timings for `FRUST_TIMINGS`; inert in a helper and when the variable is unset.
+    probe: timings::Probe,
 }
 
 impl Plan {
     fn build(cfg: &Config, args: &[OsString]) -> Option<Plan> {
+        let begun = Instant::now();
         // `<rustc> --flag ...`: a second positional means a tool chain such as clippy-driver.
         if args.len() < 2 || !args[1].to_string_lossy().starts_with('-') {
             return None;
@@ -254,6 +258,12 @@ impl Plan {
         let unit = env::var_os("CARGO_MANIFEST_DIR")
             .filter(|dir| !dir.is_empty() && !hasher.in_immutable_root(&cwd.join(dir)))
             .map(|_| unit);
+        let probe = timings::Probe::new(begun, || {
+            let mut record =
+                timings::Record::new(&parsed.crate_name, unit.is_some(), primary, parsed.incremental());
+            record.prekey_ms = timings::ms(keyed);
+            record
+        });
         Some(Plan {
             cfg: cfg.clone(),
             context,
@@ -273,6 +283,7 @@ impl Plan {
             trust,
             waited_ms: AtomicU64::new(0),
             deferred: false,
+            probe,
         })
     }
 
@@ -343,6 +354,7 @@ impl Plan {
             trust,
             waited_ms: AtomicU64::new(0),
             deferred: true,
+            probe: timings::Probe::off(),
         })
     }
 
@@ -351,9 +363,17 @@ impl Plan {
     }
 
     fn execute_after_miss(&self, after_miss: impl FnOnce()) -> i32 {
+        let code = self.run_phases(after_miss);
+        self.probe.finish();
+        code
+    }
+
+    fn run_phases(&self, after_miss: impl FnOnce()) -> i32 {
         fsx::install_temp_cleanup();
         let started = Instant::now();
         if self.try_hit(started) {
+            self.probe.mode(|| "hit".to_string());
+            self.probe.set(|r| r.lookup_ms = timings::ms(started).saturating_sub(r.restore_ms));
             self.debug(&format!(
                 "hit {} in {}ms",
                 self.parsed.crate_name,
@@ -361,6 +381,7 @@ impl Plan {
             ));
             return 0;
         }
+        self.probe.set(|r| r.lookup_ms = timings::ms(started));
         self.debug(&format!(
             "lookup {} missed after {}ms",
             self.parsed.crate_name,
@@ -371,11 +392,14 @@ impl Plan {
             Ok(locked) => locked,
             Err(error) => {
                 eprintln!("frust-wrap: cannot settle compiler slot: {error}");
+                self.probe.mode(|| "skip:slot-error".to_string());
                 return 1;
             }
         };
+        self.probe.set(|r| r.keywait_ms = self.waited());
         // The process that held the lock has published its entry by now if it stored one.
         if (key_lock.is_some() || waited) && self.try_hit(started) {
+            self.probe.mode(|| "hit".to_string());
             self.debug(&format!(
                 "hit {} after key lock, in {}ms",
                 self.parsed.crate_name,
@@ -468,8 +492,10 @@ impl Plan {
             let Some((dir, meta)) = self.cache.load_entry(&candidate.key) else {
                 continue;
             };
+            let restore_started = Instant::now();
             match self.restore(&dir, &meta) {
                 Ok(bytes) => {
+                    self.probe.set(|r| r.restore_ms = timings::ms(restore_started));
                     self.cache.mark_used(&candidate.key);
                     self.note_unit(&candidate.key);
                     let elapsed = started.elapsed().as_millis() as u64;
@@ -638,8 +664,8 @@ impl Plan {
         Ok(bytes)
     }
 
-    /// `key_lock` is held until the store has published, so a process queued behind it finds the entry.
-    fn compile_and_store(&self, key_lock: Option<File>) -> i32 {
+    /// A registry or git unit's `key_lock` is held until the store has published, so a process queued behind it finds the entry; a path unit's is released once its store is queued.
+    fn compile_and_store(&self, mut key_lock: Option<File>) -> i32 {
         if self.can_defer_store()
             && env::var_os(crate::store_broker::CAPABILITY_ENV).is_some_and(|value| !value.is_empty())
         {
@@ -658,6 +684,7 @@ impl Plan {
             preexisting.len(),
             started.elapsed().as_millis()
         ));
+        let rustc_started = Instant::now();
         let mut child = match compiler_command(&self.args[0])
             .args(&self.args[1..])
             .stderr(Stdio::piped())
@@ -669,6 +696,7 @@ impl Plan {
                     "frust-wrap: cannot run {}: {err}",
                     Path::new(&self.args[0]).display()
                 );
+                self.probe.mode(|| "skip:spawn-failed".to_string());
                 return 127;
             }
         };
@@ -676,8 +704,15 @@ impl Plan {
         let forwarder = thread::spawn(move || forward(pipe));
         let status = child.wait();
         let captured = forwarder.join().unwrap_or_default();
-        let Ok(status) = status else { return 1 };
+        self.probe.set(|r| r.rustc_ms = timings::ms(rustc_started));
+        let Ok(status) = status else {
+            self.probe.mode(|| "skip:wait-failed".to_string());
+            return 1;
+        };
         let code = status.code().unwrap_or(1);
+        if !status.success() {
+            self.probe.mode(|| "skip:rustc-failed".to_string());
+        }
         if status.success() {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
@@ -686,7 +721,7 @@ impl Plan {
                 compile_ms,
                 spawned_ns,
                 &preexisting,
-                key_lock.as_ref(),
+                &mut key_lock,
             ) {
                 self.debug(&format!(
                     "compiled {} in {compile_ms}ms, store deferred",
@@ -699,6 +734,7 @@ impl Plan {
                         self.parsed.crate_name
                     ));
                 }
+                self.probe.set(|r| r.inline_store_ms = timings::ms(store_started));
                 self.debug(&format!(
                     "compiled {} in {compile_ms}ms, stored in {}ms",
                     self.parsed.crate_name,
@@ -718,15 +754,20 @@ impl Plan {
         compile_ms: u64,
         spawned_ns: i128,
         preexisting: &HashMap<String, Stamp>,
-        key_lock: Option<&File>,
+        key_lock: &mut Option<File>,
     ) -> bool {
         // Capability probes reuse or delete these exact output names immediately after the wrapper returns.
         if !self.can_defer_store() {
+            self.probe.mode(|| {
+                let reason = if self.cfg.store_sync { "sync" } else { "metadata-only" };
+                format!("inline:{reason}")
+            });
             return false;
         }
         match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock) {
             Ok(handed_over) => handed_over,
             Err(err) => {
+                self.probe.mode(|| "inline:error".to_string());
                 self.debug(&format!(
                     "store of {} not deferred: {err}",
                     self.parsed.crate_name
@@ -734,6 +775,16 @@ impl Plan {
                 false
             }
         }
+    }
+
+    /// Edits of a path unit share a prekey, so its store must not hold the lock the next edit's build needs.
+    fn lends_key_lock(&self) -> bool {
+        self.unit.is_none()
+    }
+
+    fn declined(&self, reason: &str) -> io::Result<bool> {
+        self.probe.mode(|| format!("inline:{reason}"));
+        Ok(false)
     }
 
     fn can_defer_store(&self) -> bool {
@@ -747,7 +798,7 @@ impl Plan {
         compile_ms: u64,
         spawned_ns: i128,
         preexisting: &HashMap<String, Stamp>,
-        key_lock: Option<&File>,
+        key_lock: &mut Option<File>,
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
         let broker = crate::store_broker::AdmissionPermit::try_reserve(&self.dirs)?;
@@ -761,16 +812,22 @@ impl Plan {
                 "deferred store slots busy or unavailable for {}; storing inline",
                 self.parsed.crate_name
             ));
-            return Ok(false);
+            return self.declined("slots-busy");
         };
-        let Some(frozen) = self.freeze(captured, spawned_ns, preexisting) else {
-            return Ok(false);
+        let frozen_started = Instant::now();
+        let frozen = self.freeze(captured, spawned_ns, preexisting);
+        self.probe.set(|r| r.freeze_ms = timings::ms(frozen_started));
+        let Some(frozen) = frozen else {
+            return self.declined("freeze");
         };
+        let spawn_started = Instant::now();
+        let queued = broker.is_some();
+        let lent = self.lent(key_lock);
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
         let mut keep: Vec<&File> = slot.iter().map(|(file, _)| file).collect();
-        keep.extend(key_lock);
+        keep.extend(lent);
         if broker.is_none() && !sys::inheritable_clear_of_stdio(&keep) {
-            return Ok(false);
+            return self.declined("stdio-overlap");
         }
         // Where handles are not inherited the helper takes both locks again by path.
         let helper_relocks = broker.is_none() && !sys::INHERITS_DESCRIPTORS;
@@ -780,7 +837,7 @@ impl Plan {
             .map(|a| a.to_str().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
         else {
-            return Ok(false);
+            return self.declined("non-utf8-args");
         };
         let job = StoreJob {
             format: JOB_FORMAT,
@@ -823,7 +880,7 @@ impl Plan {
                 .as_ref()
                 .filter(|_| helper_relocks)
                 .map(|(_, path)| self.cwd.join(path)),
-            key_lock: key_lock
+            key_lock: lent
                 .filter(|_| helper_relocks)
                 .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
         };
@@ -833,12 +890,16 @@ impl Plan {
         keep.push(&job_lease);
         let handed_over = match broker {
             Some(permit) => submit_broker_job(&job_path, |path| {
-                permit.submit(&self.cwd.join(path), key_lock)
+                permit.submit(&self.cwd.join(path), lent)
             }),
             None => spawn_helper(&job_path, &self.cwd, &keep, &job_lease).map(|()| true),
         };
+        self.probe.set(|r| r.spawn_ms = timings::ms(spawn_started));
         match handed_over {
             Ok(true) => {
+                let mode = if queued { "queued" } else { "deferred" };
+                self.probe.mode(|| mode.to_string());
+                self.release_unlent(key_lock);
                 // Recorded now so the run's feed sees the compile; the helper stores quietly.
                 events::record_waited(
                     &self.dirs,
@@ -855,11 +916,23 @@ impl Plan {
                 );
                 Ok(true)
             }
-            Ok(false) => Ok(false),
+            Ok(false) => self.declined("handoff-declined"),
             Err(err) => {
                 let _ = fs::remove_file(&job_path);
                 Err(err)
             }
+        }
+    }
+
+    /// The lock a store receives: only registry and git units pass theirs on.
+    fn lent<'a>(&self, key_lock: &'a Option<File>) -> Option<&'a File> {
+        key_lock.as_ref().filter(|_| self.lends_key_lock())
+    }
+
+    /// A path unit's lock is released once its store is queued, so the next edit's build does not wait for the store.
+    fn release_unlent(&self, key_lock: &mut Option<File>) {
+        if !self.lends_key_lock() {
+            drop(key_lock.take());
         }
     }
 
@@ -2491,7 +2564,7 @@ fn helper_beside(exe: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// Starts the detached helper. The `keep` files (the held locks) are inherited where the platform allows, so the locks outlive the wrapper.
+/// Starts the detached helper. The `keep` files (the held locks) are inherited where the platform allows, so the locks outlive the wrapper; where it does not, the helper relocks by path.
 fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File], lease: &File) -> io::Result<()> {
     let mut cmd = Command::new(helper_exe()?);
     // Preserve the producer directory for compatibility with one-shot helpers.
@@ -2506,8 +2579,7 @@ fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File], lease: &File) -> io::Res
     }
     #[cfg(not(unix))]
     let _ = lease;
-    sys::detach_command(&mut cmd, keep);
-    cmd.spawn().map(drop)
+    sys::spawn_detached(&mut cmd, keep)
 }
 
 /// Takes the locks the wrapper could not hand over; blocking, because the wrapper releases its own as it returns.
@@ -2562,7 +2634,7 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
     0
 }
 
-/// The key lock and slot lock were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
+/// The slot lock, and the key lock of a registry or git unit, were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
 fn run_deferred(job: &StoreJob) {
     run_deferred_with(job, &Config::from_env());
 }
@@ -6002,7 +6074,7 @@ mod tests {
         let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         assert!(
             !plan
-                .spawn_deferred(&[], 0, 0, &HashMap::new(), None)
+                .spawn_deferred(&[], 0, 0, &HashMap::new(), &mut None)
                 .unwrap()
         );
         let dir = plan.dirs.deferred();
@@ -6014,6 +6086,42 @@ mod tests {
             acquire_slot(&dir, 1).or_else(|| (thread::sleep(Duration::from_millis(20)), None).1)
         });
         assert!(released.is_some(), "the early return releases its slot");
+    }
+
+    fn held_key_lock(plan: &Plan) -> (Option<File>, File) {
+        let path = keylock_path(&plan.dirs, &plan.prekey);
+        let held = open_key_lock(&plan.dirs, &path).unwrap();
+        assert!(try_key_lock(&held).unwrap());
+        (Some(held), open_key_lock(&plan.dirs, &path).unwrap())
+    }
+
+    #[test]
+    fn a_queued_path_unit_store_releases_the_key_lock_at_once() {
+        let s = Scratch::new("path-unit-lock");
+        let (mut job, _, _) = fixture(&s);
+        job.unit = Some("workspace-unit".to_string());
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let (mut held, probe) = held_key_lock(&plan);
+        assert!(plan.lent(&held).is_none(), "the store receives no lock for a path unit");
+        assert!(!try_key_lock(&probe).unwrap());
+        plan.release_unlent(&mut held);
+        assert!(held.is_none());
+        assert!(try_key_lock(&probe).unwrap(), "the next edit's build can take the lock");
+    }
+
+    #[test]
+    fn a_queued_registry_unit_store_keeps_the_key_lock_until_it_publishes() {
+        let s = Scratch::new("registry-unit-lock");
+        let (job, _, _) = fixture(&s);
+        assert!(job.unit.is_none());
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let (mut held, probe) = held_key_lock(&plan);
+        assert!(plan.lent(&held).is_some(), "the store receives the registry unit's lock");
+        plan.release_unlent(&mut held);
+        assert!(held.is_some());
+        assert!(!try_key_lock(&probe).unwrap(), "still held for the store");
+        drop(held);
+        assert!(try_key_lock(&probe).unwrap());
     }
 
     #[test]

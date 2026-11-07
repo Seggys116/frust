@@ -445,8 +445,7 @@ fn spawn_checker(dirs: &Dirs) -> bool {
     let Some(exe) = frust_binary() else { return false };
     let mut cmd = Command::new(exe);
     cmd.args(["self-update", BACKGROUND_FLAG]).env("FRUST_HOME", dirs.root());
-    sys::detach_command(&mut cmd, &[]);
-    cmd.spawn().is_ok()
+    sys::spawn_detached(&mut cmd, &[]).is_ok()
 }
 
 fn overrides_active() -> bool {

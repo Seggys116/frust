@@ -543,6 +543,11 @@ pub fn detach_command(cmd: &mut Command, inherit: &[&File]) {
     }
 }
 
+pub fn spawn_detached(cmd: &mut Command, inherit: &[&File]) -> io::Result<()> {
+    detach_command(cmd, inherit);
+    cmd.spawn().map(drop)
+}
+
 pub fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
 }
