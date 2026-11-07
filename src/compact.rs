@@ -2870,6 +2870,8 @@ struct StoreIndex {
     by_size: HashMap<u64, Vec<PathBuf>>,
     raw_context: HashMap<PathBuf, StoredArtifact>,
     encoded: HashMap<u64, Vec<StoredArtifact>>,
+    /// Store files that are second names of target outputs; they cover a target file only while they still hold its recorded bytes.
+    linked: HashMap<u64, Vec<StoredArtifact>>,
     proofs: RefCell<CoverageProofs>,
 }
 
@@ -2994,18 +2996,20 @@ impl StoreIndex {
             for artifact in entries {
                 let file = &artifact.entry.files[artifact.file];
                 if file.encoding.is_raw() || file.dir { continue; }
+                let linked = file.encoding == crate::cache::payload::Encoding::Linked;
                 if let (Some(len), Some(hash)) = (file.decoded_bytes, file.content_hash.as_ref())
                     && len > 0 && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
                     && regular_key(&artifact.path).is_some()
                 {
-                    index.encoded.entry(len).or_default().push(artifact);
+                    let bucket = if linked { &mut index.linked } else { &mut index.encoded };
+                    bucket.entry(len).or_default().push(artifact);
                 }
             }
         }
         for paths in index.by_size.values_mut() {
             paths.sort();
         }
-        for paths in index.encoded.values_mut() {
+        for paths in index.encoded.values_mut().chain(index.linked.values_mut()) {
             paths.sort_by(|a, b| a.path.cmp(&b.path));
         }
         index
@@ -3043,12 +3047,27 @@ impl StoreIndex {
         {
             return regular_key(path) == Some(FileKey::of(meta));
         }
-        if candidates.is_none() && !self.encoded.contains_key(&meta.len()) {
+        if candidates.is_none() && !self.encoded.contains_key(&meta.len()) && !self.linked.contains_key(&meta.len()) {
             return false;
         }
         let key = FileKey::of(meta);
         let mut proof = self.proofs.borrow_mut();
         let Some(hash) = proof.hash(path, key) else { return false };
+        for artifact in self.linked.get(&meta.len()).into_iter().flatten() {
+            let payload = &artifact.entry.files[artifact.file];
+            let Some(mode) = payload.mode else { continue };
+            if payload.content_hash.as_ref() != Some(&hash) || mode & 0o7777 != meta.mode() & 0o7777 || !artifact.entry.current() { continue; }
+            let Ok(stored) = sys::lstat(&artifact.path) else { continue };
+            if !stored.is_file() || stored.len() != meta.len() { continue; }
+            // The same inode already proves the bytes; otherwise the store file must hash to the record itself.
+            let shared = stored.dev() == meta.dev() && stored.ino() == meta.ino();
+            if (shared || proof.hash(&artifact.path, FileKey::of(&stored)).as_ref() == Some(&hash))
+                && regular_key(path) == Some(key) && artifact.entry.current()
+                && regular_key(&artifact.path).is_some_and(|now| shared || now == FileKey::of(&stored))
+            {
+                return true;
+            }
+        }
         if let Some(encoded) = self.encoded.get(&meta.len()) {
             for artifact in encoded {
                 let payload = &artifact.entry.files[artifact.file];
@@ -3484,7 +3503,7 @@ mod tests {
             crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(),
             files: vec![crate::cache::StoredFile {
                 name: source.file_name().unwrap().to_str().unwrap().into(), stored: "f0".into(), text: false, bytes: file.bytes, dir: false,
-                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None,
+                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None, mode: None,
             }], stderr: "stderr".into(),
         };
         fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
@@ -3515,12 +3534,12 @@ mod tests {
         let base = crate::cache::StoredFile {
             name: "libapp-0123456789abcdef.rlib".into(), stored: "f0".into(), text: false, bytes: stored.bytes,
             encoding: stored.encoding, stored_bytes: stored.stored_bytes, decoded_bytes: stored.decoded_bytes,
-            content_hash: stored.content_hash, metadata_slice: None, dir: false,
+            content_hash: stored.content_hash, metadata_slice: None, dir: false, mode: None,
         };
         let target = crate::cache::StoredFile {
             name: artifact.file_name().unwrap().to_string_lossy().into_owned(), stored: "f1".into(), text: false,
             bytes: fsx::allocated_size(&artifact), encoding: crate::cache::payload::Encoding::Raw, stored_bytes: None,
-            decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false,
+            decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None,
         };
         let slice = crate::cache::metadata_slice::build(&entry.join("f0"), &base, &artifact, &target, None).unwrap().unwrap();
         let meta = crate::cache::EntryMeta {
@@ -3677,6 +3696,37 @@ mod tests {
             assert!(!index.covers(&paths), "payload mutations invalidate source proofs");
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn a_linked_store_file_covers_a_target_only_while_it_holds_the_recorded_bytes() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-coverage-linked"));
+        let artifact = root.join("debug/deps/libapp-0123456789abcdef.rlib");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, vec![7; 128 * 1024]).unwrap();
+        let store = root.join("store");
+        let entry = coverage_entry(&store, &artifact, false);
+        let stored = entry.join("f0");
+        fs::remove_file(&stored).unwrap();
+        fs::hard_link(&artifact, &stored).unwrap();
+        let meta_path = entry.join("meta.json");
+        let mut meta: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let file = &mut meta.files[0];
+        file.encoding = crate::cache::payload::Encoding::Linked;
+        file.stored_bytes = Some(128 * 1024);
+        file.decoded_bytes = Some(128 * 1024);
+        file.content_hash = Some(crate::cache::hash_file(&artifact).unwrap());
+        file.mode = Some(sys::lstat(&artifact).unwrap().mode());
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let paths = [(artifact.clone(), 0)];
+        assert!(StoreIndex::new(&store).covers(&paths), "a link that still holds the recorded bytes covers the target name");
+        fs::write(&artifact, vec![8; 128 * 1024]).unwrap();
+        assert!(!StoreIndex::new(&store).covers(&paths), "a rewrite through the target name changes the store file too, leaving no copy");
+        fs::write(&artifact, vec![7; 128 * 1024]).unwrap();
+        fs::remove_file(&stored).unwrap();
+        fs::write(&stored, vec![9; 128 * 1024]).unwrap();
+        assert!(!StoreIndex::new(&store).covers(&paths), "a store file whose bytes differ from the record is no copy of the target");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -521,10 +521,22 @@ impl Plan {
                     );
                     return true;
                 }
-                Err(err) => self.debug(&format!(
-                    "restore failed for {}: {err}",
-                    self.parsed.crate_name
-                )),
+                Err(err) => {
+                    self.debug(&format!(
+                        "restore failed for {}: {err}",
+                        self.parsed.crate_name
+                    ));
+                    // A linked entry whose store file was rewritten in place (or lost) cannot restore again, and a surviving one would stop the store that replaces it.
+                    if cache::payload::is_unbacked(&err) {
+                        self.debug(&format!(
+                            "dropped linked entry {} of {}: {err}",
+                            candidate.key, self.parsed.crate_name
+                        ));
+                        self.cache.remove_entry(&candidate.key);
+                    } else if cache::payload::is_unstable(&err) {
+                        self.debug(&format!("kept linked entry {} of {}: {err}", candidate.key, self.parsed.crate_name));
+                    }
+                }
             }
         }
         false
@@ -650,6 +662,10 @@ impl Plan {
             }
             let src = entry.join(&file.stored);
             let dst = out_dir.join(&file.name);
+            if file.encoding == cache::payload::Encoding::Linked {
+                self.restore_linked(entry, file, &dst)?;
+                return Ok(file.bytes);
+            }
             if file.text {
                 let text = dep_info_resolved(&fs::read_to_string(&src)?, profile);
                 fsx::write_atomic(&dst, text.as_bytes())?;
@@ -669,6 +685,30 @@ impl Plan {
         out.write_all(stderr.as_bytes())?;
         out.flush()?;
         Ok(bytes)
+    }
+
+    /// A destination already holding the bytes is kept; otherwise the store file is copied into place (never linked) and then offered to `adopt`. An `Unbacked` error means the store file no longer carries the entry.
+    fn restore_linked(&self, entry: &Path, file: &StoredFile, dst: &Path) -> io::Result<()> {
+        if cache::payload::verify_in_place(dst, file).is_ok() {
+            fsx::touch(dst);
+            return Ok(());
+        }
+        let store_file = entry.join(&file.stored);
+        cache::payload::restore_linked(&store_file, dst, file)?;
+        fsx::touch(dst);
+        cache::payload::adopt(&store_file, dst);
+        Ok(())
+    }
+
+    /// Whether outputs may be stored as links to the target file: the cache volume has no clones (or the mode forces it) and compression is not off.
+    fn linked_storage(&self) -> bool {
+        let mode = self.context.backed;
+        if mode == cache::payload::BackedMode::Off || !self.context.compression_requested {
+            return false;
+        }
+        let tmp = self.dirs.tmp();
+        let _ = fs::create_dir_all(&tmp);
+        mode == cache::payload::BackedMode::Force || cache::payload::clones_unavailable(&tmp)
     }
 
     /// A registry or git unit's `key_lock` is held until the store has published, so a process queued behind it finds the entry; a path unit's is released once its store is queued.
@@ -989,6 +1029,7 @@ impl Plan {
         let mut commitments = HashMap::new();
         let compress = self.context.compression_requested
             && cache::payload::compression_supported(&self.dirs.tmp());
+        let linked = self.linked_storage();
         for name in &names {
             let path = self.output_dir_abs.join(name);
             // A bundle's inner files can change without its own stamp moving.
@@ -996,10 +1037,10 @@ impl Plan {
             if meta.is_dir() {
                 return None;
             }
-            if compress
-                && !name.ends_with(".d")
+            if !name.ends_with(".d")
                 && meta.is_file()
-                && meta.len() >= cache::payload::MIN_BYTES
+                && ((compress && meta.len() >= cache::payload::MIN_BYTES)
+                    || (linked && meta.len() >= cache::payload::LINKED_MIN_BYTES))
             {
                 let (committed_meta, commitment) = capture(&path).ok()?;
                 if Stamp::of(&meta) != Stamp::of(&committed_meta)
@@ -1264,7 +1305,11 @@ impl Plan {
                 )
             })
             .collect();
-        let key = entry_key(&self.prekey, &inputs, &envs);
+        let key = if self.linked_storage() {
+            backed_entry_key(&self.prekey, &inputs, &envs)
+        } else {
+            entry_key(&self.prekey, &inputs, &envs)
+        };
         let hashed_ms = started.elapsed().as_millis();
 
         if !self.cache.has_entry(&key) {
@@ -1363,14 +1408,27 @@ impl Plan {
             .enumerate()
             .map(|(i, name)| (name.as_str(), i))
             .collect();
-        let paired: Vec<Option<usize>> = names
+        // Linked files need a commitment taken before Cargo's handoff; an inline store takes its own.
+        let linked = self.linked_storage();
+        let wants_linked: Vec<bool> = names
             .iter()
             .map(|name| {
-                if !compress {
+                linked
+                    && !name.ends_with(".d")
+                    && commitments.is_none_or(|committed| committed.contains_key(name))
+                    && fs::symlink_metadata(out_dir.join(name)).is_ok_and(|m| m.is_file() && m.len() >= cache::payload::LINKED_MIN_BYTES)
+            })
+            .collect();
+        let paired: Vec<Option<usize>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if !compress || wants_linked[i] {
                     return None;
                 }
                 name.strip_suffix(".rmeta")
                     .and_then(|stem| indices.get(format!("{stem}.rlib").as_str()).copied())
+                    .filter(|&base| !wants_linked[base])
             })
             .collect();
         let captured_backings: BTreeSet<usize> = paired
@@ -1405,9 +1463,18 @@ impl Plan {
                         stored_bytes: None,
                         decoded_bytes: None,
                         content_hash: None,
+                        mode: None,
                     },
                     None,
                 )
+            } else if wants_linked[i] {
+                cache::payload::store_linked(
+                    &src,
+                    &staged.join(&stored),
+                    compress,
+                    commitments.and_then(|c| c.get(name)),
+                    false,
+                )?
             } else if capture {
                 cache::payload::store_proven(
                     &src,
@@ -1440,6 +1507,7 @@ impl Plan {
                     decoded_bytes: payload.decoded_bytes,
                     content_hash: payload.content_hash,
                     metadata_slice: None,
+                    mode: payload.mode,
                 },
                 proof,
             ))
@@ -1474,6 +1542,7 @@ impl Plan {
                 decoded_bytes: None,
                 content_hash: None,
                 metadata_slice: None,
+                mode: None,
             };
             match cache::metadata_slice::build_proven(
                 &staged.join(&base.stored),
@@ -1791,6 +1860,8 @@ impl StampWire {
 struct StoreContext {
     package_version: String,
     compression_requested: bool,
+    #[serde(default)]
+    backed: cache::payload::BackedMode,
     immutable_source_roots: Vec<PathBuf>,
 }
 
@@ -1799,6 +1870,7 @@ impl StoreContext {
         Self {
             package_version: env::var("CARGO_PKG_VERSION").unwrap_or_default(),
             compression_requested: cache_compression_requested(),
+            backed: cache::payload::BackedMode::from_env(),
             immutable_source_roots: immutable_source_roots()
                 .iter()
                 .map(|root| cwd.join(root))
@@ -2713,8 +2785,17 @@ fn forward(pipe: impl io::Read) -> Vec<u8> {
 
 /// Stamps are not part of the key: it names content only.
 fn entry_key(prekey: &str, inputs: &[Input], envs: &[(String, Option<String>)]) -> String {
+    entry_key_in(b"frust-entry-payload-v1\0", prekey, inputs, envs)
+}
+
+/// Entries that may hold backed files get their own key domain, so writers unaware of them never compute or find these keys.
+fn backed_entry_key(prekey: &str, inputs: &[Input], envs: &[(String, Option<String>)]) -> String {
+    entry_key_in(b"frust-entry-backed-v1\0", prekey, inputs, envs)
+}
+
+fn entry_key_in(domain: &[u8], prekey: &str, inputs: &[Input], envs: &[(String, Option<String>)]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"frust-entry-payload-v1\0");
+    hasher.update(domain);
     hasher.update(prekey.as_bytes());
     for input in inputs {
         hasher.update(b"\0i");
@@ -4929,6 +5010,7 @@ mod tests {
             job.context = StoreContext {
                 package_version: version.to_string(),
                 compression_requested: compress,
+                backed: cache::payload::BackedMode::default(),
                 immutable_source_roots: vec![job.cwd.join("immutable")],
             };
             let plan = Plan::from_job(&job, &worker_config).unwrap();
@@ -5026,6 +5108,99 @@ mod tests {
             assert!(frozen.inputs.contains_key(&src));
             assert!(frozen.inputs.keys().all(|path| path.is_absolute()));
         }
+    }
+
+    // A finished compile whose library is large enough to be linked, with the commitment the wrapper would have frozen.
+    fn linked_job(s: &Scratch) -> (StoreJob, PathBuf) {
+        let (mut job, _, rlib) = fixture(s);
+        fs::write(&rlib, vec![b'r'; 3 * 4096 + 5]).unwrap();
+        job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
+        job.context.backed = cache::payload::BackedMode::Force;
+        let (_, commitment) = cache::payload::capture(&rlib).unwrap();
+        job.commitments.insert("libk.rlib".to_string(), commitment);
+        (job, rlib)
+    }
+
+    #[test]
+    fn a_linked_deferred_store_shares_the_target_inode_and_restores_only_verified_bytes() {
+        let s = Scratch::new("linked-deferred");
+        let (job, rlib) = linked_job(&s);
+        let expected = fs::read(&rlib).unwrap();
+        run_deferred(&job);
+        let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let candidates = plan.cache.candidates(&job.prekey);
+        assert_eq!(candidates.len(), 1);
+        let key = candidates[0].key.clone();
+        assert_eq!(key, backed_entry_key(&job.prekey, &candidates[0].inputs, &[]));
+        assert_ne!(key, entry_key(&job.prekey, &candidates[0].inputs, &[]), "linked entries use their own key domain");
+        let (entry, meta) = plan.cache.load_entry(&key).unwrap();
+        let file = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
+        assert_eq!(file.encoding, cache::payload::Encoding::Linked);
+        let stored = entry.join(&file.stored);
+        let original = sys::lstat(&rlib).unwrap();
+        assert_eq!(sys::lstat(&stored).unwrap().ino(), original.ino(), "the store file is a second name of the output");
+        assert_eq!(file.mode, Some(original.mode()));
+        let dep = meta.files.iter().find(|f| f.name == "k.d").unwrap();
+        assert!(dep.mode.is_none() && entry.join(&dep.stored).is_file());
+
+        plan.restore(&entry, &meta).unwrap();
+        assert_eq!(sys::lstat(&rlib).unwrap().ino(), original.ino(), "an intact destination is verified in place");
+
+        // Cargo unlinks the name and rustc renames a new file over it; the store file keeps the old inode alive.
+        fs::remove_file(&rlib).unwrap();
+        fs::write(rlib.with_file_name("rustc-temp"), b"another build").unwrap();
+        sys::rename(&rlib.with_file_name("rustc-temp"), &rlib).unwrap();
+        plan.restore(&entry, &meta).unwrap();
+        assert_eq!(fs::read(&rlib).unwrap(), expected);
+        assert_eq!(sys::lstat(&rlib).unwrap().ino(), sys::lstat(&stored).unwrap().ino(), "an orphaned store file adopts the verified destination");
+
+        let second = s.0.join("second").join("deps");
+        fs::create_dir_all(&second).unwrap();
+        plan.parsed.out_dir = second.clone();
+        plan.output_dir_abs = second.clone();
+        plan.restore(&entry, &meta).unwrap();
+        assert_eq!(fs::read(second.join("libk.rlib")).unwrap(), expected);
+        assert_ne!(sys::lstat(&second.join("libk.rlib")).unwrap().ino(), sys::lstat(&rlib).unwrap().ino(), "two targets never share an inode");
+        assert_ne!(sys::lstat(&second.join("libk.rlib")).unwrap().ino(), sys::lstat(&stored).unwrap().ino());
+
+        #[cfg(unix)]
+        {
+            sys::set_path_mode(&rlib, 0o700).unwrap();
+            let third = s.0.join("third").join("deps");
+            fs::create_dir_all(&third).unwrap();
+            plan.parsed.out_dir = third.clone();
+            plan.output_dir_abs = third.clone();
+            plan.restore(&entry, &meta).unwrap();
+            assert_eq!(sys::lstat(&third.join("libk.rlib")).unwrap().mode(), original.mode(), "the recorded mode wins over a chmod through another name");
+        }
+
+        let mut changed = expected.clone();
+        changed[100] ^= 1;
+        fs::write(&rlib, &changed).unwrap();
+        let fourth = s.0.join("fourth").join("deps");
+        fs::create_dir_all(&fourth).unwrap();
+        plan.parsed.out_dir = fourth.clone();
+        plan.output_dir_abs = fourth.clone();
+        let denied = plan.restore(&entry, &meta).unwrap_err();
+        assert!(cache::payload::is_unbacked(&denied), "{denied}");
+        assert!(!fourth.join("libk.rlib").exists(), "an in-place rewrite publishes nothing");
+    }
+
+    #[test]
+    fn a_link_that_fails_stores_an_ordinary_copy() {
+        let s = Scratch::new("linked-fallback");
+        let (job, rlib) = linked_job(&s);
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let staged = plan.cache.stage().unwrap();
+        // A staged name that already exists makes the link fail.
+        fs::write(staged.join("f1"), b"in the way").unwrap();
+        let meta = plan
+            .stage_entry(&staged, &job.names, (&job.dep_name, &job.dep_text), b"", 7, Some(&job.commitments))
+            .unwrap();
+        let file = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
+        assert_ne!(file.encoding, cache::payload::Encoding::Linked);
+        assert_ne!(sys::lstat(&staged.join(&file.stored)).unwrap().ino(), sys::lstat(&rlib).unwrap().ino());
+        assert!(file.mode.is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Clone or copy artifacts, never hard-link: rustc/linker in-place rewrites could corrupt the cache.
+//! Clone or copy artifacts, never link one target to another; the store links a target output only as a Linked file that every restore re-hashes.
 
 use std::fs::{self, File};
 use std::io::{self, Write};

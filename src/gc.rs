@@ -205,6 +205,36 @@ struct ScannedEntry {
     unit: Option<IncrementalUnit>,
     estimate: Option<u64>,
     retirement: Option<cache::EntryRetirementSnapshot>,
+    link: LinkState,
+    /// The prekey, which names a unit across every state of its inputs.
+    group: Option<String>,
+}
+
+/// How an entry's linked files relate to target names: a file still shared with one frees nothing when the entry goes.
+#[derive(Debug, Default, Clone, Copy)]
+struct LinkState {
+    any: bool,
+    /// Every linked file has no other name left.
+    orphaned: bool,
+    shared_alloc: u64,
+    shared_estimate: u64,
+}
+
+fn link_state(entry: &Path, meta: &cache::EntryMeta) -> LinkState {
+    let mut state = LinkState { orphaned: true, ..LinkState::default() };
+    for file in meta.files.iter().filter(|f| f.encoding == cache::payload::Encoding::Linked && cache::safe_file_name(&f.stored)) {
+        state.any = true;
+        if let Ok(stored) = sys::lstat(&entry.join(&file.stored))
+            && stored.is_file()
+            && stored.nlink() > 1
+        {
+            state.orphaned = false;
+            state.shared_alloc += stored.allocated();
+            state.shared_estimate += file.stored_bytes.unwrap_or(file.bytes).div_ceil(4096) * 4096;
+        }
+    }
+    state.orphaned &= state.any;
+    state
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -266,10 +296,12 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
                 Err(_) => (SystemTime::UNIX_EPOCH, None),
             };
             let unit = meta.as_ref().and_then(unit_identity);
-            let estimate = meta.as_ref().and_then(estimate_entry_bytes);
+            let link = meta.as_ref().map(|meta| link_state(&path, meta)).unwrap_or_default();
+            let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| bytes.saturating_sub(link.shared_estimate));
+            let group = meta.as_ref().and_then(|meta| meta.prekey.clone());
             let retirement = retirement.filter(|snapshot| snapshot.used() == used
                 && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
-            out.push(ScannedEntry { path, used, unit, estimate, retirement });
+            out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group });
         }
     }
     out
@@ -278,7 +310,9 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
 fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)> {
     let mut units: HashMap<&IncrementalUnit, Vec<(SystemTime, &Path)>> = HashMap::new();
     for entry in scanned {
-        if let Some(unit) = &entry.unit {
+        if let Some(unit) = &entry.unit
+            && !entry.link.any
+        {
             units.entry(unit).or_default().push((entry.used, entry.path.as_path()));
         }
     }
@@ -287,6 +321,19 @@ fn superseded_among(scanned: &[ScannedEntry], keep: usize) -> Vec<(PathBuf, u64)
         entries.sort_by_key(|e| std::cmp::Reverse(e.0));
         for (_, path) in entries.into_iter().skip(keep) {
             out.push((path.to_path_buf(), fsx::allocated_size(path)));
+        }
+    }
+    // A linked entry that no target name shares costs a full copy, so every one but the newest of its unit goes at once.
+    let mut groups: HashMap<&str, Vec<&ScannedEntry>> = HashMap::new();
+    for entry in scanned {
+        if entry.link.any && let Some(group) = entry.group.as_deref() {
+            groups.entry(group).or_default().push(entry);
+        }
+    }
+    for (_, mut entries) in groups {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.used));
+        for entry in entries.into_iter().skip(1).filter(|e| e.link.orphaned) {
+            out.push((entry.path.clone(), fsx::allocated_size(&entry.path)));
         }
     }
     out.sort();
@@ -341,13 +388,15 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
             evicted.insert(key.to_string_lossy().into_owned());
         }
     }
+    let shared: HashMap<PathBuf, u64> = scanned.iter().map(|e| (e.path.clone(), e.link.shared_alloc)).collect();
+    let measured = |path: &Path| fsx::allocated_size(path).saturating_sub(shared.get(path).copied().unwrap_or(0));
     let entries: Vec<(SystemTime, PathBuf, u64)> = scanned
         .iter()
         .filter(|e| !doomed.contains(e.path.as_path()))
         .map(|e| {
             let bytes = match e.estimate {
                 Some(estimate) if !exact => estimate,
-                _ => fsx::allocated_size(&e.path),
+                _ => measured(&e.path),
             };
             (e.used, e.path.clone(), bytes)
         })
@@ -371,7 +420,7 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
     let mut total = sum(&entries);
     if !exact && total > opts.max_cache_bytes {
         for entry in &mut entries {
-            entry.2 = fsx::allocated_size(&entry.1);
+            entry.2 = measured(&entry.1);
         }
         total = sum(&entries);
     }
@@ -995,12 +1044,12 @@ fn plan_metadata(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan:
     plan_history(dirs, opts, plan);
     plan_hashmemo(dirs, opts, plan);
     plan_startup_memos(dirs, opts, plan);
-    plan_compact_memos(dirs, opts, plan);
+    plan_aged_dir(&dirs.compact_memo_dir(), opts, plan);
 }
 
-/// A memo is rewritten only when its target's files change, so one untouched for a long time belongs to a target that is gone or idle.
-fn plan_compact_memos(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
-    let Ok(entries) = fs::read_dir(dirs.compact_memo_dir()) else { return };
+/// A memo or holder log is rewritten only when its target's files change, so one untouched for a long time belongs to a target that is gone or idle.
+fn plan_aged_dir(dir: &Path, opts: &GcOptions, plan: &mut Plan) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
@@ -2377,6 +2426,59 @@ mod tests {
         let superseded: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
         assert_eq!(superseded, vec![oldest]);
         assert!(middle.exists() && newest.exists() && plain.exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    fn linked_entry(home: &Path, key: &str, target: &Path, age_secs: u64) -> PathBuf {
+        let dir = home.join("store").join(&key[..2]).join(key);
+        fs::create_dir_all(&dir).unwrap();
+        fs::hard_link(target, dir.join("f0")).unwrap();
+        let len = fs::metadata(target).unwrap().len();
+        let meta = serde_json::json!({
+            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "prekey": "ab".repeat(20), "stderr": "",
+            "files": [{"name": "libx.rlib", "stored": "f0", "text": false, "bytes": len, "encoding": "linked",
+                       "stored_bytes": len, "decoded_bytes": len, "content_hash": "ab".repeat(32), "mode": 0o100644}],
+        });
+        fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        File::options().write(true).open(dir.join("meta.json")).unwrap().set_modified(SystemTime::now() - Duration::from_secs(age_secs)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn linked_entries_cost_nothing_while_shared_and_a_full_copy_once_orphaned() {
+        let home = home("linked-sizes");
+        let dirs = Dirs::at(&home);
+        let target = home.join("target-file");
+        fs::write(&target, vec![7u8; 65_536]).unwrap();
+        linked_entry(&home, &format!("aa{}", "1".repeat(38)), &target, 100);
+        let shared = scan_entries(&dirs);
+        assert_eq!(shared[0].estimate, Some(ENTRY_OVERHEAD_BYTES), "a file shared with a target name frees nothing");
+        assert!(!shared[0].link.orphaned);
+        fs::remove_file(&target).unwrap();
+        let orphaned = scan_entries(&dirs);
+        assert_eq!(orphaned[0].estimate, Some(ENTRY_OVERHEAD_BYTES + 65_536));
+        assert!(orphaned[0].link.orphaned);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn superseded_linked_entries_are_dropped_once_no_target_name_shares_them() {
+        let home = home("linked-superseded");
+        let dirs = Dirs::at(&home);
+        let mut targets = Vec::new();
+        let mut entries = Vec::new();
+        for (i, age) in [(1u8, 3000u64), (2, 2000), (3, 1000)] {
+            let target = home.join(format!("target-{i}"));
+            fs::write(&target, vec![i; 8192]).unwrap();
+            entries.push(linked_entry(&home, &format!("{i:02x}{}", "1".repeat(38)), &target, age));
+            targets.push(target);
+        }
+        assert!(superseded_incremental_entries(&dirs, 2).is_empty(), "entries shared with target names are kept");
+        fs::remove_file(&targets[0]).unwrap();
+        fs::remove_file(&targets[2]).unwrap();
+        let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
+        assert_eq!(dropped, vec![entries[0].clone()], "only older orphaned entries go, never the newest of the unit");
+        assert!(cache_removals(&plan(&dirs, &GcOptions::new(u64::MAX))).contains(&entries[0]));
         let _ = fs::remove_dir_all(&home);
     }
 

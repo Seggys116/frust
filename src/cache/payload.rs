@@ -11,6 +11,33 @@ use serde::{Deserialize, Serialize};
 use super::StoredFile;
 use crate::{fsx, sys};
 
+/// Outputs smaller than this keep ordinary payloads; a link saves too little to be worth the bookkeeping.
+pub const LINKED_MIN_BYTES: u64 = 4096;
+
+/// `FRUST_CACHE_BACKED`: `force` treats the cache volume as one without clones, for tests on copy-on-write volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackedMode {
+    Off,
+    #[default]
+    Auto,
+    Force,
+}
+
+impl BackedMode {
+    pub fn parse(value: Option<&str>) -> BackedMode {
+        match value {
+            Some("off" | "0" | "false" | "no") => BackedMode::Off,
+            Some("force") => BackedMode::Force,
+            _ => BackedMode::Auto,
+        }
+    }
+
+    pub fn from_env() -> BackedMode {
+        BackedMode::parse(std::env::var("FRUST_CACHE_BACKED").ok().as_deref())
+    }
+}
+
 const MAGIC: &[u8; 9] = b"FRUSTLZ4\x01";
 // Blocks use bounded little-endian decoded/encoded u32 lengths; a zero pair ends the stream.
 
@@ -24,6 +51,8 @@ pub enum Encoding {
     Raw,
     Lz4BlocksV1,
     InlineMetadataSliceV1,
+    /// The stored file is a second name of the target output, so the bytes exist once; every restore re-hashes it.
+    Linked,
 }
 
 impl Encoding {
@@ -38,16 +67,17 @@ pub struct StoredPayload {
     pub stored_bytes: Option<u64>,
     pub decoded_bytes: Option<u64>,
     pub content_hash: Option<String>,
+    pub mode: Option<u32>,
 }
 
 /// Captured before Cargo can uplift an output; the full hash permits later ctime-only drift.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commitment {
     pub(super) hash: String,
-    mode: u32,
+    pub(super) mode: u32,
     dev: u64,
-    ino: u64,
-    len: u64,
+    pub(super) ino: u64,
+    pub(super) len: u64,
     mtime: (i64, i64),
 }
 
@@ -121,9 +151,11 @@ pub fn capture(src: &Path) -> io::Result<(sys::Meta, Commitment)> {
 }
 
 pub fn compression_supported(staged: &Path) -> bool {
-    if !cfg!(any(target_os = "linux", windows)) {
-        return false;
-    }
+    cfg!(any(target_os = "linux", windows)) && clones_unavailable(staged)
+}
+
+/// A volume without clones and with a steady change time, probed once per device; the condition for compressed and backed storage.
+pub fn clones_unavailable(staged: &Path) -> bool {
     static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
     let Ok(meta) = sys::stat(staged) else {
         return false;
@@ -436,6 +468,7 @@ fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
                     stored_bytes: Some(fsx::allocated_size(dst)),
                     decoded_bytes: Some(decoded_bytes),
                     content_hash: Some(content_hash),
+                    mode: None,
                 },
                 proof,
             ));
@@ -473,6 +506,7 @@ fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
             stored_bytes: Some(fsx::allocated_size(dst)),
             decoded_bytes: None,
             content_hash: None,
+            mode: None,
         },
         None,
     ))
@@ -482,6 +516,9 @@ fn store_inner_captured<B: FnOnce(), C: FnOnce(), A: FnOnce()>(
 pub fn restore(src: &Path, dst: &Path, meta: &StoredFile) -> io::Result<()> {
     if meta.metadata_slice.is_some() || meta.encoding == Encoding::InlineMetadataSliceV1 {
         return Err(invalid("inline metadata requires grouped restore"));
+    }
+    if meta.encoding == Encoding::Linked {
+        return Err(invalid("linked entries restore through a verified copy"));
     }
     if meta.encoding.is_raw() {
         return fsx::clone_replace(src, dst);
@@ -584,6 +621,197 @@ pub(super) fn decode(source: &File, meta: &StoredFile, output: &mut impl Write) 
     Ok(())
 }
 
+/// A holder or destination that cannot supply an entry's bytes; any other error is a local failure to write.
+#[derive(Debug)]
+pub struct Unbacked(&'static str);
+
+impl std::fmt::Display for Unbacked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "linked file unusable: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unbacked {}
+
+pub fn unbacked(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, Unbacked(reason))
+}
+
+pub fn is_unbacked(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Unbacked>())
+}
+
+/// A copy whose source kept changing underneath it; the entry may be fine, so the candidate is skipped and nothing is removed.
+#[derive(Debug)]
+pub struct Unstable(&'static str);
+
+impl std::fmt::Display for Unstable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "linked file unstable: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unstable {}
+
+pub fn is_unstable(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Unstable>())
+}
+
+// Only a missing file means the store file is gone; any other failure is transient and leaves the entry alone.
+fn lost<T>(result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|error| if error.kind() == io::ErrorKind::NotFound { unbacked("stored file is gone") } else { error })
+}
+
+fn linked_expectation(file: &StoredFile) -> io::Result<(u64, &str, u32)> {
+    match (file.encoding, file.decoded_bytes, file.content_hash.as_deref(), file.mode) {
+        (Encoding::Linked, Some(len), Some(hash), Some(mode)) if !file.dir && !file.text => Ok((len, hash, mode)),
+        _ => Err(invalid("linked metadata is incomplete")),
+    }
+}
+
+/// Content identity only: a link added or removed by Cargo's uplift moves ctime without touching the bytes.
+fn same_content(a: &sys::Meta, b: &sys::Meta) -> bool {
+    a.is_file()
+        && b.is_file()
+        && a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mode() == b.mode()
+}
+
+fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> io::Result<StoredPayload> {
+    let meta = sys::lstat(src)?;
+    if !meta.is_file() || meta.len() < LINKED_MIN_BYTES {
+        return Err(invalid("output is not linkable"));
+    }
+    let captured;
+    let commitment = match commitment {
+        Some(commitment) => commitment,
+        None => {
+            captured = capture(src)?.1;
+            &captured
+        }
+    };
+    if !commitment.valid() || !commitment.matches(&meta) {
+        return Err(invalid("artifact changed after commitment"));
+    }
+    fs::hard_link(src, dst)?;
+    if !commitment.matches(&sys::lstat(dst)?) {
+        return Err(invalid("linked artifact differs from commitment"));
+    }
+    Ok(StoredPayload {
+        bytes: fsx::allocated_size(src),
+        encoding: Encoding::Linked,
+        stored_bytes: Some(commitment.len),
+        decoded_bytes: Some(commitment.len),
+        content_hash: Some(commitment.hash.clone()),
+        mode: Some(commitment.mode),
+    })
+}
+
+/// Stores a large output as a second name of the target file; any link failure leaves no staged name and falls back to a copy.
+pub(crate) fn store_linked(
+    src: &Path,
+    dst: &Path,
+    compress: bool,
+    commitment: Option<&Commitment>,
+    capture: bool,
+) -> io::Result<(StoredPayload, Option<StoreProof>)> {
+    match link_commitment(src, dst, commitment) {
+        Ok(payload) => Ok((payload, None)),
+        Err(_) => {
+            let _ = fs::remove_file(dst);
+            store_proven(src, dst, compress, commitment, capture)
+        }
+    }
+}
+
+fn copy_hashed(source: &File, len: u64, out: &mut impl Write) -> io::Result<(u64, String)> {
+    let mut input = source.take(len.saturating_add(1));
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = vec![0; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        hash.update(&buffer[..n]);
+        out.write_all(&buffer[..n])?;
+        total += n as u64;
+    }
+    Ok((total, hash.finalize().to_hex().to_string()))
+}
+
+/// Succeeds only when `path` already holds exactly the entry's bytes and did not change while being read.
+pub fn verify_in_place(path: &Path, file: &StoredFile) -> io::Result<()> {
+    let (len, expected, mode) = linked_expectation(file)?;
+    let path_meta = lost(sys::lstat(path))?;
+    if !path_meta.is_file() || path_meta.len() != len || path_meta.mode() != mode {
+        return Err(unbacked("destination differs from the entry"));
+    }
+    let source = lost(File::open(path))?;
+    let before = lost(sys::fstat(&source))?;
+    if !same_content(&path_meta, &before) {
+        return Err(unbacked("destination changed before reading"));
+    }
+    let (read, hash) = lost(hash_open(&source, len))?;
+    let after = lost(sys::fstat(&source))?;
+    let again = lost(sys::lstat(path))?;
+    if read != len || hash != expected || !same_content(&before, &after) || !same_content(&after, &again) {
+        return Err(unbacked("destination bytes differ from the entry"));
+    }
+    Ok(())
+}
+
+/// Copies the store file to `dst` (never a link) and publishes it only if the bytes copied hash to the recorded content hash; the mode is the recorded one, since a chmod through any name changes them all.
+pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::Result<()> {
+    let (len, expected, mode) = linked_expectation(file)?;
+    // Only the bytes copied count: a touch or an adopt during the copy may move mtime or the name, so a copy that hashes right is published, and one that does not is retried once before it is called unstable.
+    for _ in 0..2 {
+        let source = lost(File::open(store_file))?;
+        let before = lost(sys::fstat(&source))?;
+        if !before.is_file() {
+            return Err(unbacked("stored file is not a regular file"));
+        }
+        let tmp = Temporary(fsx::temp_sibling(dst));
+        let output = OpenOptions::new().write(true).create_new(true).open(&tmp.0)?;
+        let mut output = BufWriter::new(output);
+        let (copied, hash) = copy_hashed(&source, len, &mut output)?;
+        output.flush()?;
+        if copied == len && hash == expected {
+            sys::set_path_mode(&tmp.0, mode & 0o7777)?;
+            drop(output);
+            if fs::symlink_metadata(dst).is_ok_and(|m| m.is_dir()) {
+                fs::remove_dir_all(dst)?;
+            }
+            return sys::rename(&tmp.0, dst);
+        }
+        let after = lost(sys::fstat(&source))?;
+        // The open handle kept its inode, so a length or mtime change means a writer was active during the read.
+        if after.len() == before.len() && after.mtime() == before.mtime() {
+            return Err(unbacked("stored bytes differ from the record"));
+        }
+    }
+    Err(io::Error::other(Unstable("the store file kept changing during the copy")))
+}
+
+/// Best effort: when no target name shares the store file any more, the freshly verified destination replaces it, so the store and that one target keep a single copy.
+pub fn adopt(store_file: &Path, dst: &Path) {
+    let (Ok(stored), Ok(placed)) = (sys::lstat(store_file), sys::lstat(dst)) else { return };
+    if !stored.is_file() || stored.nlink() != 1 || !placed.is_file() || stored.dev() != placed.dev() || stored.len() != placed.len() {
+        return;
+    }
+    let tmp = Temporary(fsx::temp_sibling(store_file));
+    if fs::hard_link(dst, &tmp.0).is_err() || !sys::lstat(&tmp.0).is_ok_and(|linked| same_content(&linked, &placed)) {
+        return;
+    }
+    let _ = sys::rename(&tmp.0, store_file);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +877,201 @@ mod tests {
             decoded_bytes: payload.decoded_bytes,
             content_hash: payload.content_hash,
             metadata_slice: None,
+            mode: payload.mode,
         }
+    }
+
+    // Links `source` into a staged name and returns the record a store would write for it.
+    fn linked(scratch: &Path, source: &Path) -> (PathBuf, StoredFile) {
+        let (_, commitment) = capture(source).unwrap();
+        let staged = scratch.join("f0");
+        let (payload, proof) = store_linked(source, &staged, false, Some(&commitment), false).unwrap();
+        assert!(proof.is_none());
+        (staged, metadata(payload))
+    }
+
+    #[test]
+    fn a_linked_store_shares_the_inode_and_falls_back_to_a_copy_when_it_cannot_link() {
+        let scratch = Scratch::new();
+        let big = scratch.0.join("big");
+        fs::write(&big, vec![b'b'; 8192]).unwrap();
+        let (staged, file) = linked(&scratch.0, &big);
+        assert_eq!(file.encoding, Encoding::Linked);
+        assert_eq!((file.decoded_bytes, file.mode), (Some(8192), Some(sys::lstat(&big).unwrap().mode())));
+        assert_eq!(file.content_hash.as_deref(), Some(blake3::hash(&vec![b'b'; 8192]).to_hex().as_str()));
+        assert_eq!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&big).unwrap().ino());
+        assert_eq!(sys::lstat(&big).unwrap().nlink(), 2);
+
+        let (_, commitment) = capture(&big).unwrap();
+        let taken = scratch.0.join("taken");
+        fs::write(&taken, b"already here").unwrap();
+        let (payload, _) = store_linked(&big, &taken, false, Some(&commitment), false).unwrap();
+        assert_eq!(payload.encoding, Encoding::Raw, "a link that fails leaves an ordinary copy");
+        assert_eq!(fs::read(&taken).unwrap(), vec![b'b'; 8192]);
+        assert_ne!(sys::lstat(&taken).unwrap().ino(), sys::lstat(&big).unwrap().ino());
+
+        let small = scratch.0.join("small");
+        fs::write(&small, vec![b's'; (LINKED_MIN_BYTES - 1) as usize]).unwrap();
+        let (payload, _) = store_linked(&small, &scratch.0.join("g0"), false, None, false).unwrap();
+        assert_eq!(payload.encoding, Encoding::Raw, "small outputs are copied");
+
+        fs::write(&big, vec![b'c'; 8193]).unwrap();
+        let stale = store_linked(&big, &scratch.0.join("g1"), false, Some(&commitment), false);
+        assert!(stale.is_err(), "a rewritten output no longer matches its commitment");
+    }
+
+    #[test]
+    fn restores_copy_with_the_recorded_mode_and_adopt_shares_only_with_an_orphaned_store_file() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("source");
+        let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&source, &bytes).unwrap();
+        let (staged, file) = linked(&scratch.0, &source);
+        let recorded = file.mode.unwrap();
+        let first = scratch.0.join("first");
+        fs::write(&first, b"stale").unwrap();
+        restore_linked(&staged, &first, &file).unwrap();
+        assert_eq!(fs::read(&first).unwrap(), bytes);
+        assert_ne!(sys::lstat(&first).unwrap().ino(), sys::lstat(&staged).unwrap().ino(), "a restore always copies");
+        assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)), "no temporary is left behind");
+
+        adopt(&staged, &first);
+        assert_ne!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "the store is still shared with the source name");
+        fs::remove_file(&source).unwrap();
+        adopt(&staged, &first);
+        assert_eq!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "an orphaned store file is replaced by the verified destination");
+        let second = scratch.0.join("second");
+        restore_linked(&staged, &second, &file).unwrap();
+        adopt(&staged, &second);
+        assert_ne!(sys::lstat(&second).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "no two destinations ever share an inode");
+        assert_ne!(sys::lstat(&second).unwrap().ino(), sys::lstat(&staged).unwrap().ino());
+
+        #[cfg(unix)]
+        {
+            sys::set_path_mode(&first, 0o700).unwrap();
+            let third = scratch.0.join("third");
+            restore_linked(&staged, &third, &file).unwrap();
+            assert_eq!(sys::lstat(&third).unwrap().mode(), recorded, "the mode comes from the record, not from a chmod through another name");
+        }
+        let _ = recorded;
+
+        let mut mutated = bytes.clone();
+        mutated[30_000] ^= 0x40;
+        fs::write(&first, &mutated).unwrap();
+        let other = scratch.0.join("other");
+        let denied = restore_linked(&staged, &other, &file).unwrap_err();
+        assert!(is_unbacked(&denied), "{denied}");
+        assert!(!other.exists(), "an in-place rewrite through a target name publishes nothing");
+
+        fs::remove_file(&staged).unwrap();
+        assert!(is_unbacked(&restore_linked(&staged, &other, &file).unwrap_err()));
+        let plain = StoredFile { encoding: Encoding::Raw, ..file };
+        assert!(!is_unbacked(&restore_linked(&staged, &other, &plain).unwrap_err()));
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 253) as u8).collect()
+    }
+
+    // Exact bytes, or a miss that leaves the entry alone: never a verdict that the entry is corrupt.
+    fn assert_sound(result: io::Result<()>, dst: &Path, bytes: &[u8]) {
+        match result {
+            Ok(()) => assert_eq!(fs::read(dst).unwrap(), bytes),
+            Err(error) => assert!(!is_unbacked(&error), "{error}"),
+        }
+    }
+
+    #[test]
+    fn a_concurrent_touch_of_the_shared_inode_never_makes_the_entry_look_corrupt() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("source");
+        let bytes = pattern(16 * 1024 * 1024);
+        fs::write(&source, &bytes).unwrap();
+        let (staged, file) = linked(&scratch.0, &source);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    fsx::touch(&source);
+                }
+            });
+            for n in 0..4 {
+                let dst = scratch.0.join(format!("dst-{n}"));
+                assert_sound(restore_linked(&staged, &dst, &file), &dst, &bytes);
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_adopt_replacing_the_store_file_during_a_copy_never_removes_the_entry() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("source");
+        let bytes = pattern(16 * 1024 * 1024);
+        fs::write(&source, &bytes).unwrap();
+        let (staged, file) = linked(&scratch.0, &source);
+        fs::remove_file(&source).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut previous: Option<PathBuf> = None;
+                for n in 0..200 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let placed = scratch.0.join(format!("placed-{n}"));
+                    fs::write(&placed, &bytes).unwrap();
+                    sys::set_path_mode(&placed, file.mode.unwrap() & 0o7777).unwrap();
+                    if let Some(old) = previous.take() {
+                        fs::remove_file(old).unwrap();
+                    }
+                    adopt(&staged, &placed);
+                    previous = Some(placed);
+                }
+            });
+            for n in 0..4 {
+                let dst = scratch.0.join(format!("dst-{n}"));
+                assert_sound(restore_linked(&staged, &dst, &file), &dst, &bytes);
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_store_file_is_a_plain_error_that_removes_nothing() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("source");
+        fs::write(&source, pattern(9000)).unwrap();
+        let (staged, file) = linked(&scratch.0, &source);
+        let mode = sys::lstat(&staged).unwrap().mode() & 0o7777;
+        sys::set_path_mode(&staged, 0).unwrap();
+        if File::open(&staged).is_ok() {
+            // Running with privileges that ignore permissions.
+            return;
+        }
+        let dst = scratch.0.join("dst");
+        let error = restore_linked(&staged, &dst, &file).unwrap_err();
+        sys::set_path_mode(&staged, mode).unwrap();
+        assert!(!is_unbacked(&error) && !is_unstable(&error), "{error}");
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn verifying_in_place_requires_the_exact_bytes_and_leaves_the_file_alone() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("artifact");
+        fs::write(&path, vec![b'v'; 9000]).unwrap();
+        let (_, file) = linked(&scratch.0, &path);
+        verify_in_place(&path, &file).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), vec![b'v'; 9000]);
+        fs::write(&path, vec![b'w'; 9000]).unwrap();
+        assert!(is_unbacked(&verify_in_place(&path, &file).unwrap_err()));
+        fs::write(&path, vec![b'v'; 8999]).unwrap();
+        assert!(is_unbacked(&verify_in_place(&path, &file).unwrap_err()));
+        fs::remove_file(&path).unwrap();
+        assert!(is_unbacked(&verify_in_place(&path, &file).unwrap_err()));
     }
 
     #[test]

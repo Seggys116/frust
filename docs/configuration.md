@@ -7,6 +7,7 @@ For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` tur
 | `FRUST_HOME` | platform cache dir + `/frust` | All state lives here |
 | `FRUST_CACHE` | `on` | Compile cache |
 | `FRUST_CACHE_COMPRESSION` | `auto` | New cache writes use LZ4 on Linux when a reflink probe fails; `off` writes raw payloads. Both settings can read existing raw and compressed entries. See [cache payload storage](how-it-works.md#cache-payload-storage) |
+| `FRUST_CACHE_BACKED` | `auto` | On volumes without block cloning (ext4, NTFS), large outputs are stored as a hard link to the target file, so the bytes exist once; any link failure falls back to a copy. `off` stores ordinary payloads; `force` links on any volume (for tests). Needs `FRUST_CACHE_COMPRESSION` not `off`. Existing entries of every kind stay readable. See [linked entries](how-it-works.md#linked-entries) |
 | `FRUST_CACHE_PRIMARY` | `on` | Cache workspace packages too (non-incremental builds only) |
 | `FRUST_CACHE_PRIMARY_INCREMENTAL` | `on` | Cache incrementally compiled workspace outputs. Clean builds and branch switches can restore matching outputs; the next edit may need to rebuild incremental state. Storing changed states adds cache work; see [benchmarks](benchmarks.md). |
 | `FRUST_COMPACT_INCREMENTAL_IDLE_DAYS` | `7` | Idle incremental reuse data retention. Metadata-only state with unknown ownership can expire without cache coverage; fresh, active and unreadable state is protected. See [cleanup rules](how-it-works.md#incremental-data-and-compaction) |

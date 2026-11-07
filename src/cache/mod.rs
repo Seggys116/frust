@@ -28,6 +28,9 @@ const MAX_CANDIDATES: usize = 8;
 /// Format five adds inline metadata ranges; formats three and four remain readable.
 const MANIFEST_FORMAT: u32 = 5;
 
+/// Written only for manifests that list a backed entry, so writers that cannot restore one ignore the manifest.
+const BACKED_MANIFEST_FORMAT: u32 = 6;
+
 /// A volume where a stamp once lied stays distrusted this long after its latest violation.
 const QUARANTINE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -66,6 +69,9 @@ pub struct StoredFile {
     /// A directory output (such as a `.dSYM` bundle); entries stored before this field existed read as `false`.
     #[serde(default)]
     pub dir: bool,
+    /// Set exactly for `Encoding::Linked` files: the mode the output had, restored instead of whatever the shared inode has now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +150,18 @@ impl Cache {
     fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
         let bytes = fs::read(self.manifest_path(prekey)).ok()?;
         let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
-        matches!(manifest.format, 3 | 4 | MANIFEST_FORMAT).then_some(manifest)
+        matches!(manifest.format, 3 | 4 | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
+    }
+
+    /// Reads `meta.json` for the one marker a manifest format depends on; an unreadable entry counts as not linked.
+    fn entry_is_linked(&self, key: &str) -> bool {
+        #[derive(Deserialize)]
+        struct Files { #[serde(default)] files: Vec<LinkedProbe> }
+        #[derive(Deserialize)]
+        struct LinkedProbe { #[serde(default)] encoding: payload::Encoding }
+        fs::read(self.entry_dir(key).join("meta.json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<Files>(&bytes).ok())
+            .is_some_and(|meta| meta.files.iter().any(|file| file.encoding == payload::Encoding::Linked))
     }
 
     /// Drops candidates whose entry is gone so lookups do not hash their inputs for nothing; the manifest is left alone when nothing changes.
@@ -158,9 +175,11 @@ impl Cache {
         if !self.has_entry(&candidate.key) { return; }
         self.mark_used_guarded(guard, &candidate.key);
         let manifest = self.read_manifest(prekey);
-        let current_format = manifest
-            .as_ref()
-            .is_some_and(|m| m.format == MANIFEST_FORMAT);
+        // A manifest that ever listed a backed entry stays in the backed format.
+        let format = if manifest.as_ref().is_some_and(|m| m.format == BACKED_MANIFEST_FORMAT)
+            || self.entry_is_linked(&candidate.key)
+        { BACKED_MANIFEST_FORMAT } else { MANIFEST_FORMAT };
+        let current_format = manifest.as_ref().is_some_and(|m| m.format == format);
         let existing = manifest.map(|m| m.candidates).unwrap_or_default();
         let unchanged_front = existing.first() == Some(&candidate);
         let before = existing.len();
@@ -180,7 +199,7 @@ impl Cache {
             return;
         }
         let manifest = Manifest {
-            format: MANIFEST_FORMAT,
+            format,
             candidates: rows,
         };
         if let Ok(json) = serde_json::to_vec(&manifest) {
@@ -1882,6 +1901,36 @@ mod tests {
             vec![candidate],
             "adding rewrites it in the current format"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_manifests_listing_a_linked_entry_use_the_backed_format() {
+        let (dir, cache) = scratch("backed-format");
+        publish_entry(&cache, 1);
+        let backed = cache.stage().unwrap();
+        let meta = serde_json::json!({
+            "crate_name": "k", "version": "1", "compile_ms": 1, "created_unix": 1, "stderr": "stderr",
+            "files": [{
+                "name": "libk.rlib", "stored": "f0", "text": false, "bytes": 8192, "encoding": "linked",
+                "decoded_bytes": 8192, "content_hash": "ab".repeat(32), "mode": 33188,
+            }],
+        });
+        fs::write(backed.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        cache.publish(&backed, &key(2)).unwrap();
+        let format_of = |prekey: &str| {
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(cache.manifest_path(prekey)).unwrap()).unwrap();
+            value["format"].as_u64().unwrap()
+        };
+        let (plain, mixed) = (key(0x7a), key(0x7b));
+        cache.add_candidate(&plain, empty_candidate(1));
+        assert_eq!(format_of(&plain), u64::from(MANIFEST_FORMAT));
+        cache.add_candidate(&mixed, empty_candidate(1));
+        cache.add_candidate(&mixed, empty_candidate(2));
+        assert_eq!(format_of(&mixed), u64::from(BACKED_MANIFEST_FORMAT));
+        assert_eq!(cache.candidates(&mixed).len(), 2, "the backed format stays readable");
+        cache.add_candidate(&mixed, empty_candidate(1));
+        assert_eq!(format_of(&mixed), u64::from(BACKED_MANIFEST_FORMAT), "a backed manifest never drops back");
         let _ = fs::remove_dir_all(&dir);
     }
 

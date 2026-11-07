@@ -88,6 +88,16 @@ pub fn validate_groups(files: &[StoredFile]) -> io::Result<Vec<RestoreGroup>> {
             {
                 return Err(invalid("inconsistent raw backing metadata"));
             }
+            if (file.encoding == Encoding::Linked) != file.mode.is_some()
+                || (file.encoding == Encoding::Linked
+                    && (file.dir
+                        || file.text
+                        || file.decoded_bytes.is_none()
+                        || !file.content_hash.as_deref().is_some_and(hash_valid)
+                        || file.mode.is_some_and(|mode| !mode_valid(mode))))
+            {
+                return Err(invalid("invalid linked metadata"));
+            }
             groups.push(RestoreGroup {
                 base_index: i,
                 slice_indices: Vec::new(),
@@ -1282,8 +1292,36 @@ mod tests {
             content_hash: None,
             metadata_slice: None,
             dir: false,
+            mode: None,
         }
     }
+
+    #[test]
+    fn linked_records_need_a_mode_and_a_complete_commitment() {
+        let linked = || {
+            let mut file = record("libk.rlib", "f0");
+            file.encoding = Encoding::Linked;
+            file.decoded_bytes = Some(8192);
+            file.content_hash = Some("ab".repeat(32));
+            file.mode = Some(0o100644);
+            file
+        };
+        assert_eq!(validate_groups(&[linked()]).unwrap().len(), 1);
+        let mut missing_mode = linked();
+        missing_mode.mode = None;
+        let mut missing_hash = linked();
+        missing_hash.content_hash = None;
+        let mut directory = linked();
+        directory.dir = true;
+        let mut stray_mode = linked();
+        stray_mode.encoding = Encoding::Raw;
+        stray_mode.decoded_bytes = None;
+        stray_mode.content_hash = None;
+        for bad in [missing_mode, missing_hash, directory, stray_mode] {
+            assert!(validate_groups(&[bad]).is_err());
+        }
+    }
+
     fn archive_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
         out.extend_from_slice(
             format!(

@@ -162,6 +162,32 @@ When compression is enabled on a supported filesystem, a `.rmeta` payload can sh
 raw entries remain readable without conversion. New manifests use format 5 so older readers ignore them, and
 encoded entries use a separate key domain from the keys older writers compute.
 
+### Linked entries
+
+On a cache volume without block cloning (ext4, NTFS), keeping a payload next to the target's copy of every output
+would use about twice cargo's disk. There, an output file of at least 4 KiB (in any target directory on the same
+volume) is stored as a hard link: the store file `f<N>` is a second name of the target output, so the bytes exist
+once. The entry records the blake3 hash, length and mode taken before cargo uplifted the output, and the link must
+still match that commitment when it is made. Dep-info, stderr, directory bundles, small files and files without a
+commitment keep ordinary payloads, and any link failure (another volume, a filesystem or account that cannot link)
+falls back to the raw copy or LZ4 payload of that file. Copy-on-write volumes (APFS, btrfs, XFS, ReFS) keep raw
+clones, and `FRUST_CACHE_BACKED=off` or `FRUST_CACHE_COMPRESSION=off` disables linking.
+
+The guarantee: a restore writes bytes only if they hash to the recorded content hash. A destination that already
+holds them is kept; otherwise the store file is copied (never linked, so no two targets share an inode) to a
+temporary sibling of the destination while hashing, the length, hash and file identity must agree before and after,
+the recorded mode is applied, and the copy is renamed into place. If the store file's only remaining name is the
+store (the target was deleted), the verified destination then replaces it, so the store shares that one output.
+A writer that changed the shared file in place (a linker that rewrites without unlinking, `strip` or `objcopy` on a
+file with several names) makes the entry unusable: it is dropped, rustc runs, and `FRUST_DEBUG` logs the drop.
+
+The cost and sizing: deleting or replacing the target name leaves the store file as the only copy, so entries
+survive `cargo clean`. `frust gc` counts a linked file that still has another name as zero bytes and an orphaned one
+in full, and drops every orphaned linked entry older than the newest of its unit at once, so frust never holds more
+than cargo does. Compaction treats a linked store file as covering a target file only while it hashes to the
+recorded content, so it cannot delete the only copy. Manifests that list a linked entry use format 6 and linked
+entries use their own key domain, so older versions treat them as misses.
+
 ## Smaller build directories
 
 * Opt-in `FRUST_TUNE=on` builds dependencies without debug info in dev profiles (about a tenth smaller, no

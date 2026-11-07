@@ -1,0 +1,203 @@
+//! Linked entries store a large output as a second name of the target file, and never let a rewritten shared file produce a build.
+
+mod common;
+
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use common::{Sandbox, assert_success, run_binary, stdout};
+use frust::cache::EntryMeta;
+use frust::cache::payload::Encoding;
+
+const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
+
+// Enough code that the library and its metadata exceed the smallest size worth linking.
+fn leaf_source() -> String {
+    let mut text = String::from("pub fn value() -> u32 { 41 }\n");
+    for n in 0..300u32 {
+        text.push_str(&format!("pub fn filler_{n}(x: u32) -> u32 {{ x.wrapping_mul({}).wrapping_add({n}) }}\n", n + 3));
+    }
+    text
+}
+
+fn scene(tag: &str) -> (Sandbox, PathBuf, PathBuf) {
+    let sb = Sandbox::new(tag);
+    sb.vendor_crate("leaf", "1.0.0", &leaf_source());
+    let a = sb.project("a", &[("leaf", "1.0.0")], MAIN);
+    let b = sb.project("b", &[("leaf", "1.0.0")], MAIN);
+    (sb, a, b)
+}
+
+fn build(sb: &Sandbox, project: &Path, mode: &str) {
+    assert_success(&sb.bin("fcargo").arg("build").env("FRUST_CACHE_BACKED", mode).current_dir(project).output().unwrap());
+}
+
+fn app_output(sb: &Sandbox, project: &Path) -> String {
+    let out = run_binary(&sb.central_target(project), "debug", "app");
+    assert_success(&out);
+    stdout(&out).trim().to_string()
+}
+
+fn entries(sb: &Sandbox, krate: &str) -> Vec<(PathBuf, EntryMeta)> {
+    let mut found = Vec::new();
+    let Ok(shards) = fs::read_dir(sb.home().join("store")) else { return found };
+    for shard in shards.flatten() {
+        for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+            let Ok(bytes) = fs::read(entry.path().join("meta.json")) else { continue };
+            if let Ok(meta) = serde_json::from_slice::<EntryMeta>(&bytes)
+                && meta.crate_name == krate
+            {
+                found.push((entry.path(), meta));
+            }
+        }
+    }
+    found
+}
+
+fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(shards) = fs::read_dir(sb.home().join("manifests")) else { return found };
+    for shard in shards.flatten() {
+        for file in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+            if file.path().extension().is_some_and(|e| e == "json") {
+                found.push(file.path());
+            }
+        }
+    }
+    found
+}
+
+fn manifest_formats(sb: &Sandbox) -> Vec<u64> {
+    manifests(sb)
+        .iter()
+        .filter_map(|path| serde_json::from_slice::<serde_json::Value>(&fs::read(path).ok()?).ok()?["format"].as_u64())
+        .collect()
+}
+
+fn leaf_library(target: &Path, extension: &str) -> PathBuf {
+    let deps = target.join("debug").join("deps");
+    fs::read_dir(&deps)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name.starts_with("libleaf-") && name.ends_with(extension)
+        })
+        .unwrap_or_else(|| panic!("no leaf {extension} in {}", deps.display()))
+}
+
+fn leaf_entry(sb: &Sandbox) -> (PathBuf, EntryMeta) {
+    let mut found = entries(sb, "leaf");
+    assert_eq!(found.len(), 1, "exactly one leaf entry: {found:#?}");
+    found.remove(0)
+}
+
+fn rlib_record(meta: &EntryMeta) -> &frust::cache::StoredFile {
+    meta.files.iter().find(|file| file.name.ends_with(".rlib")).unwrap()
+}
+
+fn ino(path: &Path) -> u64 {
+    frust::sys::lstat(path).unwrap().ino()
+}
+
+#[test]
+fn a_linked_store_shares_the_target_inode_instead_of_keeping_a_second_copy() {
+    let (sb, a, _) = scene("lk-store");
+    build(&sb, &a, "force");
+    assert_eq!(app_output(&sb, &a), "41");
+    let (dir, meta) = leaf_entry(&sb);
+    let rlib = rlib_record(&meta);
+    assert_eq!(rlib.encoding, Encoding::Linked);
+    assert!(rlib.mode.is_some());
+    let target_file = leaf_library(&sb.central_target(&a), ".rlib");
+    assert_eq!(ino(&dir.join(&rlib.stored)), ino(&target_file), "the store file is a second name of the output");
+    assert_eq!(rlib.content_hash.clone().unwrap(), frust::cache::hash_file(&target_file).unwrap());
+    let dep_info = meta.files.iter().find(|file| file.text).unwrap();
+    assert!(dep_info.mode.is_none() && dir.join(&dep_info.stored).is_file(), "dep-info stays a small raw file");
+    let formats = manifest_formats(&sb);
+    assert!(formats.contains(&6) && formats.iter().all(|f| matches!(f, 5 | 6)), "{formats:?}");
+}
+
+#[test]
+fn a_second_workspace_gets_a_copy_and_never_shares_an_inode() {
+    let (sb, a, b) = scene("lk-second");
+    build(&sb, &a, "force");
+    let held_a = leaf_library(&sb.central_target(&a), ".rlib");
+    let bytes = fs::read(&held_a).unwrap();
+    build(&sb, &b, "force");
+    assert_eq!(sb.count_cache("hit", "leaf"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(app_output(&sb, &b), "41");
+    let copy = leaf_library(&sb.central_target(&b), ".rlib");
+    assert_eq!(fs::read(&copy).unwrap(), bytes, "the restored output has exactly the stored bytes");
+    let (dir, meta) = leaf_entry(&sb);
+    assert_ne!(ino(&copy), ino(&held_a), "a copy, never a link between targets");
+    assert_ne!(ino(&copy), ino(&dir.join(&rlib_record(&meta).stored)), "the store file stays shared with the first target only");
+}
+
+#[test]
+fn a_rewrite_through_the_target_name_is_a_miss_and_the_dead_entry_is_replaced() {
+    let (sb, a, b) = scene("lk-mutated");
+    build(&sb, &a, "force");
+    let held = leaf_library(&sb.central_target(&a), ".rlib");
+    let mut file = OpenOptions::new().read(true).write(true).open(&held).unwrap();
+    file.seek(SeekFrom::Start(2048)).unwrap();
+    file.write_all(&[0xA5, 0x5A]).unwrap();
+    drop(file);
+
+    build(&sb, &b, "force");
+    assert_eq!(sb.count_cache("hit", "leaf"), 0, "{:#?}", sb.cache_events());
+    assert_eq!(sb.count_cache("miss", "leaf"), 2, "rustc ran again");
+    assert_eq!(app_output(&sb, &b), "41");
+    let (dir, meta) = leaf_entry(&sb);
+    let fresh = leaf_library(&sb.central_target(&b), ".rlib");
+    assert_eq!(ino(&dir.join(&rlib_record(&meta).stored)), ino(&fresh), "the entry now rests on the fresh build");
+}
+
+#[test]
+fn a_deleted_target_still_restores_from_the_store_file_and_the_store_adopts_the_new_output() {
+    let (sb, a, b) = scene("lk-deleted");
+    build(&sb, &a, "force");
+    let bytes = fs::read(leaf_library(&sb.central_target(&a), ".rlib")).unwrap();
+    sb.lose_target(&a);
+    build(&sb, &b, "force");
+    assert_eq!(sb.count_cache("hit", "leaf"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(sb.count_cache("miss", "leaf"), 1);
+    assert_eq!(app_output(&sb, &b), "41");
+    let restored = leaf_library(&sb.central_target(&b), ".rlib");
+    assert_eq!(fs::read(&restored).unwrap(), bytes);
+    let (dir, meta) = leaf_entry(&sb);
+    assert_eq!(ino(&dir.join(&rlib_record(&meta).stored)), ino(&restored), "an orphaned store file shares the restored output");
+}
+
+#[test]
+fn off_keeps_ordinary_payloads_and_older_manifests_and_entries_still_restore() {
+    let (sb, a, b) = scene("lk-off");
+    build(&sb, &a, "off");
+    let (dir, meta) = leaf_entry(&sb);
+    for file in &meta.files {
+        assert!(file.mode.is_none() && file.encoding != Encoding::Linked, "{file:?}");
+        assert!(dir.join(&file.stored).exists(), "{} keeps its payload", file.name);
+    }
+    assert_eq!(manifest_formats(&sb).iter().filter(|f| **f == 6).count(), 0);
+    for path in manifests(&sb) {
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["format"] = serde_json::json!(4);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    build(&sb, &b, "force");
+    assert_eq!(sb.count_cache("hit", "leaf"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(app_output(&sb, &b), "41");
+    assert_eq!(entries(&sb, "leaf").len(), 1, "an older entry is used, not shadowed by a linked one");
+}
+
+#[test]
+fn auto_links_outputs_exactly_when_the_cache_volume_has_no_clones() {
+    let (sb, a, _) = scene("lk-auto");
+    build(&sb, &a, "auto");
+    let (_, meta) = leaf_entry(&sb);
+    let linked = meta.files.iter().any(|file| file.encoding == Encoding::Linked);
+    assert_eq!(linked, frust::cache::payload::clones_unavailable(&sb.home().join("tmp")), "{meta:#?}");
+    assert_eq!(app_output(&sb, &a), "41");
+}
