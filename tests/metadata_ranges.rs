@@ -126,7 +126,8 @@ exec rustc "$@"
     }
     assert!(found, "the real dependency was cached");
     let compiled = fs::read(&calls).unwrap();
-    run(&["clean"]);
+    // `app` is a path crate, so `fcargo clean` would release its entry; losing the target keeps this a restore test.
+    sb.lose_target(&project);
     run(&["build"]);
     assert_eq!(
         fs::read(&calls).unwrap(),
@@ -138,7 +139,7 @@ exec rustc "$@"
     assert_success(&output);
     assert_eq!(stdout(&output).trim(), "19");
     sb.replace_vendor_source("slice_fixture", "0.1.0", &source(23));
-    run(&["clean"]);
+    sb.lose_target(&project);
     run(&["build"]);
     assert!(
         fs::read(&calls).unwrap().len() > compiled.len(),

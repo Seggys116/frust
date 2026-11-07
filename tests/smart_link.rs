@@ -171,7 +171,7 @@ mod macos {
         assert_applied(&plain, false);
         assert_eq!(sb.count_cache("miss", "app"), 1);
 
-        assert_success(&cargo(&sb, &project).arg("clean").output().unwrap());
+        sb.lose_target(&project);
         assert_applied(&build(&sb, &project), true);
         assert_eq!(
             sb.count_cache("hit", "app"),
@@ -181,7 +181,7 @@ mod macos {
         assert_eq!(sb.count_cache("miss", "app"), 2);
         assert_program(&target, "debug", "21");
 
-        assert_success(&cargo(&sb, &project).arg("clean").output().unwrap());
+        sb.lose_target(&project);
         build(&sb, &project);
         assert_eq!(
             sb.count_cache("hit", "app"),

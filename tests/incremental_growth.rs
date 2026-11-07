@@ -182,7 +182,8 @@ fn maintenance_retains_the_two_latest_incremental_states_for_restores() {
     for value in [3, 4] {
         fs::write(&source, format!("fn main() {{ println!(\"{value}\"); }}\n")).unwrap();
         common::settle(&source);
-        assert_success(&sb.bin("fcargo").arg("clean").current_dir(&project).output().unwrap());
+        // `app` is a path crate, so `fcargo clean` would release the retained states this test restores.
+        sb.lose_target(&project);
         build(&sb, &project, &[]);
         assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), value.to_string());
     }

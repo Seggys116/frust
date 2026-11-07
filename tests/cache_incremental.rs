@@ -74,7 +74,7 @@ fn path_dependency_is_restored_after_clean_and_in_another_project() {
     assert_eq!(sb.count_cache("miss", "pathdep"), 1, "the incremental path dependency is stored");
     assert_eq!(output(&sb, &a), "pathdep 7");
 
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&a).output().unwrap());
+    sb.lose_target(&a);
     build(&sb, &a);
     assert_eq!(sb.count_cache("hit", "pathdep"), 1, "restored after a clean");
     assert_eq!(output(&sb, &a), "pathdep 7");
@@ -144,10 +144,10 @@ fn a_path_dependency_selected_for_building_is_cached_unless_turned_off() {
     assert_success(&sb.bin("fcargo").args(["build", "-p", "pathdep"]).current_dir(&app).output().unwrap());
     assert_eq!(sb.count_cache("miss", "pathdep"), 1);
     assert!(sessions(&sb, &app, "pathdep") > 0, "the miss was rustc's own incremental compile");
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&app).output().unwrap());
+    sb.lose_target(&app);
     assert_success(&sb.bin("fcargo").args(["build", "-p", "pathdep"]).current_dir(&app).output().unwrap());
     assert_eq!(sb.count_cache("hit", "pathdep"), 1);
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&app).output().unwrap());
+    sb.lose_target(&app);
     build(&sb, &app);
     assert_eq!(
         (sb.count_cache("hit", "pathdep"), sb.count_cache("miss", "pathdep")),
@@ -157,7 +157,7 @@ fn a_path_dependency_selected_for_building_is_cached_unless_turned_off() {
     assert_eq!(output(&sb, &app), "pathdep 5");
 
     // FRUST_CACHE_PRIMARY_INCREMENTAL=off leaves the selected package to rustc.
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&app).output().unwrap());
+    sb.lose_target(&app);
     let off = sb
         .bin("fcargo")
         .args(["build", "-p", "pathdep"])
@@ -179,12 +179,12 @@ fn incremental_entries_are_switchable_and_never_serve_non_incremental_builds() {
     assert_success(&off);
     assert_eq!(sb.count_cache("miss", "pathdep"), 0, "FRUST_CACHE_INCREMENTAL=off leaves incremental units uncached");
 
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&app).output().unwrap());
+    sb.lose_target(&app);
     build(&sb, &app);
     assert_eq!(sb.count_cache("miss", "pathdep"), 1);
 
     // Incremental outputs are not byte-identical to non-incremental ones, so they are a different entry.
-    assert_success(&sb.bin("fcargo").arg("clean").current_dir(&app).output().unwrap());
+    sb.lose_target(&app);
     let plain = sb.bin("fcargo").arg("build").env("CARGO_INCREMENTAL", "0").current_dir(&app).output().unwrap();
     assert_success(&plain);
     assert_eq!(sb.count_cache("hit", "pathdep"), 0, "a non-incremental build is not served an incremental entry");

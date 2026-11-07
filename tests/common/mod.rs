@@ -173,6 +173,15 @@ impl Sandbox {
             .count()
     }
 
+    /// Deletes the project's central target without the cache release a whole-target `fcargo clean` performs.
+    pub fn lose_target(&self, project: &Path) {
+        match fs::remove_dir_all(self.central_target(project)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot remove the central target: {error}"),
+        }
+    }
+
     pub fn central_target(&self, project: &Path) -> PathBuf {
         let out = self
             .bin("frust")

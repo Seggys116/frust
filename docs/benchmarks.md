@@ -124,9 +124,9 @@ frust bench --repo ~/src/ripgrep --runs 3 --edits 20 --gate --markdown --out rip
 frust bench --repo ~/src/tokio --package tokio --json
 ```
 
-Flags: `--repo PATH`, `--edits N` (default 20), `--runs N` (default 3), `--package P` (edit and build only that workspace member), `--json`, `--markdown`, `--out FILE`, `--gate`.
+Flags: `--repo PATH`, `--edits N` (default 20), `--runs N` (default 3), `--package P` (a workspace member name or `name@version`, resolved through `cargo metadata` to its path package id and passed as `cargo build -p`; edits come from that member only; without it the build is `--workspace`), `--json`, `--markdown`, `--out FILE`, `--gate`.
 
-Each run times, for both tools in alternating order: cold build (empty target and cache), clean rebuild (cache kept, target removed), no-op (median of three builds), then N edits. Edits append a marker constant to up to eight `.rs` files, taken round-robin from the entry points and sources of the workspace default members (`cargo metadata --no-deps`), each followed by a debug build. The first edit that touches a crate after a restore has no incremental session; it is reported separately (`edit_first`) and excluded from the edit median and p90 (`edit_warm`). Original file bytes are saved in scratch and written back after every run and on every error path; git is never used.
+Each run times, for both tools in alternating order: cold build (empty target and cache), clean rebuild (cache kept, target removed), no-op (median of three builds), then N edits. Edits append a marker constant to up to eight `.rs` files, taken round-robin from the entry points and sources of all workspace path members (`cargo metadata --no-deps`), each followed by a debug build. The first edit that touches a crate after a restore has no incremental session; it is reported separately (`edit_first`) and excluded from the edit median and p90 (`edit_warm`). Original file bytes are saved in scratch and written back after every run and on every error path; git is never used.
 
 Before each timed frust build the harness waits up to 60 s for deferred stores to finish (no pending job files, every slot lock held exclusively), so background storage never lands in the next row.
 
@@ -140,6 +140,8 @@ Disk compares the physical size of Cargo's target directory with the physical si
 | Cold | at most 1.05x |
 | Clean rebuild from cache | at most 0.5x |
 
-`--markdown` prints a table for `$GITHUB_STEP_SUMMARY`; `--json` prints a versioned report; `--out FILE` always writes the JSON to the file while stdout carries the markdown (or the JSON when only `--json` is given). The thresholds are constants in `src/bench/repo.rs`.
+The report also carries a `disk_breakdown` object (additive; schema version 1): physical and logical bytes of Cargo's target and of frust's `store`, `targets`, `manifests`, `tmp` and everything else, each inode and clone extent counted once; the targets-only comparison; the number of cache entries; and the share of store bytes whose extents are also referenced from targets.
+
+`--markdown` prints a table (cold, clean rebuild, no-op, first edit, warm edit, edit p90, disk, plus a frust/cargo ratio row and, with `--gate`, a gate column) and the disk breakdown for `$GITHUB_STEP_SUMMARY`; `--json` prints a versioned report; `--out FILE` always writes the JSON to the file while stdout carries the markdown (or the JSON when only `--json` is given). The thresholds are constants in `src/bench/repo.rs`.
 
 `.github/workflows/bench.yml` runs this gate on ubuntu, macOS and Windows free runners against ripgrep 14.1.1, bat v0.24.0 and tokio 1.40.0 (package `tokio`), on manual dispatch, weekly, and on pull requests touching `src/**`, `Cargo.toml` or the workflow. Each job uploads its JSON as an artifact and removes the clone and scratch state at the end.

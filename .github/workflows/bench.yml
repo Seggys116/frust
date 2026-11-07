@@ -32,7 +32,7 @@ jobs:
         repo:
           - { name: ripgrep, slug: BurntSushi/ripgrep, tag: "14.1.1", package: "" }
           - { name: bat, slug: sharkdp/bat, tag: v0.24.0, package: "" }
-          - { name: tokio, slug: tokio-rs/tokio, tag: tokio-1.40.0, package: tokio }
+          - { name: tokio, slug: tokio-rs/tokio, tag: tokio-1.40.0, package: "tokio@1.40.0" }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

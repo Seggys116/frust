@@ -28,6 +28,7 @@ fn build_deferred(sb: &Sandbox, project: &Path) -> std::process::Output {
         .arg("build")
         .current_dir(project)
         .env("FRUST_CACHE", "1")
+        .env("FRUST_TIMINGS", sb.root.join("timings.jsonl"))
         .env_remove("FRUST_STORE_SYNC")
         .output()
         .unwrap();
@@ -279,7 +280,7 @@ fn unobserved_lock_off_builds_keep_inline_fallback_and_restore() {
     let compiled = leaf_rlib(&sb, &project);
     assert_eq!(app_output(&sb, &project), "41");
     drop(execution);
-    clean(&sb, &project);
+    sb.lose_target(&project);
     build();
     wait_for_stores(&sb, 2);
     assert_eq!(sb.count_cache("hit", "leaf"), 1);
@@ -339,7 +340,11 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
     });
 
     let early = stored(&sb);
-    assert!((1..3).contains(&early), "early units store inline, but the gated app stays queued: {early}");
+    assert!(
+        (1..3).contains(&early),
+        "early units store inline, but the gated app stays queued: {early}\n{}",
+        fs::read_to_string(sb.root.join("timings.jsonl")).unwrap_or_default()
+    );
     assert_eq!(published_entries(&sb), early);
     let queued = job_markers(&sb);
     assert_eq!(queued.len(), 3 - early, "all later units remain queued: {queued:?}");
@@ -481,7 +486,7 @@ fn queued_stores_survive_frontend_exit_drain_and_restore_exact_outputs() {
     assert!(job_markers(&sb).is_empty() && broker_directories(&sb).is_empty());
     assert_eq!(leaf_rlib(&sb, &project), compiled);
 
-    clean(&sb, &project);
+    sb.lose_target(&project);
     build_deferred(&sb, &project);
     wait_for_stores(&sb, 3);
     assert_eq!(sb.count_cache("hit", "leaf"), 1);

@@ -5358,6 +5358,19 @@ mod tests {
             );
             assert_eq!(slice.mode, modes[2]);
             assert_eq!(target.stored_bytes, Some(0));
+        } else if compressed {
+            assert_eq!(backing.encoding, cache::payload::Encoding::Lz4BlocksV1);
+            assert_eq!(target.encoding, cache::payload::Encoding::Lz4BlocksV1);
+            assert_ne!(target.stored, backing.stored);
+            assert_eq!(
+                backing.content_hash,
+                Some(blake3::hash(&archive).to_hex().to_string())
+            );
+            assert_eq!(
+                target.content_hash,
+                Some(blake3::hash(&metadata).to_hex().to_string())
+            );
+            assert!(backing.metadata_slice.is_none() && target.metadata_slice.is_none());
         } else {
             assert!(backing.encoding.is_raw() && target.encoding.is_raw());
             assert_ne!(target.stored, backing.stored);
