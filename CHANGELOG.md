@@ -10,12 +10,16 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
 * `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
 * `frust gc --max-age-days N` and `FRUST_CACHE_MAX_AGE_DAYS` (default 14) set how long an unused cache entry is kept.
+* Cache entries record whether they came from a registry, git or path source and which central-target workspaces used them (optional `source` and `workspaces` fields in `meta.json`; entries stored by earlier versions read as unattributed).
+* `fcargo clean` of a whole central target also retires the path-crate cache entries only that workspace used. Registry and git entries stay in the shared store; `--frust-evict-registry` also retires the ones only that workspace used.
 
 ### Changed
 
 * Cache entries are evicted by age, not by size. `FRUST_CACHE_MAX_GIB` and `FRUST_TARGET_MAX_GIB` are unlimited unless set.
-* Path-unit deferred stores no longer hold the unit key lock, so the next edit does not wait for the previous store.
+* Deferred stores of primary incremental units no longer hold the unit key lock, so the next edit does not wait for the previous store.
 * Detached helpers on Windows are created without inheriting handles.
+* `cargo clean` of a central target now runs as a child of frust under the whole-target build lock, so no build can start between releasing cache entries and deleting the target. Its arguments, output and exit code are unchanged, and the empty workspace directory is removed afterwards.
+* Cache payloads are LZ4-compressed on Windows volumes without block cloning (such as NTFS), so the store no longer keeps a raw copy of each large artifact next to the target's copy.
 
 ### Fixed
 

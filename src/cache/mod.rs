@@ -1,5 +1,6 @@
 //! Direct-mode compile cache: a pre-key selects a manifest of recorded input sets, a match yields an entry key.
 
+pub mod clean;
 pub mod depinfo;
 pub mod hashing;
 pub mod metadata_slice;
@@ -77,6 +78,12 @@ pub struct EntryMeta {
     pub incremental_unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prekey: Option<String>,
+    /// `registry`, `git` or `path`; absent for entries stored before attribution or outside a central target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Central-target workspace ids that stored or restored this entry, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
     pub files: Vec<StoredFile>,
     pub stderr: String,
 }

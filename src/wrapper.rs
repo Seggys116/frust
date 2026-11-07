@@ -169,6 +169,8 @@ struct Plan {
     deferred: bool,
     /// Stage timings for `FRUST_TIMINGS`; inert in a helper and when the variable is unset.
     probe: timings::Probe,
+    /// Cargo marked this invocation as a package the user asked to build.
+    primary: bool,
 }
 
 impl Plan {
@@ -284,6 +286,7 @@ impl Plan {
             waited_ms: AtomicU64::new(0),
             deferred: false,
             probe,
+            primary,
         })
     }
 
@@ -355,6 +358,7 @@ impl Plan {
             waited_ms: AtomicU64::new(0),
             deferred: true,
             probe: timings::Probe::off(),
+            primary: false,
         })
     }
 
@@ -497,6 +501,9 @@ impl Plan {
                 Ok(bytes) => {
                     self.probe.set(|r| r.restore_ms = timings::ms(restore_started));
                     self.cache.mark_used(&candidate.key);
+                    if meta.source.is_some() && !meta.workspaces.contains(&self.user_id()) {
+                        self.note_workspace(&candidate.key);
+                    }
                     self.note_unit(&candidate.key);
                     let elapsed = started.elapsed().as_millis() as u64;
                     events::record_waited(
@@ -777,9 +784,9 @@ impl Plan {
         }
     }
 
-    /// Edits of a path unit share a prekey, so its store must not hold the lock the next edit's build needs.
+    /// Edits of the primary incremental package share a prekey, so its store must not hold the lock the next edit's build needs; every other unit keeps sharing one compile across builds.
     fn lends_key_lock(&self) -> bool {
-        self.unit.is_none()
+        !(self.primary && self.parsed.incremental())
     }
 
     fn declined(&self, reason: &str) -> io::Result<bool> {
@@ -1297,6 +1304,8 @@ impl Plan {
             }
         }
         let entry_ms = started.elapsed().as_millis();
+        // Covers an entry another process published first or one that already existed.
+        self.note_workspace(&key);
         self.note_unit(&key);
         self.cache
             .add_candidate(&self.prekey, Candidate { inputs, envs, key });
@@ -1488,12 +1497,18 @@ impl Plan {
         cache::metadata_slice::validate_groups(&files)?;
         let stderr_text = String::from_utf8_lossy(captured).replace(&self.profile, PROFILE_TOKEN);
         fs::write(staged.join("stderr"), stderr_text)?;
+        let (source, workspaces) = match self.workspace().zip(self.source()) {
+            Some((workspace, source)) => (Some(source.to_owned()), vec![workspace]),
+            None => (None, Vec::new()),
+        };
         let meta = EntryMeta {
             crate_name: self.parsed.crate_name.clone(),
             version: self.version(),
             compile_ms,
             created_unix: fsx::unix_now(),
             prekey: Some(self.prekey.clone()),
+            source,
+            workspaces,
             incremental_unit: if self.parsed.incremental() {
                 self.unit.clone()
             } else {
@@ -1518,6 +1533,24 @@ impl Plan {
             Ok(now) => now.stable && &now.hash == keyed,
             Err(_) => false,
         }
+    }
+
+    /// The central-target workspace this compile runs for; `None` for local, explicit and loose targets.
+    fn workspace(&self) -> Option<String> {
+        cache::clean::workspace_of(&self.dirs, &self.profile_abs)
+    }
+
+    /// A compile outside a central target still uses the entry, so it counts as a user that no clean releases.
+    fn user_id(&self) -> String {
+        self.workspace().unwrap_or_else(|| cache::clean::UNATTRIBUTED.to_owned())
+    }
+
+    fn source(&self) -> Option<&'static str> {
+        entry_source(&self.context.immutable_source_roots, &self.cwd, &self.args, self.unit.is_some())
+    }
+
+    fn note_workspace(&self, key: &str) {
+        self.cache.note_workspace(key, &self.user_id());
     }
 
     fn note_unit(&self, key: &str) {
@@ -2957,6 +2990,28 @@ fn immutable_source_roots() -> Vec<PathBuf> {
             home.join("git").join("checkouts"),
         ],
         None => Vec::new(),
+    }
+}
+
+/// `roots` is registry sources then git checkouts; `unit` marks a crate outside both, which is only trusted to be a path crate when the roots are known.
+fn entry_source(roots: &[PathBuf], cwd: &Path, args: &[OsString], has_unit: bool) -> Option<&'static str> {
+    if roots.is_empty() {
+        return None;
+    }
+    let main = args
+        .iter()
+        .skip(1)
+        .filter_map(|arg| arg.to_str())
+        .find(|arg| !arg.starts_with('-') && arg.ends_with(".rs"))?;
+    let main = cwd.join(main);
+    match roots.iter().position(|root| main.starts_with(root)) {
+        Some(0) => Some(cache::clean::SOURCE_REGISTRY),
+        Some(_) => Some(cache::clean::SOURCE_GIT),
+        // Cargo caps lints for every non-local package (vendored directory sources included) and never for path crates.
+        None if args.iter().any(|arg| arg.to_str().is_some_and(|a| a == "--cap-lints" || a.starts_with("--cap-lints="))) => {
+            Some(cache::clean::SOURCE_REGISTRY)
+        }
+        None => has_unit.then_some(cache::clean::SOURCE_PATH),
     }
 }
 
@@ -5002,6 +5057,27 @@ mod tests {
     }
 
     #[test]
+    fn entry_source_follows_where_the_main_source_file_lives() {
+        let roots = vec![PathBuf::from("/h/registry/src"), PathBuf::from("/h/git/checkouts")];
+        let args = |main: &str| -> Vec<OsString> {
+            ["rustc", "--crate-name", "c", main, "--edition=2021"].iter().map(OsString::from).collect()
+        };
+        let cwd = Path::new("/w/app");
+        let source = |main: &str, unit: bool| entry_source(&roots, cwd, &args(main), unit);
+        assert_eq!(source("/h/registry/src/index-1/serde-1/src/lib.rs", false), Some("registry"));
+        assert_eq!(source("/h/git/checkouts/repo-1/abc/src/lib.rs", false), Some("git"));
+        assert_eq!(source("src/lib.rs", true), Some("path"));
+        assert_eq!(source("src/lib.rs", false), None, "no manifest directory means no attribution");
+        for capped in [["--cap-lints", "allow"].as_slice(), ["--cap-lints=allow"].as_slice()] {
+            let mut vendored = args("/w/vendor/leaf-1/src/lib.rs");
+            vendored.extend(capped.iter().map(OsString::from));
+            assert_eq!(entry_source(&roots, cwd, &vendored, true), Some("registry"), "a vendored directory source is non-local");
+        }
+        assert_eq!(entry_source(&[], cwd, &args("src/lib.rs"), true), None, "unknown roots cannot tell a registry crate from a path crate");
+        assert_eq!(entry_source(&roots, cwd, &["rustc".into(), "--version".into()], true), None);
+    }
+
+    #[test]
     fn deferred_jobs_refresh_immutable_roots_and_quarantine_state() {
         let s = Scratch::new("context-state");
         let (mut job, src, _) = fixture(&s);
@@ -6096,13 +6172,15 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_path_unit_store_releases_the_key_lock_at_once() {
-        let s = Scratch::new("path-unit-lock");
+    fn a_queued_primary_incremental_store_releases_the_key_lock_at_once() {
+        let s = Scratch::new("primary-incremental-lock");
         let (mut job, _, _) = fixture(&s);
         job.unit = Some("workspace-unit".to_string());
-        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        plan.primary = true;
+        plan.parsed.incremental_args = vec![1];
         let (mut held, probe) = held_key_lock(&plan);
-        assert!(plan.lent(&held).is_none(), "the store receives no lock for a path unit");
+        assert!(plan.lent(&held).is_none(), "the store receives no lock for the edited package");
         assert!(!try_key_lock(&probe).unwrap());
         plan.release_unlent(&mut held);
         assert!(held.is_none());
@@ -6110,18 +6188,24 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_registry_unit_store_keeps_the_key_lock_until_it_publishes() {
-        let s = Scratch::new("registry-unit-lock");
-        let (job, _, _) = fixture(&s);
-        assert!(job.unit.is_none());
-        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
-        let (mut held, probe) = held_key_lock(&plan);
-        assert!(plan.lent(&held).is_some(), "the store receives the registry unit's lock");
-        plan.release_unlent(&mut held);
-        assert!(held.is_some());
-        assert!(!try_key_lock(&probe).unwrap(), "still held for the store");
-        drop(held);
-        assert!(try_key_lock(&probe).unwrap());
+    fn other_queued_stores_keep_the_key_lock_until_they_publish() {
+        // (unit, primary, incremental): registry, non-primary path, primary non-incremental, non-primary incremental
+        let cases = [(None, false, false), (Some("u"), false, false), (Some("u"), true, false), (Some("u"), false, true)];
+        for (unit, primary, incremental) in cases {
+            let s = Scratch::new("kept-lock");
+            let (mut job, _, _) = fixture(&s);
+            job.unit = unit.map(str::to_string);
+            let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+            plan.primary = primary;
+            plan.parsed.incremental_args = if incremental { vec![1] } else { Vec::new() };
+            let (mut held, probe) = held_key_lock(&plan);
+            assert!(plan.lent(&held).is_some(), "{unit:?} {primary} {incremental}: the store receives the lock");
+            plan.release_unlent(&mut held);
+            assert!(held.is_some());
+            assert!(!try_key_lock(&probe).unwrap(), "still held for the store");
+            drop(held);
+            assert!(try_key_lock(&probe).unwrap());
+        }
     }
 
     #[test]

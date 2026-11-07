@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cache::Cache;
 use crate::cargo_args::{self, CargoArgs, Class, ExecKind, os};
 use crate::config::{Config, RenderMode, TargetMode};
 use crate::events::{self, CacheResult, Event, Feed};
@@ -32,12 +33,13 @@ const MAX_LINE: usize = 16 * 1024 * 1024;
 /// Draining after cargo exits is bounded so a grandchild that inherited the pipes cannot hang frust.
 const LINGER: Duration = Duration::from_secs(2);
 const PUBLISH_TICK: Duration = Duration::from_millis(200);
+const EVICT_REGISTRY_FLAG: &str = "--frust-evict-registry";
 
 pub fn cargo_main(args: Vec<OsString>) -> i32 {
     let started = Instant::now();
     let cfg = Config::from_env();
     let dirs = Dirs::discover();
-    let parsed = CargoArgs::parse(args);
+    let mut parsed = CargoArgs::parse(args);
     // One stat when not due; at most once a day it trims the cache, metadata and scratch files.
     crate::gc::maybe_auto_gc(&dirs, &cfg);
 
@@ -49,6 +51,8 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
     if class == Class::Inert || env::var_os("FRUST_BYPASS").is_some() {
         return exec(&cargo, &parsed.original(), &[]);
     }
+    // Any other subcommand leaves the flag for cargo to judge.
+    let evict_registry = class == Class::Clean && parsed.strip_flag(EVICT_REGISTRY_FLAG);
 
     let cwd = working_dir(&parsed);
     // Both answers are memoised and revalidated each run, so a warm build spawns neither the probe nor `locate-project`.
@@ -77,6 +81,7 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
         }
     }
     let tuning = tuning_args(&cfg, &probe, &parsed, root.as_deref(), &cwd, class, &configs);
+    let owns_clean = class == Class::Clean && target.central.is_some() && parsed.cleans_whole_target();
 
     let session = Session {
         cfg,
@@ -93,11 +98,23 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
     };
     match class {
         Class::Compile | Class::Exec(_) => session.build_and_maybe_exec(class),
+        Class::Clean if owns_clean => session.clean(evict_registry),
         _ => {
             let args = session.parsed.assemble(&session.tuning, session.parsed.subcommand.as_deref().unwrap_or(""), &session.parsed.rest);
             exec(&session.cargo, &args, &session.env_vars)
         }
     }
+}
+
+/// A workspace directory still holding another toolchain's target is left alone; the marker file only names the project.
+fn remove_empty_workspace(target: &Path) {
+    let Some(workspace) = target.parent() else { return };
+    let holds_target = fs::read_dir(workspace).map(|entries| entries.flatten().any(|e| e.path().is_dir())).unwrap_or(true);
+    if holds_target {
+        return;
+    }
+    let _ = fs::remove_file(workspace.join("workspace"));
+    let _ = fs::remove_dir(workspace);
 }
 
 fn trace(cfg: &Config, since: Instant, what: &str) {
@@ -617,6 +634,58 @@ impl Session {
         // Our lock is already released, so user code never blocks other builds.
         let args = self.parsed.assemble(&self.tuning, self.sub(), &self.parsed.rest);
         exec(&self.cargo, &args, &self.env_vars)
+    }
+
+    /// Holds the whole-target build lock from releasing cache entries until the target is gone, so no build starts in between.
+    fn clean(&self, evict_registry: bool) -> i32 {
+        let scope = Scope::All;
+        let held = if self.cfg.lock {
+            let request = lock::Request { command: "cargo clean", fingerprint: "", scope: &scope, join: false, timeout: self.cfg.lock_timeout };
+            let mut announced = false;
+            let mut on_event = |event: LockEvent<'_>| {
+                if let LockEvent::Waiting(waiting) = event
+                    && !announced
+                {
+                    announced = true;
+                    eprintln!("frust: {}", describe_wait(waiting));
+                }
+            };
+            match lock::acquire(&self.dirs, &self.lock_target, request, &mut on_event) {
+                Ok(Acquired::Lock(guard)) => Some(*guard),
+                Ok(Acquired::Failed(failure)) => return failure.code,
+                Err(err) => {
+                    eprintln!("frust: {err}");
+                    return err.exit_code();
+                }
+            }
+        } else {
+            None
+        };
+
+        let (entries, bytes) = crate::cache::clean::workspace_of(&self.dirs, &self.lock_target)
+            .map(|id| Cache::new(&self.dirs).release_workspace(&id, evict_registry))
+            .unwrap_or((0, 0));
+
+        let args = self.parsed.assemble(&self.tuning, self.sub(), &self.parsed.rest);
+        let mut cmd = Command::new(&self.cargo);
+        cmd.args(&args);
+        for (k, v) in &self.env_vars {
+            cmd.env(k, v);
+        }
+        cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
+        let code = supervise_plain(cmd);
+        if code == 0 {
+            remove_empty_workspace(&self.lock_target);
+        }
+        if entries > 0 {
+            let noun = if entries == 1 { "entry" } else { "entries" };
+            eprintln!("frust: released {entries} cache {noun} ({})", crate::fsx::human_bytes(bytes));
+        }
+        if let Some(held) = held {
+            let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
+            held.finish(BuildResult { code, units: 0, interrupted });
+        }
+        code
     }
 
     fn build_phase_command(&self, class: Class) -> (String, Vec<OsString>) {

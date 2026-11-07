@@ -3481,7 +3481,7 @@ mod tests {
         fs::create_dir_all(&entry).unwrap();
         let file = crate::cache::payload::store(source, &entry.join("f0"), compress).unwrap();
         let meta = crate::cache::EntryMeta {
-            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None,
+            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(),
             files: vec![crate::cache::StoredFile {
                 name: source.file_name().unwrap().to_str().unwrap().into(), stored: "f0".into(), text: false, bytes: file.bytes, dir: false,
                 encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None,
@@ -3524,7 +3524,7 @@ mod tests {
         };
         let slice = crate::cache::metadata_slice::build(&entry.join("f0"), &base, &artifact, &target, None).unwrap().unwrap();
         let meta = crate::cache::EntryMeta {
-            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None,
+            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(),
             files: vec![base, slice], stderr: "stderr".into(),
         };
         fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();

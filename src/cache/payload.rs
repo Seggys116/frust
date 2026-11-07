@@ -121,7 +121,7 @@ pub fn capture(src: &Path) -> io::Result<(sys::Meta, Commitment)> {
 }
 
 pub fn compression_supported(staged: &Path) -> bool {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return false;
     }
     static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
@@ -134,7 +134,16 @@ pub fn compression_supported(staged: &Path) -> bool {
         .unwrap_or_else(|e| e.into_inner());
     *devices
         .entry(meta.dev())
-        .or_insert_with(|| !fsx::reflink_supported(staged))
+        .or_insert_with(|| probe_allows_compression(staged, fsx::reflink_supported))
+}
+
+// Volumes without a change time (FAT-style) would fail every stability check, so they keep raw payloads.
+fn probe_allows_compression(staged: &Path, reflinks: impl FnOnce(&Path) -> bool) -> bool {
+    let steady_ctime = || -> io::Result<bool> {
+        let first = sys::stat(staged)?;
+        Ok(first.ctime() == sys::stat(staged)?.ctime())
+    };
+    !reflinks(staged) && steady_ctime().unwrap_or(false)
 }
 
 struct Temporary(PathBuf);
@@ -640,6 +649,24 @@ mod tests {
             decoded_bytes: payload.decoded_bytes,
             content_hash: payload.content_hash,
             metadata_slice: None,
+        }
+    }
+
+    #[test]
+    fn compression_follows_the_reflink_probe_on_every_platform() {
+        let scratch = Scratch::new();
+        assert!(probe_allows_compression(&scratch.0, |_| false));
+        assert!(!probe_allows_compression(&scratch.0, |_| true));
+        assert!(!probe_allows_compression(&scratch.0.join("missing"), |_| false));
+    }
+
+    #[test]
+    fn compression_support_is_enabled_only_where_implemented() {
+        let scratch = Scratch::new();
+        if !cfg!(any(target_os = "linux", windows)) {
+            assert!(!compression_supported(&scratch.0));
+        } else if !fsx::reflink_supported(&scratch.0) {
+            assert!(compression_supported(&scratch.0));
         }
     }
 

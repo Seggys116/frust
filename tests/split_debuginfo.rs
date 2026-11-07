@@ -165,7 +165,8 @@ fn unpacked_split_debuginfo_restores_unannounced_outputs_and_excludes_unchanged_
     let expected = hashes(&deps, meta);
     let executable = blake3::hash(&fs::read(target.join("debug/app")).unwrap());
 
-    fixture.command("clean", "clean");
+    // `app` is a path crate, so `fcargo clean` would also release its cache entries; deleting the target keeps this a restore test.
+    fs::remove_dir_all(&target).unwrap();
     fs::create_dir_all(&deps).unwrap();
     fs::write(&unrelated, b"unrelated bytes after clean").unwrap();
     fs::write(deps.join(&leftover), b"a retained sibling must not be overwritten").unwrap();

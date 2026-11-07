@@ -37,6 +37,10 @@ For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` tur
 
 An explicit `CARGO_TARGET_DIR`, `--target-dir`, or a `target-dir` in your cargo config is always respected.
 
+`--frust-evict-registry` is a flag of `fcargo clean`, not a variable. frust removes it before cargo sees the arguments, and
+it also retires registry and git cache entries that only the cleaned workspace used. Any other command receives the flag
+unchanged. See [cleaning a project](how-it-works.md#cleaning-a-project).
+
 Automatic target retirement applies to frust-managed central targets after 30 days of inactivity. It rechecks
 activity while holding the frust target guard and Cargo profile locks, removes eligible payloads and preserves
 the target/profile directories, `deps` and `.fingerprint` roots, and Cargo lock files. Unknown or user-managed layouts

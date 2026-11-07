@@ -72,7 +72,7 @@ fn osc_sequences_follow_configuration() {
     assert!(raw.contains("\x1b]9;4;0"), "progress must be cleared at the end");
 
     sb.bin("fcargo").arg("clean").current_dir(&p).output().unwrap();
-    let without = sb.bin("fcargo").arg("build").env("FRUST_RENDER", "ansi").env("FRUST_OSC", "off").current_dir(&p).output().unwrap();
+    let without =sb.bin("fcargo").arg("build").env("FRUST_RENDER", "ansi").env("FRUST_OSC", "off").current_dir(&p).output().unwrap();
     assert!(!stderr(&without).contains("\x1b]"), "no OSC when disabled");
 }
 

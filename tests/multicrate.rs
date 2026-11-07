@@ -111,6 +111,11 @@ impl Ws {
         assert_success(&self.fcargo(args).output().unwrap());
     }
 
+    /// Every unit here is a workspace member, which `fcargo clean` releases from the cache; deleting the target keeps these restore tests meaningful.
+    fn lose_target(&self) {
+        fs::remove_dir_all(self.sb.central_target(&self.root)).unwrap();
+    }
+
     fn events_of(&self, args: &[&str]) -> BTreeMap<String, (usize, usize)> {
         let before = self.sb.cache_events().len();
         self.run(args);
@@ -175,7 +180,7 @@ fn clean_rebuild_restores_every_member_and_an_edit_compiles_only_its_dependents(
     }
     assert_eq!(ws.output(), expected(&A));
 
-    ws.run(&["clean"]);
+    ws.lose_target();
     let rebuilt = ws.events_of(&["build"]);
     for member in MEMBERS.iter().chain(&["gen"]) {
         assert_eq!((hits(&rebuilt, member), misses(&rebuilt, member)), (1, 0), "{member} is restored: {rebuilt:?}");
@@ -248,7 +253,7 @@ fn selection_flags_targets_and_check_build_interplay() {
     assert_eq!(ws.output(), expected(&A));
 
     // Built as a dependency under `-p app`, the proc-macro gets cargo's build-override profile (no debug info), a different compile.
-    ws.run(&["clean"]);
+    ws.lose_target();
     let selected = ws.events_of(&["build", "-p", "app"]);
     for member in ["base", "left", "right", "top", "gen", "build_script_build"] {
         assert_eq!(
@@ -269,19 +274,19 @@ fn selection_flags_targets_and_check_build_interplay() {
     let all = ws.events_of(&["build", "--all-targets"]);
     assert_eq!(misses(&all, "top"), 1, "the unit tests of `top` compile: {all:?}");
     assert_eq!(misses(&all, "it"), 1, "the integration test of `top` compiles: {all:?}");
-    ws.run(&["clean"]);
+    ws.lose_target();
     let all_again = ws.events_of(&["build", "--all-targets"]);
     assert_eq!(all_again.values().map(|e| e.1).sum::<usize>(), 0, "every unit is restored: {all_again:?}");
     assert_success(&ws.fcargo(&["test", "--workspace"]).output().unwrap());
 
     // check and build are separate units; neither stands in for the other.
-    ws.run(&["clean"]);
+    ws.lose_target();
     let check = ws.events_of(&["check"]);
     assert!(misses(&check, "top") == 1 && hits(&check, "top") == 0, "check units are new: {check:?}");
     let build = ws.events_of(&["build"]);
     assert_eq!(build.values().map(|e| e.1).sum::<usize>(), 0, "build units are restored: {build:?}");
     assert_eq!(ws.output(), expected(&A));
-    ws.run(&["clean"]);
+    ws.lose_target();
     let check_again = ws.events_of(&["check"]);
     assert_eq!(check_again.values().map(|e| e.1).sum::<usize>(), 0, "check units are restored: {check_again:?}");
     assert_eq!(hits(&check_again, "top"), 1);
@@ -325,7 +330,7 @@ fn primary_incremental_caching_can_be_turned_off() {
         ws.sb.cache_events()[before..].iter().filter(|e| MEMBERS.contains(&e["crate"].as_str().unwrap_or(""))).count()
     };
     assert_eq!(off(&["build"]), 0, "members are left to rustc");
-    assert_success(&ws.fcargo(&["clean"]).output().unwrap());
+    ws.lose_target();
     assert!(off(&["build", "-p", "app"]) >= 4);
     assert_eq!(ws.output(), expected(&A));
 }

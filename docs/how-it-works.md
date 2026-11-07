@@ -98,7 +98,7 @@ dependency), only one should compile it.
   the fallback on unsupported platforms, watcher errors and missed notifications.
   This is fail-open: if the lock file cannot be opened or locked, or the wait runs out, the wrapper compiles
   anyway. Every acquired key lock triggers another lookup, including an immediate acquisition. The lock is
-  held until the entry is published (for workspace units, until the store is queued). Matching compiler units can share results across profile and target
+  held until the entry is published (for primary incremental units, until the store is queued). Matching compiler units can share results across profile and target
   directories; different compiler flags keep separate identities.
 * Publication, manifest updates, usage refreshes, version-record updates and retirement renames share a short
   cache-wide metadata lock. Compilation, hashing and payload deletion happen outside it. Retirement prunes
@@ -118,9 +118,9 @@ dependency), only one should compile it.
   writes a job file under `tmp/deferred` and hands it to a background worker. On Linux and macOS, an observed second
   eligible compile attempt starts broker setup while Cargo is active. The broker admits up to eight jobs per shared
   cache home, retaining job metadata without queued output copies. Single-unit builds use the detached helper.
-  Workers store an entry only if its files still match. Workers of registry and git units hold the unit key lock
-  until completion; a workspace unit releases it once its job is queued, so the next edit's build never waits for
-  the previous store. The wrapper
+  Workers store an entry only if its files still match. Workers hold the unit key lock until completion,
+  except for a primary incremental unit, which releases it once its job is queued so the next edit's build never
+  waits for the previous store. The wrapper
   records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4.
 * Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
 * The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
@@ -144,8 +144,11 @@ reach are 0.
 ## Cache payload storage
 
 `FRUST_CACHE_COMPRESSION=auto` is the default. New regular-file payloads are compressed with LZ4 only on Linux
-when a probe on the cache filesystem finds that reflinks do not work. Reflink-capable cache filesystems and other
-platforms keep raw payloads. Files smaller than 64 KiB stay raw, and a compressed file is kept only when it saves
+and Windows when a probe on the cache filesystem finds that reflinks do not work, so NTFS compresses and ReFS with
+block cloning (including Dev Drive) keeps raw clones. Windows also keeps raw payloads on volumes that report no
+change time. Reflink-capable cache filesystems and macOS keep raw payloads. Windows does not produce the inline
+metadata slices of format 5, which need a Unix-only capture of the encoder stream; its encoded payloads are still
+verified by length and blake3 on restore. Files smaller than 64 KiB stay raw, and a compressed file is kept only when it saves
 at least 12.5 percent and 4 KiB. Dep-info, stderr and directory bundles stay raw. The codec is pure Rust and needs
 no external compression program.
 
@@ -250,6 +253,26 @@ encoded entries use a separate key domain from the keys older writers compute.
   output, updates the progress estimate when ready, and is cancelled before the build lock is released. It has a
   five-second deadline and never waits for completion after the build. Target selection, tuning and lock scoping
   share an invocation-local snapshot of Cargo configuration files.
+
+### Cleaning a project
+
+`fcargo clean` of a whole central target takes the whole-target build lock, retires cache entries that only this
+workspace needs, runs cargo's own `clean` as a child with the original arguments and returns its exit code. Cargo's
+output is unchanged; one `frust: released N cache entries (SIZE)` line follows it when something was retired.
+
+* Each entry records where it came from (`registry`, `git` or `path`) and a list of up to 16 workspace ids that stored
+  or restored it, oldest first. A hit adds its workspace once; a build outside a central target adds a marker id
+  that no clean releases. Entries stored before this existed carry neither field and are never retired by a clean.
+* A clean retires path entries whose list is exactly the cleaned workspace. Registry and git entries are kept in the
+  shared store, where they are already compressed on platforms that support it. `--frust-evict-registry` retires those
+  too when only this workspace used them. An entry shared with another workspace is kept and the cleaned workspace
+  leaves its list, with the entry's last-use time unchanged so age-based eviction is unaffected.
+* `-p`, `--release`, `--profile`, `--target`, `--doc` and `--dry-run` clean less than the whole target, and entries do
+  not record a profile, so those runs retire nothing. They, and any clean with `--target-dir`, `CARGO_TARGET_DIR`, a
+  configured `target-dir` or `FRUST_TARGET=local`, are passed to cargo exactly as before.
+* After a successful clean the workspace directory under `targets/` is removed when no other toolchain's target remains.
+* The list is capped, and a workspace dropped from a full list is forgotten, so an entry can look less shared than it is
+  and be retired by a clean; the cost is a recompile, never wrong output.
 
 ## Incremental data and compaction
 
