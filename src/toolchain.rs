@@ -26,6 +26,36 @@ pub fn resolve_tool(name: &str) -> Option<PathBuf> {
     find_on_path(name)
 }
 
+/// Prefix of the wrapper's key error when an explicit linker cannot be found, which the timing record classifies as `skip:linker`.
+pub const LINKER_UNRESOLVED: &str = "cannot resolve linker";
+
+/// The directories rustc itself searches for the linkers rustup ships.
+pub fn sysroot_linker_dirs(sysroot: &Path, host: &str) -> [PathBuf; 3] {
+    let bin = sysroot.join("lib").join("rustlib").join(host).join("bin");
+    [bin.clone(), bin.join("gcc-ld"), bin.join("self-contained")]
+}
+
+/// PATH first, then the toolchain's own directories; `None` means the linker must not be keyed.
+pub fn resolve_linker(name: &str, sysroot: Option<(&Path, &str)>) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    find_on_path(name).or_else(|| {
+        let (root, host) = sysroot?;
+        let suffixed = format!("{name}{}", env::consts::EXE_SUFFIX);
+        sysroot_linker_dirs(root, host)
+            .iter()
+            .find_map(|dir| sys::find_executable_in(dir, name).or_else(|| sys::find_executable_in(dir, &suffixed)))
+    })
+}
+
+/// The sysroot and host triple come from the front end, so no rustc is spawned per unit.
+pub fn resolve_linker_env(name: &str) -> Option<PathBuf> {
+    let root = env::var_os("FRUST_SYSROOT").filter(|v| !v.is_empty()).map(PathBuf::from);
+    let host = env::var("FRUST_HOST").ok().filter(|v| !v.is_empty());
+    resolve_linker(name, root.as_deref().zip(host.as_deref()))
+}
+
 fn probe_rustc() -> Option<PathBuf> {
     env::var_os("RUSTC").map(PathBuf::from).or_else(|| resolve_tool("rustc"))
 }
@@ -37,6 +67,8 @@ pub struct Probe {
     pub host: String,
     pub cargo_version: (u32, u32, u32),
     pub id: String,
+    /// Empty when `rustc --print sysroot` failed.
+    pub sysroot: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +89,7 @@ impl CacheOutcome {
     }
 }
 
-const PROBE_FORMAT: &str = "frust-probe-v1";
+const PROBE_FORMAT: &str = "frust-probe-v2";
 /// Backstop for selection inputs the key cannot see, such as a hand-written `rustc` wrapper script.
 const PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 /// A validated file modified this close to the probe start may have changed mid-probe, so the result is not memoised.
@@ -118,17 +150,22 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
     // Run one query alone first: parallel proxies would each start rustup's auto-install of a missing toolchain and corrupt it.
     let cargo_out = query(cargo, tc.as_deref(), &["-V"], cwd);
     let rustc_handle = spawn(rustc.to_path_buf(), &["-vV"]);
+    let own_handle = spawn(rustc.to_path_buf(), &["--print", "sysroot"]);
     let mut sysroot_handles = Vec::new();
-    if want_sysroot {
-        sysroot_handles.push(spawn(rustc.to_path_buf(), &["--print", "sysroot"]));
-        // `RUSTC` may name a compiler other than the proxied one `cargo` belongs to.
-        if let Some(proxy) = resolve_tool("rustc").filter(|p| p != rustc) {
-            sysroot_handles.push(spawn(proxy, &["--print", "sysroot"]));
-        }
+    // `RUSTC` may name a compiler other than the proxied one `cargo` belongs to.
+    if want_sysroot && let Some(proxy) = resolve_tool("rustc").filter(|p| p != rustc) {
+        sysroot_handles.push(spawn(proxy, &["--print", "sysroot"]));
     }
     let rustc_out = rustc_handle.join().ok().flatten();
+    let own_sysroot = own_handle.join().ok().flatten().map(|s| PathBuf::from(s.trim())).filter(|s| s.is_absolute());
     let mut sysroots = Vec::new();
     let mut complete = true;
+    if want_sysroot {
+        match &own_sysroot {
+            Some(dir) => sysroots.push(dir.clone()),
+            None => complete = false,
+        }
+    }
     for handle in sysroot_handles {
         match handle.join().ok().flatten().map(|s| PathBuf::from(s.trim())).filter(|s| s.is_absolute()) {
             Some(dir) => sysroots.push(dir),
@@ -148,6 +185,7 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
         release,
         host,
         id,
+        sysroot: own_sysroot.map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default(),
     };
     Some((probe, sysroots))
 }
@@ -470,6 +508,37 @@ mod tests {
         assert_eq!(digest(&file.join("nested")), digest(&file.join("nested")), "a file used as a directory reads as absent");
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir(&dir);
+    }
+
+    fn fake_linker(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"linker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn linkers_resolve_from_the_sysroot_after_path_and_not_at_all_otherwise() {
+        let root = env::temp_dir().join(format!("frust-linker-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("lib").join("rustlib").join("x86_64-test").join("bin");
+        let suffix = env::consts::EXE_SUFFIX;
+        fake_linker(&bin.join(format!("frust-test-lld{suffix}")));
+        fake_linker(&bin.join("gcc-ld").join(format!("frust-test-ld.lld{suffix}")));
+        fake_linker(&bin.join("self-contained").join(format!("frust-test-sc{suffix}")));
+
+        let sysroot = Some((root.as_path(), "x86_64-test"));
+        assert_eq!(resolve_linker("frust-test-lld", sysroot), Some(bin.join(format!("frust-test-lld{suffix}"))));
+        assert_eq!(resolve_linker("frust-test-ld.lld", sysroot), Some(bin.join("gcc-ld").join(format!("frust-test-ld.lld{suffix}"))));
+        assert_eq!(resolve_linker("frust-test-sc", sysroot), Some(bin.join("self-contained").join(format!("frust-test-sc{suffix}"))));
+        assert_eq!(resolve_linker("frust-test-lld", None), None, "without a sysroot only PATH is searched");
+        assert_eq!(resolve_linker("frust-test-lld", Some((root.as_path(), "other-host"))), None);
+        assert_eq!(resolve_linker("frust-test-missing", sysroot), None);
+        assert_eq!(resolve_linker("", sysroot), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

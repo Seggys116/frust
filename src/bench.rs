@@ -3349,9 +3349,51 @@ fn deferred_slots(paths: &[PathBuf]) -> Vec<PathBuf> {
     slots.sort(); slots
 }
 
+fn json_file_named(path: &Path, prefix: &[u8]) -> bool {
+    path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(prefix) && name.as_encoded_bytes().ends_with(b".json"))
+}
+
+/// Queued (`job-*`) and claimed (`claimed-*`) job files are both unfinished work.
+fn pending_job_names(paths: &[PathBuf]) -> Vec<String> {
+    let mut names: Vec<String> = paths.iter().filter(|path| json_file_named(path, b"job-") || json_file_named(path, b"claimed-"))
+        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())).collect();
+    names.sort();
+    names
+}
+
 fn has_deferred_jobs(paths: &[PathBuf]) -> bool {
-    paths.iter().any(|path| path.file_name()
-        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"job-") && name.as_encoded_bytes().ends_with(b".json")))
+    !pending_job_names(paths).is_empty()
+}
+
+// Unreadable or locked slots count as held, so a helper is only started when nobody can be draining.
+fn any_slot_held(paths: &[PathBuf]) -> bool {
+    deferred_slots(paths).iter().any(|path| {
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else { return true };
+        match sys::try_lock(&file, sys::LockKind::Exclusive) {
+            Ok(()) => { let _ = sys::unlock(&file); false }
+            Err(_) => true,
+        }
+    })
+}
+
+/// Queued jobs with nobody draining them: nothing but a helper will ever store them.
+fn drainer_needed(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| json_file_named(path, b"job-")) && !any_slot_held(paths)
+}
+
+fn start_drainer(home: &Path, envs: &[(&str, &str)]) -> Result<std::process::Child, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let helper = exe.with_file_name(format!("frust-wrap{}", std::env::consts::EXE_SUFFIX));
+    if !helper.is_file() {
+        return Err(format!("no frust-wrap binary at {}", helper.display()));
+    }
+    let mut cmd = Command::new(&helper);
+    controlled_environment(&mut cmd);
+    cmd.arg("--deferred-drain").env("FRUST_HOME", home).env("FRUST_STORE_SYNC", "0");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("{}: {e}", helper.display()))
 }
 
 fn deferred_stores_idle(home: &Path) -> Result<bool, String> {
@@ -3388,13 +3430,38 @@ fn deferred_stores_idle(home: &Path) -> Result<bool, String> {
 
 /// Waits only on this benchmark's isolated home; completion proves no pending job and exclusive ownership of every existing slot.
 pub fn drain_deferred_stores(home: &Path, timeout: Duration) -> Result<(), String> {
+    drain_deferred_with(home, timeout, &[])
+}
+
+/// Same wait, started with the child environment of the context so a helper stores with the same settings.
+fn drain_deferred_for(ctx: &Ctx, timeout: Duration) -> Result<(), String> {
+    drain_deferred_with(&ctx.home, timeout, &[("FRUST_CACHE_COMPRESSION", ctx.compression.as_str())])
+}
+
+// Queued jobs left with no slot holder are drained by a helper started here; leftover claimed files of dead helpers only end the wait at the timeout.
+fn drain_deferred_with(home: &Path, timeout: Duration, envs: &[(&str, &str)]) -> Result<(), String> {
     let started = Instant::now();
+    let directory = Dirs::at(home).deferred();
+    let mut helper: Option<std::process::Child> = None;
+    let mut last_start: Option<Instant> = None;
+    let mut start_error: Option<String> = None;
     loop {
         if deferred_stores_idle(home)? { return Ok(()); }
-        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-            return Err(format!("deferred stores did not drain within {}ms in {}", timeout.as_millis(), home.display()));
+        if helper.as_mut().is_some_and(|child| child.try_wait().ok().flatten().is_some()) { helper = None; }
+        let paths = deferred_entries(&directory)?.unwrap_or_default();
+        if helper.is_none() && last_start.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) && drainer_needed(&paths) {
+            last_start = Some(Instant::now());
+            match start_drainer(home, envs) {
+                Ok(child) => helper = Some(child),
+                Err(error) => start_error = Some(error),
+            }
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()).filter(|left| !left.is_zero()) else {
+            let left = pending_job_names(&paths);
+            let files = if left.is_empty() { "no job files (slot locks still held)".to_string() } else { left.join(", ") };
+            let started_note = start_error.map(|e| format!("; helper start failed: {e}")).unwrap_or_default();
+            return Err(format!("deferred stores did not drain within {}ms in {}: remaining {files}{started_note}", timeout.as_millis(), home.display()));
         };
-        if remaining.is_zero() { return Err(format!("deferred stores did not drain in {}", home.display())); }
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
@@ -3418,7 +3485,7 @@ fn timed_with_store(ctx: &Ctx, frust: bool, cmd: &mut Command, store: StorePolic
     let before = crate::stats::totals(&crate::stats::read_ledger(&dirs));
     let captured = spawn_capture(cmd)?;
     let (store_drain_millis, settled_millis) = if frust && store == StorePolicy::Deferred {
-        drain_deferred_stores(&ctx.home, Duration::from_secs(120)).map_err(|error| format!("deferred-store drain failed: {error}"))?;
+        drain_deferred_for(ctx, Duration::from_secs(120)).map_err(|error| format!("deferred-store drain failed: {error}"))?;
         let settled = Instant::now();
         (Some(settled.duration_since(captured.exited).as_millis() as u64), Some(settled.duration_since(captured.started).as_millis() as u64))
     } else { (None, None) };

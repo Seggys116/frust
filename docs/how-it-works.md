@@ -7,7 +7,7 @@ Details behind the README: cache correctness, disk usage, locking, platforms and
 The cache uses a two-step key, the same idea as ccache's direct mode.
 
 1. A *pre-key* is derived from the toolchain, the normalised command line, `CARGO_*` environment, the
-   working directory, and the **contents** of every `--extern` library, native library directory and explicitly selected linker executable. Explicit linker names are resolved through the current path; a missing or unreadable executable bypasses caching.
+   working directory, and the **contents** of every `--extern` library, native library directory and explicitly selected linker executable. A bare linker name (`-C linker=NAME`, a cargo config `linker` or rustflags, `RUSTFLAGS`) is resolved on `PATH` first (with `PATHEXT` on Windows), then in the directories rustc searches in the toolchain sysroot: `lib/rustlib/<host>/bin`, its `gcc-ld` and its `self-contained` subdirectories, so rustup's `rust-lld` resolves. The sysroot comes from the toolchain probe and is passed to the wrapper by `fcargo` (`FRUST_SYSROOT`, `FRUST_HOST`). A name that resolves nowhere, or an unreadable executable, bypasses caching rather than being keyed by a guess. The bypass is visible: the wrapper prints one `frust-wrap: cache bypassed: ...` line per reason (repeated only after gc clears its marker in the state directory's `tmp`), the timing record says `skip:linker`, and `frust doctor` warns with the same reason using the same resolution code.
 2. Earlier real compiles record, per pre-key, the exact source files they read (from rustc's own dep-info,
    with content hashes) and every environment variable the compile observed (`env!`, `option_env!`,
    tracked env in proc macros). A candidate matches only if every file still has its recorded content hash
@@ -30,6 +30,10 @@ remain readable and retain the object-name fallback; entries without either iden
 
 If a `RUSTC_WRAPPER` is already set (for example `sccache`), frust leaves it in place and the compile cache
 stays inactive. `frust doctor` says so.
+
+Workspace crates are keyed by their absolute directory, because their outputs embed absolute paths. Each git
+worktree or clone therefore misses once for its own crates, while registry and git crates hit across worktrees.
+Sharing workspace crate entries across roots is not done.
 
 ## Stamp trust and audits
 
@@ -121,11 +125,22 @@ dependency), only one should compile it.
   Workers store an entry only if its files still match. Workers hold the unit key lock until completion,
   except for a primary incremental unit, which releases it once its job is queued so the next edit's build never
   waits for the previous store. The wrapper
-  records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4.
+  records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4 (2 and
+  8 on Windows, where the store is bound by file I/O rather than cores); `FRUST_STORE_SLOTS` sets the count.
 * Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
-* The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when no slot is free, when the
-  result cannot be handed over (for example a directory output, or an incremental compile that printed an
-  incremental-compilation warning), for unhashed metadata probes whose outputs may be deleted immediately,
+* With no free slot the store never runs on the compile's path. The wrapper freezes the outputs as usual and writes
+  the job as `job-<pid>-<ns>-q<prekey>.json`, without a slot, then returns. A helper that finishes its job drains
+  such files before it exits, newest first, claiming each by renaming it to `claimed-<pid>-...`; older queued jobs
+  for the same prekey are dropped unread, since a newer compile has replaced their outputs. A wrapper that finishes
+  a compile and sees queued files with a slot free starts a helper just to drain them, so a job written after the
+  last helper's final scan waits at most until the next compile. Every frozen-state check applies to a queued job
+  exactly as to any other, so bytes that changed after the freeze are never published.
+* Test and bench harness executables (`rustc --test`, or `--cfg test` for a binary) are not stored by default: they
+  are rebuilt on almost every edit and rarely restored. They still run normally and are restored if an entry
+  exists. `FRUST_CACHE_TESTS=on` stores them again.
+* The store runs inline in the wrapper, as before, when `FRUST_STORE_SYNC=1`, when the result cannot be frozen
+  (for example a directory output, a coarse timestamp, an untrusted volume, or an incremental compile that printed
+  an incremental-compilation warning), for unhashed metadata probes whose outputs may be deleted immediately,
   or when a background handoff cannot complete.
 
 So the entry for a crate can appear a moment after cargo has moved on. A build started in that moment simply
@@ -138,8 +153,9 @@ in a single write as it exits; passthrough invocations write nothing, and with t
 touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans describe the unit), `prekey_ms`,
 `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
 `spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
-`hit`, `deferred` (helper), `queued` (broker), `inline:<reason>` or `skip:<reason>`. Stages a run did not
-reach are 0.
+`hit`, `deferred` (helper), `queued` (broker), `queued:slots` (job file waiting for a helper),
+`inline:<reason>` or `skip:<reason>`; `skip:linker` marks a unit that ran uncached because its explicit linker could
+not be resolved, and `skip:test` a test or bench executable that was compiled but not stored. Stages a run did not reach are 0.
 
 ## Cache payload storage
 

@@ -243,7 +243,7 @@ fn config_relative(file: &Path, dir: &str) -> PathBuf {
 }
 
 /// Cargo's read order: from the working directory upwards (not the workspace root), then the root's ancestors, then `CARGO_HOME`.
-fn config_files(root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn config_files(root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for start in [Some(cwd), root].into_iter().flatten() {
         for dir in start.ancestors() {
@@ -422,6 +422,10 @@ fn moves_outputs(text: &str) -> bool {
 
 fn accelerator_env(cfg: &Config, probe: &Probe) -> Vec<(OsString, OsString)> {
     let mut vars = vec![(os("FRUST_RUSTC_ID"), os(&probe.id))];
+    if !probe.sysroot.is_empty() {
+        vars.push((os("FRUST_SYSROOT"), os(&probe.sysroot)));
+        vars.push((os("FRUST_HOST"), os(&probe.host)));
+    }
     if !cfg.cache && !(crate::linking::requested() && crate::linking::supported()) {
         return vars;
     }

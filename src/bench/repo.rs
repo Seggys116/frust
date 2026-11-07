@@ -1054,7 +1054,7 @@ struct Rig<'a> {
 impl Rig<'_> {
     // A background store from the previous build must not run during the next timed row.
     fn quiesce(&self) {
-        if let Err(error) = drain_deferred_stores(&self.ctx.home, QUIESCE_TIMEOUT) {
+        if let Err(error) = drain_deferred_for(self.ctx, QUIESCE_TIMEOUT) {
             eprintln!("frust bench: warning: {error}");
         }
     }
@@ -1517,6 +1517,46 @@ mod tests {
         let unsupported = StoreOnly::unsupported("no extents".into());
         assert!(store_only_lines(&unsupported)[0].contains("unsupported (no extents)"));
         assert!(store_only_lines(&all)[0].contains("2.7 KiB"));
+    }
+
+    fn deferred_dir(tag: &str, names: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("frust-bench-test-deferred-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let paths = deferred_entries(&dir).unwrap().unwrap();
+        (dir, paths)
+    }
+
+    #[test]
+    fn pending_jobs_cover_queued_and_claimed_files_but_not_slots_or_other_files() {
+        let names = ["job-1-2-qabc.json", "job-1-5.json", "claimed-9-1-2-qabc.json", "slot-0", "job-1-2.txt", "notes.json"];
+        let (dir, paths) = deferred_dir("pending", &names);
+        assert_eq!(pending_job_names(&paths), ["claimed-9-1-2-qabc.json", "job-1-2-qabc.json", "job-1-5.json"]);
+        assert!(has_deferred_jobs(&paths));
+        let (slots_dir, only_slots) = deferred_dir("slots", &["slot-0", "slot-1", "notes.json"]);
+        assert!(!has_deferred_jobs(&only_slots));
+        let (claimed_dir, only_claimed) = deferred_dir("claimed", &["claimed-9-1-2-qabc.json"]);
+        assert!(has_deferred_jobs(&only_claimed));
+        for path in [dir, slots_dir, claimed_dir] {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn a_drainer_is_needed_only_for_queued_jobs_with_no_slot_holder() {
+        let (dir, paths) = deferred_dir("needed", &["job-1-2-qabc.json", "slot-0"]);
+        assert!(drainer_needed(&paths));
+        let slot = fs::OpenOptions::new().read(true).write(true).open(dir.join("slot-0")).unwrap();
+        sys::try_lock(&slot, sys::LockKind::Exclusive).unwrap();
+        assert!(!drainer_needed(&paths), "a held slot means a helper is draining");
+        let _ = sys::unlock(&slot);
+        let (other, claimed_only) = deferred_dir("needed-claimed", &["claimed-9-1-2-qabc.json", "slot-0"]);
+        assert!(!drainer_needed(&claimed_only), "claimed files belong to their claimer, not to a new helper");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other);
     }
 
     #[test]

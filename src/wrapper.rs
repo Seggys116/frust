@@ -1,7 +1,7 @@
 //! The `RUSTC_WRAPPER`: anything not understood or not cacheable is exec'd straight through, so new rustc flags cannot break a build.
 
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -79,6 +79,9 @@ const ENV_AFFECTS_OUTPUT: &[&str] = &[
 
 /// First argument of the detached helper that finishes a store; a compiler command line never starts with it.
 const DEFERRED_ARG: &str = "--deferred-store";
+/// Sole argument of a helper that finds a slot itself and drains queued job files.
+const DRAIN_ARG: &str = "--deferred-drain";
+const CLAIMED_PREFIX: &str = "claimed-";
 const JOB_LEASE_ENV: &str = "FRUST_DEFERRED_JOB_LEASE";
 
 // A lock held by a process that is working finishes within seconds, so the poll starts fast and settles at 40 ms.
@@ -102,6 +105,10 @@ pub fn run(args: Vec<OsString>) -> i32 {
     if let Some(job) = deferred_entry(&args) {
         DETACHED_STORE.store(true, Ordering::Relaxed);
         return deferred_main(job);
+    }
+    if drain_entry(&args) {
+        DETACHED_STORE.store(true, Ordering::Relaxed);
+        return drain_main();
     }
     // SAFETY: startup has opened no files; pipe validation rejects stale descriptor numbers.
     JOBSERVER.get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() });
@@ -248,6 +255,10 @@ impl Plan {
             Ok(found) => found,
             Err(reason) => {
                 debug(format!("not cacheable: {} ({reason})", parsed.crate_name));
+                if reason.starts_with(crate::toolchain::LINKER_UNRESOLVED) {
+                    note_linker_bypass(&dirs, &reason);
+                    timings::skipped(begun, &parsed.crate_name, primary, parsed.incremental(), "skip:linker");
+                }
                 return None;
             }
         };
@@ -713,7 +724,8 @@ impl Plan {
 
     /// A registry or git unit's `key_lock` is held until the store has published, so a process queued behind it finds the entry; a path unit's is released once its store is queued.
     fn compile_and_store(&self, mut key_lock: Option<File>) -> i32 {
-        if self.can_defer_store()
+        if !self.skips_store()
+            && self.can_defer_store()
             && env::var_os(crate::store_broker::CAPABILITY_ENV).is_some_and(|value| !value.is_empty())
         {
             events::request_store();
@@ -763,7 +775,10 @@ impl Plan {
         if status.success() {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
-            if self.defer_store(
+            if self.skips_store() {
+                self.probe.mode(|| "skip:test".to_string());
+                let _ = self.skip_store("test executables are not stored", compile_ms);
+            } else if self.defer_store(
                 &captured,
                 compile_ms,
                 spawned_ns,
@@ -791,7 +806,27 @@ impl Plan {
         }
         // Dropped after the store: the helper of a deferred store holds its own copy of the lock.
         drop(key_lock);
+        if status.success() {
+            self.wake_queue();
+        }
         code
+    }
+
+    /// Test and bench executables are rebuilt on nearly every edit and rarely restored, so they are stored only with `FRUST_CACHE_TESTS=on`.
+    fn skips_store(&self) -> bool {
+        self.parsed.test_harness && !crate::config::cache_tests()
+    }
+
+    /// Jobs queued while every slot was busy are picked up here when a slot has freed since, so a quiet build still stores them.
+    fn wake_queue(&self) {
+        let deferred = self.dirs.deferred();
+        if self.cfg.store_sync || queued_jobs(&deferred).is_empty() {
+            return;
+        }
+        // The probe only shows whether a slot is free; the drain helper takes its own.
+        if acquire_slot(&deferred, slot_count()).is_some() {
+            let _ = spawn_drainer(&self.cwd);
+        }
     }
 
     /// Returns true on acknowledged deferral; false requests inline fallback, possibly after a lost broker acknowledgement.
@@ -854,13 +889,14 @@ impl Plan {
         } else {
             None
         };
-        if broker.is_none() && slot.is_none() {
+        // Without a slot the job waits as a file for any helper to drain, so the compile never waits on a store.
+        let queue_only = broker.is_none() && slot.is_none();
+        if queue_only {
             self.debug(&format!(
-                "deferred store slots busy or unavailable for {}; storing inline",
+                "deferred store slots busy for {}; queueing the store",
                 self.parsed.crate_name
             ));
-            return self.declined("slots-busy");
-        };
+        }
         let frozen_started = Instant::now();
         let frozen = self.freeze(captured, spawned_ns, preexisting);
         self.probe.set(|r| r.freeze_ms = timings::ms(frozen_started));
@@ -872,8 +908,10 @@ impl Plan {
         let lent = self.lent(key_lock);
         // Both locks travel to the helper as inherited handles, which stdio must not be mistaken for.
         let mut keep: Vec<&File> = slot.iter().map(|(file, _)| file).collect();
-        keep.extend(lent);
-        if broker.is_none() && !sys::inheritable_clear_of_stdio(&keep) {
+        if !queue_only {
+            keep.extend(lent);
+        }
+        if broker.is_none() && !queue_only && !sys::inheritable_clear_of_stdio(&keep) {
             return self.declined("stdio-overlap");
         }
         // Where handles are not inherited the helper takes both locks again by path.
@@ -888,7 +926,8 @@ impl Plan {
         };
         let job = StoreJob {
             format: JOB_FORMAT,
-            ownership_version: u32::from(sys::INHERITS_DESCRIPTORS),
+            // A queued job has no spawned owner to inherit a lease, so its helper leases it by path.
+            ownership_version: u32::from(sys::INHERITS_DESCRIPTORS && !queue_only),
             context: self.context.clone(),
             home: self.cwd.join(self.dirs.root()),
             cwd: self.cwd.clone(),
@@ -928,23 +967,34 @@ impl Plan {
                 .filter(|_| helper_relocks)
                 .map(|(_, path)| self.cwd.join(path)),
             key_lock: lent
-                .filter(|_| helper_relocks)
+                .filter(|_| helper_relocks || queue_only)
                 .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
-        let (job_path, job_lease) = write_leased_job(&deferred, &job)?;
+        let (job_path, job_lease) = if queue_only {
+            write_queued_job(&deferred, &job)?
+        } else {
+            write_leased_job(&deferred, &job)?
+        };
         keep.push(&job_lease);
         let handed_over = match broker {
             Some(permit) => submit_broker_job(&job_path, |path| {
                 permit.submit(&self.cwd.join(path), lent)
             }),
+            None if queue_only => Ok(true),
             None => spawn_helper(&job_path, &self.cwd, &keep, &job_lease).map(|()| true),
         };
         self.probe.set(|r| r.spawn_ms = timings::ms(spawn_started));
         match handed_over {
             Ok(true) => {
-                let mode = if queued { "queued" } else { "deferred" };
+                let mode = if queue_only {
+                    "queued:slots"
+                } else if queued {
+                    "queued"
+                } else {
+                    "deferred"
+                };
                 self.probe.mode(|| mode.to_string());
                 self.release_unlent(key_lock);
                 // Recorded now so the run's feed sees the compile; the helper stores quietly.
@@ -2272,7 +2322,7 @@ fn wait_key_with_slot<L: SlotLoan>(
 
 /// How many deferred stores may run at once across all processes.
 fn slot_count() -> usize {
-    (thread::available_parallelism().map_or(2, |n| n.get()) / 2).clamp(1, 4)
+    crate::config::store_slots()
 }
 
 /// A free slot lock and its path, or `None` when all `count` are taken or none can be opened.
@@ -2291,12 +2341,24 @@ fn write_job(dir: &Path, job: &StoreJob) -> io::Result<PathBuf> {
 }
 
 fn write_leased_job(dir: &Path, job: &StoreJob) -> io::Result<(PathBuf, File)> {
-    lock::ensure_dir(dir, None)?;
-    let path = dir.join(format!(
-        "job-{}-{}.json",
+    let name = format!("job-{}-{}.json", std::process::id(), hashing::now_ns());
+    write_named_job(dir, &name, job)
+}
+
+/// The prekey in the name lets a drain drop superseded jobs without reading them.
+fn write_queued_job(dir: &Path, job: &StoreJob) -> io::Result<(PathBuf, File)> {
+    let name = format!(
+        "job-{}-{}-q{}.json",
         std::process::id(),
-        hashing::now_ns()
-    ));
+        hashing::now_ns(),
+        job.prekey
+    );
+    write_named_job(dir, &name, job)
+}
+
+fn write_named_job(dir: &Path, name: &str, job: &StoreJob) -> io::Result<(PathBuf, File)> {
+    lock::ensure_dir(dir, None)?;
+    let path = dir.join(name);
     let bytes = serde_json::to_vec(job).map_err(io::Error::other)?;
     let tmp = fsx::temp_sibling(&path);
     let result = (|| {
@@ -2578,7 +2640,8 @@ pub(crate) fn deferred_protection(dirs: &Dirs) -> DeferredProtection {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with("job-") || !name.ends_with(".json") {
+            let is_job = name.starts_with("job-") || name.starts_with(CLAIMED_PREFIX);
+            if !is_job || !name.ends_with(".json") {
                 continue;
             }
             jobs += 1;
@@ -2588,6 +2651,10 @@ pub(crate) fn deferred_protection(dirs: &Dirs) -> DeferredProtection {
             let path = entry.path();
             let file = match sys::open_existing_lock_file(&path) {
                 Ok(file) => file,
+                // A queued job may have been renamed to its claimed name after the listing; the scan then cannot vouch for it.
+                Err(err) if err.kind() == io::ErrorKind::NotFound && name.contains("-q") => {
+                    return Err(err);
+                }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
             };
@@ -2739,8 +2806,109 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
         };
         let _held = relock(&job);
         compact::at_background_priority(|| run_deferred(&job));
+        // The slot is still held, so queued jobs are finished before it is given back.
+        drain_queue(deferred, run_queued);
     }
     0
+}
+
+/// The sole argument of a drain helper is `--deferred-drain`; compiler command lines never match.
+fn drain_entry(args: &[OsString]) -> bool {
+    matches!(args, [flag] if flag == DRAIN_ARG)
+}
+
+fn drain_main() -> i32 {
+    let Ok(dirs) = Dirs::try_discover() else {
+        return 0;
+    };
+    let deferred = dirs.deferred();
+    // Held until exit; with every slot taken the running helpers drain the queue instead.
+    let Some(_slot) = acquire_slot(&deferred, slot_count()) else {
+        return 0;
+    };
+    drain_queue(&deferred, run_queued);
+    0
+}
+
+/// Starts a drain helper without handing it a slot, which it takes itself.
+fn spawn_drainer(cwd: &Path) -> io::Result<()> {
+    let mut cmd = Command::new(helper_exe()?);
+    cmd.arg(DRAIN_ARG).current_dir(cwd).env_remove(JOB_LEASE_ENV);
+    sys::spawn_detached(&mut cmd, &[])
+}
+
+/// A queued job as named on disk: `job-<pid>-<ns>-q<prekey>.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedName {
+    path: PathBuf,
+    ns: i128,
+    prekey: String,
+}
+
+/// Queued jobs, newest first; other job files belong to a helper that was spawned for them.
+fn queued_jobs(deferred: &Path) -> Vec<QueuedName> {
+    let Ok(entries) = fs::read_dir(deferred) else {
+        return Vec::new();
+    };
+    let mut found: Vec<QueuedName> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = name.strip_prefix("job-")?.strip_suffix(".json")?;
+            let (pid, rest) = stem.split_once('-')?;
+            let (ns, prekey) = rest.split_once("-q")?;
+            pid.parse::<u32>().ok()?;
+            cache::valid_key(prekey).then_some(QueuedName {
+                path: entry.path(),
+                ns: ns.parse().ok()?,
+                prekey: prekey.to_string(),
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| b.path.cmp(&a.path)));
+    found
+}
+
+/// The rename is the claim: when helpers race for one file exactly one rename succeeds.
+fn claim_queued(job: &QueuedName) -> Option<JobFile> {
+    let name = job.path.file_name()?.to_str()?.strip_prefix("job-")?;
+    let claimed = job
+        .path
+        .with_file_name(format!("{CLAIMED_PREFIX}{}-{name}", std::process::id()));
+    sys::rename(&job.path, &claimed).ok()?;
+    Some(JobFile(claimed))
+}
+
+/// Claims and runs queued jobs until none remain; only the newest job of a prekey is read, since an older one would fail its frozen check against the newer compile's outputs.
+fn drain_queue(deferred: &Path, mut run: impl FnMut(&JobFile)) {
+    loop {
+        let mut claimed_any = false;
+        let mut seen = HashSet::new();
+        for job in queued_jobs(deferred) {
+            let Some(file) = claim_queued(&job) else {
+                continue;
+            };
+            claimed_any = true;
+            if seen.insert(job.prekey) {
+                run(&file);
+            }
+        }
+        if !claimed_any {
+            return;
+        }
+    }
+}
+
+/// Queued jobs hold no inherited lease and their key lock, if any, is taken again by path.
+fn run_queued(file: &JobFile) {
+    let Some(job) = read_job(&file.0).filter(|job| job.ownership_version == 0) else {
+        return;
+    };
+    let Ok(_lease) = helper_job_lease(&file.0, 0) else {
+        return;
+    };
+    let _held = relock(&job);
+    compact::at_background_priority(|| run_deferred(&job));
 }
 
 /// The slot lock, and the key lock of a registry or git unit, were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
@@ -3359,6 +3527,14 @@ impl KeyContext<'_> {
     }
 
     fn linker_tool(&self, program: &Path) -> Result<PathBuf, String> {
+        self.linker_tool_in(program, crate::toolchain::resolve_linker_env)
+    }
+
+    fn linker_tool_in(
+        &self,
+        program: &Path,
+        resolve: impl FnOnce(&str) -> Option<PathBuf>,
+    ) -> Result<PathBuf, String> {
         if program.is_absolute()
             || program
                 .parent()
@@ -3368,10 +3544,15 @@ impl KeyContext<'_> {
         }
         program
             .to_str()
-            .filter(|name| !name.is_empty())
-            .and_then(crate::toolchain::find_on_path)
+            .and_then(resolve)
             .map(|path| self.cwd.join(path))
-            .ok_or_else(|| format!("cannot resolve linker {} on PATH", program.display()))
+            .ok_or_else(|| {
+                format!(
+                    "{} {}; searched PATH and the toolchain sysroot",
+                    crate::toolchain::LINKER_UNRESOLVED,
+                    program.display()
+                )
+            })
     }
 
     fn dir_hash(&self, dir: &Path, watched: &mut Vec<(PathBuf, Stamp)>) -> Result<String, String> {
@@ -3408,6 +3589,16 @@ impl KeyContext<'_> {
             }
         }
         Ok(None)
+    }
+}
+
+/// One stderr line per reason until gc clears the marker, so a bypass is visible without a line per unit.
+fn note_linker_bypass(dirs: &Dirs, reason: &str) {
+    let marker = dirs.tmp().join(format!("linker-note-{}", crate::paths::short_hash(reason)));
+    let first = fs::create_dir_all(dirs.tmp()).is_ok()
+        && fs::OpenOptions::new().write(true).create_new(true).open(&marker).is_ok();
+    if first {
+        eprintln!("frust-wrap: cache bypassed: {reason}");
     }
 }
 
@@ -3562,6 +3753,30 @@ mod tests {
         let keyed = keyed(&cwd, &["-Clinker=rustc"]).unwrap();
         assert_eq!(keyed.watched[0].0, cwd.join(driver));
         assert!(keyed.extern_hashes.is_empty());
+    }
+
+    #[test]
+    fn bare_linkers_fall_back_to_the_toolchain_sysroot() {
+        let s = Scratch::new("linker-sysroot");
+        let suffix = env::consts::EXE_SUFFIX;
+        let bin = s.0.join("sysroot").join("lib").join("rustlib").join("x86_64-test").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let lld = bin.join(format!("frust-test-rust-lld{suffix}"));
+        fs::write(&lld, b"lld").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lld, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hasher = Hasher::ephemeral();
+        let profile = s.0.join("target").join("debug");
+        let profile_text = profile.to_string_lossy().into_owned();
+        let ctx = KeyContext { hasher: &hasher, cwd: &s.0, profile: &profile_text, profile_abs: &profile };
+        let sysroot = s.0.join("sysroot");
+        let resolve = |name: &str| crate::toolchain::resolve_linker(name, Some((sysroot.as_path(), "x86_64-test")));
+        assert_eq!(ctx.linker_tool_in(Path::new("frust-test-rust-lld"), resolve).unwrap(), lld);
+        let err = ctx.linker_tool_in(Path::new("frust-test-absent-lld"), resolve).unwrap_err();
+        assert!(err.starts_with(crate::toolchain::LINKER_UNRESOLVED) && err.contains("sysroot"), "{err}");
     }
 
     #[test]
@@ -6375,7 +6590,7 @@ mod tests {
         drop(again);
         assert!(acquire_slot(&dir, 0).is_none());
         drop(second);
-        assert!((1..=4).contains(&slot_count()));
+        assert!((1..=16).contains(&slot_count()));
     }
 
     #[test]
@@ -6492,6 +6707,117 @@ mod tests {
         assert_eq!(deferred_main_in(path.clone(), &deferred), 0);
         assert!(!path.exists());
         assert_eq!(rows(&job), 1);
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn only_queued_job_names_are_listed_newest_first() {
+        let s = Scratch::new("queue-names");
+        let deferred = s.0.join("deferred");
+        fs::create_dir_all(&deferred).unwrap();
+        let (a, b) = ("ab".repeat(20), "cd".repeat(20));
+        for name in [
+            "job-1-5.json".to_string(),
+            "job-1-broker-abc.json".to_string(),
+            format!("job-x-1-q{a}.json"),
+            "job-1-2-qzz.json".to_string(),
+            format!("claimed-1-2-q{a}.json"),
+            format!("job-1-2-q{a}.txt"),
+        ] {
+            fs::write(deferred.join(name), b"x").unwrap();
+        }
+        assert!(queued_jobs(&deferred).is_empty());
+        for name in [format!("job-1-100-q{a}.json"), format!("job-2-300-q{b}.json"), format!("job-1-200-q{a}.json")] {
+            fs::write(deferred.join(name), b"x").unwrap();
+        }
+        let order: Vec<i128> = queued_jobs(&deferred).iter().map(|q| q.ns).collect();
+        assert_eq!(order, [300, 200, 100]);
+    }
+
+    #[test]
+    fn claiming_a_queued_job_is_a_rename_that_only_one_claimant_wins() {
+        let s = Scratch::new("queue-claim");
+        let deferred = s.0.join("deferred");
+        fs::create_dir_all(&deferred).unwrap();
+        let key = "ab".repeat(20);
+        let path = deferred.join(format!("job-1-100-q{key}.json"));
+        fs::write(&path, b"x").unwrap();
+        let queued = queued_jobs(&deferred).remove(0);
+        let first = claim_queued(&queued).expect("first claimant");
+        assert!(!path.exists());
+        assert_eq!(first.0.file_name().unwrap().to_str().unwrap(), format!("claimed-{}-1-100-q{key}.json", std::process::id()));
+        assert!(claim_queued(&queued).is_none(), "the file is already taken");
+        drop(first);
+        assert!(file_names(&deferred).is_empty(), "a finished claim leaves nothing behind");
+    }
+
+    #[test]
+    fn a_drain_runs_the_newest_job_of_each_prekey_and_drops_older_ones_unread() {
+        let s = Scratch::new("queue-order");
+        let deferred = s.0.join("deferred");
+        fs::create_dir_all(&deferred).unwrap();
+        let (a, b) = ("ab".repeat(20), "cd".repeat(20));
+        for name in [format!("job-1-100-q{a}.json"), format!("job-1-200-q{b}.json"), format!("job-1-300-q{a}.json")] {
+            fs::write(deferred.join(name), b"x").unwrap();
+        }
+        fs::write(deferred.join("job-1-50.json"), b"x").unwrap();
+        let mut ran = Vec::new();
+        drain_queue(&deferred, |file| {
+            let name = file.0.file_name().unwrap().to_str().unwrap();
+            ran.push(name.split_once(&format!("{}-", std::process::id())).unwrap().1.to_string());
+        });
+        assert_eq!(ran, [format!("1-300-q{a}.json"), format!("1-200-q{b}.json")]);
+        assert_eq!(file_names(&deferred), ["job-1-50.json"], "a job meant for its own helper is left alone");
+    }
+
+    #[test]
+    fn a_drained_job_is_stored_and_removed() {
+        let s = Scratch::new("queue-store");
+        let (job, _, _) = fixture(&s);
+        let deferred = s.0.join("deferred");
+        let (_, lease) = write_queued_job(&deferred, &job).unwrap();
+        drain_queue(&deferred, run_queued);
+        drop(lease);
+        assert_eq!(rows(&job), 1);
+        assert!(file_names(&deferred).is_empty());
+    }
+
+    #[test]
+    fn a_drained_job_does_not_publish_bytes_that_changed_after_the_freeze() {
+        let s = Scratch::new("queue-changed");
+        let (job, _, rlib) = fixture(&s);
+        let deferred = s.0.join("deferred");
+        let (_, lease) = write_queued_job(&deferred, &job).unwrap();
+        fs::write(&rlib, b"object rewritten after the freeze").unwrap();
+        drain_queue(&deferred, run_queued);
+        drop(lease);
+        assert_eq!(rows(&job), 0);
+        assert!(file_names(&deferred).is_empty());
+    }
+
+    #[test]
+    fn a_queued_job_is_protected_under_both_its_names() {
+        if crate::isolated_test(module_path!(), "a_queued_job_is_protected_under_both_its_names") {
+            return;
+        }
+        let s = Scratch::new("queue-protection");
+        let (job, _, output) = fixture(&s);
+        let dirs = Dirs::at(&job.home);
+        let (path, lease) = write_queued_job(&dirs.deferred(), &job).unwrap();
+        assert!(deferred_protection(&dirs).protects(&output));
+        let queued = queued_jobs(&dirs.deferred()).remove(0);
+        let claimed = claim_queued(&queued).unwrap();
+        assert!(!path.exists());
+        assert!(deferred_protection(&dirs).protects(&output));
+        drop((claimed, lease));
     }
 
     #[test]

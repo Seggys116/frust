@@ -18,8 +18,13 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Linked outputs are no longer hashed before the wrapper returns to cargo; the store hashes them and checks the file's identity around the hash and before the link.
 * Manifest format 6 is written only for manifests that list a linked entry, and linked entries use their own key domain, so earlier versions treat them as misses. Formats 3, 4 and 5 stay readable.
 
+* `FRUST_STORE_SLOTS` (1 to 16) sets the number of concurrent background stores; the default is half the CPU count, 1 to 4, and 2 to 8 on Windows.
+* `FRUST_CACHE_TESTS=on` stores test and bench harness executables, which are no longer stored by default.
+
 ### Changed
 
+* Test and bench harness executables (`rustc --test`) are compiled but not stored unless `FRUST_CACHE_TESTS=on`, so a rebuild of many test targets no longer pays for storing each one.
+* A finished compile with no free store slot queues its store as a job file that any helper drains, instead of storing inline on the compile's critical path. `FRUST_TIMINGS` reports it as `queued:slots`; inline stores remain only where the outputs cannot be frozen.
 * Cache entries are evicted by age, not by size. `FRUST_CACHE_MAX_GIB` and `FRUST_TARGET_MAX_GIB` are unlimited unless set.
 * Deferred stores of primary incremental units no longer hold the unit key lock, so the next edit does not wait for the previous store.
 * Detached helpers on Windows are created without inheriting handles.
@@ -28,6 +33,9 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+* `frust env` and `frust doctor` look for `frust-wrap.exe` on Windows, so `frust env` prints its `RUSTC_WRAPPER` line and doctor finds the wrapper.
+* A bare explicit linker such as `rust-lld` (from `-C linker`, cargo config or `RUSTFLAGS`) is also resolved in the toolchain sysroot, so those units are cached instead of silently compiled uncached.
+* A cache bypass caused by an unresolved linker is now visible: one stderr line per reason, `skip:linker` in `FRUST_TIMINGS`, and a `frust doctor` warning that names the linker.
 * A pending deferred store no longer protects the rest of the cache from eviction once its scan budget is exhausted.
 
 ## [0.3.0]

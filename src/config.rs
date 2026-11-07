@@ -94,6 +94,28 @@ pub fn unit_versions() -> usize {
         .clamp(1, crate::wrapper::UNIT_VERSIONS)
 }
 
+/// `FRUST_CACHE_TESTS`: whether test and bench harness executables are stored; off by default, since they are rebuilt on edits and rarely restored.
+pub fn cache_tests() -> bool {
+    flag("FRUST_CACHE_TESTS", false)
+}
+
+/// The most slot lock files a store can ever use; gc treats every slot below it as canonical.
+pub const MAX_STORE_SLOTS: usize = 16;
+
+/// Background store slots: `FRUST_STORE_SLOTS` (1..=16) or a default sized for the volume's I/O, which Windows tolerates less well than its core count suggests.
+pub fn store_slots() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+    env::var("FRUST_STORE_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=MAX_STORE_SLOTS).contains(n))
+        .unwrap_or_else(|| default_store_slots(cpus))
+}
+
+fn default_store_slots(cpus: usize) -> usize {
+    if cfg!(windows) { (cpus / 2).clamp(2, 8) } else { (cpus / 2).clamp(1, 4) }
+}
+
 /// Days (fractional allowed) as a duration; negative or non-numeric input is rejected and huge values saturate.
 pub fn days_to_duration(days: f64) -> Option<Duration> {
     (days >= 0.0).then(|| Duration::from_secs_f64((days * 86_400.0).min(u32::MAX as f64 * 86_400.0)))
@@ -147,4 +169,17 @@ fn detect_osc() -> Osc {
         || env::var_os("VTE_VERSION").is_some();
     let modern = known_links || term.starts_with("xterm") || term.starts_with("tmux") || term.starts_with("screen");
     Osc { progress: known_progress, title: modern && term != "dumb", links: known_links }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_store_slots;
+
+    #[test]
+    fn default_store_slots_scale_with_cores_within_the_platform_bounds() {
+        let (floor, ceiling) = if cfg!(windows) { (2, 8) } else { (1, 4) };
+        assert_eq!(default_store_slots(1), floor);
+        assert_eq!(default_store_slots(64), ceiling);
+        assert_eq!(default_store_slots(6), 3);
+    }
 }

@@ -458,7 +458,7 @@ fn worker(dirs: &Dirs, config: &Config, queue: &SharedQueue) {
     }
 }
 
-fn slot_count() -> usize { (thread::available_parallelism().map_or(2, |n| n.get()) / 2).clamp(1, 4) }
+fn slot_count() -> usize { crate::config::store_slots() }
 
 fn wait_execution_slot(dirs: &Dirs, deadline: Option<Instant>) -> io::Result<Option<File>> {
     lock::ensure_dir(&dirs.deferred(), None)?;
@@ -1206,7 +1206,9 @@ mod tests {
         let acquired = received.recv_timeout(CLIENT_WAIT).unwrap().unwrap().unwrap();
         waiter.join().unwrap();
         assert!(!owned_path.exists());
-        assert!(try_exclusive(&reservation_probe).unwrap());
+        // A child forked by another test thread keeps a copy of the descriptor until it execs, so the release can lag briefly.
+        let released = (0..100).any(|_| try_exclusive(&reservation_probe).unwrap() || (thread::sleep(Duration::from_millis(20)), false).1);
+        assert!(released);
         drop(acquired);
     }
 

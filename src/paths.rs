@@ -132,6 +132,15 @@ pub fn private_temp_dir(base: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+pub fn wrapper_binary_name() -> String {
+    format!("frust-wrap{}", env::consts::EXE_SUFFIX)
+}
+
+/// The installed wrapper that sits next to the running binary, if it exists.
+pub fn sibling_wrapper() -> Option<PathBuf> {
+    env::current_exe().ok().map(|exe| exe.with_file_name(wrapper_binary_name())).filter(|path| path.exists())
+}
+
 pub fn short_hash(input: impl AsRef<[u8]>) -> String {
     let hash = blake3::hash(input.as_ref());
     hash.to_hex()[..12].to_string()

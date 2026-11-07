@@ -151,6 +151,23 @@ fn stats_gc_doctor_and_locks_commands_work() {
 }
 
 #[test]
+fn env_prints_the_wrapper_line_with_the_platform_suffix() {
+    let sb = Sandbox::new("env-wrapper");
+    let p = project_with_leaf(&sb, "a");
+    let out = sb.bin("frust").arg("env").current_dir(&p).output().unwrap();
+    assert_success(&out);
+    let text = stdout(&out);
+    let line = text.lines().find(|l| l.starts_with("export RUSTC_WRAPPER=")).unwrap_or_else(|| panic!("no RUSTC_WRAPPER line: {text}"));
+    let path = std::path::PathBuf::from(line.trim_start_matches("export RUSTC_WRAPPER='").trim_end_matches('\''));
+    let expected = format!("frust-wrap{}", std::env::consts::EXE_SUFFIX);
+    assert_eq!(path.file_name().unwrap().to_string_lossy(), expected, "{line}");
+    assert!(path.is_file(), "{line}");
+
+    let doctor = sb.bin("frust").arg("doctor").current_dir(&p).output().unwrap();
+    assert!(stdout(&doctor).contains("frust-wrap found next to the frust binary"), "{}", stdout(&doctor));
+}
+
+#[test]
 fn gc_refuses_without_confirmation_and_frees_with_it() {
     let sb = Sandbox::new("gc");
     let p = project_with_leaf(&sb, "a");

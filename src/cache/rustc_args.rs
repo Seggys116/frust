@@ -11,6 +11,8 @@ pub struct RustcArgs {
     /// Without a disambiguating suffix, only explicit metadata-only libraries have a fixed output set.
     pub metadata_only_library: bool,
     pub windows_pdb_output: bool,
+    /// Builds a test or bench executable: `--test`, or `--cfg test` for a binary.
+    pub test_harness: bool,
     pub paths: Vec<(usize, PathArg)>,
     pub libs: Vec<NativeLib>,
     pub out_dir_args: Vec<usize>,
@@ -99,6 +101,8 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
     let mut emits_link = false;
     let mut target = None;
     let mut crate_types = Vec::new();
+    let mut test_flag = false;
+    let mut cfg_test = false;
     let mut paths = Vec::new();
     let mut libs = Vec::new();
     let mut out_dir_args = Vec::new();
@@ -216,8 +220,13 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
                 target = Some(value.clone());
                 paths.push((i, PathArg::Target(value)));
             }
-            "--cfg"
-            | "--check-cfg"
+            "--test" => test_flag = true,
+            "--cfg" => {
+                cfg_test |= next == Some("test");
+                i += 1;
+            }
+            _ if arg == "--cfg=test" => cfg_test = true,
+            "--check-cfg"
             | "--edition"
             | "--cap-lints"
             | "--json"
@@ -253,6 +262,7 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
             && target.as_deref().map_or(cfg!(all(windows, target_env = "msvc")), |target| {
                 matches!(target, "i586-pc-windows-msvc" | "i686-pc-windows-msvc" | "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" | "arm64ec-pc-windows-msvc" | "thumbv7a-pc-windows-msvc")
             }),
+        test_harness: emits_link && (test_flag || cfg_test && crate_types.iter().any(|kind| kind == "bin")),
         paths,
         libs,
         out_dir_args,
@@ -496,6 +506,28 @@ mod tests {
         assert!(parsed.libs[0].bundled());
         assert!(!parsed.libs[1].bundled());
         assert_eq!(parsed.libs[1].name, "bar");
+    }
+
+    #[test]
+    fn test_harness_units_are_recognised_by_flag_or_test_cfg_on_a_binary() {
+        for flags in [
+            vec!["--test"],
+            vec!["--crate-type", "bin", "--test"],
+            vec!["--crate-type=bin", "--cfg", "test"],
+            vec!["--cfg=test", "--crate-type=bin"],
+        ] {
+            assert!(with(&flags).unwrap().test_harness, "{flags:?}");
+        }
+        for flags in [
+            vec![],
+            vec!["--crate-type=bin"],
+            vec!["--crate-type=lib", "--cfg", "test"],
+            vec!["--cfg", "feature=\"test\"", "--crate-type=bin"],
+        ] {
+            assert!(!with(&flags).unwrap().test_harness, "{flags:?}");
+        }
+        let args = os(&["--crate-name=a", "--out-dir=/o", "--emit=dep-info,metadata", "--test"]);
+        assert!(!parse(&args).unwrap().test_harness);
     }
 
     #[test]

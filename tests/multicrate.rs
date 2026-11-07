@@ -117,8 +117,16 @@ impl Ws {
     }
 
     fn events_of(&self, args: &[&str]) -> BTreeMap<String, (usize, usize)> {
+        self.events_with_tests(args, None)
+    }
+
+    fn events_with_tests(&self, args: &[&str], cache_tests: Option<&str>) -> BTreeMap<String, (usize, usize)> {
         let before = self.sb.cache_events().len();
-        self.run(args);
+        let mut cmd = self.fcargo(args);
+        if let Some(value) = cache_tests {
+            cmd.env("FRUST_CACHE_TESTS", value);
+        }
+        assert_success(&cmd.output().unwrap());
         let mut counts = BTreeMap::new();
         for event in &self.sb.cache_events()[before..] {
             let entry = counts.entry(event["crate"].as_str().unwrap_or("").to_string()).or_insert((0, 0));
@@ -275,7 +283,15 @@ fn selection_flags_targets_and_check_build_interplay() {
     assert_eq!(misses(&all, "top"), 1, "the unit tests of `top` compile: {all:?}");
     assert_eq!(misses(&all, "it"), 1, "the integration test of `top` compiles: {all:?}");
     ws.lose_target();
-    let all_again = ws.events_of(&["build", "--all-targets"]);
+    let unstored = ws.events_of(&["build", "--all-targets"]);
+    for harness in ["top", "it"] {
+        assert_eq!(misses(&unstored, harness), 1, "test executables are not stored by default: {unstored:?}");
+    }
+    ws.lose_target();
+    let stored = ws.events_with_tests(&["build", "--all-targets"], Some("on"));
+    assert_eq!(misses(&stored, "it"), 1, "the first build with FRUST_CACHE_TESTS=on compiles and stores: {stored:?}");
+    ws.lose_target();
+    let all_again = ws.events_with_tests(&["build", "--all-targets"], Some("on"));
     assert_eq!(all_again.values().map(|e| e.1).sum::<usize>(), 0, "every unit is restored: {all_again:?}");
     assert_success(&ws.fcargo(&["test", "--workspace"]).output().unwrap());
 

@@ -25,7 +25,7 @@ pub struct Record {
     pub rustc_ms: u64,
     pub freeze_ms: u64,
     pub spawn_ms: u64,
-    /// `hit`, `deferred`, `queued`, `inline:<reason>` or `skip:<reason>`.
+    /// `hit`, `deferred`, `queued`, `inline:<reason>` or `skip:<reason>`, where `skip:linker` is an explicit linker that could not be resolved.
     pub store_mode: String,
     pub inline_store_ms: u64,
     pub total_ms: u64,
@@ -74,6 +74,16 @@ fn target() -> Option<&'static Path> {
 fn append(path: &Path, record: &Record) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(record.line().as_bytes())
+}
+
+/// Appends the record of a unit that ran uncached before any plan existed.
+pub fn skipped(begun: Instant, krate: &str, primary: bool, incremental: bool, mode: &str) {
+    Probe::new(begun, || {
+        let mut record = Record::new(krate, false, primary, incremental);
+        record.store_mode = mode.to_string();
+        record
+    })
+    .finish();
 }
 
 /// Collects the stages of one wrapper run; inert, with no file access, when no sink is configured.

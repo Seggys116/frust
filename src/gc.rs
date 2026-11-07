@@ -1342,6 +1342,13 @@ fn plan_keylocks(dirs: &Dirs, plan: &mut Plan) {
     }
 }
 
+/// Every slot index a store may use is canonical, so the shared worker bound never loses a lock identity.
+fn canonical_slot(name: &str) -> bool {
+    name.strip_prefix(DEFERRED_SLOT_PREFIX)
+        .and_then(|index| index.parse::<usize>().ok().filter(|n| n.to_string() == index))
+        .is_some_and(|n| n < config::MAX_STORE_SLOTS)
+}
+
 /// Collect stale jobs, temporaries and unheld noncanonical slots while preserving execution-lock identities.
 fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
     let Ok(entries) = fs::read_dir(dirs.deferred()) else { return };
@@ -1352,11 +1359,11 @@ fn plan_deferred(dirs: &Dirs, plan: &mut Plan) {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(name.strip_prefix(DEFERRED_SLOT_PREFIX), Some("0" | "1" | "2" | "3")) {
+        if canonical_slot(&name) {
             continue;
         }
         let guarded = name.starts_with(DEFERRED_SLOT_PREFIX)
-            || name.starts_with("job-") && name.ends_with(".json");
+            || (name.starts_with("job-") || name.starts_with("claimed-")) && name.ends_with(".json");
         let Ok(meta) = sys::lstat(&path) else { continue };
         let Ok(identity) = MetadataIdentity::read(&meta) else { continue };
         let snapshot = DeferredMetadata { identity, guarded };
@@ -2027,6 +2034,44 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn every_slot_a_store_can_use_is_canonical() {
+        for index in 0..config::MAX_STORE_SLOTS {
+            assert!(canonical_slot(&format!("{DEFERRED_SLOT_PREFIX}{index}")), "slot {index}");
+        }
+        for name in ["slot-16", "slot-04", "slot-", "slot-x", "slot--1", "job-1-2.json"] {
+            assert!(!canonical_slot(name), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_queued_and_claimed_jobs_are_collected_but_fresh_ones_and_high_slots_stay() {
+        let root = home("deferred-queued-claimed");
+        let dirs = Dirs::at(&root);
+        fs::create_dir_all(dirs.deferred()).unwrap();
+        let key = "ab".repeat(20);
+        let old = SystemTime::now() - DEFERRED_MAX_AGE * 2;
+        let stale: Vec<PathBuf> = [format!("job-1-2-q{key}.json"), format!("claimed-1-2-q{key}.json"), format!("claimed-3-4-q{key}.json")]
+            .iter().map(|name| dirs.deferred().join(name)).collect();
+        let fresh = dirs.deferred().join(format!("claimed-5-6-q{key}.json"));
+        let slot = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}7"));
+        for file in stale.iter().chain([&fresh, &slot]) {
+            fs::write(file, []).unwrap();
+        }
+        for file in stale.iter().chain([&slot]) {
+            File::open(file).unwrap().set_modified(old).unwrap();
+        }
+        let mut selected = Plan::default();
+        plan_deferred(&dirs, &mut selected);
+        for file in &stale {
+            assert!(selected.deferred_retirements.contains_key(file), "{}", file.display());
+        }
+        assert!(!selected.deferred_retirements.contains_key(&fresh));
+        assert!(!selected.deferred_retirements.contains_key(&slot), "a slot below the maximum is never retired");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn deferred_legacy_age_and_canonical_lock_policies_are_preserved() {
@@ -2042,7 +2087,7 @@ mod tests {
         assert!(selected.removals.is_empty(), "an unlocked fresh legacy record is not dead");
         File::open(&path).unwrap().set_modified(SystemTime::now() - DEFERRED_MAX_AGE * 2).unwrap();
         let canonical = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}0"));
-        let noncanonical = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}9"));
+        let noncanonical = dirs.deferred().join(format!("{DEFERRED_SLOT_PREFIX}20"));
         let stray = dirs.deferred().join("orphan.tmp");
         for file in [&canonical, &noncanonical, &stray] {
             fs::write(file, []).unwrap();

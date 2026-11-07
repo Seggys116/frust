@@ -490,10 +490,14 @@ fn env_cmd(dirs: &Dirs) -> i32 {
         eprintln!("frust: could not query the toolchain");
         return 1;
     };
-    if let Some(wrapper) = env::current_exe().ok().map(|e| e.with_file_name("frust-wrap")).filter(|p| p.exists()) {
+    if let Some(wrapper) = crate::paths::sibling_wrapper() {
         println!("export RUSTC_WRAPPER='{}'", wrapper.display());
     }
     println!("export FRUST_RUSTC_ID='{}'", probe.id);
+    if !probe.sysroot.is_empty() {
+        println!("export FRUST_SYSROOT='{}'", probe.sysroot);
+        println!("export FRUST_HOST='{}'", probe.host);
+    }
     let (root, _) = workspace::locate_cached(dirs, &cwd, None, None, &probe.id);
     println!("export CARGO_TARGET_DIR='{}'", workspace::central_target(dirs, root.as_deref(), &probe.id).display());
     0

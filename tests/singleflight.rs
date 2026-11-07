@@ -344,7 +344,7 @@ fn counted_profile_pair(tag: &str, deferred: bool, profiles: [&str; 2]) {
         let leaf_deferred = |stderr: &str| stderr.lines().any(|line| line.contains("compiled leaf ") && line.contains("store deferred"));
         // Independent keys can race for the sole deferred slot on small runners.
         assert!(leaf_deferred(&first_stderr) || (different_flags
-            && first_stderr.contains("deferred store slots busy or unavailable for leaf; storing inline")
+            && first_stderr.contains("deferred store slots busy for leaf; queueing the store")
             && leaf_deferred(&second_stderr)), "{first_stderr}\n{second_stderr}");
     }
 }

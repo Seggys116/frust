@@ -39,7 +39,8 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
         Some(path) => checks.push(check("rustc", Status::Ok, path.display().to_string())),
         None => checks.push(check("rustc", Status::Fail, "not found on PATH")),
     }
-    match Probe::run(None, cwd) {
+    let probe = Probe::run(None, cwd);
+    match &probe {
         Some(probe) => {
             checks.push(check(
                 "toolchain",
@@ -50,13 +51,16 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
         None => checks.push(check("toolchain", Status::Fail, "could not query rustc -vV / cargo -V")),
     }
 
-    let wrapper_ok = env::current_exe().ok().is_some_and(|e| e.with_file_name("frust-wrap").exists())
-        || toolchain::find_on_path("frust-wrap").is_some();
+    let wrapper_ok = crate::paths::sibling_wrapper().is_some()
+        || toolchain::find_on_path(&crate::paths::wrapper_binary_name()).is_some();
     checks.push(if wrapper_ok {
         check("rustc wrapper", Status::Ok, "frust-wrap found next to the frust binary")
     } else {
         check("rustc wrapper", Status::Fail, "frust-wrap not found; reinstall with `cargo install --path .` so all binaries are installed")
     });
+
+    let sysroot = probe.as_ref().filter(|p| !p.sysroot.is_empty()).map(|p| (Path::new(p.sysroot.as_str()), p.host.as_str()));
+    checks.extend(linker_check(&configured_linkers(cwd), cwd, sysroot));
 
     // A foreign RUSTC_WRAPPER (such as sccache) wins over frust-wrap, so the compile cache cannot run.
     match env::var("RUSTC_WRAPPER") {
@@ -119,6 +123,112 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
     checks
 }
 
+fn quoted(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find(['"', '\'']) {
+        let quote = rest.as_bytes()[start] as char;
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(quote) else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// Linker names from `-C linker=X`, `-Clinker=X` and `--codegen linker=X` in a flag list.
+fn flag_linkers(tokens: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let setting = if token == "-C" || token == "--codegen" {
+            tokens.get(i + 1).map(String::as_str)
+        } else {
+            token.strip_prefix("-C").or_else(|| token.strip_prefix("--codegen="))
+        };
+        if let Some(name) = setting.and_then(|s| s.strip_prefix("linker=")).filter(|n| !n.is_empty()) {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// Reads `target.<triple>.linker` and the rustflags keys of one cargo config file.
+fn config_linkers(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut table = String::new();
+    let mut lines = text.lines();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            table = line.trim_matches(['[', ']']).replace([' ', '"', '\''], "");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim().trim_matches(['"', '\'']);
+        let full = if table.is_empty() { key.to_string() } else { format!("{table}.{key}") };
+        let target = full.starts_with("target.");
+        if target && full.ends_with(".linker") {
+            found.extend(quoted(value));
+        } else if full == "build.rustflags" || (target && full.ends_with(".rustflags")) {
+            let mut value = value.trim().to_string();
+            while value.starts_with('[') && !value.contains(']') {
+                let Some(next) = lines.next() else { break };
+                value.push(' ');
+                value.push_str(next.split('#').next().unwrap_or(""));
+            }
+            let tokens: Vec<String> = quoted(&value).iter().flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>()).collect();
+            found.extend(flag_linkers(&tokens));
+        }
+    }
+    found
+}
+
+/// Every explicit linker that applies to `cwd`: cargo config files, `RUSTFLAGS` and `CARGO_BUILD_RUSTFLAGS`.
+fn configured_linkers(cwd: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for file in crate::run::config_files(None, cwd) {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            found.extend(config_linkers(&text));
+        }
+    }
+    for var in ["RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"] {
+        if let Ok(flags) = env::var(var) {
+            let tokens: Vec<String> = flags.split_whitespace().map(str::to_string).collect();
+            found.extend(flag_linkers(&tokens));
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Resolves each name the way the wrapper does, so a warning here means the wrapper skips the cache.
+fn linker_check(names: &[String], cwd: &Path, sysroot: Option<(&Path, &str)>) -> Option<Check> {
+    if names.is_empty() {
+        return None;
+    }
+    let missing: Vec<String> = names
+        .iter()
+        .filter(|name| {
+            let path = Path::new(name.as_str());
+            if path.is_absolute() || path.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+                !cwd.join(path).is_file()
+            } else {
+                toolchain::resolve_linker(name, sysroot).is_none()
+            }
+        })
+        .map(|name| format!("cache bypassed: linker {name} not found; searched PATH and the toolchain sysroot"))
+        .collect();
+    Some(if missing.is_empty() {
+        check("explicit linker", Status::Ok, format!("{} resolves, so the compile cache applies", names.join(", ")))
+    } else {
+        check("explicit linker", Status::Warn, missing.join("; "))
+    })
+}
+
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
@@ -172,6 +282,44 @@ mod tests {
         assert_eq!(warn.status, Status::Warn);
         assert!(warn.detail.contains("mode audit") && warn.detail.contains("2 volume(s) quarantined"), "{}", warn.detail);
         assert!(warn.detail.contains("last violation 1m ago") && warn.detail.contains("3 violation(s)"), "{}", warn.detail);
+    }
+
+    #[test]
+    fn linkers_are_read_from_config_tables_and_every_flag_spelling() {
+        let text = "[build]\nrustflags = [\"-C\", \"linker=rust-lld\"]\n\n[target.x86_64-pc-windows-msvc]\nlinker = \"lld-link\"\nrustflags = [\n  \"-Clinker=ld.lld\", # comment\n]\n\n[profile.dev]\nlinker = \"ignored\"\n";
+        assert_eq!(config_linkers(text), ["rust-lld", "lld-link", "ld.lld"]);
+        assert_eq!(config_linkers("target.a.linker = 'mold'\n"), ["mold"]);
+        assert!(config_linkers("[build]\njobs = 4\n").is_empty());
+        let flags: Vec<String> = ["-C", "linker=a", "-Clinker=b", "--codegen=linker=c", "--codegen", "linker=d", "-C", "opt-level=3", "-Clinker="]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(flag_linkers(&flags), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn an_unresolvable_linker_warns_with_the_bypass_reason_and_a_sysroot_linker_is_ok() {
+        let root = env::temp_dir().join(format!("frust-doctor-linker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("lib").join("rustlib").join("x86_64-test").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let lld = bin.join(format!("frust-test-rust-lld{}", env::consts::EXE_SUFFIX));
+        std::fs::write(&lld, b"lld").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&lld, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sysroot = Some((root.as_path(), "x86_64-test"));
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert!(linker_check(&[], &root, sysroot).is_none());
+        let ok = linker_check(&names(&["frust-test-rust-lld"]), &root, sysroot).unwrap();
+        assert_eq!(ok.status, Status::Ok, "{}", ok.detail);
+        let warn = linker_check(&names(&["frust-test-rust-lld", "frust-test-absent"]), &root, sysroot).unwrap();
+        assert_eq!(warn.status, Status::Warn);
+        assert_eq!(warn.detail, "cache bypassed: linker frust-test-absent not found; searched PATH and the toolchain sysroot");
+        let without = linker_check(&names(&["frust-test-rust-lld"]), &root, None).unwrap();
+        assert_eq!(without.status, Status::Warn, "no sysroot means only PATH is searched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
