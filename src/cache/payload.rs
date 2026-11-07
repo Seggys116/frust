@@ -121,7 +121,7 @@ pub(super) fn stable(before: &sys::Meta, after: &sys::Meta) -> bool {
         && before.mode() == after.mode()
 }
 
-fn hash_open(source: &File, len: u64) -> io::Result<(u64, String)> {
+pub(super) fn hash_open(source: &File, len: u64) -> io::Result<(u64, String)> {
     let limit = len.saturating_add(1);
     let mut input = source.take(limit);
     let hash = super::hashing::hash_reader(&mut input)?;

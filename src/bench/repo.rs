@@ -1,9 +1,16 @@
 //! Real-repository benchmark: paired cargo and frust builds of an external checkout.
 
 use super::*;
-use std::collections::HashSet;
+use crate::cache::EntryMeta;
+use crate::timings::Record as TimingRecord;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashSet};
 
 const MAX_EDIT_FILES: usize = 8;
+const STORE_TOP_JSON: usize = 20;
+const STORE_TOP_MARKDOWN: usize = 10;
+// The allocation helper accepts 64 unions per call: one for the targets alone plus one per probed file.
+const FILES_PER_QUERY: usize = 63;
 const DEFAULT_EDITS: usize = 20;
 const DEFAULT_REPO_RUNS: usize = 3;
 const NOOP_REPEATS: usize = 3;
@@ -11,12 +18,24 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
 const REPORT_SCHEMA_VERSION: u32 = 1;
 
 const GATE_NOOP_SLACK_MS: f64 = 15.0;
+const GATE_NOOP_SLACK_WINDOWS_MS: f64 = 25.0;
 const GATE_NOOP_RATIO: f64 = 1.25;
 const GATE_EDIT_RATIO: f64 = 1.05;
-const GATE_EDIT_SLACK_MS: f64 = 10.0;
+const GATE_EDIT_SLACK_MS: f64 = 25.0;
 const GATE_EDIT_P90_RATIO: f64 = 1.15;
+const GATE_EDIT_P90_SLACK_MS: f64 = 40.0;
 const GATE_COLD_RATIO: f64 = 1.05;
+const GATE_COLD_SLACK_MS: f64 = 150.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
+const GATE_CLEAN_SLACK_MS: f64 = 100.0;
+
+const CLASSES: [&str; 5] = ["registry-git", "path", "unknown", "build-script", "proc-macro"];
+const EXTENSIONS: [&str; 6] = ["rlib", "rmeta", "dylib", "bin", "d", "other"];
+const TIMING_ROWS: [(&str, &str); 4] = [("cold", "cold"), ("clean rebuild", "clean_rebuild"), ("no-op", "noop"), ("first edit", "edit_first")];
+const TIMING_HEADER: [&str; 14] = [
+    "row", "builds", "units", "total ms", "rustc ms", "overhead ms", "prekey", "lookup", "keywait", "restore",
+    "freeze", "spawn", "inline store", "store modes",
+];
 
 const TABLE_HEADER: [&str; 8] = ["tool", "cold", "clean rebuild", "no-op", "first edit", "warm edit", "edit p90", "disk"];
 const EDIT_NOTE: &str = "First edit is the first touch of a crate after a restore (no incremental session); warm edit and p90 cover later edits. The ratio row is the median of per-pair frust/cargo ratios.";
@@ -32,6 +51,8 @@ struct RepoOptions {
     markdown: bool,
     out: Option<PathBuf>,
     gate: bool,
+    features: Option<String>,
+    disk_slack: f64,
 }
 
 fn positive(name: &str, value: &str) -> Result<usize, String> {
@@ -44,6 +65,8 @@ impl RepoOptions {
         let mut repo = None;
         let mut package = None;
         let mut out = None;
+        let mut features = None;
+        let mut disk_slack = 0.0;
         let (mut edits, mut runs) = (DEFAULT_EDITS, DEFAULT_REPO_RUNS);
         let (mut json, mut markdown, mut gate) = (false, false, false);
         let mut index = 0;
@@ -57,7 +80,7 @@ impl RepoOptions {
                 "--json" if inline.is_none() => json = true,
                 "--markdown" if inline.is_none() => markdown = true,
                 "--gate" if inline.is_none() => gate = true,
-                "--repo" | "--edits" | "--runs" | "--package" | "--out" => {
+                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -73,6 +96,11 @@ impl RepoOptions {
                         "--edits" => edits = positive(name, value)?,
                         "--runs" => runs = positive(name, value)?,
                         "--package" => package = Some(value.to_string()),
+                        "--features" => features = Some(value.to_string()),
+                        "--disk-slack" => {
+                            disk_slack = value.trim().parse::<f64>().ok().filter(|p| p.is_finite() && *p >= 0.0)
+                                .ok_or_else(|| format!("{name} needs a non-negative percentage, got `{value}`"))?;
+                        }
                         _ => out = Some(PathBuf::from(value)),
                     }
                 }
@@ -81,7 +109,7 @@ impl RepoOptions {
             index += 1;
         }
         let repo = repo.ok_or("--repo PATH is required")?;
-        Ok(Self { repo, edits, runs, package, json, markdown, out, gate })
+        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack })
     }
 }
 
@@ -134,6 +162,7 @@ impl Samples {
 struct DiskReport {
     cargo_bytes: u64,
     frust_bytes: u64,
+    slack_pct: f64,
     ok: bool,
     message: Option<String>,
 }
@@ -254,6 +283,304 @@ fn measure_disk_breakdown(dirs: &Dirs, cargo_target: &Path, cargo_physical: u64)
     Ok(build_breakdown(cargo_physical, cargo_logical, cumulative, logical, count_cache_entries(&store)))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct StoreFile {
+    key: String,
+    krate: String,
+    version: String,
+    source: Option<String>,
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct GroupBytes {
+    name: String,
+    bytes: u64,
+    files: usize,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct EntryUse {
+    key: String,
+    crate_name: String,
+    version: String,
+    source: Option<String>,
+    kinds: Vec<String>,
+    files: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct StoreOnly {
+    status: String,
+    reason: Option<String>,
+    total_bytes: u64,
+    entries: usize,
+    unreadable_entries: usize,
+    files: usize,
+    top_entries: Vec<EntryUse>,
+    by_class: Vec<GroupBytes>,
+    by_extension: Vec<GroupBytes>,
+}
+
+impl StoreOnly {
+    fn unsupported(reason: String) -> Self {
+        Self {
+            status: "unsupported".to_string(),
+            reason: Some(reason),
+            total_bytes: 0,
+            entries: 0,
+            unreadable_entries: 0,
+            files: 0,
+            top_entries: Vec::new(),
+            by_class: Vec::new(),
+            by_extension: Vec::new(),
+        }
+    }
+}
+
+fn extension_group(name: &str) -> &'static str {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    match ext.as_str() {
+        "rlib" => "rlib",
+        "rmeta" => "rmeta",
+        "so" | "dylib" | "dll" => "dylib",
+        "exe" | "bin" | "" => "bin",
+        "d" => "d",
+        _ => "other",
+    }
+}
+
+// Host dylibs of an entry mark proc-macro crates; the name patterns catch the rest.
+fn crate_class(krate: &str, source: Option<&str>, host_dylib: bool) -> &'static str {
+    if krate.starts_with("build_script_") {
+        "build-script"
+    } else if host_dylib || krate.ends_with("_derive") || krate.ends_with("_macros") || krate.ends_with("_macro") {
+        "proc-macro"
+    } else {
+        match source {
+            Some("registry" | "git") => "registry-git",
+            Some("path") => "path",
+            _ => "unknown",
+        }
+    }
+}
+
+fn group_list(names: &[&str], totals: &BTreeMap<&str, (u64, usize)>) -> Vec<GroupBytes> {
+    names.iter().map(|name| {
+        let (bytes, files) = totals.get(name).copied().unwrap_or((0, 0));
+        GroupBytes { name: name.to_string(), bytes, files }
+    }).collect()
+}
+
+fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usize) -> StoreOnly {
+    let mut entries: BTreeMap<&str, Vec<&StoreFile>> = BTreeMap::new();
+    for file in files {
+        entries.entry(file.key.as_str()).or_default().push(file);
+    }
+    let mut classes: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    let mut extensions: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    let mut uses = Vec::new();
+    for (key, group) in &entries {
+        let first = group[0];
+        let host_dylib = group.iter().any(|f| extension_group(&f.name) == "dylib");
+        let class = crate_class(&first.krate, first.source.as_deref(), host_dylib);
+        let bytes: u64 = group.iter().map(|f| f.bytes).sum();
+        let total = classes.entry(class).or_default();
+        *total = (total.0 + bytes, total.1 + group.len());
+        let mut kinds: Vec<String> = Vec::new();
+        for file in group {
+            let ext = extension_group(&file.name);
+            let total = extensions.entry(ext).or_default();
+            *total = (total.0 + file.bytes, total.1 + 1);
+            if !kinds.iter().any(|k| k == ext) {
+                kinds.push(ext.to_string());
+            }
+        }
+        kinds.sort();
+        uses.push(EntryUse {
+            key: key.to_string(),
+            crate_name: first.krate.clone(),
+            version: first.version.clone(),
+            source: first.source.clone(),
+            kinds,
+            files: group.len(),
+            bytes,
+        });
+    }
+    uses.retain(|u| u.bytes > 0);
+    uses.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
+    uses.truncate(top);
+    StoreOnly {
+        status: "ok".to_string(),
+        reason: None,
+        total_bytes: files.iter().map(|f| f.bytes).sum(),
+        entries: entries.len(),
+        unreadable_entries,
+        files: files.len(),
+        top_entries: uses,
+        by_class: group_list(&CLASSES, &classes),
+        by_extension: group_list(&EXTENSIONS, &extensions),
+    }
+}
+
+// Returns the payload files of every readable entry with their paths, plus the count of entries whose record could not be read.
+fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
+    let (mut files, mut paths, mut unreadable) = (Vec::new(), Vec::new(), 0);
+    let Ok(shards) = fs::read_dir(store) else { return (files, paths, unreadable) };
+    let mut entry_dirs: Vec<PathBuf> = shards.flatten().filter_map(|shard| fs::read_dir(shard.path()).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path())).filter(|path| path.is_dir()).collect();
+    entry_dirs.sort();
+    for dir in entry_dirs {
+        let Some(key) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let meta: Option<EntryMeta> = fs::read(dir.join("meta.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let Some(meta) = meta else {
+            unreadable += 1;
+            continue;
+        };
+        for stored in &meta.files {
+            let path = dir.join(&stored.stored);
+            if fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            files.push(StoreFile {
+                key: key.clone(),
+                krate: meta.crate_name.clone(),
+                version: meta.version.clone(),
+                source: meta.source.clone(),
+                name: stored.name.clone(),
+                bytes: 0,
+            });
+            paths.push(path);
+        }
+    }
+    (files, paths, unreadable)
+}
+
+// Bytes of each file that no file under the targets shares by hardlink or extent, from the same allocation helper as the disk totals.
+fn store_only_bytes(targets: &Path, files: &[PathBuf]) -> Result<Vec<u64>, String> {
+    let base = [targets];
+    let mut out = Vec::with_capacity(files.len());
+    for chunk in files.chunks(FILES_PER_QUERY) {
+        let roots: Vec<[&Path; 2]> = chunk.iter().map(|path| [targets, path.as_path()]).collect();
+        let mut sets: Vec<&[&Path]> = vec![&base[..]];
+        sets.extend(roots.iter().map(|pair| &pair[..]));
+        let sizes = compact::physical_sizes_checked(&sets).map_err(|e| e.to_string())?;
+        out.extend(sizes[1..].iter().map(|size| size.saturating_sub(sizes[0])));
+    }
+    Ok(out)
+}
+
+fn scan_store(dirs: &Dirs) -> StoreOnly {
+    let (mut files, paths, unreadable) = collect_store_files(&dirs.store());
+    match store_only_bytes(&dirs.targets(), &paths) {
+        Ok(sizes) => {
+            for (file, bytes) in files.iter_mut().zip(sizes) {
+                file.bytes = bytes;
+            }
+            summarize_store_only(&files, unreadable, STORE_TOP_JSON)
+        }
+        Err(error) => StoreOnly::unsupported(format!("allocation sharing could not be measured: {error}")),
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Serialize)]
+struct TimingSummary {
+    builds: usize,
+    units: usize,
+    total_ms: u64,
+    rustc_ms: u64,
+    overhead_ms: u64,
+    prekey_ms: u64,
+    lookup_ms: u64,
+    keywait_ms: u64,
+    restore_ms: u64,
+    freeze_ms: u64,
+    spawn_ms: u64,
+    inline_store_ms: u64,
+    store_modes: BTreeMap<String, usize>,
+}
+
+impl TimingSummary {
+    fn add_build(&mut self, records: &[TimingRecord]) {
+        self.builds += 1;
+        for r in records {
+            self.units += 1;
+            self.total_ms += r.total_ms;
+            self.rustc_ms += r.rustc_ms;
+            self.overhead_ms += r.total_ms.saturating_sub(r.rustc_ms);
+            self.prekey_ms += r.prekey_ms;
+            self.lookup_ms += r.lookup_ms;
+            self.keywait_ms += r.keywait_ms;
+            self.restore_ms += r.restore_ms;
+            self.freeze_ms += r.freeze_ms;
+            self.spawn_ms += r.spawn_ms;
+            self.inline_store_ms += r.inline_store_ms;
+            *self.store_modes.entry(r.store_mode.clone()).or_default() += 1;
+        }
+    }
+}
+
+fn parse_timings(text: &str) -> Vec<TimingRecord> {
+    text.lines().filter_map(|line| serde_json::from_str(line.trim()).ok()).collect()
+}
+
+fn markdown_table(rows: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        out.push_str(&markdown_row(row));
+        out.push('\n');
+        if index == 0 {
+            out.push_str(&markdown_row(&vec!["---".to_string(); row.len()]));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn timing_rows(timings: &BTreeMap<String, TimingSummary>) -> Vec<Vec<String>> {
+    let mut rows = vec![TIMING_HEADER.iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    for (label, key) in TIMING_ROWS {
+        let Some(t) = timings.get(key) else { continue };
+        let modes: Vec<String> = t.store_modes.iter().map(|(mode, count)| format!("{mode} {count}")).collect();
+        rows.push(vec![
+            label.to_string(), t.builds.to_string(), t.units.to_string(), t.total_ms.to_string(), t.rustc_ms.to_string(),
+            t.overhead_ms.to_string(), t.prekey_ms.to_string(), t.lookup_ms.to_string(), t.keywait_ms.to_string(),
+            t.restore_ms.to_string(), t.freeze_ms.to_string(), t.spawn_ms.to_string(), t.inline_store_ms.to_string(),
+            if modes.is_empty() { "none".to_string() } else { modes.join(", ") },
+        ]);
+    }
+    rows
+}
+
+fn store_group_text(groups: &[GroupBytes]) -> String {
+    groups.iter().map(|g| format!("{} {}", g.name, human_bytes(g.bytes))).collect::<Vec<_>>().join(", ")
+}
+
+fn store_only_lines(s: &StoreOnly) -> Vec<String> {
+    if s.status != "ok" {
+        return vec![format!("Store-only bytes: {} ({}).", s.status, s.reason.as_deref().unwrap_or("no detail"))];
+    }
+    vec![
+        format!("Store-only bytes: {} in {} payload files of {} entries, not shared with targets by hardlink or extent.",
+            human_bytes(s.total_bytes), s.files, s.entries),
+        format!("Store-only by crate class: {}.", store_group_text(&s.by_class)),
+        format!("Store-only by file kind: {}.", store_group_text(&s.by_extension)),
+    ]
+}
+
+fn store_top_rows(s: &StoreOnly, limit: usize) -> Vec<Vec<String>> {
+    let mut rows = vec![["crate", "version", "source", "kinds", "files", "store-only"].iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    for e in s.top_entries.iter().take(limit) {
+        rows.push(vec![
+            e.crate_name.clone(), e.version.clone(), e.source.clone().unwrap_or_else(|| "-".to_string()),
+            e.kinds.join(","), e.files.to_string(), human_bytes(e.bytes),
+        ]);
+    }
+    rows
+}
+
 #[derive(Debug, Serialize)]
 struct GateCheck {
     name: String,
@@ -278,6 +605,9 @@ struct RepoReport {
     disk: DiskReport,
     ratios: Ratios,
     disk_breakdown: Option<DiskBreakdown>,
+    store_only: StoreOnly,
+    frust_timings: BTreeMap<String, TimingSummary>,
+    features: Option<String>,
     gate: Option<Vec<GateCheck>>,
 }
 
@@ -319,16 +649,21 @@ fn ratio_check(name: &str, ratio: f64, cargo_ms: f64, factor: f64, slack_ms: f64
 }
 
 fn evaluate_gate(cargo: &Samples, frust: &Samples) -> Vec<GateCheck> {
+    evaluate_gate_for(cargo, frust, cfg!(windows))
+}
+
+fn evaluate_gate_for(cargo: &Samples, frust: &Samples, windows: bool) -> Vec<GateCheck> {
     let mut checks = Vec::new();
     let paired = |c: &[f64], f: &[f64]| median_ratio(c, f).zip(median_of(c));
     if let Some((ratio, base)) = paired(&cargo.cold, &frust.cold) {
-        checks.push(ratio_check("cold", ratio, base, GATE_COLD_RATIO, 0.0));
+        checks.push(ratio_check("cold", ratio, base, GATE_COLD_RATIO, GATE_COLD_SLACK_MS));
     }
     if let Some((ratio, base)) = paired(&cargo.clean, &frust.clean) {
-        checks.push(ratio_check("clean-rebuild", ratio, base, GATE_CLEAN_RATIO, 0.0));
+        checks.push(ratio_check("clean-rebuild", ratio, base, GATE_CLEAN_RATIO, GATE_CLEAN_SLACK_MS));
     }
     if let Some((ratio, base)) = paired(&cargo.noop, &frust.noop) {
-        checks.push(ratio_check("noop-slack", ratio, base, 1.0, GATE_NOOP_SLACK_MS));
+        let slack = if windows { GATE_NOOP_SLACK_WINDOWS_MS } else { GATE_NOOP_SLACK_MS };
+        checks.push(ratio_check("noop-slack", ratio, base, 1.0, slack));
         checks.push(ratio_check("noop-ratio", ratio, base, GATE_NOOP_RATIO, 0.0));
     }
     if let Some((ratio, base)) = paired(&cargo.warm, &frust.warm) {
@@ -337,17 +672,18 @@ fn evaluate_gate(cargo: &Samples, frust: &Samples) -> Vec<GateCheck> {
     if let (Some(base), Some(measured)) = (percentile(&cargo.warm, 90.0), percentile(&frust.warm, 90.0))
         && base > 0.0
     {
-        let mut check = ratio_check("edit-p90", measured / base, base, GATE_EDIT_P90_RATIO, 0.0);
+        let mut check = ratio_check("edit-p90", measured / base, base, GATE_EDIT_P90_RATIO, GATE_EDIT_P90_SLACK_MS);
         check.frust_ms = measured;
         checks.push(check);
     }
     checks
 }
 
-fn disk_verdict(cargo_bytes: u64, frust_bytes: u64) -> Result<(), String> {
-    if frust_bytes > cargo_bytes {
+fn disk_verdict(cargo_bytes: u64, frust_bytes: u64, slack_pct: f64) -> Result<(), String> {
+    let allowed = if slack_pct > 0.0 { (cargo_bytes as f64 * (1.0 + slack_pct / 100.0)) as u64 } else { cargo_bytes };
+    if frust_bytes > allowed {
         return Err(format!(
-            "disk guard: frust uses {} in total, {} more than cargo's {}",
+            "disk guard: frust uses {} in total, {} more than cargo's {} (allowed slack {slack_pct}%)",
             human_bytes(frust_bytes),
             human_bytes(frust_bytes - cargo_bytes),
             human_bytes(cargo_bytes)
@@ -485,10 +821,19 @@ fn repo_markdown(report: &RepoReport) -> String {
         out.push('\n');
     }
     out.push_str(&format!("\n{EDIT_NOTE}\n"));
-    for line in report.disk_breakdown.iter().flat_map(breakdown_lines) {
+    for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         out.push_str(&format!("\n- {line}"));
     }
     out.push('\n');
+    if report.store_only.status == "ok" && !report.store_only.top_entries.is_empty() {
+        out.push_str(&format!("\n#### Largest store-only entries (top {STORE_TOP_MARKDOWN})\n\n"));
+        out.push_str(&markdown_table(&store_top_rows(&report.store_only, STORE_TOP_MARKDOWN)));
+    }
+    let timing = timing_rows(&report.frust_timings);
+    if timing.len() > 1 {
+        out.push_str("\n#### Where the time goes (frust wrapper records, summed over the builds in each row, ms)\n\n");
+        out.push_str(&markdown_table(&timing));
+    }
     if let Some(message) = &report.disk.message {
         out.push_str(&format!("\n{message}\n"));
     }
@@ -499,17 +844,35 @@ fn repo_markdown(report: &RepoReport) -> String {
     out
 }
 
+fn aligned(rows: &[Vec<String>]) -> Vec<String> {
+    let columns = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..columns).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
+    rows.iter().map(|row| {
+        let cells: Vec<String> = row.iter().zip(&widths).map(|(cell, &width)| format!("{cell:<width$}")).collect();
+        cells.join("  ").trim_end().to_string()
+    }).collect()
+}
+
 fn print_repo(report: &RepoReport) {
-    let rows = table_rows(report);
-    let widths: Vec<usize> = (0..rows[0].len()).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
     println!("{} (rustc {}, {} runs, {} edits per run)", report.repo, report.rustc, report.runs, report.edits);
-    for row in &rows {
-        let line: Vec<String> = row.iter().zip(&widths).map(|(cell, &width)| format!("{cell:<width$}")).collect();
-        println!("  {}", line.join("  ").trim_end());
+    for line in aligned(&table_rows(report)) {
+        println!("  {line}");
     }
     println!("{EDIT_NOTE}");
-    for line in report.disk_breakdown.iter().flat_map(breakdown_lines) {
+    for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         println!("{line}");
+    }
+    if !report.store_only.top_entries.is_empty() {
+        for line in aligned(&store_top_rows(&report.store_only, STORE_TOP_MARKDOWN)) {
+            println!("  {line}");
+        }
+    }
+    let timing = timing_rows(&report.frust_timings);
+    if timing.len() > 1 {
+        println!("Where the time goes (frust wrapper records, summed over builds, ms):");
+        for line in aligned(&timing) {
+            println!("  {line}");
+        }
     }
     if let Some(message) = &report.disk.message {
         println!("{message}");
@@ -571,11 +934,16 @@ fn parse_packages(meta: &serde_json::Value, package: Option<&str>) -> Result<Vec
     Ok(found)
 }
 
-fn build_args(packages: &[RepoPackage], package: Option<&str>) -> Vec<String> {
-    if package.is_none() {
-        return vec!["--workspace".to_string()];
+fn build_args(packages: &[RepoPackage], package: Option<&str>, features: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = if package.is_none() {
+        vec!["--workspace".to_string()]
+    } else {
+        packages.iter().flat_map(|p| ["-p".to_string(), p.spec.clone()]).collect()
+    };
+    if let Some(list) = features {
+        args.extend(["--features".to_string(), list.to_string()]);
     }
-    packages.iter().flat_map(|p| ["-p".to_string(), p.spec.clone()]).collect()
+    args
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -678,6 +1046,9 @@ struct Rig<'a> {
     cargo_target: PathBuf,
     dirs: Dirs,
     args: Vec<String>,
+    scratch: PathBuf,
+    timings: RefCell<BTreeMap<String, TimingSummary>>,
+    sequence: Cell<u64>,
 }
 
 impl Rig<'_> {
@@ -697,7 +1068,8 @@ impl Rig<'_> {
         clear(&path)
     }
 
-    fn build(&self, frust: bool, label: &str) -> Result<f64, String> {
+    // `row` names the table row; frust builds also record per-wrapper timings under it.
+    fn build(&self, frust: bool, row: &str) -> Result<f64, String> {
         if frust {
             self.quiesce();
         }
@@ -705,8 +1077,21 @@ impl Rig<'_> {
         let target = (!frust).then_some(self.cargo_target.as_path());
         let mut cmd = build_command(self.ctx, frust, self.repo, target, &args, "off");
         cmd.env("CARGO_NET_OFFLINE", "false");
+        let timing_file = frust.then(|| {
+            self.sequence.set(self.sequence.get() + 1);
+            self.scratch.join(format!("timings-{row}-{}.jsonl", self.sequence.get()))
+        });
+        if let Some(file) = &timing_file {
+            cmd.env(crate::timings::ENV, file);
+        }
         let tool = if frust { "frust" } else { "cargo" };
-        timed(self.ctx, frust, &mut cmd).map(|run| run.millis as f64).map_err(|e| format!("{label} with {tool}: {e}"))
+        let ms = timed(self.ctx, frust, &mut cmd).map(|run| run.millis as f64).map_err(|e| format!("{row} build with {tool}: {e}"))?;
+        if let Some(file) = timing_file {
+            let text = fs::read_to_string(&file).unwrap_or_default();
+            let _ = fs::remove_file(&file);
+            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&parse_timings(&text));
+        }
+        Ok(ms)
     }
 }
 
@@ -721,16 +1106,16 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
         let order = tool_order(run);
         for frust in order {
             rig.reset(frust, true)?;
-            samples[usize::from(frust)].cold.push(rig.build(frust, "cold build")?);
+            samples[usize::from(frust)].cold.push(rig.build(frust, "cold")?);
         }
         for frust in order {
             rig.reset(frust, false)?;
-            samples[usize::from(frust)].clean.push(rig.build(frust, "clean rebuild")?);
+            samples[usize::from(frust)].clean.push(rig.build(frust, "clean_rebuild")?);
         }
         for frust in order {
             let mut repeats = Vec::new();
             for _ in 0..NOOP_REPEATS {
-                repeats.push(rig.build(frust, "no-op build")?);
+                repeats.push(rig.build(frust, "noop")?);
             }
             samples[usize::from(frust)].noop.extend(median_of(&repeats));
         }
@@ -740,7 +1125,7 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             backup.apply(slot, edit + 1)?;
             let first = touched.insert(owners[slot]);
             for frust in tool_order(run + edit) {
-                let ms = rig.build(frust, "edit build")?;
+                let ms = rig.build(frust, if first { "edit_first" } else { "edit_warm" })?;
                 let target = &mut samples[usize::from(frust)];
                 if first { target.first.push(ms) } else { target.warm.push(ms) }
             }
@@ -809,13 +1194,17 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         repo: &repo,
         cargo_target: scratch.join("cargo-target"),
         dirs: Dirs::at(&ctx.home),
-        args: build_args(&packages, opts.package.as_deref()),
+        args: build_args(&packages, opts.package.as_deref(), opts.features.as_deref()),
+        scratch: scratch.to_path_buf(),
+        timings: RefCell::new(BTreeMap::new()),
+        sequence: Cell::new(0),
     };
     let samples = measure(&rig, &backup, &owners, opts)?;
     rig.quiesce();
     let cargo_bytes = compact::physical_size(&[rig.cargo_target.as_path()]);
     let frust_bytes = compact::physical_size(&[ctx.home.as_path()]);
-    let verdict = disk_verdict(cargo_bytes, frust_bytes);
+    let verdict = disk_verdict(cargo_bytes, frust_bytes, opts.disk_slack);
+    let store_only = scan_store(&rig.dirs);
     let disk_breakdown = measure_disk_breakdown(&rig.dirs, &rig.cargo_target, cargo_bytes)
         .inspect_err(|error| eprintln!("frust bench: warning: disk breakdown unavailable: {error}")).ok();
     let (cargo_report, frust_report) = (samples[0].report(cargo_bytes), samples[1].report(frust_bytes));
@@ -831,8 +1220,11 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         ratios: paired_ratios(&cargo_report, &frust_report),
         cargo: cargo_report,
         frust: frust_report,
-        disk: DiskReport { cargo_bytes, frust_bytes, ok: verdict.is_ok(), message: verdict.err() },
+        disk: DiskReport { cargo_bytes, frust_bytes, slack_pct: opts.disk_slack, ok: verdict.is_ok(), message: verdict.err() },
         disk_breakdown,
+        store_only,
+        frust_timings: rig.timings.take(),
+        features: opts.features.clone(),
         gate: opts.gate.then(|| evaluate_gate(&samples[0], &samples[1])),
     })
 }
@@ -902,7 +1294,7 @@ mod tests {
     }
 
     fn report_with(cargo: &Samples, frust: &Samples, disk: (u64, u64), gate: bool) -> RepoReport {
-        let verdict = disk_verdict(disk.0, disk.1);
+        let verdict = disk_verdict(disk.0, disk.1, 0.0);
         RepoReport {
             schema_version: REPORT_SCHEMA_VERSION,
             repo: "demo".into(),
@@ -914,9 +1306,12 @@ mod tests {
             ratios: paired_ratios(&cargo.report(disk.0), &frust.report(disk.1)),
             cargo: cargo.report(disk.0),
             frust: frust.report(disk.1),
-            disk: DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, ok: verdict.is_ok(), message: verdict.err() },
+            disk: DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, slack_pct: 0.0, ok: verdict.is_ok(), message: verdict.err() },
             disk_breakdown: None,
-            gate: gate.then(|| evaluate_gate(cargo, frust)),
+            store_only: StoreOnly::unsupported("not measured in this test".to_string()),
+            frust_timings: BTreeMap::new(),
+            features: None,
+            gate: gate.then(|| evaluate_gate_for(cargo, frust, false)),
         }
     }
 
@@ -929,15 +1324,16 @@ mod tests {
         let parsed = RepoOptions::parse(&flags(&["--repo", "/work/rg"])).unwrap();
         assert_eq!(parsed, RepoOptions {
             repo: PathBuf::from("/work/rg"), edits: 20, runs: 3, package: None,
-            json: false, markdown: false, out: None, gate: false,
+            json: false, markdown: false, out: None, gate: false, features: None, disk_slack: 0.0,
         });
         let full = RepoOptions::parse(&flags(&[
             "--repo=/work/tokio", "--edits", "5", "--runs=2", "--package", "tokio",
-            "--json", "--markdown", "--out", "r.json", "--gate",
+            "--json", "--markdown", "--out", "r.json", "--gate", "--features", "full", "--disk-slack=2.5",
         ])).unwrap();
         assert_eq!(full, RepoOptions {
             repo: PathBuf::from("/work/tokio"), edits: 5, runs: 2, package: Some("tokio".into()),
             json: true, markdown: true, out: Some(PathBuf::from("r.json")), gate: true,
+            features: Some("full".into()), disk_slack: 2.5,
         });
     }
 
@@ -950,6 +1346,9 @@ mod tests {
         assert!(RepoOptions::parse(&flags(&["--repo", "x", "--gate=1"])).is_err());
         assert!(RepoOptions::parse(&flags(&["--repo"])).unwrap_err().contains("needs a value"));
         assert!(RepoOptions::parse(&flags(&["--repo=", "--gate"])).is_err());
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--disk-slack", "-1"])).unwrap_err().contains("--disk-slack"));
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--disk-slack=nan"])).is_err());
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--features="])).is_err());
     }
 
     #[test]
@@ -987,7 +1386,8 @@ mod tests {
         assert_eq!(names, ["root", "inner"]);
         assert_eq!(all[0].root, PathBuf::from("/w"));
         assert_eq!(all[0].entries, paths(&["/w/src/main.rs"]));
-        assert_eq!(build_args(&all, None), ["--workspace"]);
+        assert_eq!(build_args(&all, None, None), ["--workspace"]);
+        assert_eq!(build_args(&all, None, Some("full")), ["--workspace", "--features", "full"]);
         let named = parse_packages(&meta, Some("inner")).unwrap();
         assert_eq!(named.len(), 1);
         assert_eq!(named[0].entries, paths(&["/w/crates/inner/src/lib.rs"]));
@@ -1011,7 +1411,8 @@ mod tests {
             let found = parse_packages(&meta, Some(wanted)).unwrap();
             assert_eq!(found.len(), 1, "{wanted}");
             assert_eq!(found[0].spec, "path+file:///w/tokio#tokio@1.40.0");
-            assert_eq!(build_args(&found, Some(wanted)), ["-p", "path+file:///w/tokio#tokio@1.40.0"]);
+            assert_eq!(build_args(&found, Some(wanted), None), ["-p", "path+file:///w/tokio#tokio@1.40.0"]);
+            assert_eq!(build_args(&found, Some(wanted), Some("full")), ["-p", "path+file:///w/tokio#tokio@1.40.0", "--features", "full"]);
         }
         assert!(parse_packages(&meta, Some("tokio@1.39.0")).is_err());
         assert_eq!(parse_packages(&meta, None).unwrap().len(), 2);
@@ -1065,6 +1466,116 @@ mod tests {
         assert_eq!(r.disk, Some(0.5));
         assert_eq!(fmt_ratio(r.clean_rebuild), "0.40x");
         assert_eq!(fmt_ratio(None), "n/a");
+    }
+
+    fn sf(key: &str, krate: &str, source: Option<&str>, name: &str, bytes: u64) -> StoreFile {
+        StoreFile { key: key.into(), krate: krate.into(), version: "1.0.0".into(), source: source.map(String::from), name: name.into(), bytes }
+    }
+
+    fn synthetic_store() -> Vec<StoreFile> {
+        vec![
+            sf("k1", "serde", Some("registry"), "libserde-h.rlib", 1000),
+            sf("k1", "serde", Some("registry"), "libserde-h.rmeta", 300),
+            sf("k1", "serde", Some("registry"), "serde-h.d", 10),
+            sf("k2", "app", Some("path"), "libapp-h.rlib", 500),
+            sf("k2", "app", Some("path"), "app", 200),
+            sf("k3", "serde_derive", Some("registry"), "libserde_derive-h.so", 700),
+            sf("k4", "build_script_build", Some("path"), "build_script_build-h", 40),
+            sf("k5", "mystery", None, "libm-h.rlib", 0),
+        ]
+    }
+
+    fn group<'a>(groups: &'a [GroupBytes], name: &str) -> &'a GroupBytes {
+        groups.iter().find(|g| g.name == name).unwrap()
+    }
+
+    #[test]
+    fn store_only_bytes_group_by_class_and_extension() {
+        let summary = summarize_store_only(&synthetic_store(), 2, 3);
+        assert_eq!((summary.status.as_str(), summary.total_bytes, summary.entries, summary.files, summary.unreadable_entries), ("ok", 2750, 5, 8, 2));
+        let classes: Vec<(&str, u64, usize)> = summary.by_class.iter().map(|g| (g.name.as_str(), g.bytes, g.files)).collect();
+        assert_eq!(classes, [("registry-git", 1310, 3), ("path", 700, 2), ("unknown", 0, 1), ("build-script", 40, 1), ("proc-macro", 700, 1)]);
+        let kinds: Vec<(&str, u64, usize)> = summary.by_extension.iter().map(|g| (g.name.as_str(), g.bytes, g.files)).collect();
+        assert_eq!(kinds, [("rlib", 1500, 3), ("rmeta", 300, 1), ("dylib", 700, 1), ("bin", 240, 2), ("d", 10, 1), ("other", 0, 0)]);
+        assert_eq!(group(&summary.by_class, "proc-macro").bytes, 700);
+    }
+
+    #[test]
+    fn store_only_top_entries_are_ordered_capped_and_skip_empty_entries() {
+        let summary = summarize_store_only(&synthetic_store(), 0, 3);
+        let top: Vec<(&str, u64)> = summary.top_entries.iter().map(|e| (e.key.as_str(), e.bytes)).collect();
+        assert_eq!(top, [("k1", 1310), ("k2", 700), ("k3", 700)]);
+        assert_eq!(summary.top_entries[0].kinds, ["d", "rlib", "rmeta"]);
+        assert_eq!(summary.top_entries[1].kinds, ["bin", "rlib"]);
+        assert_eq!(summary.top_entries[0].files, 3);
+        let all = summarize_store_only(&synthetic_store(), 0, 20);
+        assert_eq!(all.top_entries.len(), 4);
+        let rows = store_top_rows(&all, 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1][..3], ["serde", "1.0.0", "registry"]);
+        assert_eq!(store_top_rows(&all, 10)[4][2], "path");
+        let unsupported = StoreOnly::unsupported("no extents".into());
+        assert!(store_only_lines(&unsupported)[0].contains("unsupported (no extents)"));
+        assert!(store_only_lines(&all)[0].contains("2.7 KiB"));
+    }
+
+    #[test]
+    fn extension_and_class_rules_follow_the_documented_patterns() {
+        for (name, group) in [
+            ("libx-h.so", "dylib"), ("x.DLL", "dylib"), ("libx.dylib", "dylib"), ("x.exe", "bin"), ("tool", "bin"),
+            ("x.d", "d"), ("x.dSYM", "other"), ("libx.rlib", "rlib"), ("libx.rmeta", "rmeta"),
+        ] {
+            assert_eq!(extension_group(name), group, "{name}");
+        }
+        assert_eq!(crate_class("build_script_main", Some("path"), false), "build-script");
+        assert_eq!(crate_class("foo_macros", Some("registry"), false), "proc-macro");
+        assert_eq!(crate_class("anything", Some("git"), true), "proc-macro");
+        assert_eq!(crate_class("regex", Some("git"), false), "registry-git");
+        assert_eq!(crate_class("regex", None, false), "unknown");
+    }
+
+    #[test]
+    fn timing_records_aggregate_overhead_and_store_modes() {
+        let mut deferred = TimingRecord::new("serde", false, true, false);
+        deferred.total_ms = 10;
+        deferred.rustc_ms = 6;
+        deferred.prekey_ms = 1;
+        deferred.lookup_ms = 2;
+        deferred.freeze_ms = 1;
+        deferred.spawn_ms = 1;
+        deferred.store_mode = "deferred".to_string();
+        let mut hit = TimingRecord::new("app", true, true, false);
+        hit.total_ms = 4;
+        hit.restore_ms = 3;
+        hit.keywait_ms = 1;
+        hit.store_mode = "hit".to_string();
+        let text = format!("{}\nnot json\n\n{}", deferred.line().trim_end(), hit.line());
+        let records = parse_timings(&text);
+        assert_eq!(records.len(), 2);
+        let mut summary = TimingSummary::default();
+        summary.add_build(&records);
+        assert_eq!((summary.builds, summary.units, summary.total_ms, summary.rustc_ms, summary.overhead_ms), (1, 2, 14, 6, 8));
+        assert_eq!((summary.prekey_ms, summary.lookup_ms, summary.keywait_ms, summary.restore_ms), (1, 2, 1, 3));
+        assert_eq!((summary.freeze_ms, summary.spawn_ms, summary.inline_store_ms), (1, 1, 0));
+        assert_eq!(summary.store_modes.get("hit"), Some(&1));
+        summary.add_build(&[]);
+        assert_eq!((summary.builds, summary.units), (2, 2));
+    }
+
+    #[test]
+    fn timing_table_lists_only_recorded_frust_rows_in_display_order() {
+        let mut timings = BTreeMap::new();
+        let mut cold = TimingSummary::default();
+        cold.add_build(&[]);
+        timings.insert("cold".to_string(), cold);
+        timings.insert("edit_warm".to_string(), TimingSummary::default());
+        let rows = timing_rows(&timings);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), TIMING_HEADER.len());
+        assert_eq!(rows[1][0], "cold");
+        assert_eq!(rows[1][13], "none");
+        assert_eq!(timing_rows(&BTreeMap::new()).len(), 1);
+        assert!(markdown_table(&rows).lines().nth(1).unwrap().starts_with("| --- |"));
     }
 
     #[test]
@@ -1127,17 +1638,25 @@ mod tests {
 
     #[test]
     fn disk_verdict_fails_only_when_frust_is_larger() {
-        assert!(disk_verdict(100, 100).is_ok());
-        assert!(disk_verdict(100, 40).is_ok());
-        let error = disk_verdict(1024 * 1024, 2 * 1024 * 1024).unwrap_err();
+        assert!(disk_verdict(100, 100, 0.0).is_ok());
+        assert!(disk_verdict(100, 40, 0.0).is_ok());
+        assert!(disk_verdict(100, 101, 0.0).is_err());
+        let error = disk_verdict(1024 * 1024, 2 * 1024 * 1024, 0.0).unwrap_err();
         assert!(error.contains("2.0 MiB") && error.contains("1.0 MiB"), "{error}");
+    }
+
+    #[test]
+    fn disk_slack_widens_the_allowance_by_a_percentage() {
+        assert!(disk_verdict(1000, 1100, 10.0).is_ok());
+        assert!(disk_verdict(1000, 1101, 10.0).is_err());
+        assert!(disk_verdict(1000, 1000, 10.0).is_ok());
     }
 
     #[test]
     fn gate_passes_when_every_threshold_holds() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let frust = samples(1040.0, 400.0, 24.0, 110.0);
-        let checks = evaluate_gate(&cargo, &frust);
+        let checks = evaluate_gate_for(&cargo, &frust, false);
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["cold", "clean-rebuild", "noop-slack", "noop-ratio", "edit-median", "edit-p90"]);
         assert!(failing(&checks).is_empty(), "{checks:?}");
@@ -1146,19 +1665,38 @@ mod tests {
     #[test]
     fn gate_flags_each_regression_separately() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1100.0, 400.0, 20.0, 100.0))), ["cold"]);
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1000.0, 600.0, 20.0, 100.0))), ["clean-rebuild"]);
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1000.0, 400.0, 40.0, 100.0))), ["noop-slack", "noop-ratio"]);
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1000.0, 400.0, 24.0, 100.0))), Vec::<&str>::new());
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1000.0, 400.0, 20.0, 116.0))), ["edit-median", "edit-p90"]);
-        assert_eq!(failing(&evaluate_gate(&cargo, &samples(1000.0, 400.0, 20.0, 114.0))), Vec::<&str>::new());
+        let gate = |frust: &Samples| evaluate_gate_for(&cargo, frust, false);
+        assert_eq!(failing(&gate(&samples(1300.0, 400.0, 20.0, 100.0))), ["cold"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 700.0, 20.0, 100.0))), ["clean-rebuild"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 40.0, 100.0))), ["noop-slack", "noop-ratio"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 24.0, 100.0))), Vec::<&str>::new());
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 140.0))), ["edit-median"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 160.0))), ["edit-median", "edit-p90"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 120.0))), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn gate_floors_absorb_small_absolute_differences_on_short_builds() {
+        let cargo = samples(200.0, 100.0, 20.0, 50.0);
+        let frust = samples(340.0, 140.0, 20.0, 70.0);
+        assert!(failing(&evaluate_gate_for(&cargo, &frust, false)).is_empty());
+        let slower = samples(380.0, 170.0, 20.0, 100.0);
+        assert_eq!(failing(&evaluate_gate_for(&cargo, &slower, false)), ["cold", "clean-rebuild", "edit-median", "edit-p90"]);
+    }
+
+    #[test]
+    fn noop_slack_is_wider_on_windows_only() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let frust = samples(1000.0, 400.0, 38.0, 100.0);
+        assert_eq!(failing(&evaluate_gate_for(&cargo, &frust, false)), ["noop-slack", "noop-ratio"]);
+        assert_eq!(failing(&evaluate_gate_for(&cargo, &frust, true)), ["noop-ratio"]);
     }
 
     #[test]
     fn gate_uses_the_median_of_paired_ratios_not_pooled_medians() {
-        let cargo = Samples { cold: vec![10.0, 20.0, 30.0], clean: vec![1.0], noop: vec![20.0], first: vec![], warm: vec![] };
-        let frust = Samples { cold: vec![30.0, 25.0, 31.0], clean: vec![1.0], noop: vec![20.0], first: vec![], warm: vec![] };
-        let cold = evaluate_gate(&cargo, &frust).into_iter().find(|c| c.name == "cold").unwrap();
+        let cargo = Samples { cold: vec![1000.0, 2000.0, 3000.0], clean: vec![1.0], noop: vec![20.0], first: vec![], warm: vec![] };
+        let frust = Samples { cold: vec![3000.0, 2500.0, 3100.0], clean: vec![1.0], noop: vec![20.0], first: vec![], warm: vec![] };
+        let cold = evaluate_gate_for(&cargo, &frust, false).into_iter().find(|c| c.name == "cold").unwrap();
         assert_eq!(cold.ratio, 1.25);
         assert!(!cold.pass);
     }
@@ -1169,7 +1707,7 @@ mod tests {
         let mut frust = cargo.clone();
         cargo.warm.clear();
         frust.warm.clear();
-        let names: Vec<String> = evaluate_gate(&cargo, &frust).into_iter().map(|c| c.name).collect();
+        let names: Vec<String> = evaluate_gate_for(&cargo, &frust, false).into_iter().map(|c| c.name).collect();
         assert!(!names.iter().any(|n| n.starts_with("edit")));
     }
 

@@ -1200,6 +1200,21 @@ pub fn verify_group(entry: &Path, files: &[StoredFile], group: &RestoreGroup) ->
         }
         return Err(invalid("invalid grouped artifact"));
     }
+    if base.encoding == Encoding::Linked {
+        // A linked file is a plain file that never backs a range; it is intact when it still hashes to the record.
+        if !group.slice_indices.is_empty() {
+            return Err(invalid("a linked file cannot back a metadata range"));
+        }
+        let (Some(len), Some(hash)) = (base.decoded_bytes, base.content_hash.as_deref()) else {
+            return Err(invalid("missing linked commitment"));
+        };
+        let file = File::open(entry.join(&base.stored))?;
+        let (read, actual) = payload::hash_open(&file, len)?;
+        if read != len || actual != hash {
+            return Err(invalid("linked file differs from its record"));
+        }
+        return Ok(());
+    }
     decode_group(
         entry,
         files,
@@ -1320,6 +1335,25 @@ mod tests {
         for bad in [missing_mode, missing_hash, directory, stray_mode] {
             assert!(validate_groups(&[bad]).is_err());
         }
+    }
+
+    #[test]
+    fn verify_group_accepts_an_intact_linked_file_and_rejects_a_changed_one() {
+        let dir = fsx::temp_sibling(&std::env::temp_dir().join("frust-linked-verify"));
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = vec![5u8; 8192];
+        fs::write(dir.join("f0"), &bytes).unwrap();
+        let mut file = record("libk.rlib", "f0");
+        file.encoding = Encoding::Linked;
+        file.decoded_bytes = Some(8192);
+        file.content_hash = Some(blake3::hash(&bytes).to_hex().to_string());
+        file.mode = Some(0o100644);
+        let files = [file];
+        let groups = validate_groups(&files).unwrap();
+        verify_group(&dir, &files, &groups[0]).unwrap();
+        fs::write(dir.join("f0"), vec![6u8; 8192]).unwrap();
+        assert!(verify_group(&dir, &files, &groups[0]).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn archive_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {

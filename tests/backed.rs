@@ -199,6 +199,22 @@ fn a_linked_store_shares_the_target_inode_instead_of_keeping_a_second_copy() {
 }
 
 #[test]
+fn every_entry_of_a_linked_build_passes_the_group_validation_the_bench_uses() {
+    let (sb, a, _) = scene("lk-validate");
+    build(&sb, &a, "force");
+    let mut checked = 0;
+    for krate in ["leaf", "app"] {
+        for (dir, meta) in entries(&sb, krate) {
+            for group in frust::cache::metadata_slice::validate_groups(&meta.files).unwrap() {
+                frust::cache::metadata_slice::verify_group(&dir, &meta.files, &group).unwrap();
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0);
+}
+
+#[test]
 fn a_second_workspace_gets_a_copy_and_never_shares_an_inode() {
     let (sb, a, b) = scene("lk-second");
     build(&sb, &a, "force");
