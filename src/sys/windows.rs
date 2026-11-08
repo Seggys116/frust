@@ -1499,6 +1499,9 @@ pub fn lower_thread_priority() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
 }
 
+/// Handles are never inherited by detached helpers here, so there is nothing to seal.
+pub fn seal_inherited_descriptors() {}
+
 /// Background mode also lowers I/O and memory priority and can starve; a store only yields CPU to builds.
 pub fn lower_store_priority() {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};

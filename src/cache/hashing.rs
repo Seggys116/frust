@@ -223,12 +223,117 @@ fn hash_with_stamp_in(path: &Path, immutable: bool) -> io::Result<Hashed> {
 
 /// `stamp` is what the handle reported before any byte was read; a later difference makes the result unstable.
 fn hash_opened(path: &Path, mut file: File, stamp: Stamp, at_ns: i128, immutable: bool) -> io::Result<Hashed> {
-    let hash = match hash_mapped(path, &stamp, at_ns, immutable) {
+    let hash = match archive_hash(path, &file, stamp.size)? {
         Some(hash) => hash,
-        None => hash_sized(&mut file, stamp.size)?,
+        None => match hash_mapped(path, &stamp, at_ns, immutable) {
+            Some(hash) => hash,
+            None => hash_sized(&mut file, stamp.size)?,
+        },
     };
     let stable = Stamp::read(path).map(|after| after == stamp).unwrap_or(false);
     Ok(Hashed { hash, stamp, stable, at_ns, birth_ns: None })
+}
+
+/// Archives larger than this are hashed as plain bytes rather than held in memory.
+const ARCHIVE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
+const AR_HEADER: usize = 60;
+const AR_DOMAIN: &[u8] = b"frust-canonical-ar-v1\0";
+
+/// Linkers read static libraries through their members, so only these extensions have their archive metadata normalised.
+fn is_static_library(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("a") || e.eq_ignore_ascii_case("lib"))
+}
+
+/// A static library whose bytes differ from another only in member dates, owners or COFF timestamps hashes the same; `None` means hash the plain bytes.
+fn archive_hash(path: &Path, file: &File, size: u64) -> io::Result<Option<String>> {
+    if size < (AR_MAGIC.len() + AR_HEADER) as u64 || size > ARCHIVE_MAX_BYTES || !is_static_library(path) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(size as usize + 1);
+    Read::take(file, size + 1).read_to_end(&mut bytes)?;
+    if !bytes.starts_with(AR_MAGIC) {
+        return Ok(Some(blake3::hash(&bytes).to_hex().to_string()));
+    }
+    Ok(Some(canonical_archive_hash(&bytes).unwrap_or_else(|| blake3::hash(&bytes).to_hex().to_string())))
+}
+
+fn ar_field(header: &[u8], range: std::ops::Range<usize>) -> Option<u64> {
+    let text = std::str::from_utf8(&header[range]).ok()?.trim_end_matches(' ');
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn le16(data: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn le32(data: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Where the 4-byte build timestamp sits in a COFF object member, if the member looks like one.
+fn coff_timestamp_offset(data: &[u8]) -> Option<usize> {
+    const MACHINES: [u16; 6] = [0x8664, 0x014c, 0xaa64, 0x01c4, 0xa641, 0x0200];
+    // Short import members and anonymous (bigobj) headers start with 0x0000 0xFFFF and keep the stamp at offset 8.
+    if le16(data, 0)? == 0 && le16(data, 2)? == 0xFFFF {
+        return (data.len() >= 12 && MACHINES.contains(&le16(data, 6)?)).then_some(8);
+    }
+    if !MACHINES.contains(&le16(data, 0)?) || data.len() < 20 {
+        return None;
+    }
+    let symbols = u64::from(le32(data, 8)?);
+    let count = u64::from(le32(data, 12)?);
+    let table_end = if symbols == 0 { 0 } else { symbols.checked_add(count.checked_mul(18)?)? };
+    (table_end <= data.len() as u64).then_some(4)
+}
+
+/// Hashes member names, order, sizes, modes and data but not date, owner or group, nor a COFF member's timestamp; `None` for a malformed archive.
+fn canonical_archive_hash(bytes: &[u8]) -> Option<String> {
+    if bytes.get(..AR_MAGIC.len())? != AR_MAGIC {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(AR_DOMAIN);
+    hasher.update(AR_MAGIC);
+    let mut at = AR_MAGIC.len();
+    let mut members = 0usize;
+    let limit = bytes.len() / AR_HEADER;
+    while at < bytes.len() {
+        members += 1;
+        let header = bytes.get(at..at.checked_add(AR_HEADER)?)?;
+        if members > limit || &header[58..60] != b"`\n" {
+            return None;
+        }
+        let size = usize::try_from(ar_field(header, 48..58)?).ok()?;
+        // Date, owner and group are the volatile fields; the rest of the header is kept.
+        let mut kept = [0u8; AR_HEADER];
+        kept.copy_from_slice(header);
+        kept[16..40].fill(0);
+        hasher.update(&kept);
+        let start = at + AR_HEADER;
+        let end = start.checked_add(size)?;
+        let data = bytes.get(start..end)?;
+        match coff_timestamp_offset(data) {
+            Some(stamp) => {
+                hasher.update(&data[..stamp]);
+                hasher.update(&[0u8; 4]);
+                hasher.update(&data[stamp + 4..]);
+            }
+            None => {
+                hasher.update(data);
+            }
+        }
+        at = end;
+        if size % 2 == 1 && at < bytes.len() {
+            hasher.update(&bytes[at..at + 1]);
+            at += 1;
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 /// Truncating a mapped file faults the reader, so only large files nobody edits in place, untouched for the settle margin, are mapped.
@@ -438,7 +543,7 @@ impl Hasher {
     fn persisted(&self, path: &Path, stamp: &Stamp) -> Option<(String, bool)> {
         let text = fs::read_to_string(self.record_path(path)?).ok()?;
         let mut lines = text.lines();
-        if lines.next()? != "frust-hashmemo-v1" || lines.next()? != path.to_str()? {
+        if lines.next()? != "frust-hashmemo-v2" || lines.next()? != path.to_str()? {
             return None;
         }
         let fields: Vec<i128> = lines.next()?.split(' ').map(|f| f.parse().ok()).collect::<Option<_>>()?;
@@ -463,7 +568,7 @@ impl Hasher {
             return false;
         };
         let mut body = format!(
-            "frust-hashmemo-v1\n{text_path}\n{} {} {} {} {}\n{hash}\n",
+            "frust-hashmemo-v2\n{text_path}\n{} {} {} {} {}\n{hash}\n",
             s.dev, s.ino, s.size, s.mtime_ns, s.ctime_ns
         );
         if attested {
@@ -476,14 +581,16 @@ impl Hasher {
     pub fn attest(&self, path: &Path, hash: &str, stamp: &Stamp) -> bool {
         // The file must still carry the stamp it had while hashed, on a believed volume with fine timestamps.
         let sound = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-        if !sound || self.persist_dir.is_none() || stamp.size < PERSIST_MIN_BYTES || stamp.ctime_ns <= 0 || !self.believes(path, stamp) {
+        // A static library's canonical hash is not the plain hash the producer computed.
+        if !sound || is_static_library(path) || self.persist_dir.is_none() || stamp.size < PERSIST_MIN_BYTES || stamp.ctime_ns <= 0 || !self.believes(path, stamp) {
             return false;
         }
         Stamp::read(path).is_ok_and(|now| now == *stamp) && self.write_record(path, stamp, hash, true)
     }
 
     /// Linkers read only the top level and `*.framework` bundles, so other sub-directories count by name unless `recursive`.
-    pub fn hash_dir(&self, dir: &Path, recursive: bool, watch: &mut Vec<(PathBuf, Stamp)>) -> DirHash {
+    /// With `only`, just those top-level file names are read (a compile that never runs the linker opens nothing else); absent ones count by omission.
+    pub fn hash_dir(&self, dir: &Path, recursive: bool, only: Option<&[String]>, watch: &mut Vec<(PathBuf, Stamp)>) -> DirHash {
         let mut walk = DirWalk { hasher: self, entries: Vec::new(), files: 0, bytes: 0, seen: HashSet::new(), watch };
         match fs::metadata(dir) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -493,7 +600,11 @@ impl Hasher {
             Ok(meta) if !meta.is_dir() => return DirHash::Hash("not-a-directory".to_string()),
             Ok(_) => {}
         }
-        if let Err(reason) = walk.visit(dir, "", recursive) {
+        let visited = match only {
+            Some(names) => walk.visit_named(dir, names),
+            None => walk.visit(dir, "", recursive),
+        };
+        if let Err(reason) = visited {
             return DirHash::Unverifiable(reason);
         }
         walk.entries.sort();
@@ -518,6 +629,36 @@ struct DirWalk<'a> {
 }
 
 impl DirWalk<'_> {
+    fn visit_named(&mut self, dir: &Path, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let path = dir.join(name);
+            let meta = match sys::stat(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(format!("{}: {err}", path.display())),
+            };
+            if !meta.is_file() {
+                self.entries.push((name.clone(), "not-a-file".to_string()));
+                continue;
+            }
+            self.read_file(path, name.clone(), &meta)?;
+        }
+        Ok(())
+    }
+
+    fn read_file(&mut self, path: PathBuf, rel: String, meta: &sys::Meta) -> Result<(), String> {
+        self.files += 1;
+        self.bytes += meta.len();
+        if self.files > DIR_MAX_FILES || self.bytes > DIR_MAX_BYTES {
+            return Err(format!("{} is too large to hash", path.display()));
+        }
+        // Link directories are shared by every dependent, so the persistent memo avoids rehashing large libraries per process.
+        let hashed = self.hasher.hash_observed(&path, true, Stamp::of(meta)).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.watch.push((path, hashed.stamp));
+        self.entries.push((rel, hashed.hash));
+        Ok(())
+    }
+
     fn visit(&mut self, dir: &Path, prefix: &str, recursive: bool) -> Result<(), String> {
         let meta = sys::stat(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         if !self.seen.insert((meta.dev(), meta.ino())) {
@@ -546,15 +687,7 @@ impl DirWalk<'_> {
                     self.entries.push((rel, "dir".to_string()));
                 }
             } else if meta.is_file() {
-                self.files += 1;
-                self.bytes += meta.len();
-                if self.files > DIR_MAX_FILES || self.bytes > DIR_MAX_BYTES {
-                    return Err(format!("{} is too large to hash", dir.display()));
-                }
-                // Recursive dirs are build script outputs every dependent links, so the persistent memo avoids rehashing per dependent.
-                let hashed = self.hasher.hash_observed(&path, recursive, Stamp::of(&meta)).map_err(|e| format!("{}: {e}", path.display()))?;
-                self.watch.push((path, hashed.stamp));
-                self.entries.push((rel, hashed.hash));
+                self.read_file(path, rel, &meta)?;
             } else {
                 self.entries.push((rel, "special".to_string()));
             }
@@ -668,17 +801,37 @@ mod tests {
         crate::sys::link_tool(&dir.join("libreal.a"), &dir.join("liblink.a")).unwrap();
         fs::create_dir_all(dir.join("Foo.framework")).unwrap();
         fs::write(dir.join("Foo.framework").join("Foo"), b"fw").unwrap();
-        let a = Hasher::ephemeral().hash_dir(&dir, false, &mut Vec::new());
+        let a = Hasher::ephemeral().hash_dir(&dir, false, None, &mut Vec::new());
         fs::write(dir.join("Foo.framework").join("Foo"), b"fw2").unwrap();
-        let b = Hasher::ephemeral().hash_dir(&dir, false, &mut Vec::new());
+        let b = Hasher::ephemeral().hash_dir(&dir, false, None, &mut Vec::new());
         assert_ne!(a, b, "framework contents are part of the hash");
         fs::write(dir.join("libreal.a"), b"two").unwrap();
-        let c = Hasher::ephemeral().hash_dir(&dir, false, &mut Vec::new());
+        let c = Hasher::ephemeral().hash_dir(&dir, false, None, &mut Vec::new());
         assert_ne!(b, c, "a symlinked library's target contents are part of the hash");
         assert_eq!(
-            Hasher::ephemeral().hash_dir(&dir.join("missing"), false, &mut Vec::new()),
+            Hasher::ephemeral().hash_dir(&dir.join("missing"), false, None, &mut Vec::new()),
             DirHash::Hash("absent".into())
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_named_directory_hash_reads_only_the_named_libraries() {
+        let dir = scratch("named");
+        fs::write(dir.join("libwanted.a"), vec![1u8; 4096]).unwrap();
+        fs::write(dir.join("libbig.so"), vec![9u8; 1 << 20]).unwrap();
+        let only = vec!["libwanted.a".to_string(), "wanted.lib".to_string()];
+        let hasher = Hasher::ephemeral();
+        let first = hasher.hash_dir(&dir, false, Some(&only), &mut Vec::new());
+        assert_eq!(hasher.tally().0, 4096, "an unnamed library is never read");
+        fs::write(dir.join("libbig.so"), vec![8u8; 1 << 20]).unwrap();
+        assert_eq!(Hasher::ephemeral().hash_dir(&dir, false, Some(&only), &mut Vec::new()), first);
+        fs::write(dir.join("libwanted.a"), vec![2u8; 4096]).unwrap();
+        let changed = Hasher::ephemeral().hash_dir(&dir, false, Some(&only), &mut Vec::new());
+        assert_ne!(changed, first, "a named library's contents are part of the hash");
+        fs::write(dir.join("wanted.lib"), b"new").unwrap();
+        assert_ne!(Hasher::ephemeral().hash_dir(&dir, false, Some(&only), &mut Vec::new()), changed, "a named library appearing changes the hash");
+        assert_ne!(Hasher::ephemeral().hash_dir(&dir, false, None, &mut Vec::new()), changed);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -705,6 +858,148 @@ mod tests {
         blake3::hash(bytes).to_hex().to_string()
     }
 
+    fn member(name: &str, date: u64, uid: u64, gid: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = format!("{name:<16}{date:<12}{uid:<6}{gid:<6}{:<8}{:<10}`\n", "100644", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn archive(members: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = AR_MAGIC.to_vec();
+        for m in members {
+            out.extend_from_slice(m);
+        }
+        out
+    }
+
+    fn coff(stamp: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x64, 0x86, 1, 0];
+        out.extend_from_slice(&stamp.to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn canonical(bytes: &[u8]) -> String {
+        canonical_archive_hash(bytes).expect("well-formed archive")
+    }
+
+    #[test]
+    fn archives_differing_only_in_dates_owners_and_groups_hash_equal() {
+        let one = archive(&[member("__.SYMDEF SORTED", 1700000000, 501, 20, b"symbols"), member("x.o", 1700000001, 501, 20, b"object data")]);
+        let two = archive(&[member("__.SYMDEF SORTED", 1800000000, 0, 0, b"symbols"), member("x.o", 5, 1000, 1000, b"object data")]);
+        assert_ne!(one, two);
+        assert_eq!(canonical(&one), canonical(&two));
+        assert_ne!(canonical(&one), plain(&one), "the canonical hash is domain separated from the plain hash");
+    }
+
+    #[test]
+    fn any_link_relevant_archive_change_changes_the_hash() {
+        let base = archive(&[member("a.o", 0, 0, 0, b"alpha"), member("b.o", 0, 0, 0, b"beta!")]);
+        let data = archive(&[member("a.o", 0, 0, 0, b"alphx"), member("b.o", 0, 0, 0, b"beta!")]);
+        let name = archive(&[member("c.o", 0, 0, 0, b"alpha"), member("b.o", 0, 0, 0, b"beta!")]);
+        let order = archive(&[member("b.o", 0, 0, 0, b"beta!"), member("a.o", 0, 0, 0, b"alpha")]);
+        let extra = archive(&[member("a.o", 0, 0, 0, b"alpha"), member("b.o", 0, 0, 0, b"beta!"), member("c.o", 0, 0, 0, b"")]);
+        let longer = archive(&[member("a.o", 0, 0, 0, b"alpha!"), member("b.o", 0, 0, 0, b"beta!")]);
+        let reference = canonical(&base);
+        for changed in [data, name, order, extra, longer] {
+            assert_ne!(canonical(&changed), reference);
+        }
+    }
+
+    #[test]
+    fn a_coff_member_timestamp_is_ignored_but_its_content_is_not() {
+        let one = archive(&[member("a.obj", 0, 0, 0, &coff(1, b"code"))]);
+        let two = archive(&[member("a.obj", 0, 0, 0, &coff(0xdead_beef, b"code"))]);
+        let other = archive(&[member("a.obj", 0, 0, 0, &coff(1, b"cod3"))]);
+        assert_eq!(canonical(&one), canonical(&two));
+        assert_ne!(canonical(&one), canonical(&other));
+        // Bytes that only resemble a machine type but fail the symbol table bounds are hashed as they are.
+        let mut odd = coff(1, b"code");
+        odd[8..12].copy_from_slice(&0xffff_0000u32.to_le_bytes());
+        let (a, b) = (archive(&[member("a.obj", 0, 0, 0, &odd)]), {
+            let mut changed = odd.clone();
+            changed[4] = 9;
+            archive(&[member("a.obj", 0, 0, 0, &changed)])
+        });
+        assert_ne!(canonical(&a), canonical(&b));
+    }
+
+    #[test]
+    fn short_import_member_timestamps_are_ignored() {
+        let import = |stamp: u32| {
+            let mut data = vec![0, 0, 0xff, 0xff, 0, 0, 0x64, 0x86];
+            data.extend_from_slice(&stamp.to_le_bytes());
+            data.extend_from_slice(b"rest of header and names");
+            archive(&[member("kernel32.dll/", 0, 0, 0, &data)])
+        };
+        assert_eq!(canonical(&import(1)), canonical(&import(2)));
+    }
+
+    #[test]
+    fn malformed_archives_fall_back_to_plain_hashing_without_panicking() {
+        let good = archive(&[member("a.o", 0, 0, 0, b"alpha"), member("b.o", 0, 0, 0, b"beta!")]);
+        assert!(canonical_archive_hash(&good).is_some());
+        for len in 0..good.len() {
+            let cut = &good[..len];
+            let _ = canonical_archive_hash(cut);
+        }
+        assert!(canonical_archive_hash(&good[..good.len() - 30]).is_none(), "a truncated member");
+        let mut bad_end = good.clone();
+        bad_end[8 + 58] = b'x';
+        assert!(canonical_archive_hash(&bad_end).is_none());
+        let mut bad_size = good.clone();
+        bad_size[8 + 48..8 + 58].copy_from_slice(b"not-digits");
+        assert!(canonical_archive_hash(&bad_size).is_none());
+        let mut huge = good.clone();
+        huge[8 + 48..8 + 58].copy_from_slice(b"9999999999");
+        assert!(canonical_archive_hash(&huge).is_none());
+        assert!(canonical_archive_hash(b"!<thin>\n").is_none());
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"junk");
+        assert!(canonical_archive_hash(&trailing).is_none());
+
+        let dir = scratch("ar-corrupt");
+        let file = dir.join("libbad.a");
+        fs::write(&file, &good[..good.len() - 30]).unwrap();
+        assert_eq!(hash_with_stamp(&file).unwrap().hash, plain(&good[..good.len() - 30]));
+        fs::write(&file, vec![b'z'; 4096]).unwrap();
+        assert_eq!(hash_with_stamp(&file).unwrap().hash, plain(&vec![b'z'; 4096]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_static_libraries_are_canonicalised_and_memoised_hashing_agrees() {
+        let dir = scratch("ar-memo");
+        let one = archive(&[member("a.o", 11, 501, 20, &pattern(40_000)), member("b.o", 12, 501, 20, b"beta!")]);
+        let two = archive(&[member("a.o", 99, 0, 0, &pattern(40_000)), member("b.o", 98, 0, 0, b"beta!")]);
+        let (lib_one, lib_two, rlib) = (dir.join("libone.a"), dir.join("two.lib"), dir.join("libone.rlib"));
+        fs::write(&lib_one, &one).unwrap();
+        fs::write(&lib_two, &two).unwrap();
+        fs::write(&rlib, &one).unwrap();
+        let direct = canonical(&one);
+        assert_eq!(hash_with_stamp(&lib_one).unwrap().hash, direct);
+        assert_eq!(hash_with_stamp(&lib_two).unwrap().hash, direct);
+        assert_eq!(hash_with_stamp(&rlib).unwrap().hash, plain(&one), "rlibs keep the plain hash");
+
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let memo = dir.join("memo");
+        let hasher = Hasher::new(Some(memo.clone()), vec![dir.clone()]);
+        assert_eq!(hasher.hash(&lib_one, true).unwrap().hash, direct);
+        assert_eq!(hasher.hash(&lib_one, true).unwrap().hash, direct, "in-process memo");
+        assert!(fs::read_dir(&memo).map(|rd| rd.count() > 0).unwrap_or(false));
+        assert_eq!(Hasher::new(Some(memo), Vec::new()).hash(&lib_one, true).unwrap().hash, direct, "persistent memo");
+        let mut watch = Vec::new();
+        let one_dir = Hasher::ephemeral().hash_dir(&dir, false, Some(&["libone.a".to_string()]), &mut watch);
+        let two_dir = Hasher::ephemeral().hash_dir(&dir, false, Some(&["libone.a".to_string()]), &mut watch);
+        assert_eq!(one_dir, two_dir);
+        assert!(!Hasher::new(Some(dir.join("m2")), Vec::new()).attest(&lib_one, &plain(&one), &Stamp::read(&lib_one).unwrap()), "static libraries are never attested by plain hash");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn mapped_hashing_of_large_settled_files_equals_plain_blake3() {
@@ -722,6 +1017,8 @@ mod tests {
         assert_eq!(mapped(&medium), Some(plain(&medium_bytes)), "update_mmap path");
         assert_eq!(mapped(&large), Some(plain(&large_bytes)), "large mappings keep the same hash");
         assert_eq!(mapped(&small), None, "small files are read, not mapped");
+        // Touching the file now keeps it inside the settle margin however long the writes above took under load.
+        File::options().write(true).open(&large).unwrap().set_modified(SystemTime::now()).unwrap();
         assert_eq!(hash_mapped(&large, &Stamp::read(&large).unwrap(), now_ns(), true), None, "a file inside the settle margin is read, not mapped");
         assert_eq!(hash_mapped(&large, &Stamp::read(&large).unwrap(), settled, false), None, "a file that may be edited in place is read, not mapped");
         let _ = fs::remove_dir_all(&dir);

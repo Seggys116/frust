@@ -110,10 +110,13 @@ pub fn run(args: Vec<OsString>) -> i32 {
     }
     if let Some(job) = deferred_entry(&args) {
         DETACHED_STORE.store(true, Ordering::Relaxed);
+        // The inherited slot and key locks must not pass to a drainer this helper starts, or they outlive it.
+        sys::seal_inherited_descriptors();
         return deferred_main(job);
     }
     if drain_entry(&args) {
         DETACHED_STORE.store(true, Ordering::Relaxed);
+        sys::seal_inherited_descriptors();
         return drain_main();
     }
     // SAFETY: startup has opened no files; pipe validation rejects stale descriptor numbers.
@@ -872,6 +875,9 @@ impl Plan {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
             self.settle(&captured, &preexisting);
+            if !self.skips_store() {
+                self.supersede_unit_versions();
+            }
             if self.skips_store() {
                 self.probe.mode(|| "skip:test".to_string());
                 let _ = self.skip_store("test executables are not stored", compile_ms);
@@ -1580,6 +1586,9 @@ impl Plan {
         // Covers an entry another process published first or one that already existed.
         self.note_workspace(&key);
         self.note_unit(&key);
+        if let Some(lineage) = self.lineage() {
+            self.cache.note_unit_entry(&lineage, &key, usize::MAX);
+        }
         self.cache
             .add_candidate(self.target().prekey, Candidate { inputs, envs, key });
         self.debug(&format!(
@@ -1871,6 +1880,37 @@ impl Plan {
                 continue;
             }
             self.debug(&format!("retired superseded store-only entry {key} of {}", self.parsed.crate_name));
+            self.cache.remove_entry(&key);
+        }
+    }
+
+    /// The compile just replaced the unit's outputs, so its earlier entries no longer match the target; retiring them now does not depend on the store publishing, being skipped, failing or being dropped.
+    fn supersede_unit_versions(&self) {
+        let Some(unit) = self.target().unit else { return self.supersede_lineage() };
+        for old in self.cache.supersede_unit_entries(unit, self.context.unit_versions.clamp(1, UNIT_VERSIONS)) {
+            self.debug(&format!("retired entry {old} of {} superseded by a new compile", self.parsed.crate_name));
+        }
+    }
+
+    /// Cargo's output names of a registry or git unit; its entries are recorded under this so a recompile (a build script that writes a differently stamped static library, say) finds the states it replaced.
+    fn lineage(&self) -> Option<String> {
+        if self.target().unit.is_some() || self.parsed.extra_filename.is_empty() {
+            return None;
+        }
+        let parsed = &self.parsed;
+        Some(cache::hash_str(&format!("lineage\0{}\0{}\0{}", parsed.crate_name, parsed.extra_filename, parsed.metadata_only_library)))
+    }
+
+    /// Only entries no other workspace has stored or restored are retired, so a recompile here never takes a shared registry entry from another checkout.
+    fn supersede_lineage(&self) {
+        let (Some(lineage), Some(workspace)) = (self.lineage(), self.workspace()) else { return };
+        let mut protection = None;
+        for key in self.cache.unit_keys(&lineage) {
+            let Some((dir, meta)) = self.cache.load_entry(&key) else { continue };
+            if meta.workspaces != [workspace.as_str()] || protection.get_or_insert_with(|| deferred_protection(&self.dirs)).protects(&dir) {
+                continue;
+            }
+            self.debug(&format!("retired entry {key} of {} superseded by a recompile in this workspace", self.parsed.crate_name));
             self.cache.remove_entry(&key);
         }
     }
@@ -3964,6 +4004,13 @@ impl KeyContext<'_> {
         };
 
         let mut native_dirs = Vec::new();
+        // Without a link step rustc opens only the libraries named by -l, so the rest of a link directory cannot reach the outputs.
+        let only: Option<Vec<String>> = (!parsed.links).then(|| {
+            let mut names: Vec<String> = parsed.libs.iter().flat_map(|lib| lib.file_names()).collect();
+            names.sort();
+            names.dedup();
+            names
+        });
         // Incremental outputs are not byte-identical with non-incremental ones (different codegen unit split), so they never share entries.
         if parsed.incremental() {
             hasher.update(b"\0incremental-unit");
@@ -4034,7 +4081,7 @@ impl KeyContext<'_> {
                         let dir = self.cwd.join(dir);
                         hasher.update(b"\0d");
                         let before = self.hasher.tally();
-                        hasher.content(self.dir_hash(&dir, &mut watched)?.as_bytes());
+                        hasher.content(self.dir_hash(&dir, only.as_deref(), &mut watched)?.as_bytes());
                         stats.native_dir_hashed += self.hasher.tally().0 - before.0;
                         native_dirs.push(dir);
                     }
@@ -4140,13 +4187,13 @@ impl KeyContext<'_> {
             })
     }
 
-    fn dir_hash(&self, dir: &Path, watched: &mut Vec<(PathBuf, Stamp)>) -> Result<String, String> {
+    fn dir_hash(&self, dir: &Path, only: Option<&[String]>, watched: &mut Vec<(PathBuf, Stamp)>) -> Result<String, String> {
         if let Ok(stamp) = Stamp::read(dir) {
             watched.push((dir.to_path_buf(), stamp));
         }
         match self
             .hasher
-            .hash_dir(dir, dir.starts_with(self.profile_abs), watched)
+            .hash_dir(dir, dir.starts_with(self.profile_abs), only, watched)
         {
             DirHash::Hash(hash) => Ok(hash),
             DirHash::Unverifiable(reason) => Err(reason),
@@ -4427,6 +4474,25 @@ mod tests {
         for (b, a) in before.iter().zip(&after) {
             assert_ne!(b, a);
         }
+    }
+
+    #[test]
+    fn library_compiles_hash_only_the_native_libraries_they_name() {
+        let s = Scratch::new("native-named");
+        let lib = s.0.join("ext");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("libfoo.a"), b"v1").unwrap();
+        fs::write(lib.join("libunrelated.so"), vec![7u8; 1 << 16]).unwrap();
+        let dir = format!("-Lnative={}", lib.display());
+        let library = ["--crate-type=lib", "-l", "static=foo", dir.as_str()];
+        let program = ["--crate-type=bin", "-l", "static=foo", dir.as_str()];
+        let (lib_before, bin_before) = (keyed(&s.0, &library).unwrap(), key(&s.0, &program).unwrap());
+        assert!(lib_before.stats.native_dir_hashed < 1 << 16, "a library compile never reads an unnamed file");
+        fs::write(lib.join("libunrelated.so"), vec![8u8; 1 << 16]).unwrap();
+        assert_eq!(keyed(&s.0, &library).unwrap().key, lib_before.key);
+        assert_ne!(key(&s.0, &program).unwrap(), bin_before, "a linked artifact sees every file in the directory");
+        fs::write(lib.join("libfoo.a"), b"v2").unwrap();
+        assert_ne!(keyed(&s.0, &library).unwrap().key, lib_before.key);
     }
 
     #[test]

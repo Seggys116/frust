@@ -105,8 +105,14 @@ fn across_checkouts(tag: &str, incremental: bool, debuginfo: bool) {
     let first = run(&sb, &a);
 
     build_with(&sb, &b, true, incremental, debuginfo);
-    assert_eq!(sb.count_cache("hit", "shared_lib"), 1, "{:#?}", sb.cache_events());
-    assert_eq!(sb.count_cache("miss", "shared_lib"), 1, "the second checkout must not launch the compiler for it");
+    let pdb_paths = cfg!(windows) && debuginfo;
+    if pdb_paths {
+        assert_eq!(sb.count_cache("hit", "shared_lib"), 0, "a PDB records the checkout path, so the entry stays specific");
+        assert_eq!(sb.count_cache("miss", "shared_lib"), 2);
+    } else {
+        assert_eq!(sb.count_cache("hit", "shared_lib"), 1, "{:#?}", sb.cache_events());
+        assert_eq!(sb.count_cache("miss", "shared_lib"), 1, "the second checkout must not launch the compiler for it");
+    }
     let second = run(&sb, &b);
 
     for output in [&first, &second] {
@@ -115,7 +121,7 @@ fn across_checkouts(tag: &str, incremental: bool, debuginfo: bool) {
             assert!(!output[1].contains(&*dir.to_string_lossy()), "file!() names no checkout directory: {output:?}");
         }
     }
-    for root in [&a, &b] {
+    for root in [&a, &b].into_iter().filter(|_| !pdb_paths) {
         let rlib = library(&sb, root, "shared_lib");
         for dir in [&a, &b] {
             assert!(!contains(&rlib, &dir.to_string_lossy()), "the shared library in {} embeds no checkout path", root.display());

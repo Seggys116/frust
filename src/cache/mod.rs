@@ -290,14 +290,26 @@ impl Cache {
         self.note_unit_entry_with(unit, key, keep, || {}, |_| {}, fsx::remove_any)
     }
 
+    /// A fresh compile of the unit is its newest state whether or not a store follows, so only `keep - 1` earlier entries stay; returned retired keys are for logging.
+    pub fn supersede_unit_entries(&self, unit: &str, keep: usize) -> Vec<String> {
+        self.record_unit_versions(unit, None, keep.saturating_sub(1), || {}, |_| {}, fsx::remove_any)
+    }
+
     fn note_unit_entry_with(
         &self, unit: &str, key: &str, keep: usize,
+        after_lock: impl FnOnce(), before_commit: impl FnOnce(&Path), delete: impl FnMut(&Path) -> io::Result<()>,
+    ) -> Vec<String> {
+        self.record_unit_versions(unit, Some(key), keep, after_lock, before_commit, delete)
+    }
+
+    fn record_unit_versions(
+        &self, unit: &str, key: Option<&str>, keep: usize,
         after_lock: impl FnOnce(), before_commit: impl FnOnce(&Path), mut delete: impl FnMut(&Path) -> io::Result<()>,
     ) -> Vec<String> {
-        if !valid_key(unit) || !valid_key(key) { return Vec::new(); }
+        if !valid_key(unit) || key.is_some_and(|key| !valid_key(key)) { return Vec::new(); }
         let Ok(guard) = UnitRecordsGuard::acquire(&self.dirs) else { return Vec::new() };
         after_lock();
-        if !self.has_entry(key) { return Vec::new(); }
+        if key.is_some_and(|key| !self.has_entry(key)) { return Vec::new(); }
         let path = Self::shard(self.units_dir(), unit);
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -306,9 +318,9 @@ impl Cache {
         };
         let previous: Vec<String> = text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect();
         let mut seen = std::collections::HashSet::new();
-        let mut keys: Vec<String> = previous.iter().filter(|old| old.as_str() != key && self.has_entry(old)
+        let mut keys: Vec<String> = previous.iter().filter(|old| Some(old.as_str()) != key && self.has_entry(old)
             && seen.insert(old.as_str())).cloned().collect();
-        keys.insert(0, key.to_owned());
+        if let Some(key) = key { keys.insert(0, key.to_owned()); }
         let evicted = if keys.len() > keep { keys.split_off(keep) } else { Vec::new() };
         if keys == previous && evicted.is_empty() { return Vec::new(); }
         before_commit(&path);

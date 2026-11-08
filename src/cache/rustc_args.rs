@@ -13,6 +13,8 @@ pub struct RustcArgs {
     pub windows_pdb_output: bool,
     /// Builds a test or bench executable: `--test`, or `--cfg test` for a binary.
     pub test_harness: bool,
+    /// Runs the system linker; a library-only compile reads just the bundled static libraries it names.
+    pub links: bool,
     pub paths: Vec<(usize, PathArg)>,
     pub libs: Vec<NativeLib>,
     pub out_dir_args: Vec<usize>,
@@ -262,6 +264,7 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
             && target.as_deref().map_or(cfg!(all(windows, target_env = "msvc")), |target| {
                 matches!(target, "i586-pc-windows-msvc" | "i686-pc-windows-msvc" | "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" | "arm64ec-pc-windows-msvc" | "thumbv7a-pc-windows-msvc")
             }),
+        links: test_flag || cfg_test || !crate_types.iter().all(|kind| matches!(kind.as_str(), "lib" | "rlib")) || crate_types.is_empty(),
         test_harness: emits_link && (test_flag || cfg_test && crate_types.iter().any(|kind| kind == "bin")),
         paths,
         libs,
@@ -528,6 +531,23 @@ mod tests {
         }
         let args = os(&["--crate-name=a", "--out-dir=/o", "--emit=dep-info,metadata", "--test"]);
         assert!(!parse(&args).unwrap().test_harness);
+    }
+
+    #[test]
+    fn only_library_crate_types_skip_the_link_step() {
+        for flags in [vec!["--crate-type", "lib"], vec!["--crate-type=rlib"], vec!["--crate-type", "lib,rlib"]] {
+            assert!(!with(&flags).unwrap().links, "{flags:?}");
+        }
+        for flags in [
+            vec![],
+            vec!["--crate-type=bin"],
+            vec!["--crate-type=lib", "--crate-type=cdylib"],
+            vec!["--crate-type=proc-macro"],
+            vec!["--crate-type=lib", "--test"],
+            vec!["--crate-type=staticlib"],
+        ] {
+            assert!(with(&flags).unwrap().links, "{flags:?}");
+        }
     }
 
     #[test]

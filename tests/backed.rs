@@ -197,6 +197,29 @@ fn a_store_skipped_for_a_fresh_edit_retires_the_entry_its_compile_superseded() {
     assert_eq!(store_only_linked_files(&sb, &["leaf", "mid", "app"]), 0);
 }
 
+// Whatever the payload, a compile whose store cannot follow leaves no earlier version of the unit in the store.
+fn skipped_stores_keep_no_superseded_version(tag: &str, backed: &str, incremental: &str) {
+    let sb = Sandbox::new(tag);
+    let ws = path_workspace(&sb);
+    let envs = [("FRUST_CACHE_BACKED", backed), ("FRUST_CACHE_UNIT_VERSIONS", "1"), ("CARGO_INCREMENTAL", incremental)];
+    edit_leaf(&ws, 1);
+    build_with(&sb, &ws, &envs);
+    assert_eq!(entries(&sb, "leaf").len(), 1);
+    edit_leaf_unsettled(&ws, 2);
+    build_with(&sb, &ws, &envs);
+    assert!(entries(&sb, "leaf").is_empty(), "{backed}, incremental {incremental}: the stored version was superseded by a compile that could not be stored");
+}
+
+#[test]
+fn a_skipped_store_supersedes_copied_entries_too() {
+    skipped_stores_keep_no_superseded_version("lk-skip-copy", "off", "1");
+}
+
+#[test]
+fn a_skipped_store_supersedes_linked_entries_of_non_incremental_compiles() {
+    skipped_stores_keep_no_superseded_version("lk-skip-whole", "force", "0");
+}
+
 #[test]
 fn the_unit_versions_setting_keeps_that_many_states() {
     let sb = Sandbox::new("lk-versions-two");
@@ -291,6 +314,47 @@ fn a_deleted_target_still_restores_from_the_store_file_and_the_store_adopts_the_
     assert_eq!(fs::read(&restored).unwrap(), bytes);
     let (dir, meta) = leaf_entry(&sb);
     assert_eq!(ino(&dir.join(&rlib_record(&meta).stored)), ino(&restored), "an orphaned store file shares the restored output");
+}
+
+// A keyed variable stands in for a build script whose static library differs on every run: the clean rebuild misses and recompiles.
+fn rebuild_with_new_key(tag: &str, backed: &str, share: bool) -> Sandbox {
+    let (sb, a, b) = scene(tag);
+    // Sources under CARGO_HOME/registry/src are what frust treats as registry crates, which keep no unit versions.
+    let registry = sb.cargo_home().join("registry").join("src").join("vendored");
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    frust::sys::rename(&sb.vendor(), &registry).unwrap();
+    let config = sb.cargo_home().join("config.toml");
+    let text = fs::read_to_string(&config).unwrap().replace(&sb.vendor().display().to_string(), &registry.display().to_string());
+    fs::write(&config, text).unwrap();
+    let build_keyed = |project: &Path, target: &str| {
+        let mut command = sb.bin("fcargo");
+        command.arg("build").current_dir(project).env("FRUST_CACHE_BACKED", backed).env("MACOSX_DEPLOYMENT_TARGET", target);
+        assert_success(&command.output().unwrap());
+    };
+    build_keyed(&a, "11.0");
+    if share {
+        build_keyed(&b, "11.0");
+    }
+    sb.lose_target(&a);
+    build_keyed(&a, "12.0");
+    assert_eq!(sb.count_cache("miss", "leaf"), 2, "{:#?}", sb.cache_events());
+    assert_eq!(app_output(&sb, &a), "41");
+    sb
+}
+
+#[test]
+fn a_registry_recompile_retires_the_entry_only_its_workspace_used() {
+    for backed in ["force", "off"] {
+        let sb = rebuild_with_new_key(&format!("lk-lineage-{backed}"), backed, false);
+        assert_eq!(entries(&sb, "leaf").len(), 1, "{backed}: the replaced state is retired with the recompile");
+        assert_eq!(store_only_linked_files(&sb, &["leaf"]), 0);
+    }
+}
+
+#[test]
+fn a_registry_recompile_keeps_an_entry_another_workspace_restored() {
+    let sb = rebuild_with_new_key("lk-lineage-shared", "off", true);
+    assert_eq!(entries(&sb, "leaf").len(), 2, "the other checkout still uses the first state");
 }
 
 #[test]

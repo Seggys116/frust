@@ -681,6 +681,11 @@ pub fn lower_thread_priority() {
     imp::lower_thread_priority()
 }
 
+/// Inherited lock handles stay with this process: a child it spawns must not hold a store slot or key lock past its exit.
+pub fn seal_inherited_descriptors() {
+    imp::seal_inherited_descriptors()
+}
+
 /// Below builds but never starved, for stores that builds and drains wait on.
 pub fn lower_store_priority() {
     imp::lower_store_priority()

@@ -1220,6 +1220,27 @@ pub fn lower_thread_priority() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn lower_store_priority() {}
 
+/// A detached helper keeps the lock handles it inherited, but none of its own children may receive them.
+pub fn seal_inherited_descriptors() {
+    let Ok(entries) = fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<libc::c_int> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|&fd| fd > 2)
+        .collect();
+    for fd in fds {
+        // SAFETY: only the close-on-exec flag changes; a descriptor already closed (the listing's own) just fails.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn fs_type_name(path: &Path) -> Option<String> {
     let c = cstr(path).ok()?;
@@ -1291,6 +1312,29 @@ pub(super) fn non_utf8_os_string() -> std::ffi::OsString {
 #[cfg(test)]
 mod compact_hashing_tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_inherited_lock_does_not_outlive_this_process_in_a_child() {
+        if crate::isolated_test(module_path!(), "a_sealed_inherited_lock_does_not_outlive_this_process_in_a_child") {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("frust-sys-sealed-{}", std::process::id()));
+        let held = File::create(&path).unwrap();
+        // SAFETY: only the close-on-exec flag of an owned descriptor changes, as inheritance by a helper leaves it.
+        unsafe {
+            let flags = libc::fcntl(held.as_raw_fd(), libc::F_GETFD);
+            libc::fcntl(held.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+        held.lock().unwrap();
+        seal_inherited_descriptors();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        drop(held);
+        let free = File::open(&path).unwrap().try_lock().is_ok();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(free, "a child of the helper kept the inherited lock");
+    }
 
     #[test]
     fn lowering_priority_on_a_spawned_thread_returns() {
