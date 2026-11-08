@@ -125,7 +125,17 @@ tick. A record is written only if the file still has the stamp it had while it w
 trust mode: `off` neither writes nor uses them, `audit` re-reads the file on every use of an attested record, so it
 proves them, and discards a record that does not match; a mismatch under an unchanged stamp is reported and
 quarantines the volume like any other stamp violation. `on` uses them like any other settled record. Test harnesses
-and binary-only crates are not attested, since nothing depends on them.
+and binary-only crates are not attested, since nothing depends on them. On Linux and Windows cargo uplifts a root
+library of `cargo build` into the profile directory by hard link right after rustc exits, which moves the change time
+and voids an attestation at once; the wrapper skips that read when `fcargo build` runs and cargo's plain name
+(`lib<crate>.rlib`) still shares the inode this compile replaced, so a library uplifted last time is not read for
+nothing. A wrong guess only costs a dependent one read. macOS cargo copies instead, so attestation there is unchanged.
+
+A file under a build script's `build/<unit>/out` is remembered while still inside the settle margin when cargo's
+`output` file beside it, stat'd before the read, has a later change time on the same volume. Cargo writes that file only
+after the script exited, and the timestamp clock had passed the file's change time by then, so any later write gives the
+file a newer change time and a different stamp. These records are marked attested, so `audit` proves them by content.
+Static archives a build script just wrote are then read once per build instead of again on the first edit.
 
 Related lookup behaviour:
 
@@ -188,6 +198,13 @@ dependency), only one should compile it.
   waits for the previous store. The wrapper
   records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4 (2 and
   8 on Windows, where the store is bound by file I/O rather than cores); `FRUST_STORE_SLOTS` sets the count.
+* `FRUST_STORE_START=after-build` (default `eager`) keeps every store off the build: the wrapper writes the job as
+  `job-<pid>-<ns>-q<prekey>.json` without a broker hand-off, slot or key lock, starts no drain, and the front end
+  starts up to one drain per slot after cargo exits. Measured on bat (macOS, 16 cores): the stores of a cold build
+  take 0.44 s of CPU (1.05 s with linked storage) against about 97 s for the build, and the wrapper saves the 3 to 5 ms
+  broker hand-off per unit, while the stores finish about 0.5 s later. It stays opt-in because no store holds a
+  dependency's key lock, so concurrent builds sharing that dependency each compile it instead of one waiting for the
+  other's entry, and without a supervising front end (no build lock and no display) stores start eagerly.
 * Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
 * With no free slot the store never runs on the compile's path. The wrapper freezes the outputs as usual and writes
   the job as `job-<pid>-<ns>-q<prekey>.json`, without a slot, then returns. A helper that finishes its job drains
@@ -217,8 +234,11 @@ touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans descri
 for `-L` directories), `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
 `spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
 `hit`, `deferred` (helper), `queued` (broker), `queued:slots` (job file waiting for a helper),
+`queued:after-build` (job file the front end drains once cargo exits),
 `inline:<reason>` or `skip:<reason>`; `skip:linker` marks a unit that ran uncached because its explicit linker could
 not be resolved, and `skip:test` a test or bench executable that was compiled but not stored. Stages a run did not reach are 0.
+Store outcomes go to `<file>.events` when that file exists, with `kind` `store`, the outcome in `store_mode`, the
+store's wall time in `total_ms` and the CPU time of the thread that stored in `cpu_ms`.
 
 ## Cache payload storage
 
@@ -272,8 +292,11 @@ The cost and sizing: deleting or replacing the target name leaves the store file
 survive `cargo clean`. `frust gc` counts a linked file that still has another name as zero bytes and an orphaned one
 in full, and drops every orphaned linked entry older than the newest of its unit (grouped by the unit records, not by
 prekey) at once, so frust never holds more than cargo does. A stale incremental object name left in a target does not
-keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path, with its
-identity checked around the hash and again before the link. Compaction treats a linked store file as covering a target file only while it hashes to the
+keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path: the
+store makes the link first and hashes through the new name, and the output must keep its inode, size, modification time
+and mode from before the link to the end of the read. That one read also attests a library again, since the new name
+moved its change time: only when the full stamp, change time included, held for the whole read and the link count grew,
+under the stamp the file carries after the link; otherwise the library is read once more to attest it. Compaction treats a linked store file as covering a target file only while it hashes to the
 recorded content, so it cannot delete the only copy. Manifests that list a linked entry use format 6 and linked
 entries use their own key domain, so older versions treat them as misses.
 

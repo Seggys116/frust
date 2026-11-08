@@ -93,6 +93,22 @@ pub fn now_ns() -> i128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0)
 }
 
+#[cfg(test)]
+thread_local! {
+    static HASHED_SIZES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sizes of the files this thread has read whole to hash them, oldest first; clears the list.
+#[cfg(test)]
+pub(crate) fn take_hashed_sizes() -> Vec<u64> {
+    HASHED_SIZES.with(|sizes| std::mem::take(&mut *sizes.borrow_mut()))
+}
+
+fn note_hashed(_size: u64) {
+    #[cfg(test)]
+    HASHED_SIZES.with(|sizes| sizes.borrow_mut().push(_size));
+}
+
 pub fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
     BUFFER.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -100,6 +116,7 @@ pub fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
             buf.resize(READ_BUF, 0);
         }
         let mut hasher = blake3::Hasher::new();
+        let mut total = 0u64;
         loop {
             let n = match reader.read(&mut buf[..]) {
                 Ok(0) => break,
@@ -108,7 +125,9 @@ pub fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
                 Err(err) => return Err(err),
             };
             hasher.update(&buf[..n]);
+            total += n as u64;
         }
+        note_hashed(total);
         Ok(hasher.finalize().to_hex().to_string())
     })
 }
@@ -230,6 +249,7 @@ fn hash_opened(path: &Path, mut file: File, stamp: Stamp, at_ns: i128, immutable
             None => hash_sized(&mut file, stamp.size)?,
         },
     };
+    note_hashed(stamp.size);
     let stable = Stamp::read(path).map(|after| after == stamp).unwrap_or(false);
     Ok(Hashed { hash, stamp, stable, at_ns, birth_ns: None })
 }
@@ -388,6 +408,16 @@ fn hash_sized(reader: &mut impl Read, size: u64) -> io::Result<String> {
     })
 }
 
+/// For a file under a build script's `build/<unit>/out`, the stamp of cargo's `output` file beside it, which cargo writes only after the script exited.
+fn build_output_witness(path: &Path) -> Option<Stamp> {
+    let out = path.ancestors().skip(1).find(|dir| dir.file_name().is_some_and(|name| name == "out"))?;
+    let unit = out.parent()?;
+    if unit.parent()?.file_name()? != "build" {
+        return None;
+    }
+    Stamp::read(&unit.join("output")).ok()
+}
+
 /// Says whether a stamp on `path`, which lies on volume `dev`, may be believed.
 pub type StampTrust = Box<dyn Fn(u64, &Path) -> bool + Send + Sync>;
 
@@ -533,9 +563,19 @@ impl Hasher {
             self.memo().insert(path.to_path_buf(), hashed.clone());
             return Ok(hashed);
         }
+        // Stat'd before the read: the proof needs the witness's change time set before any byte is read.
+        let young = persist && current.changed_since(now_ns(), SETTLE_MARGIN_NS);
+        let witness = young.then(|| build_output_witness(path)).flatten();
         let hashed = self.read(path, immutable)?;
         if persist && hashed.reusable() {
             self.remember(path, &hashed);
+        } else if persist
+            && hashed.stable
+            && hashed.stamp.ctime_ns > 0
+            && witness.is_some_and(|w| w.dev == hashed.stamp.dev && !w.coarse() && w.ctime_ns > hashed.stamp.ctime_ns)
+        {
+            // The timestamp clock had passed the file's change time before the read, so any later write moves the stamp; audit mode proves it as attested.
+            self.write_record(path, &hashed.stamp, &hashed.hash, true);
         }
         self.memo().insert(path.to_path_buf(), hashed.clone());
         Ok(hashed)
@@ -1633,6 +1673,53 @@ mod tests {
         let unattested = dependent(&memo);
         assert_eq!(unattested.hash(&other, true).unwrap().hash, plain(&other_bytes));
         assert_eq!(unattested.tally(), (ATTESTED_LEN as u64, 0), "an unsettled, unattested file is read");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A build script's output directory, its archive written now and, unless `output_first`, cargo's `output` file just after.
+    fn build_script_archive(dir: &Path, output_first: bool) -> Option<(PathBuf, Vec<u8>)> {
+        let script = dir.join("build").join("foo-0123abcd");
+        fs::create_dir_all(script.join("out")).unwrap();
+        let output = || fs::write(script.join("output"), "cargo:rustc-link-lib=static=foo\n").unwrap();
+        if output_first {
+            output();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let (archive, bytes, stamp) = fresh_output(&script.join("out"), "libfoo.a")?;
+        if !output_first {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            output();
+        }
+        let witness = Stamp::read(&script.join("output")).unwrap();
+        (witness.ctime_ns != stamp.ctime_ns).then_some((archive, bytes))
+    }
+
+    #[test]
+    fn a_build_script_archive_older_than_its_output_file_is_remembered_while_still_young() {
+        let dir = scratch("witness-settled");
+        let Some((archive, bytes)) = build_script_archive(&dir, false) else { return };
+        let memo = dir.join("memo");
+        let first = dependent(&memo);
+        let hashed = first.hash(&archive, true).unwrap();
+        assert_eq!(first.tally().0, bytes.len() as u64);
+        let next = dependent(&memo);
+        assert_eq!(next.hash(&archive, true).unwrap().hash, hashed.hash);
+        assert_eq!(next.tally(), (0, bytes.len() as u64), "the next unit takes the young archive's hash from the memo");
+        let audit = dependent(&memo).audit_attested(true);
+        assert_eq!(audit.hash(&archive, true).unwrap().hash, hashed.hash);
+        assert_eq!(audit.tally().0, bytes.len() as u64, "audit mode proves the record by content");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_script_archive_newer_than_its_output_file_waits_for_the_settle_margin() {
+        let dir = scratch("witness-unsettled");
+        let Some((archive, bytes)) = build_script_archive(&dir, true) else { return };
+        let memo = dir.join("memo");
+        dependent(&memo).hash(&archive, true).unwrap();
+        let next = dependent(&memo);
+        next.hash(&archive, true).unwrap();
+        assert_eq!(next.tally().0, bytes.len() as u64, "an archive the script may still be writing is read again");
         let _ = fs::remove_dir_all(&dir);
     }
 

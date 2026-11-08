@@ -1224,6 +1224,16 @@ pub fn lower_thread_priority() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn lower_store_priority() {}
 
+pub fn thread_cpu_ns() -> Option<u64> {
+    // SAFETY: timespec is plain data and clock_gettime only writes the out pointer.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: CLOCK_THREAD_CPUTIME_ID is supported on Linux and macOS and `ts` is a valid out pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(u64::try_from(ts.tv_sec).ok()? * 1_000_000_000 + u64::try_from(ts.tv_nsec).ok()?)
+}
+
 /// A detached helper keeps the lock handles it inherited, but none of its own children may receive them.
 pub fn seal_inherited_descriptors() {
     let Ok(entries) = fs::read_dir("/dev/fd") else {

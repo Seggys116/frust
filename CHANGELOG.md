@@ -27,8 +27,14 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * `FRUST_STORE_SLOTS` (1 to 16) sets the number of concurrent background stores; the default is half the CPU count, 1 to 4, and 2 to 8 on Windows.
 * `FRUST_CACHE_TESTS=on` stores test and bench harness executables, which are no longer stored by default.
 
+* `FRUST_STORE_START=after-build` (default `eager`) queues every deferred store as a job file while cargo runs and lets the front end start the drains once cargo exits, so stores never compete with the compiles; concurrent builds sharing a dependency may then each compile it.
+* Store outcomes in `FRUST_TIMINGS` carry the store's wall time (`total_ms`) and the CPU time of the storing thread (`cpu_ms`).
+
 ### Changed
 
+* A linked store reads each output once: it links first and hashes through the new name, and the same read attests a library again under the stamp the link left, instead of hashing before the link and reading the library a second time after it.
+* A file under a build script's `build/<unit>/out` is remembered in the hash memo as soon as cargo's `output` file beside it has a later change time, instead of after the 2 second settle margin, so static archives rewritten during a clean rebuild are no longer read again on the first edit.
+* On Linux and Windows, `fcargo build` no longer reads a root library at freeze to attest it when cargo's uplift link will void that attestation at once, predicted from the uplifted name still sharing the inode the compile replaced.
 * `fcargo doc` locks its profile and a `doc@output` slot instead of the whole target directory, so it runs alongside builds of the other profile.
 * Dependency debuginfo tuning (`FRUST_TUNE`) is now on by default; `FRUST_TUNE=off` restores cargo's defaults. It is skipped only when your own configuration sets `debug`, `split-debuginfo` or `strip` for the profile in use; an unrelated `[profile.release]` or other profile settings no longer disable it, and release, bench, install and custom profiles are never tuned.
 * Cache entries, manifests, unit records and key lock files now live directly under `store/`, `manifests/`, `units/` and `keylocks/` instead of in two character shard directories, which cost a directory block each on ext4. Older layouts stay readable and `frust gc` moves them flat and removes the emptied shard directories.
