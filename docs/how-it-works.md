@@ -356,9 +356,22 @@ entries use their own key domain, so older versions treat them as misses.
 * Builds in different profiles (debug and release) run in parallel. Cargo locks each profile directory separately, and so
   does frust. A `--target` build also takes the host slot of its profile (build scripts and proc macros live there), so it
   queues behind other builds of that profile, including builds for other targets. This applies to `build`, `check`,
-  `clippy`, `test` and `bench` with a determinable profile; other commands, or a config that relocates outputs, lock the
-  whole target directory.
-* Builds in the same profile with different commands (`check` then `build`, `-p a` then `-p b`) queue in order.
+  `clippy`, `test`, `bench` and `doc` with a determinable profile; other commands, or a config that relocates outputs,
+  lock the whole target directory.
+* `doc` holds its profile's slots plus a `doc@output` slot. Cargo builds the dependencies of a doc run in the profile
+  directory (under that profile's build lock) and writes `target/doc`, which no profile lock covers, so two doc runs
+  of different profiles must still queue while `doc` and a build of the other profile run side by side.
+* `check` and `clippy` build in their own directory, `<toolchain id>-check` beside the build target
+  (`frust where check` prints it). Cargo takes an exclusive lock on each profile directory of a target directory and a
+  check shares no unit with a build in the same profile, so with one directory they only waited on each other. With
+  two they run side by side, each with its own frust lock, no-op records and auto-compaction; identical checks still
+  join. The directory is a normal central target, so gc, compaction, `frust stats` and `frust doctor` age and list it
+  like any other, `fcargo clean` removes both, and a partial clean (`-p`, `--release`, `--target`) is applied to both.
+  The cache key is untouched. The cost is one more copy of the host-only units (build scripts and proc macros, which
+  check builds in full) per workspace. It applies only while frust owns the target directory: a `CARGO_TARGET_DIR`,
+  `--target-dir`, configured `target-dir` or `FRUST_TARGET=local` keeps check and build together, as does
+  `FRUST_CHECK_DIR=off`.
+* Builds in the same profile and directory with different commands (`build -p a` then `build -p b`) queue in order.
   Cargo serialises them on its own lock anyway; the queue shows who you are waiting for.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
   busy. Maintenance reserves all canonical Cargo profile lock names, including missing ones, so different Cargo

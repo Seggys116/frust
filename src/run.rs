@@ -69,6 +69,9 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
     if class == Class::CacheOnly {
         target.central = None;
     }
+    if class == Class::Compile && matches!(parsed.subcommand.as_deref(), Some("check" | "c" | "clippy")) && crate::config::check_dir() {
+        target = target.for_check();
+    }
     let mut env_vars = accelerator_env(&cfg, &probe);
     if let Some(dir) = &target.central {
         env_vars.push((os("CARGO_TARGET_DIR"), dir.as_os_str().to_os_string()));
@@ -105,6 +108,12 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
         Class::Compile | Class::Exec(_) => session.build_and_maybe_exec(class),
         Class::Clean if owns_clean => session.clean(evict_registry),
         _ => {
+            if class == Class::Clean {
+                let code = session.clean_check_directory();
+                if code != 0 {
+                    return code;
+                }
+            }
             let args = session.parsed.assemble(&session.tuning, session.parsed.subcommand.as_deref().unwrap_or(""), &session.parsed.rest);
             exec(&session.cargo, &args, &session.env_vars)
         }
@@ -136,9 +145,25 @@ fn working_dir(parsed: &CargoArgs) -> PathBuf {
     }
 }
 
+/// Serialises every `doc` run of a target directory, whichever profile it builds in.
+const DOC_SLOT: &str = "doc@output";
+
 struct TargetChoice {
     central: Option<PathBuf>,
     lock_key: PathBuf,
+}
+
+impl TargetChoice {
+    /// A frust-owned target moves to its sibling check directory; a user's target is left alone.
+    fn for_check(self) -> TargetChoice {
+        match self.central {
+            Some(build) => {
+                let check = workspace::check_target(&build);
+                TargetChoice { lock_key: check.clone(), central: Some(check) }
+            }
+            None => self,
+        }
+    }
 }
 
 fn pick_target_dir(
@@ -292,33 +317,161 @@ impl ConfigInputs {
     }
 }
 
-fn defines_profile(text: &str) -> bool {
-    let mut top_level = true;
+/// Splits a TOML dotted key at the `=`, returning its segments and the value text; `None` when the line is not a key assignment.
+fn split_key(text: &str) -> Option<(Vec<String>, &str)> {
+    let mut segments = Vec::new();
+    let mut rest = text.trim_start();
+    loop {
+        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''));
+        let (segment, after) = match quote {
+            Some(q) => {
+                let inner = &rest[1..];
+                let end = inner.find(q)?;
+                (&inner[..end], &inner[end + 1..])
+            }
+            None => {
+                let end = rest.find(|c: char| c.is_whitespace() || c == '.' || c == '=')?;
+                (&rest[..end], &rest[end..])
+            }
+        };
+        if segment.is_empty() && quote.is_none() {
+            return None;
+        }
+        segments.push(segment.to_string());
+        rest = after.trim_start();
+        if let Some(next) = rest.strip_prefix('.') {
+            rest = next.trim_start();
+        } else {
+            let value = rest.strip_prefix('=')?;
+            return Some((segments, value.trim()));
+        }
+    }
+}
+
+/// Splits the body of a one-line inline table at its top-level commas.
+fn inline_entries(body: &str) -> Vec<&str> {
+    let (mut entries, mut depth, mut quote, mut start) = (Vec::new(), 0usize, None::<char>, 0);
+    for (at, c) in body.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                entries.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&body[start..]);
+    entries
+}
+
+fn collect_assignment(prefix: &[String], key: Vec<String>, value: &str, out: &mut Vec<Vec<String>>) {
+    let path: Vec<String> = prefix.iter().cloned().chain(key).collect();
+    match value.strip_prefix('{') {
+        Some(inner) => {
+            let body = inner.rfind('}').map_or(inner, |end| &inner[..end]);
+            for entry in inline_entries(body) {
+                if let Some((sub, sub_value)) = split_key(entry) {
+                    collect_assignment(&path, sub, sub_value, out);
+                }
+            }
+        }
+        None => out.push(path),
+    }
+}
+
+/// Every assigned key of a TOML text as its full dotted path, with table headers and inline tables flattened.
+fn assigned_keys(text: &str) -> Vec<Vec<String>> {
+    let mut table: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some(header) = line.strip_prefix('[') {
-            let name = header.trim_start_matches('[').trim_start().trim_start_matches(['"', '\'']);
-            if let Some(after) = name.strip_prefix("profile")
-                && (after.trim_start().starts_with(['.', ']']) || after.starts_with(['"', '\''])) {
-                    return true;
-                }
-            top_level = false;
+            let header = header.trim_start_matches('[');
+            table = header.find(']').and_then(|end| split_header(&header[..end])).unwrap_or_default();
             continue;
         }
-        if top_level {
-            let key = line.trim_start_matches(['"', '\'']);
-            if let Some(after) = key.strip_prefix("profile") {
-                let after = after.trim_start_matches(['"', '\'']).trim_start();
-                if after.starts_with('.') || after.starts_with('=') {
-                    return true;
+        if let Some((key, value)) = split_key(line) {
+            collect_assignment(&table, key, value, &mut out);
+        }
+    }
+    out
+}
+
+fn split_header(text: &str) -> Option<Vec<String>> {
+    let (mut path, _) = split_key(&format!("{text}="))?;
+    path.retain(|segment| !segment.is_empty());
+    Some(path)
+}
+
+/// Keys of a profile that a dependency `debug=0` override would contradict.
+const PROFILE_DEBUG_KEYS: [&str; 3] = ["debug", "split-debuginfo", "strip"];
+
+fn path_conflicts(path: &[String], profiles: &[&str]) -> bool {
+    let [head, name, rest @ ..] = path else { return false };
+    if head != "profile" || !profiles.contains(&name.as_str()) {
+        return false;
+    }
+    match rest {
+        [key, ..] if PROFILE_DEBUG_KEYS.contains(&key.as_str()) => true,
+        [package, _, key, ..] if package == "package" => PROFILE_DEBUG_KEYS.contains(&key.as_str()),
+        [build, key, ..] if build == "build-override" => key == "debug",
+        _ => false,
+    }
+}
+
+/// True when the text sets debug-related keys of one of `profiles`; unrelated profile settings and other profiles do not count.
+fn sets_profile_debug(text: &str, profiles: &[&str]) -> bool {
+    assigned_keys(text).iter().any(|path| path_conflicts(path, profiles))
+}
+
+/// True when a `CARGO_PROFILE_<NAME>_...` variable sets a debug-related key of one of `profiles`.
+fn env_sets_profile_debug(vars: impl IntoIterator<Item = (OsString, OsString)>, profiles: &[&str]) -> bool {
+    vars.into_iter().any(|(key, _)| {
+        let key = key.to_string_lossy().to_ascii_uppercase();
+        profiles.iter().any(|name| {
+            let prefix = format!("CARGO_PROFILE_{}_", name.to_ascii_uppercase().replace('-', "_"));
+            key.strip_prefix(&prefix).is_some_and(|rest| matches!(rest, "DEBUG" | "SPLIT_DEBUGINFO" | "STRIP" | "BUILD_OVERRIDE_DEBUG"))
+        })
+    })
+}
+
+/// The profile chain a plain dev-like build resolves through, or `None` for release, bench, install and custom profiles.
+fn tunable_profiles(parsed: &CargoArgs) -> Option<Vec<&'static str>> {
+    let (own, _) = parsed.split_rest();
+    let all: Vec<&OsString> = parsed.globals.iter().chain(own.iter()).collect();
+    let mut chosen: Option<String> = None;
+    let mut i = 0;
+    while i < all.len() {
+        let text = all[i].to_string_lossy();
+        match text.as_ref() {
+            "--release" | "-r" => return None,
+            "--profile" => {
+                chosen = Some(all.get(i + 1)?.to_string_lossy().into_owned());
+                i += 1;
+            }
+            _ => {
+                if let Some(name) = text.strip_prefix("--profile=") {
+                    chosen = Some(name.to_string());
                 }
             }
         }
+        i += 1;
     }
-    false
+    let sub = parsed.subcommand.as_deref().unwrap_or("");
+    match (chosen.as_deref(), sub) {
+        (Some("dev"), "test") | (None, "test") | (Some("test"), _) => Some(vec!["dev", "test"]),
+        (Some("dev"), "bench" | "install") | (None, "bench" | "install") => None,
+        (Some("dev") | None, _) => Some(vec!["dev"]),
+        _ => None,
+    }
 }
 
 /// `None` when unsure (`-Z`, output-moving `--config`, file targets, conflicting profiles); a wrong answer only costs queue order, as cargo locks each profile dir itself.
@@ -516,7 +669,8 @@ fn tuning_args(cfg: &Config, probe: &Probe, parsed: &CargoArgs, root: Option<&Pa
     if !cfg.tune || !builds || probe.cargo_version < TUNING_MIN_CARGO || parsed.subcommand.as_deref() == Some("doc") {
         return Vec::new();
     }
-    if user_profiles(parsed, root, cwd, configs) {
+    let Some(profiles) = tunable_profiles(parsed) else { return Vec::new() };
+    if user_profiles(parsed, root, cwd, configs, &profiles) {
         return Vec::new();
     }
     vec![os("--config"), os("profile.dev.package.\"*\".debug=0")]
@@ -561,17 +715,19 @@ pub fn effective_tuning(dirs: &Dirs, cwd: &Path) -> String {
     tuning_label(deps, &linker)
 }
 
-fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, configs: &ConfigInputs) -> bool {
+/// True when any configuration source already sets debug-related keys for the profiles this build uses.
+fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, configs: &ConfigInputs, profiles: &[&str]) -> bool {
     let read = |p: &Path| configs.read(p);
     let cli = cli_configs(parsed).iter().any(|value| {
         let text = value.to_string_lossy();
         match cli_config_file(&text, cwd) {
-            Some(file) => defines_profile(&read(&file)),
-            None => defines_profile(&text),
+            Some(file) => sets_profile_debug(&read(&file), profiles),
+            None => sets_profile_debug(&text, profiles),
         }
     });
-    cli || configs.files.iter().any(|p| defines_profile(&read(p)))
-        || root.is_some_and(|r| defines_profile(&read(&r.join("Cargo.toml"))))
+    cli || env_sets_profile_debug(env::vars_os(), profiles)
+        || configs.files.iter().any(|p| sets_profile_debug(&read(p), profiles))
+        || root.is_some_and(|r| sets_profile_debug(&read(&r.join("Cargo.toml")), profiles))
 }
 
 fn exec(cargo: &Path, args: &[OsString], env_vars: &[(OsString, OsString)]) -> i32 {
@@ -685,11 +841,30 @@ impl Session {
         exec(&self.cargo, &args, &self.env_vars)
     }
 
-    /// Holds the whole-target build lock from releasing cache entries until the target is gone, so no build starts in between.
+    /// A partial clean (`-p`, `--release`, `--target`) applies to the check directory too, which cargo sees as a separate target directory.
+    fn clean_check_directory(&self) -> i32 {
+        let check = workspace::check_target(&self.lock_target);
+        if !self.lock_target.starts_with(self.dirs.targets()) || !check.is_dir() {
+            return 0;
+        }
+        let args = self.parsed.assemble(&self.tuning, self.sub(), &self.parsed.rest);
+        let mut cmd = Command::new(&self.cargo);
+        cmd.args(&args);
+        for (k, v) in &self.env_vars {
+            cmd.env(k, v);
+        }
+        cmd.env("CARGO_TARGET_DIR", &check);
+        cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
+        supervise_plain(cmd)
+    }
+
+    /// Holds the whole-target build lock of the build and check directories from releasing cache entries until both are gone, so no build starts in between.
     fn clean(&self, evict_registry: bool) -> i32 {
-        let scope = Scope::All;
-        let held = if self.cfg.lock {
-            let request = lock::Request { command: "cargo clean", fingerprint: "", scope: &scope, join: false, timeout: self.cfg.lock_timeout };
+        let check = workspace::check_target(&self.lock_target);
+        let check_present = check.is_dir();
+        let mut held = Vec::new();
+        if self.cfg.lock {
+            let scope = Scope::All;
             let mut announced = false;
             let mut on_event = |event: LockEvent<'_>| {
                 if let LockEvent::Waiting(waiting) = event
@@ -699,17 +874,22 @@ impl Session {
                     eprintln!("frust: {}", describe_wait(waiting));
                 }
             };
-            match lock::acquire(&self.dirs, &self.lock_target, request, &mut on_event) {
-                Ok(Acquired::Lock(guard)) => Some(*guard),
-                Ok(Acquired::Failed(failure)) => return failure.code,
-                Err(err) => {
-                    eprintln!("frust: {err}");
-                    return err.exit_code();
+            let mut targets = vec![&self.lock_target];
+            if check_present {
+                targets.push(&check);
+            }
+            for target in targets {
+                let request = lock::Request { command: "cargo clean", fingerprint: "", scope: &scope, join: false, timeout: self.cfg.lock_timeout };
+                match lock::acquire(&self.dirs, target, request, &mut on_event) {
+                    Ok(Acquired::Lock(guard)) => held.push(*guard),
+                    Ok(Acquired::Failed(failure)) => return failure.code,
+                    Err(err) => {
+                        eprintln!("frust: {err}");
+                        return err.exit_code();
+                    }
                 }
             }
-        } else {
-            None
-        };
+        }
 
         let (entries, bytes) = crate::cache::clean::workspace_of(&self.dirs, &self.lock_target)
             .map(|id| Cache::new(&self.dirs).release_workspace(&id, evict_registry))
@@ -722,7 +902,14 @@ impl Session {
             cmd.env(k, v);
         }
         cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
-        let code = supervise_plain(cmd);
+        let mut code = supervise_plain(cmd);
+        if code == 0
+            && check_present
+            && let Err(err) = crate::fsx::remove_any(&check)
+        {
+            eprintln!("frust: cannot remove {}: {err}", check.display());
+            code = 1;
+        }
         if code == 0 {
             remove_empty_workspace(&self.lock_target);
         }
@@ -730,9 +917,9 @@ impl Session {
             let noun = if entries == 1 { "entry" } else { "entries" };
             eprintln!("frust: released {entries} cache {noun} ({})", crate::fsx::human_bytes(bytes));
         }
-        if let Some(held) = held {
-            let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
-            held.finish(BuildResult { code, units: 0, interrupted });
+        let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
+        for guard in held {
+            guard.finish(BuildResult { code, units: 0, interrupted });
         }
         code
     }
@@ -790,10 +977,11 @@ impl Session {
 
     /// Cross builds also take the host profile, which holds their build scripts and proc macros.
     fn lock_scope(&self, sub: &str, rest: &[OsString]) -> Scope {
-        let default_dir = match sub {
-            "build" | "b" | "check" | "c" | "clippy" | "test" | "t" => "debug",
-            "bench" => "release",
-            // `doc` writes the shared `target/doc`; anything else is unknown territory.
+        let (default_dir, writes_docs) = match sub {
+            "build" | "b" | "check" | "c" | "clippy" | "test" | "t" => ("debug", false),
+            "bench" => ("release", false),
+            // `doc` builds its dependencies in the profile directory and writes the shared `target/doc`, which no profile lock covers.
+            "doc" | "d" => ("debug", true),
             _ => return Scope::All,
         };
         if ["CARGO_BUILD_TARGET", "CARGO_BUILD_BUILD_DIR"].iter().any(|v| env::var_os(v).is_some_and(|x| !x.is_empty())) {
@@ -811,6 +999,9 @@ impl Session {
         }
         let mut slots = vec![format!("{dir}@host")];
         slots.extend(triples.iter().map(|t| format!("{dir}@{t}")));
+        if writes_docs {
+            slots.push(DOC_SLOT.to_string());
+        }
         Scope::slots(slots)
     }
 
@@ -2093,16 +2284,53 @@ mod tests {
     }
 
     #[test]
-    fn profile_detection_covers_headers_and_dotted_keys() {
-        assert!(defines_profile("[profile.dev]\nopt-level = 1\n"));
-        assert!(defines_profile("[ profile.dev ]\n"));
-        assert!(defines_profile("[[ profile.x ]]\n"));
-        assert!(defines_profile("profile.dev.package.\"*\".debug = 1\n\n[workspace]\n"));
-        assert!(defines_profile("profile = { dev = { debug = 1 } }\n"));
-        assert!(defines_profile("profile.dev.debug=0"));
-        assert!(!defines_profile("[workspace]\nprofile.dev = 1\n"), "a key inside another table is not a profile");
-        assert!(!defines_profile("# [profile.dev]\n[package]\nname = \"profiler\"\n"));
-        assert!(!defines_profile("[profiles]\n"));
+    fn profile_debug_detection_ignores_unrelated_profile_settings() {
+        let dev = ["dev"];
+        assert!(!sets_profile_debug("[profile.release]\nlto = true\ndebug = 1\n", &dev), "release does not block dev");
+        assert!(!sets_profile_debug("[profile.dev]\nopt-level = 1\n", &dev));
+        assert!(!sets_profile_debug("[profile.dev.package.foo]\nopt-level = 3\n", &dev));
+        assert!(!sets_profile_debug("[profile.dev.package.\"*\"]\nopt-level = 3\n", &dev));
+        assert!(!sets_profile_debug("[workspace]\nprofile.dev = 1\n", &dev));
+        assert!(!sets_profile_debug("# [profile.dev]\n# debug = 1\n[package]\nname = \"profiler\"\n", &dev));
+        assert!(sets_profile_debug("[profile.dev]\ndebug = 1\n", &dev));
+        assert!(sets_profile_debug("[ profile.dev ]\nstrip = \"symbols\"\n", &dev));
+        assert!(sets_profile_debug("[profile.dev]\nsplit-debuginfo = \"unpacked\"\n", &dev));
+        assert!(sets_profile_debug("profile.dev.debug=0", &dev));
+        assert!(sets_profile_debug("profile.dev.package.\"*\".debug = 1\n\n[workspace]\n", &dev));
+        assert!(sets_profile_debug("[profile.dev.package.foo]\ndebug = 2\n", &dev));
+        assert!(sets_profile_debug("[profile.dev.build-override]\ndebug = true\n", &dev));
+        assert!(!sets_profile_debug("[profile.dev.build-override]\nopt-level = 3\n", &dev));
+        assert!(sets_profile_debug("profile = { dev = { debug = 1 } }\n", &dev));
+        assert!(sets_profile_debug("[profile]\ndev = { package = { \"*\" = { debug = 1 } } }\n", &dev));
+        assert!(!sets_profile_debug("profile = { dev = { opt-level = 1, package = { foo = { opt-level = 2 } } } }\n", &dev));
+        assert!(!sets_profile_debug("[profile.test]\ndebug = 1\n", &dev), "test only matters for test builds");
+        assert!(sets_profile_debug("[profile.test]\ndebug = 1\n", &["dev", "test"]));
+    }
+
+    #[test]
+    fn profile_environment_variables_block_only_debug_keys() {
+        let var = |k: &str| vec![(OsString::from(k), OsString::from("1"))];
+        assert!(env_sets_profile_debug(var("CARGO_PROFILE_DEV_DEBUG"), &["dev"]));
+        assert!(env_sets_profile_debug(var("CARGO_PROFILE_DEV_STRIP"), &["dev"]));
+        assert!(env_sets_profile_debug(var("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"), &["dev"]));
+        assert!(!env_sets_profile_debug(var("CARGO_PROFILE_DEV_OPT_LEVEL"), &["dev"]));
+        assert!(!env_sets_profile_debug(var("CARGO_PROFILE_RELEASE_DEBUG"), &["dev"]));
+        assert!(!env_sets_profile_debug(var("CARGO_PROFILE_TEST_DEBUG"), &["dev"]));
+        assert!(env_sets_profile_debug(var("CARGO_PROFILE_TEST_DEBUG"), &["dev", "test"]));
+    }
+
+    #[test]
+    fn only_dev_like_builds_are_tunable() {
+        let parse = |args: &[&str]| tunable_profiles(&CargoArgs::parse(args.iter().map(|a| os(a))));
+        assert_eq!(parse(&["build"]), Some(vec!["dev"]));
+        assert_eq!(parse(&["check", "--profile", "dev"]), Some(vec!["dev"]));
+        assert_eq!(parse(&["test"]), Some(vec!["dev", "test"]));
+        assert_eq!(parse(&["build", "--release"]), None);
+        assert_eq!(parse(&["build", "-r"]), None);
+        assert_eq!(parse(&["build", "--profile=custom"]), None);
+        assert_eq!(parse(&["bench"]), None);
+        assert_eq!(parse(&["install", "x"]), None);
+        assert_eq!(parse(&["--release", "build"]), None);
     }
 
     #[test]
@@ -2160,6 +2388,16 @@ mod tests {
         assert_eq!(scope_of("debug", &["--config", "build.target=\"x\""]), None);
         assert_eq!(scope_of("debug", &["--config=profile.dev.opt-level=1"]), plain("debug"));
         assert_eq!(scope_of("debug", &["--profile", "../x"]), None);
+    }
+
+    #[test]
+    fn check_moves_a_frust_owned_target_to_its_sibling_and_leaves_a_user_target_alone() {
+        let owned = TargetChoice { central: Some(PathBuf::from("/h/targets/app-1/id")), lock_key: PathBuf::from("/h/targets/app-1/id") }.for_check();
+        assert_eq!(owned.central.as_deref(), Some(Path::new("/h/targets/app-1/id-check")));
+        assert_eq!(owned.lock_key, Path::new("/h/targets/app-1/id-check"));
+        let user = TargetChoice { central: None, lock_key: PathBuf::from("/work/target") }.for_check();
+        assert!(user.central.is_none());
+        assert_eq!(user.lock_key, Path::new("/work/target"));
     }
 
     #[test]

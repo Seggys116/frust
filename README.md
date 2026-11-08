@@ -83,7 +83,7 @@ fclippy --all-targets
 | `frust locks` | Show running and queued builds |
 | `frust compact` / `frust gc` | Shrink target directories and prune the cache |
 | `frust env` | Print shell exports so IDEs and rust-analyzer share the cache |
-| `frust where` | Print the central target directory for this workspace |
+| `frust where` | Print the central target directory for this workspace (`frust where check` prints the one `check` and `clippy` use) |
 
 Anything frust does not recognise is passed straight to cargo. Set `FRUST_BYPASS=1` to run cargo completely untouched.
 

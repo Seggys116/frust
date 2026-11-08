@@ -114,6 +114,8 @@ impl Ws {
     /// Every unit here is a workspace member, which `fcargo clean` releases from the cache; deleting the target keeps these restore tests meaningful.
     fn lose_target(&self) {
         fs::remove_dir_all(self.sb.central_target(&self.root)).unwrap();
+        // The check directory is a target of its own that a lost target takes along.
+        let _ = fs::remove_dir_all(self.sb.check_target(&self.root));
     }
 
     fn events_of(&self, args: &[&str]) -> BTreeMap<String, (usize, usize)> {

@@ -92,7 +92,7 @@ fn print_help() {
         ("doctor", "check the environment frust depends on"),
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
-        ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
+        ("where", "print the target directory for this workspace  [cache|root|check] [--fresh]"),
         ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent [--concurrent-profile=dev|release|thin|fat] [--concurrent-incremental=on|off]] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking] [--repo PATH [--edits N] [--package P] [--markdown] [--out FILE] [--gate]]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
@@ -522,13 +522,15 @@ fn where_cmd(dirs: &Dirs, flags: &[String]) -> i32 {
             };
             println!("{}", root.unwrap_or(cwd.clone()).display());
         }
-        _ => {
+        kind => {
             let Some(probe) = probe() else {
                 eprintln!("frust: could not query the toolchain");
                 return 1;
             };
             let root = locate(&probe.id);
-            println!("{}", workspace::central_target(dirs, root.as_deref(), &probe.id).display());
+            let build = workspace::central_target(dirs, root.as_deref(), &probe.id);
+            let dir = if kind == Some("check") { workspace::check_target(&build) } else { build };
+            println!("{}", dir.display());
         }
     }
     0

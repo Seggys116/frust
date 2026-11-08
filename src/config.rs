@@ -104,6 +104,11 @@ pub fn share_roots() -> bool {
     flag("FRUST_CACHE_SHARE_ROOTS", false)
 }
 
+/// `FRUST_CHECK_DIR`: `check` and `clippy` get their own artifact directory beside the build target, so they never wait on a build; on by default.
+pub fn check_dir() -> bool {
+    flag("FRUST_CHECK_DIR", true)
+}
+
 /// The most slot lock files a store can ever use; gc treats every slot below it as canonical.
 pub const MAX_STORE_SLOTS: usize = 16;
 

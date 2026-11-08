@@ -1866,13 +1866,22 @@ impl Plan {
                     None,
                 )
             } else if wants_linked[i] {
-                cache::payload::store_linked(
+                let linked = cache::payload::store_linked(
                     &src,
                     &staged.join(&stored),
                     compress,
                     commitments.and_then(|c| c.get(name)),
                     false,
-                )?
+                )?;
+                // The new name moved the output's change time, voiding the attestation its dependents look up.
+                if linked.0.encoding == cache::payload::Encoding::Linked
+                    && is_dependency_artifact(name)
+                    && self.may_have_dependents()
+                    && let Ok(stamp) = Stamp::read(&src)
+                {
+                    self.attest_by_reading(&src, &stamp);
+                }
+                linked
             } else if capture {
                 cache::payload::store_proven(
                     &src,
@@ -6243,6 +6252,28 @@ mod tests {
         // No commitment: linked mode leaves the hash to the store step.
         job.context.backed = cache::payload::BackedMode::Force;
         (job, rlib)
+    }
+
+    #[test]
+    fn a_linked_store_attests_the_library_again_after_its_link_moved_the_change_time() {
+        let s = Scratch::new("linked-attest");
+        let (mut job, rlib) = linked_job(&s);
+        if !hashing::fs_trusted(&rlib) {
+            return;
+        }
+        fs::write(&rlib, vec![b'a'; hashing::ATTEST_MIN_BYTES as usize * 2]).unwrap();
+        job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        // As the wrapper does at freeze, before the store adds a name to the output.
+        plan.attest_output(&rlib, &sys::stat(&rlib).unwrap(), None);
+        run_deferred(&job);
+        let key = plan.cache.candidates(&job.prekey)[0].key.clone();
+        let (entry, meta) = plan.cache.load_entry(&key).unwrap();
+        let file = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
+        assert_eq!(sys::lstat(&entry.join(&file.stored)).unwrap().ino(), sys::lstat(&rlib).unwrap().ino());
+        let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
+        assert_eq!(dependent.hash(&rlib, true).unwrap().hash, hashing::hash_with_stamp(&rlib).unwrap().hash);
+        assert_eq!(dependent.tally().0, 0, "a dependent takes the linked library's hash from the memo");
     }
 
     #[test]

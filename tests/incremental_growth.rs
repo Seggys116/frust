@@ -217,7 +217,7 @@ fn expired_check_only_variants_are_reclaimed_without_cache_and_the_current_check
     };
     check(Some("a"));
     check(Some("b"));
-    let target = sb.central_target(&app);
+    let target = sb.check_target(&app);
     let profile = target.join("debug");
     let prior: Vec<_> = fs::read_dir(profile.join("incremental")).unwrap().map(|e| e.unwrap().path()).collect();
     check(None);
@@ -252,7 +252,7 @@ fn expired_check_only_variants_are_reclaimed_without_cache_and_the_current_check
     assert!(!stderr(&repeated).lines().any(|line| line.trim_start().starts_with("Compiling ") || line.trim_start().starts_with("Checking ")), "maintenance preserves Cargo freshness: {}", stderr(&repeated));
     assert_eq!(sb.count_cache("hit", "app") + sb.count_cache("miss", "app"), 0);
     build(&sb, &app, &[]);
-    assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), "41");
+    assert_eq!(stdout(&run_binary(&sb.central_target(&app), "debug", "app")).trim(), "41");
 }
 
 #[test]

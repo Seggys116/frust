@@ -133,6 +133,16 @@ pub fn central_target(dirs: &Dirs, root: Option<&Path>, toolchain_id: &str) -> P
     dirs.targets().join(key).join(toolchain_id)
 }
 
+/// Suffix of the sibling directory that holds `check` and `clippy` artifacts of one toolchain.
+const CHECK_SUFFIX: &str = "-check";
+
+/// Cargo locks each profile directory of a target directory exclusively, so check and build only run side by side when they use different target directories.
+pub fn check_target(build: &Path) -> PathBuf {
+    let mut name = build.file_name().map(OsStr::to_os_string).unwrap_or_default();
+    name.push(CHECK_SUFFIX);
+    build.with_file_name(name)
+}
+
 pub fn display_name(root: Option<&Path>) -> String {
     root.and_then(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "cargo".to_string())
 }
@@ -148,6 +158,15 @@ mod tests {
         assert!(a.starts_with("app-"));
         assert_ne!(a, b);
         assert_eq!(a, workspace_key(Path::new("/work/alpha/app")));
+    }
+
+    #[test]
+    fn check_target_is_a_sibling_of_the_build_target() {
+        let dirs = Dirs::at("/cache/frust");
+        let build = central_target(&dirs, Some(Path::new("/w/app")), "abc123");
+        let check = check_target(&build);
+        assert_eq!(check.parent(), build.parent());
+        assert_eq!(check.file_name().unwrap(), "abc123-check");
     }
 
     #[test]

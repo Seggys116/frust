@@ -67,7 +67,7 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
         let linker = toolchain::default_linker(&probe.host, toolchain::linker_opted_out(), user, sysroot.map(|(root, _)| root), |p| p.is_file());
         checks.push(check("default linker", Status::Ok, linker.describe()));
         let deps = cfg.tune && probe.cargo_version >= (1, 63, 0);
-        checks.push(check("tuning", Status::Ok, format!("{} (FRUST_TUNE={}, FRUST_LINKER={}; dependency debuginfo is skipped when a project defines profiles)", toolchain::tuning_label(deps, &linker), on_off(cfg.tune), if toolchain::linker_opted_out() { "system" } else { "auto" })));
+        checks.push(check("tuning", Status::Ok, format!("{} (FRUST_TUNE={}, FRUST_LINKER={}; dependency debuginfo is skipped when a project sets debug, split-debuginfo or strip for the dev profile)", toolchain::tuning_label(deps, &linker), on_off(cfg.tune), if toolchain::linker_opted_out() { "system" } else { "auto" })));
     }
 
     // A foreign RUSTC_WRAPPER (such as sccache) wins over frust-wrap, so the compile cache cannot run.
@@ -84,6 +84,12 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
         check("compile cache", Status::Ok, "enabled")
     } else {
         check("compile cache", Status::Warn, "disabled by FRUST_CACHE=off")
+    });
+
+    checks.push(if crate::config::check_dir() {
+        check("check directory", Status::Ok, "separate: check and clippy use <toolchain id>-check beside the build target, so they never wait on a build")
+    } else {
+        check("check directory", Status::Warn, "shared with builds by FRUST_CHECK_DIR=off: cargo locks the profile directory, so check and build wait on each other")
     });
 
     let now = SystemTime::now();
