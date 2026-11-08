@@ -375,8 +375,17 @@ entries use their own key domain, so older versions treat them as misses.
   Cargo serialises them on its own lock anyway; the queue shows who you are waiting for.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
   busy. Maintenance reserves all canonical Cargo profile lock names, including missing ones, so different Cargo
-  versions cannot bypass each other's lock files. `tests/stress.rs` runs eight builds against
-  continuous compaction and gc.
+  versions cannot bypass each other's lock files. A profile is any directory of a target (or of a `<triple>`
+  directory in it) that holds `deps`, so custom profiles such as `harness` are covered. A running Cargo holds
+  `.cargo-build-lock` and `.cargo-artifact-lock` exclusively and `.cargo-lock` shared, and maintenance asks for all
+  three exclusively, so a plain `cargo` build without frust is protected the same way. Every removal inside a profile
+  is rechecked under those locks at execution time, not only when planned. The locks are per profile directory, so
+  a build in one workspace never holds back maintenance of another. `tests/stress.rs` runs eight builds against
+  continuous compaction and gc, and `tests/active_build.rs` runs gc and compaction against a custom profile held by
+  plain Cargo and by fcargo.
+* `frust gc` removes a workspace directory under `targets/` only when it holds nothing but regular files (its
+  `workspace` marker), and never recursively: a build that creates its target between the check and the removal makes
+  the removal fail instead of losing its tree.
 * Queued builds subscribe to directory changes through kqueue on macOS and inotify on Linux, waking promptly when
   ownership or queue state changes. Notifications are hints: FIFO checks and OS locks still decide ownership.
   Timed polling remains as a fallback (15 ms at the front, 10 ms for followers, up to 40 ms behind the front).

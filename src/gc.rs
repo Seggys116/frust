@@ -1950,12 +1950,31 @@ fn spawn_collector(dirs: &Dirs, cfg: &Config) -> bool {
     sys::spawn_detached(&mut cmd, &[]).is_ok()
 }
 
+/// Never recursive: a build may create its target between the check and the removal, which then fails as not empty.
 fn prune_empty_workspaces(dirs: &Dirs) {
     let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return };
     for ws in workspaces.flatten() {
-        let has_target = fs::read_dir(ws.path()).map(|rd| rd.flatten().any(|e| e.path().is_dir())).unwrap_or(false);
-        if !has_target {
-            let _ = fsx::remove_any(&ws.path());
+        if !ws.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = ws.path();
+        let files = fs::read_dir(&path).and_then(|entries| {
+            entries.map(|entry| entry.and_then(|entry| Ok((entry.path(), entry.file_type()?.is_file())))).collect::<io::Result<Vec<_>>>()
+        });
+        let Ok(files) = files else { continue };
+        if !files.iter().all(|(_, file)| *file) {
+            continue;
+        }
+        let marker = path.join("workspace");
+        let recorded = fs::read(&marker).ok();
+        for (file, _) in &files {
+            let _ = fs::remove_file(file);
+        }
+        if fs::remove_dir(&path).is_err()
+            && let Some(recorded) = recorded
+            && !marker.exists()
+        {
+            let _ = fsx::write_atomic(&marker, &recorded);
         }
     }
 }
@@ -1988,6 +2007,60 @@ mod tests {
         assert_eq!(variant_of("libserde-0123456789abcdef.rmeta"), Some(("serde".into(), "0123456789abcdef".into())));
         assert_eq!(variant_of("build-script-build"), None);
         assert_eq!(variant_of("README.md"), None);
+    }
+
+    #[test]
+    fn workspace_pruning_never_removes_a_target_a_build_creates_after_the_check() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = home("prune-race");
+        let dirs = Dirs::at(&root);
+        fs::create_dir_all(dirs.targets()).unwrap();
+        let (stop, lost, built) = (AtomicBool::new(false), AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| while !stop.load(Ordering::Relaxed) { prune_empty_workspaces(&dirs); });
+            for round in 0..4000 {
+                // fcargo creates the workspace with its marker, then cargo creates and locks the profile it writes into.
+                let workspace = dirs.targets().join(format!("ws-{}", round % 8));
+                let _ = fs::create_dir_all(&workspace);
+                let _ = fs::write(workspace.join("workspace"), "/w");
+                let profile = workspace.join("tc").join("harness");
+                if fs::create_dir_all(profile.join("deps")).is_err() { continue; }
+                let Ok(lock) = File::options().read(true).write(true).create(true).truncate(false).open(profile.join(".cargo-lock")) else { continue };
+                if sys::try_lock(&lock, LockKind::Exclusive).is_err() { continue; }
+                built.fetch_add(1, Ordering::Relaxed);
+                for unit in 0..4 {
+                    if fs::write(profile.join("deps").join(format!("libu{unit}.rmeta")), b"m").is_err() {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                drop(lock);
+                let _ = fs::remove_dir_all(workspace.join("tc"));
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(built.load(Ordering::Relaxed) > 0);
+        assert_eq!(lost.load(Ordering::Relaxed), 0, "gc removed a profile while cargo held its lock");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_pruning_removes_only_workspaces_without_a_target() {
+        let root = home("prune-empty");
+        let dirs = Dirs::at(&root);
+        let empty = dirs.targets().join("empty");
+        let held = dirs.targets().join("held");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(held.join("tc").join("harness").join("deps")).unwrap();
+        for ws in [&empty, &held] {
+            fs::write(ws.join("workspace"), "/w").unwrap();
+        }
+        fs::write(empty.join("leftover"), "x").unwrap();
+        prune_empty_workspaces(&dirs);
+        assert!(!empty.exists());
+        assert!(held.join("tc").join("harness").join("deps").is_dir());
+        assert_eq!(fs::read_to_string(held.join("workspace")).unwrap(), "/w");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn home(tag: &str) -> PathBuf {

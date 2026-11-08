@@ -46,6 +46,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+* `frust gc` no longer deletes a workspace directory under `targets/` recursively. It removed one that looked empty (or could not be read) with everything in it, so a build that created its target between the check and the removal lost its `deps` mid-build (`failed to write ... deps/lib*.rmeta: No such file or directory`). Now only a directory holding nothing but regular files is removed, without recursion, and its marker is restored when the removal fails.
 * A restore that links a store file into the target gives it a fresh modification time like every other restore, so cargo no longer finds a linked build script or binary older than its dependencies and rebuilds it on every no-op build (ext4, NTFS).
 * The no-op fast path records units cargo names without a hash (a path package's `cdylib` or `dylib`, and executables on windows-msvc, whose dep-info is `deps/<crate>.d`) and follows a symlinked directory in a package whose build script has no rerun directives, instead of declining every build of such workspaces; `frust bench --repo` reports the fast path's decisions for the no-op row (`noop_decisions`).
 * `frust env` and `frust doctor` look for `frust-wrap.exe` on Windows, so `frust env` prints its `RUSTC_WRAPPER` line and doctor finds the wrapper.
