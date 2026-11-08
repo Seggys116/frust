@@ -201,6 +201,10 @@ struct Plan {
     use_shared: AtomicBool,
     /// Where store outcomes are reported for `FRUST_TIMINGS`, including from a helper or broker.
     store_sink: Option<PathBuf>,
+    /// When and at what thread CPU time this plan began, so a store outcome reports what it cost.
+    began: (Instant, Option<u64>),
+    /// Cargo runs `build` on a platform where uplifting a root library hard-links it.
+    uplift_links: bool,
 }
 
 struct Shared {
@@ -364,6 +368,8 @@ impl Plan {
             shared,
             use_shared: AtomicBool::new(false),
             store_sink: timings::configured().map(Path::to_path_buf),
+            began: (begun, sys::thread_cpu_ns()),
+            uplift_links: sys::CARGO_UPLIFT_LINKS && matches!(env::var(CARGO_COMMAND_ENV).as_deref(), Ok("build" | "b")),
         })
     }
 
@@ -447,6 +453,8 @@ impl Plan {
             shared,
             use_shared: AtomicBool::new(shared_job),
             store_sink: job.timings.clone().filter(|path| path.is_absolute()),
+            began: (Instant::now(), sys::thread_cpu_ns()),
+            uplift_links: false,
         })
     }
 
@@ -1057,7 +1065,10 @@ impl Plan {
     /// Jobs queued while every slot was busy are picked up here when a slot has freed since, so a quiet build still stores them.
     fn wake_queue(&self) {
         let deferred = self.dirs.deferred();
-        if self.cfg.store_sync || (queued_jobs(&deferred).is_empty() && orphaned_jobs(&deferred).is_empty()) {
+        if self.cfg.store_sync
+            || stores_after_build()
+            || (queued_jobs(&deferred).is_empty() && orphaned_jobs(&deferred).is_empty())
+        {
             return;
         }
         // The probe only shows whether a slot is free; the drain helper takes its own.
@@ -1120,8 +1131,10 @@ impl Plan {
         key_lock: &mut Option<File>,
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
-        let broker = crate::store_broker::AdmissionPermit::try_reserve(&self.dirs)?;
-        let slot = if broker.is_none() {
+        // The front end drains after-build jobs once cargo exits, so they wait as files and hold no slot or key lock meanwhile.
+        let after_build = stores_after_build();
+        let broker = if after_build { None } else { crate::store_broker::AdmissionPermit::try_reserve(&self.dirs)? };
+        let slot = if broker.is_none() && !after_build {
             acquire_slot(&deferred, slot_count())
         } else {
             None
@@ -1228,7 +1241,9 @@ impl Plan {
         self.probe.set(|r| r.spawn_ms = timings::ms(spawn_started));
         match handed_over {
             Ok(true) => {
-                let mode = if queue_only {
+                let mode = if after_build {
+                    "queued:after-build"
+                } else if queue_only {
                     "queued:slots"
                 } else if queued {
                     "queued"
@@ -1338,7 +1353,11 @@ impl Plan {
                 meta = committed_meta;
                 commitments.insert(name.clone(), commitment);
             }
-            if is_dependency_artifact(name) && meta.is_file() && self.may_have_dependents() {
+            if is_dependency_artifact(name)
+                && meta.is_file()
+                && self.may_have_dependents()
+                && !self.uplift_relinks(name, preexisting)
+            {
                 self.attest_output(&path, &meta, commitments.get(name));
             }
             outputs.push((name.clone(), Stamp::of(&meta)));
@@ -1352,6 +1371,15 @@ impl Plan {
             commitments,
         };
         (!frozen.has_coarse_stamp()).then_some(frozen)
+    }
+
+    /// Cargo's uplift link would void an attestation of this library at once; predicted from the uplifted name still sharing the inode this compile replaced.
+    fn uplift_relinks(&self, name: &str, preexisting: &HashMap<String, Stamp>) -> bool {
+        let uplifted = name.strip_suffix(".rlib").and_then(|stem| stem.strip_suffix(self.parsed.extra_filename.as_str()));
+        let (Some(stem), Some(replaced)) = (uplifted.filter(|_| self.uplift_links && !self.parsed.extra_filename.is_empty()), preexisting.get(name)) else {
+            return false;
+        };
+        Stamp::read(&self.profile_abs.join(format!("{stem}.rlib"))).is_ok_and(|now| now.dev == replaced.dev && now.ino == replaced.ino)
     }
 
     /// Test harnesses and binary-only crates are leaves of the build graph, so reading their outputs to attest them would be wasted.
@@ -1742,7 +1770,9 @@ impl Plan {
 
     /// Reports a store outcome to the timing sink; a helper has no record of its own, so this is its only trace.
     fn note_store(&self, outcome: &str) {
-        timings::store_outcome(self.store_sink.as_deref(), &self.parsed.crate_name, outcome);
+        let cpu = self.began.1.zip(sys::thread_cpu_ns()).map_or(0, |(then, now)| now.saturating_sub(then) / 1_000_000);
+        let spent = (timings::ms(self.began.0), cpu);
+        timings::store_outcome(self.store_sink.as_deref(), &self.parsed.crate_name, outcome, spent);
     }
 
     /// Deliberately not storing: an input may not match what rustc read. The compile still replaced the unit's outputs, so earlier entries it left store-only are retired.
@@ -1866,7 +1896,7 @@ impl Plan {
                     None,
                 )
             } else if wants_linked[i] {
-                let linked = cache::payload::store_linked(
+                let (payload, proof, proven) = cache::payload::store_linked(
                     &src,
                     &staged.join(&stored),
                     compress,
@@ -1874,14 +1904,22 @@ impl Plan {
                     false,
                 )?;
                 // The new name moved the output's change time, voiding the attestation its dependents look up.
-                if linked.0.encoding == cache::payload::Encoding::Linked
+                if payload.encoding == cache::payload::Encoding::Linked
                     && is_dependency_artifact(name)
                     && self.may_have_dependents()
-                    && let Ok(stamp) = Stamp::read(&src)
                 {
-                    self.attest_by_reading(&src, &stamp);
+                    match (proven, payload.content_hash.as_deref()) {
+                        (Some(stamp), Some(hash)) => {
+                            self.hasher.attest(&src, hash, &stamp);
+                        }
+                        _ => {
+                            if let Ok(stamp) = Stamp::read(&src) {
+                                self.attest_by_reading(&src, &stamp);
+                            }
+                        }
+                    }
                 }
-                linked
+                (payload, proof)
             } else if capture {
                 cache::payload::store_proven(
                     &src,
@@ -3317,6 +3355,22 @@ fn key_seen_free(key: &Path, cap: Duration) -> bool {
     try_key_lock(&file).unwrap_or(false) || wait_key_lock(&file, cap).unwrap_or(false)
 }
 
+/// The cargo subcommand the front end runs; only `build` uplifts root libraries.
+pub(crate) const CARGO_COMMAND_ENV: &str = "FRUST_INTERNAL_CARGO_COMMAND";
+
+/// Set by a front end that drains this cargo run's stores once it exits (`FRUST_STORE_START=after-build`).
+pub(crate) const AFTER_BUILD_ENV: &str = "FRUST_INTERNAL_STORE_AFTER_BUILD";
+
+fn stores_after_build() -> bool {
+    env::var_os(AFTER_BUILD_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// Starts up to one drain per store slot for the jobs a finished cargo run queued; each drain takes its own slot.
+pub(crate) fn drain_after_build(dirs: &Dirs, cwd: &Path) -> usize {
+    let queued = queued_jobs(&dirs.deferred()).len();
+    (0..queued.min(slot_count())).take_while(|_| spawn_drainer(cwd).is_ok()).count()
+}
+
 /// Starts a drain helper without handing it a slot, which it takes itself.
 fn spawn_drainer(cwd: &Path) -> io::Result<()> {
     let mut cmd = Command::new(helper_exe()?);
@@ -3556,7 +3610,7 @@ fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
         Frozen::from_job(job),
         job.spawned_ns.parse::<i128>(),
     ) else {
-        timings::store_outcome(job.timings.as_deref().filter(|path| path.is_absolute()), "", "skip:job-unusable");
+        timings::store_outcome(job.timings.as_deref().filter(|path| path.is_absolute()), "", "skip:job-unusable", (0, 0));
         return;
     };
     let dep_info = (frozen.dep_name.as_str(), frozen.dep_text.as_str());
@@ -6212,6 +6266,46 @@ mod tests {
     }
 
     #[test]
+    fn freeze_skips_attesting_a_library_whose_uplift_link_will_void_it_and_only_that_one() {
+        let s = Scratch::new("uplift-relink");
+        let (mut job, _, rlib) = relative_job(&s);
+        job.args.extend(["-C".to_string(), "extra-filename=-feed".to_string()]);
+        let lib = rlib.with_file_name("libk-feed.rlib");
+        let uplifted = s.0.join("target").join("debug").join("libk.rlib");
+        let size = hashing::ATTEST_MIN_BYTES as usize * 2;
+        let captured = ["k.d", "libk-feed.rlib"]
+            .iter()
+            .map(|name| format!("{}\n", serde_json::json!({"artifact": format!("target/debug/deps/{name}")})))
+            .collect::<String>();
+        // Each round: the previous compile's library under cargo's plain name (or another file), then rustc's new inode.
+        for (uplift_links, previous_uplifted, attested) in [(true, true, false), (true, false, true), (false, true, true)] {
+            let _ = fs::remove_file(&uplifted);
+            fs::write(&lib, vec![b'p'; size]).unwrap();
+            if previous_uplifted {
+                fs::hard_link(&lib, &uplifted).unwrap();
+            } else {
+                fs::write(&uplifted, vec![b'p'; size]).unwrap();
+            }
+            let preexisting = HashMap::from([("libk-feed.rlib".to_string(), Stamp::read(&lib).unwrap())]);
+            let fresh = lib.with_file_name("fresh.tmp");
+            fs::write(&fresh, vec![b'n'; size]).unwrap();
+            sys::rename(&fresh, &lib).unwrap();
+            job.names = vec!["k.d".to_string(), "libk-feed.rlib".to_string()];
+            job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
+            let mut plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+            plan.uplift_links = uplift_links;
+            if !hashing::fs_trusted(&lib)
+                || plan.freeze_with_capture(captured.as_bytes(), job.spawned_ns.parse().unwrap(), &preexisting, cache::payload::capture).is_none()
+            {
+                return;
+            }
+            let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
+            dependent.hash(&lib, true).unwrap();
+            assert_eq!(dependent.tally().0 == 0, attested, "uplift_links={uplift_links} previous_uplifted={previous_uplifted}");
+        }
+    }
+
+    #[test]
     fn a_store_dropped_for_a_newer_compile_retires_the_orphaned_entry_of_its_unit() {
         let s = Scratch::new("linked-orphan");
         let (mut job, rlib) = linked_job(&s);
@@ -6273,6 +6367,30 @@ mod tests {
         assert_eq!(sys::lstat(&entry.join(&file.stored)).unwrap().ino(), sys::lstat(&rlib).unwrap().ino());
         let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
         assert_eq!(dependent.hash(&rlib, true).unwrap().hash, hashing::hash_with_stamp(&rlib).unwrap().hash);
+        assert_eq!(dependent.tally().0, 0, "a dependent takes the linked library's hash from the memo");
+    }
+
+    #[test]
+    fn a_linked_store_reads_its_library_once_and_attests_the_stamp_the_link_left() {
+        let s = Scratch::new("linked-once");
+        let (mut job, rlib) = linked_job(&s);
+        if !hashing::fs_trusted(&rlib) {
+            return;
+        }
+        let bytes = vec![b'o'; hashing::ATTEST_MIN_BYTES as usize * 2 + 7];
+        fs::write(&rlib, &bytes).unwrap();
+        job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        hashing::take_hashed_sizes();
+        run_deferred(&job);
+        let reads = hashing::take_hashed_sizes().into_iter().filter(|&size| size == bytes.len() as u64).count();
+        assert_eq!(reads, 1, "the store hashes the library once, for the entry and the attestation together");
+        let key = plan.cache.candidates(&job.prekey)[0].key.clone();
+        let (entry, meta) = plan.cache.load_entry(&key).unwrap();
+        let file = meta.files.iter().find(|f| f.name == "libk.rlib").unwrap();
+        assert_eq!(sys::lstat(&entry.join(&file.stored)).unwrap().ino(), sys::lstat(&rlib).unwrap().ino());
+        let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
+        assert_eq!(dependent.hash(&rlib, true).unwrap().hash, blake3::hash(&bytes).to_hex().to_string());
         assert_eq!(dependent.tally().0, 0, "a dependent takes the linked library's hash from the memo");
     }
 

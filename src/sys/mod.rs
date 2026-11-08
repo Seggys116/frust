@@ -696,6 +696,14 @@ pub fn lower_store_priority() {
     imp::lower_store_priority()
 }
 
+/// Cargo uplifts a root's artifacts into the profile directory by hard link, which moves the change time of the compiled file; on macOS it copies them.
+pub const CARGO_UPLIFT_LINKS: bool = cfg!(not(target_os = "macos"));
+
+/// CPU time the calling thread has used, in nanoseconds; `None` where the platform cannot say.
+pub fn thread_cpu_ns() -> Option<u64> {
+    imp::thread_cpu_ns()
+}
+
 pub fn fs_type_name(path: &Path) -> Option<String> {
     imp::fs_type_name(path)
 }

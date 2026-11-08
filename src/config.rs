@@ -122,6 +122,23 @@ pub fn store_slots() -> usize {
         .unwrap_or_else(|| default_store_slots(cpus))
 }
 
+/// When deferred stores run relative to the cargo build that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreStart {
+    /// While cargo is still building, at store priority.
+    Eager,
+    /// Queued as job files and started once cargo has exited, so no store competes with the compiles.
+    AfterBuild,
+}
+
+/// `FRUST_STORE_START`: `eager` (default) or `after-build`.
+pub fn store_start() -> StoreStart {
+    match env::var("FRUST_STORE_START").as_deref().map(str::trim) {
+        Ok("after-build") => StoreStart::AfterBuild,
+        _ => StoreStart::Eager,
+    }
+}
+
 fn default_store_slots(cpus: usize) -> usize {
     if cfg!(windows) { (cpus / 2).clamp(2, 8) } else { (cpus / 2).clamp(1, 4) }
 }

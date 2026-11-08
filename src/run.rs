@@ -603,7 +603,13 @@ fn prepare_store_broker(
     cmd: &mut Command,
 ) -> Option<crate::store_broker::BrokerLaunch> {
     cmd.env_remove(crate::store_broker::CAPABILITY_ENV);
+    cmd.env_remove(crate::wrapper::AFTER_BUILD_ENV);
     if feed.is_some() && cfg.cache && !cfg.store_sync && env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER") {
+        // Only a supervising front end outlives cargo to start the queued stores.
+        if crate::config::store_start() == crate::config::StoreStart::AfterBuild {
+            cmd.env(crate::wrapper::AFTER_BUILD_ENV, "1");
+            return None;
+        }
         return crate::store_broker::BrokerLaunch::prepare(dirs, cmd).ok();
     }
     None
@@ -1095,6 +1101,7 @@ impl Session {
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
         }
+        cmd.env(crate::wrapper::CARGO_COMMAND_ENV, sub);
         cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
         if self.env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER")
             && (1, 89, 0) <= self.probe.cargo_version
@@ -1107,6 +1114,7 @@ impl Session {
         let feed_path = feed.as_ref().map(|feed| feed.path().to_owned());
 
         let broker = prepare_store_broker(&self.cfg, &self.dirs, &self.env_vars, feed.as_ref(), &mut cmd);
+        let drain_after = cmd.get_envs().any(|(key, value)| key == crate::wrapper::AFTER_BUILD_ENV && value.is_some());
         let mut feed = SupervisionFeed { feed, broker };
         let mut progress = Progress {
             expected,
@@ -1130,6 +1138,9 @@ impl Session {
         };
         // Frontend EOF closes admission; queued stores outlive this Cargo phase.
         feed.finish();
+        if drain_after {
+            crate::wrapper::drain_after_build(&self.dirs, &self.cwd);
+        }
         trace(&self.cfg, started, "cargo finished");
 
         // A queued build cannot take the profile before due maintenance has had its nonblocking cleanup opportunity.

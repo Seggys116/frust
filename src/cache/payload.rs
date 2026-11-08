@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use super::StoredFile;
+use super::hashing::Stamp;
 use crate::{fsx, sys};
 
 /// Outputs smaller than this keep ordinary payloads; a link saves too little to be worth the bookkeeping.
@@ -684,50 +685,50 @@ fn same_content(a: &sys::Meta, b: &sys::Meta) -> bool {
         && a.mode() == b.mode()
 }
 
-/// Like `capture`, but ctime is ignored: Cargo's uplift adds names to the inode, which moves ctime and never the bytes.
-fn capture_content(src: &Path) -> io::Result<Commitment> {
-    let source = File::open(src)?;
-    let before = sys::fstat(&source)?;
-    if !before.is_file() {
-        return Err(invalid("artifact is not a regular file"));
-    }
-    let (len, hash) = hash_open(&source, before.len())?;
-    let after = sys::fstat(&source)?;
-    if len != before.len() || !same_content(&before, &after) {
-        return Err(invalid("artifact changed while committing"));
-    }
-    Ok(Commitment { hash, mode: before.mode(), dev: before.dev(), ino: before.ino(), len, mtime: before.mtime() })
-}
-
-fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> io::Result<StoredPayload> {
+fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> io::Result<(StoredPayload, Option<Stamp>)> {
     let meta = sys::lstat(src)?;
     if !meta.is_file() || meta.len() < LINKED_MIN_BYTES {
         return Err(invalid("output is not linkable"));
     }
-    let captured;
-    let commitment = match commitment {
-        Some(commitment) => commitment,
-        None => {
-            captured = capture_content(src)?;
-            &captured
+    let (commitment, attestable) = match commitment {
+        Some(commitment) => {
+            if !commitment.valid() || !commitment.matches(&meta) || !commitment.matches(&sys::lstat(src)?) {
+                return Err(invalid("artifact changed after commitment"));
+            }
+            // The link adds a name to the inode just checked, and Cargo's uplift only adds names, so the bytes it exposes are the committed ones.
+            link_retrying(src, dst)?;
+            (commitment.clone(), None)
         }
+        None => link_then_capture(src, dst, &meta)?,
     };
-    if !commitment.valid() || !commitment.matches(&meta) || !commitment.matches(&sys::lstat(src)?) {
-        return Err(invalid("artifact changed after commitment"));
-    }
-    // The link adds a name to the inode just hashed and checked, and Cargo's uplift only adds names, so the bytes it exposes are the hashed ones.
-    link_retrying(src, dst)?;
     if !commitment.matches(&sys::lstat(dst)?) {
         return Err(invalid("linked artifact differs from commitment"));
     }
-    Ok(StoredPayload {
+    let payload = StoredPayload {
         bytes: fsx::allocated_size(src),
         encoding: Encoding::Linked,
         stored_bytes: Some(commitment.len),
         decoded_bytes: Some(commitment.len),
         content_hash: Some(commitment.hash.clone()),
         mode: Some(commitment.mode),
-    })
+    };
+    Ok((payload, attestable))
+}
+
+/// Links first and hashes through the new name, so the one read both commits the entry and proves the hash under the stamp the link left; that stamp is returned only if it held, change time included, for the whole read.
+fn link_then_capture(src: &Path, dst: &Path, linked: &sys::Meta) -> io::Result<(Commitment, Option<Stamp>)> {
+    link_retrying(src, dst)?;
+    let source = File::open(dst)?;
+    let before = sys::fstat(&source)?;
+    let (len, hash) = hash_open(&source, before.len())?;
+    let after = sys::fstat(&source)?;
+    // Cargo's uplift may add a name meanwhile, which moves only ctime: the entry stays sound but the stamp proves nothing.
+    if !same_content(linked, &before) || len != before.len() || !same_content(&before, &after) {
+        return Err(invalid("artifact changed while committing"));
+    }
+    let commitment = Commitment { hash, mode: before.mode(), dev: before.dev(), ino: before.ino(), len, mtime: before.mtime() };
+    let attestable = (stable(&before, &after) && before.nlink() > linked.nlink()).then(|| Stamp::of(&after));
+    Ok((commitment, attestable))
 }
 
 #[cfg(test)]
@@ -781,18 +782,19 @@ pub enum Placement {
 }
 
 /// Stores a large output as a second name of the target file; any link failure leaves no staged name and falls back to a copy.
+/// The stamp is set when the link's own read proved the recorded hash under the stamp the output now carries.
 pub(crate) fn store_linked(
     src: &Path,
     dst: &Path,
     compress: bool,
     commitment: Option<&Commitment>,
     capture: bool,
-) -> io::Result<(StoredPayload, Option<StoreProof>)> {
+) -> io::Result<(StoredPayload, Option<StoreProof>, Option<Stamp>)> {
     match link_commitment(src, dst, commitment) {
-        Ok(payload) => Ok((payload, None)),
+        Ok((payload, stamp)) => Ok((payload, None, stamp)),
         Err(_) => {
             let _ = fs::remove_file(dst);
-            store_proven(src, dst, compress, commitment, capture)
+            store_proven(src, dst, compress, commitment, capture).map(|(payload, proof)| (payload, proof, None))
         }
     }
 }
@@ -1063,8 +1065,9 @@ mod tests {
     fn linked(scratch: &Path, source: &Path) -> (PathBuf, StoredFile) {
         let (_, commitment) = capture(source).unwrap();
         let staged = scratch.join("f0");
-        let (payload, proof) = store_linked(source, &staged, false, Some(&commitment), false).unwrap();
+        let (payload, proof, stamp) = store_linked(source, &staged, false, Some(&commitment), false).unwrap();
         assert!(proof.is_none());
+        assert!(stamp.is_none(), "a committed link reads nothing, so it proves no stamp");
         (staged, metadata(payload))
     }
 
@@ -1083,22 +1086,24 @@ mod tests {
         let (_, commitment) = capture(&big).unwrap();
         let taken = scratch.0.join("taken");
         fs::write(&taken, b"already here").unwrap();
-        let (payload, _) = store_linked(&big, &taken, false, Some(&commitment), false).unwrap();
+        let (payload, _, _) = store_linked(&big, &taken, false, Some(&commitment), false).unwrap();
         assert_eq!(payload.encoding, Encoding::Raw, "a link that fails leaves an ordinary copy");
         assert_eq!(fs::read(&taken).unwrap(), vec![b'b'; 8192]);
         assert_ne!(sys::lstat(&taken).unwrap().ino(), sys::lstat(&big).unwrap().ino());
 
         let small = scratch.0.join("small");
         fs::write(&small, vec![b's'; (LINKED_MIN_BYTES - 1) as usize]).unwrap();
-        let (payload, _) = store_linked(&small, &scratch.0.join("g0"), false, None, false).unwrap();
+        let (payload, _, stamp) = store_linked(&small, &scratch.0.join("g0"), false, None, false).unwrap();
         assert_eq!(payload.encoding, Encoding::Raw, "small outputs are copied");
+        assert!(stamp.is_none());
 
         fs::write(&big, vec![b'c'; 8193]).unwrap();
         let stale = store_linked(&big, &scratch.0.join("g1"), false, Some(&commitment), false);
         assert!(stale.is_err(), "a rewritten output no longer matches its commitment");
-        let (hashed, _) = store_linked(&big, &scratch.0.join("g2"), false, None, false).unwrap();
+        let (hashed, _, stamp) = store_linked(&big, &scratch.0.join("g2"), false, None, false).unwrap();
         assert_eq!(hashed.encoding, Encoding::Linked, "the store step hashes an uncommitted output itself");
         assert_eq!(hashed.content_hash.as_deref(), Some(blake3::hash(&vec![b'c'; 8193]).to_hex().as_str()));
+        assert_eq!(stamp, Some(Stamp::read(&big).unwrap()), "the hash is proven under the stamp the new name left");
     }
 
     #[test]

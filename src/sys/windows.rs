@@ -1508,6 +1508,20 @@ pub fn lower_thread_priority() {
 /// Handles are never inherited by detached helpers here, so there is nothing to seal.
 pub fn seal_inherited_descriptors() {}
 
+pub fn thread_cpu_ns() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let zero = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero(), zero(), zero(), zero());
+    // SAFETY: the pseudo handle of the current thread is always valid and all four out pointers are valid.
+    if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks = |t: &FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    // FILETIME counts 100 ns intervals.
+    Some((ticks(&kernel) + ticks(&user)).saturating_mul(100))
+}
+
 /// Background mode also lowers I/O and memory priority and can starve; a store only yields CPU to builds.
 pub fn lower_store_priority() {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
