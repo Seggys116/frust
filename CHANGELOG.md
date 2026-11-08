@@ -6,6 +6,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Added
 
+* `frust gc` and `frust compact` report progress on stderr: a live status line on a terminal (phase, items done of the total, bytes, workspace or profile, elapsed time and ETA) and a line per phase plus at most one every 5 seconds in logs. `--quiet` silences it and `--progress` forces it (including with `FRUST_RENDER=off`). The gc plan and the compaction report now break the whole home down by workspace, with the store and other state listed separately, and `frust compact --workspace NAME|PATH` limits a run to one workspace. Library callers get the same events through `gc::plan_with`, `gc::execute_with` and `compact::compact_with` with a `Progress` implementation.
 * `fcargo check` and `clippy` build in their own central directory, `<toolchain id>-check` beside the build target (`frust where check`), so they no longer wait on a build through cargo's per-profile lock; identical checks still join. `FRUST_CHECK_DIR=off` restores the shared directory. `fcargo clean` removes both directories (a partial clean applies to both), gc and compaction age the check directory like any target, and `frust doctor` reports the setting.
 * `FRUST_LINKER` (`auto` or `system`): on Windows (MSVC) hosts builds link with the toolchain's `rust-lld` unless a linker is configured or `FRUST_LINKER=system`. `frust doctor` reports the default linker and the effective tuning.
 * No-op fast path: when nothing changed since the last successful `fcargo build` or `check` of the same invocation, `fcargo` prints cargo's output (replayed warnings and the `Finished` line) without launching cargo. Inputs, outputs, fingerprints, config, environment and toolchain are stamped; any difference, an active build or an untrusted volume falls back to cargo. `FRUST_NOOP=off|on|audit` (default `on`) and `FRUST_NOOP_TRACE=<file>` control and trace it.
@@ -29,6 +30,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Changed
 
+* `frust compact` lists target directories without measuring them first and measures each root once, and `frust gc` no longer walks every target after collecting just to decide whether to suggest `frust compact`, so neither spends minutes in silent extra walks on a large home.
 * `fcargo doc` locks its profile and a `doc@output` slot instead of the whole target directory, so it runs alongside builds of the other profile.
 * Dependency debuginfo tuning (`FRUST_TUNE`) is now on by default; `FRUST_TUNE=off` restores cargo's defaults. It is skipped only when your own configuration sets `debug`, `split-debuginfo` or `strip` for the profile in use; an unrelated `[profile.release]` or other profile settings no longer disable it, and release, bench, install and custom profiles are never tuned.
 * Cache entries, manifests, unit records and key lock files now live directly under `store/`, `manifests/`, `units/` and `keylocks/` instead of in two character shard directories, which cost a directory block each on ext4. Older layouts stay readable and `frust gc` moves them flat and removes the emptied shard directories.
@@ -46,6 +48,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+* `frust gc` no longer deletes a workspace directory under `targets/` recursively. It removed one that looked empty (or could not be read) with everything in it, so a build that created its target between the check and the removal lost its `deps` mid-build (`failed to write ... deps/lib*.rmeta: No such file or directory`). Now only a directory holding nothing but regular files is removed, without recursion, and its marker is restored when the removal fails.
 * A restore that links a store file into the target gives it a fresh modification time like every other restore, so cargo no longer finds a linked build script or binary older than its dependencies and rebuilds it on every no-op build (ext4, NTFS).
 * The no-op fast path records units cargo names without a hash (a path package's `cdylib` or `dylib`, and executables on windows-msvc, whose dep-info is `deps/<crate>.d`) and follows a symlinked directory in a package whose build script has no rerun directives, instead of declining every build of such workspaces; `frust bench --repo` reports the fast path's decisions for the no-op row (`noop_decisions`).
 * `frust env` and `frust doctor` look for `frust-wrap.exe` on Windows, so `frust env` prints its `RUSTC_WRAPPER` line and doctor finds the wrapper.

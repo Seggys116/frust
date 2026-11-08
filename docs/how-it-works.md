@@ -346,6 +346,21 @@ entries use their own key domain, so older versions treat them as misses.
   compiler-compatible session guards before program outputs are removed. Target/profile directories, `deps` and
   `.fingerprint` roots, and Cargo lock files remain. Fresh activity, unreadable state and unknown or user-managed layouts
   are preserved.
+* `frust gc` and `frust compact` work on the whole `FRUST_HOME`: every workspace's central targets (check
+  directories included), the store and the shared metadata. The gc plan lists each workspace with its size and what
+  would be freed in it, then the store and other state; the compaction report lists each workspace's size before, its
+  profiles (and busy ones) and what was removed, compressed and deduplicated there. `frust compact --workspace NAME|PATH`
+  limits a run to one workspace (its directory name, its project name or its project path) and leaves the shared store
+  alone. gc has no such filter, because cache entries, manifests and locks are shared by every workspace.
+* Both commands report progress on stderr, so their reports on stdout stay parseable. On a terminal one status line
+  is rewritten in place with the phase, items done of the announced total, bytes measured or freed, the workspace or
+  profile at hand, elapsed time and an ETA once the phase has a total. In a log they print a line when each phase starts
+  and at most one more every 5 seconds. `--quiet` silences progress; `--progress` forces it even with
+  `FRUST_RENDER=off`, which otherwise turns it off. gc's phases are `scan store`, `size store entries`,
+  `check idle targets`, `measure targets`, `plan targets`, `plan home`, `remove` (one item per planned removal, scoped by
+  workspace and class) and `tidy`; compaction's are `measure`, `lock profiles`, `remove superseded`, `collect files`,
+  `compress and dedupe` (one item per file; the two are interleaved by size) and `measure again`. The counts come from
+  the work itself, and automatic maintenance passes report to a no-op.
 
 ## Sharing a repo between builds
 
@@ -375,8 +390,17 @@ entries use their own key domain, so older versions treat them as misses.
   Cargo serialises them on its own lock anyway; the queue shows who you are waiting for.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
   busy. Maintenance reserves all canonical Cargo profile lock names, including missing ones, so different Cargo
-  versions cannot bypass each other's lock files. `tests/stress.rs` runs eight builds against
-  continuous compaction and gc.
+  versions cannot bypass each other's lock files. A profile is any directory of a target (or of a `<triple>`
+  directory in it) that holds `deps`, so custom profiles such as `harness` are covered. A running Cargo holds
+  `.cargo-build-lock` and `.cargo-artifact-lock` exclusively and `.cargo-lock` shared, and maintenance asks for all
+  three exclusively, so a plain `cargo` build without frust is protected the same way. Every removal inside a profile
+  is rechecked under those locks at execution time, not only when planned. The locks are per profile directory, so
+  a build in one workspace never holds back maintenance of another. `tests/stress.rs` runs eight builds against
+  continuous compaction and gc, and `tests/active_build.rs` runs gc and compaction against a custom profile held by
+  plain Cargo and by fcargo.
+* `frust gc` removes a workspace directory under `targets/` only when it holds nothing but regular files (its
+  `workspace` marker), and never recursively: a build that creates its target between the check and the removal makes
+  the removal fail instead of losing its tree.
 * Queued builds subscribe to directory changes through kqueue on macOS and inotify on Linux, waking promptly when
   ownership or queue state changes. Notifications are hints: FIFO checks and OS locks still decide ownership.
   Timed polling remains as a fallback (15 ms at the front, 10 ms for followers, up to 40 ms behind the front).

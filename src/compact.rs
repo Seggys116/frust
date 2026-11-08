@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::fsx;
 use crate::paths::Dirs;
+pub use crate::progress::Progress;
+use crate::progress::Silent;
 use crate::stats;
 use crate::sys;
 
@@ -316,13 +318,19 @@ fn on_lowered_thread<R: Send>(lower: fn(), f: impl FnOnce() -> R + Send) -> R {
 
 /// Compressed files keep their data in the resource fork, where extent probing cannot see it, so APFS uses `getattrlist`.
 pub fn physical_size(roots: &[&Path]) -> u64 {
+    physical_sizes(roots, &mut |_, _| {}).iter().sum()
+}
+
+/// Per root, in order, from one walk: sharing with an earlier root is charged to that root, so the parts sum to [`physical_size`].
+pub fn physical_sizes(roots: &[&Path], done: &mut dyn FnMut(usize, u64)) -> Vec<u64> {
     if !cfg!(target_os = "macos") {
-        return fsx::physical_size(roots);
+        return fsx::physical_sizes(roots, done);
     }
     let mut inodes = HashSet::new();
     let mut groups = HashSet::new();
-    let mut total = 0;
-    for root in roots {
+    let mut sizes = Vec::with_capacity(roots.len());
+    for (at, root) in roots.iter().enumerate() {
+        let mut total = 0;
         walk_files(root, &mut |path, meta| {
             if !inodes.insert((meta.dev(), meta.ino())) {
                 return;
@@ -333,8 +341,10 @@ pub fn physical_size(roots: &[&Path]) -> u64 {
                 _ => allocated,
             };
         });
+        done(at, total);
+        sizes.push(total);
     }
-    total
+    sizes
 }
 
 struct AllocationNode {
@@ -1417,13 +1427,50 @@ pub struct Report {
     pub allocated_after: u64,
     /// The pass ran out of its time or byte budget and left the rest for the next due pass.
     pub budget_stopped: bool,
+    /// Keyed by workspace directory name, or `cache store`.
+    pub workspaces: BTreeMap<String, WorkspaceCompaction>,
 }
 
+/// One workspace's share of a pass; the byte counts add up to the report's totals.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkspaceCompaction {
+    pub before: u64,
+    pub profiles: usize,
+    pub busy: usize,
+    pub removed: u64,
+    pub compressed: u64,
+    pub deduped: u64,
+}
+
+fn scope_of(dirs: &Dirs, path: &Path) -> String {
+    stats::workspace_of(dirs, path).unwrap_or_else(|| path.display().to_string())
+}
+
+/// A profile named by its workspace and its path inside it, such as `app-1a2b/35a0f951a33b/harness`.
+fn profile_scope(dirs: &Dirs, profile: &Path) -> String {
+    match profile.strip_prefix(dirs.targets()) {
+        Ok(rest) => rest.display().to_string(),
+        Err(_) => profile.display().to_string(),
+    }
+}
+
+/// Every workspace's toolchain directories, listed without measuring them; the pass measures each root once itself.
 pub fn central_targets(dirs: &Dirs) -> Vec<PathBuf> {
-    stats::targets(dirs).into_iter().map(|t| t.path).collect()
+    let mut out = Vec::new();
+    let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return out };
+    for workspace in workspaces.flatten() {
+        let Ok(toolchains) = fs::read_dir(workspace.path()) else { continue };
+        out.extend(toolchains.flatten().map(|tc| tc.path()).filter(|path| path.is_dir()));
+    }
+    out.sort();
+    out
 }
 
 pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Report {
+    compact_with(dirs, targets, opts, &mut Silent)
+}
+
+pub fn compact_with(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions, progress: &mut dyn Progress) -> Report {
     let mut report = Report { supported: apfs::SUPPORTED, ..Report::default() };
     let store = dirs.store();
     let mut roots: Vec<PathBuf> = targets.to_vec();
@@ -1431,20 +1478,33 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
         roots.push(store.clone());
     }
     let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-    report.physical_before = physical_size(&root_refs);
+    let scopes: Vec<String> = roots.iter().map(|root| scope_of(dirs, root)).collect();
+    progress.phase("measure", Some(roots.len() as u64), "measured");
+    let before = physical_sizes(&root_refs, &mut |at, bytes| progress.item(&scopes[at], bytes));
+    for (scope, bytes) in scopes.iter().zip(&before) {
+        report.workspaces.entry(scope.clone()).or_default().before += bytes;
+    }
+    report.physical_before = before.iter().sum();
 
     // Locks are held for the whole pass because files move between target directories.
     let mut locks = Vec::new();
     let mut profiles = Vec::new();
-    for target in targets {
-        let ours = target.starts_with(dirs.targets());
-        for profile in profile_dirs(target) {
-            match ProfileLock::try_acquire(&profile) {
-                Some(lock) => {
-                    locks.push(lock);
-                    profiles.push((profile, ours));
-                }
-                None => report.busy.push(profile),
+    let found: Vec<(PathBuf, bool)> =
+        targets.iter().flat_map(|target| profile_dirs(target).into_iter().map(move |profile| (profile, target.starts_with(dirs.targets())))).collect();
+    progress.phase("lock profiles", Some(found.len() as u64), "");
+    for (profile, ours) in found {
+        let usage = report.workspaces.entry(scope_of(dirs, &profile)).or_default();
+        match ProfileLock::try_acquire(&profile) {
+            Some(lock) => {
+                usage.profiles += 1;
+                locks.push(lock);
+                progress.item(&profile_scope(dirs, &profile), 0);
+                profiles.push((profile, ours));
+            }
+            None => {
+                usage.busy += 1;
+                progress.item(&format!("{} (busy)", profile_scope(dirs, &profile)), 0);
+                report.busy.push(profile);
             }
         }
     }
@@ -1458,10 +1518,12 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
     }
 
     if opts.remove_superseded {
+        progress.phase("remove superseded", Some(profiles.iter().filter(|(_, ours)| *ours).count() as u64), if opts.dry_run { "reclaimable" } else { "freed" });
         for (profile, ours) in &profiles {
             if !ours {
                 continue;
             }
+            let removed_before = report.removed_bytes;
             let mut doomed = Vec::new();
             let analysis = analyze(profile);
             match &analysis {
@@ -1491,28 +1553,40 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
             report.stale_objects += objects.len();
             retain_unprotected(&mut objects, &protection, &mut report);
             remove_or_plan(objects, opts.dry_run, &mut report);
+            progress.item(&profile_scope(dirs, profile), report.removed_bytes.saturating_sub(removed_before));
         }
     }
 
     if apfs::SUPPORTED && (opts.compress || opts.dedupe) {
         let mut candidates = Vec::new();
+        let with_store = opts.include_store && store.is_dir();
+        progress.phase("collect files", Some((profiles.len() + usize::from(with_store)) as u64), "eligible");
+        let mut collect = |root: &Path, in_store: bool, scope: &str, candidates: &mut Vec<Candidate>| {
+            let first = candidates.len();
+            collect_candidates(root, in_store, candidates);
+            progress.item(scope, candidates[first..].iter().map(|c| c.meta.len()).sum());
+        };
         for (profile, _) in &profiles {
-            collect_candidates(profile, false, &mut candidates);
+            collect(profile, false, &profile_scope(dirs, profile), &mut candidates);
         }
-        if opts.include_store && store.is_dir() {
-            collect_candidates(&store, true, &mut candidates);
+        if with_store {
+            collect(&store, true, stats::STORE_SCOPE, &mut candidates);
         }
         retain_unprotected_candidates(&mut candidates, &protection, &mut report);
-        shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report);
+        shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report, progress, &|path| scope_of(dirs, path));
     }
 
     drop(locks);
+    for (path, bytes) in &report.removed {
+        report.workspaces.entry(scope_of(dirs, path)).or_default().removed += bytes;
+    }
     report.physical_after = if opts.dry_run {
         report
             .physical_before
             .saturating_sub(report.removed_bytes + report.compress_before.saturating_sub(report.compress_after) + report.dedupe_saved)
     } else {
-        physical_size(&root_refs)
+        progress.phase("measure again", Some(roots.len() as u64), "measured");
+        physical_sizes(&root_refs, &mut |at, bytes| progress.item(&scopes[at], bytes)).iter().sum()
     };
     report
 }
@@ -1777,7 +1851,31 @@ impl Memo {
     }
 }
 
-fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx, report: &mut Report) {
+/// Charges a candidate's savings to its workspace; an empty scope (automatic passes) keeps no breakdown.
+struct Credit<'a> {
+    progress: &'a mut dyn Progress,
+    scope_of: &'a dyn Fn(&Path) -> String,
+}
+
+impl Credit<'_> {
+    fn done(&mut self, c: &Candidate, report: &mut Report, compressed: u64, deduped: u64) {
+        let scope = (self.scope_of)(&c.path);
+        if !scope.is_empty() {
+            let usage = report.workspaces.entry(scope.clone()).or_default();
+            usage.compressed += compressed;
+            usage.deduped += deduped;
+        }
+        self.progress.item(&scope, c.meta.len());
+    }
+}
+
+fn compress_saving(report: &Report) -> u64 {
+    report.compress_before.saturating_sub(report.compress_after)
+}
+
+fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx, report: &mut Report, progress: &mut dyn Progress, scope_of: &dyn Fn(&Path) -> String) {
+    progress.phase("compress and dedupe", Some(candidates.len() as u64), "examined");
+    let mut tally = Credit { progress, scope_of };
     let mut by_size: BTreeMap<u64, Vec<Candidate>> = BTreeMap::new();
     for c in candidates {
         by_size.entry(c.meta.len()).or_default().push(c);
@@ -1794,15 +1892,21 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
                 if ctx.exhausted() {
                     break 'buckets;
                 }
+                let saved = compress_saving(report);
                 if opts.compress && !apfs::is_compressed(&c.meta) {
                     compress_one(&c, opts.dry_run, &mut dir_times, ctx, report);
                 }
+                let saved = compress_saving(report).saturating_sub(saved);
+                tally.done(&c, report, saved, 0);
             }
             continue;
         }
         // One clone group of compressed files means an earlier pass already handled them.
         let clone_ids: HashSet<Option<u64>> = bucket.iter().map(|c| apfs::clone_info(&c.path).map(|i| i.0)).collect();
         if clone_ids.len() == 1 && !clone_ids.contains(&None) && bucket.iter().all(|c| apfs::is_compressed(&c.meta)) {
+            for c in &bucket {
+                tally.done(c, report, 0, 0);
+            }
             continue;
         }
         // The flag marks a digest that came from the memo rather than from reading the file just now.
@@ -1821,7 +1925,10 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
                     ctx.remember_hash(&c.path, &c.meta, digest);
                     groups.entry(digest).or_default().push((c, false));
                 }
-                Err(err) => report.errors.push((c.path.clone(), err.to_string())),
+                Err(err) => {
+                    report.errors.push((c.path.clone(), err.to_string()));
+                    tally.done(&c, report, 0, 0);
+                }
             }
         }
         for (_, mut group) in groups {
@@ -1832,41 +1939,51 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
             group.sort_by_key(|(c, _)| (!apfs::is_compressed(&c.meta), !c.in_store, c.path.clone()));
             let mut members = group.into_iter();
             let Some((canonical, canonical_memoised)) = members.next() else { continue };
+            let saved = compress_saving(report);
             if opts.compress && !apfs::is_compressed(&canonical.meta) {
                 compress_one(&canonical, opts.dry_run, &mut dir_times, ctx, report);
             }
+            let saved = compress_saving(report).saturating_sub(saved);
+            tally.done(&canonical, report, saved, 0);
             let canon_meta = sys::lstat(&canonical.path).ok();
             let canon_clone = apfs::clone_info(&canonical.path).map(|i| i.0);
             for (m, memoised) in members {
-                if canon_clone.is_some() && apfs::clone_info(&m.path).map(|i| i.0) == canon_clone {
-                    continue;
-                }
-                let saved = m.meta.allocated();
-                if opts.dry_run {
-                    report.deduped_files += 1;
-                    report.dedupe_saved += saved;
-                    continue;
-                }
-                if ctx.exhausted() {
-                    break 'buckets;
-                }
-                let Some(cm) = canon_meta.as_ref() else { continue };
-                // A remembered digest is only a hint: the bytes are compared before anything is replaced.
-                if (canonical_memoised || memoised) && !same_bytes(&canonical.path, &m.path).unwrap_or(false) {
-                    ctx.forget(&canonical.meta);
-                    ctx.forget(&m.meta);
-                    continue;
-                }
-                if canonical_memoised || memoised {
-                    ctx.spend(m.meta.len());
-                }
-                match replace_with_clone(&canonical.path, cm, &m, &mut dir_times) {
-                    Ok(()) => {
+                let deduped = 'member: {
+                    if canon_clone.is_some() && apfs::clone_info(&m.path).map(|i| i.0) == canon_clone {
+                        break 'member 0;
+                    }
+                    let saved = m.meta.allocated();
+                    if opts.dry_run {
                         report.deduped_files += 1;
                         report.dedupe_saved += saved;
+                        break 'member saved;
                     }
-                    Err(err) => report.errors.push((m.path.clone(), err.to_string())),
-                }
+                    if ctx.exhausted() {
+                        break 'buckets;
+                    }
+                    let Some(cm) = canon_meta.as_ref() else { break 'member 0 };
+                    // A remembered digest is only a hint: the bytes are compared before anything is replaced.
+                    if (canonical_memoised || memoised) && !same_bytes(&canonical.path, &m.path).unwrap_or(false) {
+                        ctx.forget(&canonical.meta);
+                        ctx.forget(&m.meta);
+                        break 'member 0;
+                    }
+                    if canonical_memoised || memoised {
+                        ctx.spend(m.meta.len());
+                    }
+                    match replace_with_clone(&canonical.path, cm, &m, &mut dir_times) {
+                        Ok(()) => {
+                            report.deduped_files += 1;
+                            report.dedupe_saved += saved;
+                            saved
+                        }
+                        Err(err) => {
+                            report.errors.push((m.path.clone(), err.to_string()));
+                            0
+                        }
+                    }
+                };
+                tally.done(&m, report, 0, deduped);
             }
         }
     }
@@ -2687,7 +2804,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         }
         let mut ctx = ShrinkCtx::for_auto(dirs, target, opts);
         retain_unprotected_candidates(&mut candidates, &protection, &mut report);
-        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
+        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report, &mut Silent, &|_| String::new());
         report.budget_stopped = ctx.stopped;
         ctx.finish();
     }
@@ -4057,6 +4174,59 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn progress_covers_every_phase_and_the_workspace_breakdown_adds_up_to_the_report() {
+        use crate::progress::Recorder;
+        let root = scratch("progress");
+        let dirs = Dirs::at(&root);
+        let mut targets = Vec::new();
+        for ws in ["alpha-0000", "beta-0000"] {
+            let target = dirs.targets().join(ws).join("tc");
+            let profile = target.join("harness");
+            unit_dir(&profile, "app", "aaaaaaaaaaaaaaaa", "bin-app", "0a00000000000000", &[], 7);
+            unit_dir(&profile, "app", "bbbbbbbbbbbbbbbb", "bin-app", "0b00000000000000", &[], 7);
+            set_mtime(&profile.join(".fingerprint/app-aaaaaaaaaaaaaaaa"), 100);
+            set_mtime(&profile.join(".fingerprint/app-bbbbbbbbbbbbbbbb"), 10);
+            fs::write(profile.join("deps/data.bin"), vec![b'x'; 64 * 1024]).unwrap();
+            targets.push(target);
+        }
+        let held = dirs.targets().join("gamma-0000").join("tc").join("debug");
+        fs::create_dir_all(held.join("deps")).unwrap();
+        let lock = ProfileLock::try_acquire(&held).unwrap();
+        targets.push(dirs.targets().join("gamma-0000").join("tc"));
+
+        let mut recorded = Recorder::default();
+        let report = compact_with(&dirs, &targets, &CompactOptions { include_store: false, ..CompactOptions::full() }, &mut recorded);
+        drop(lock);
+        let mut expected = vec!["measure", "lock profiles", "remove superseded"];
+        if apfs::SUPPORTED {
+            expected.extend(["collect files", "compress and dedupe"]);
+        }
+        expected.push("measure again");
+        assert_eq!(recorded.phases(), expected);
+        for phase in recorded.phases() {
+            let (totals, items) = recorded.items(phase);
+            assert_eq!(totals, [Some(items.len() as u64)], "{phase} announced its real item count");
+        }
+        assert_eq!(recorded.bytes("measure"), report.physical_before);
+        assert_eq!(recorded.bytes("measure again"), report.physical_after);
+        assert_eq!(recorded.bytes("remove superseded"), report.removed_bytes);
+        assert!(report.removed_bytes > 0 && report.dead_units == 2, "{report:?}");
+        assert!(recorded.items("lock profiles").1.iter().any(|(scope, _)| scope == "gamma-0000/tc/debug (busy)"));
+        let ws = &report.workspaces;
+        assert_eq!(ws.keys().map(String::as_str).collect::<Vec<_>>(), ["alpha-0000", "beta-0000", "gamma-0000"]);
+        assert_eq!((ws["alpha-0000"].profiles, ws["beta-0000"].profiles, ws["gamma-0000"].busy), (1, 1, 1));
+        assert!(ws["alpha-0000"].removed > 0 && ws["beta-0000"].removed > 0 && ws["gamma-0000"].removed == 0);
+        assert_eq!(ws.values().map(|w| w.before).sum::<u64>(), report.physical_before);
+        assert_eq!(ws.values().map(|w| w.removed).sum::<u64>(), report.removed_bytes);
+        assert_eq!(ws.values().map(|w| w.compressed).sum::<u64>(), report.compress_before.saturating_sub(report.compress_after));
+        assert_eq!(ws.values().map(|w| w.deduped).sum::<u64>(), report.dedupe_saved);
+        if apfs::SUPPORTED {
+            assert_eq!(recorded.items("compress and dedupe").1.len(), 2, "both large files were examined");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("frust-maint-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -4173,7 +4343,7 @@ mod tests {
         let mut ctx = ShrinkCtx::plain();
         ctx.budget = Some(Budget { deadline: Instant::now(), bytes_left: 0 });
         let mut report = Report::default();
-        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
+        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report, &mut Silent, &|_| String::new());
         assert!(ctx.stopped);
         assert_eq!((report.deduped_files, report.compressed_files), (0, 0));
         assert!(report.errors.is_empty());

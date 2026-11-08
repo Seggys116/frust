@@ -12,6 +12,8 @@ use crate::config::{self, Config, DEFAULT_CACHE_MAX_AGE};
 use crate::fsx;
 use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
+pub use crate::progress::Progress;
+use crate::progress::Silent;
 use crate::stats;
 use crate::store_broker;
 use crate::sys::{self, LockKind, Meta};
@@ -122,10 +124,24 @@ pub struct Removal {
     pub bytes: u64,
 }
 
+/// One workspace of the home: its central targets' allocated size and what the plan removes inside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceUsage {
+    pub name: String,
+    pub root: Option<String>,
+    pub bytes: u64,
+    pub items: usize,
+    pub freed: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Plan {
     pub removals: Vec<Removal>,
     pub trim_ledger: bool,
+    /// Every workspace under `targets/`, largest first, including those with nothing to remove.
+    pub workspaces: Vec<WorkspaceUsage>,
+    /// The cache store's entries as sized for this plan.
+    pub store_bytes: u64,
     /// Lock directories are rechecked just before removal: a build may have started using one since planning.
     pub lock_max_idle: Duration,
     target_retirements: HashMap<PathBuf, TargetRetirement>,
@@ -152,6 +168,32 @@ impl Plan {
         self.removals.iter().filter(|r| r.class == class).fold((0, 0), |(n, b), r| (n + 1, b + r.bytes))
     }
 
+    /// Charges each removal to the workspace whose target holds it.
+    fn attribute(&mut self, dirs: &Dirs) {
+        for usage in &mut self.workspaces {
+            (usage.items, usage.freed) = (0, 0);
+        }
+        for removal in &self.removals {
+            let Some(name) = removal.path.strip_prefix(dirs.targets()).ok().and_then(|rest| rest.components().next()) else { continue };
+            if let Some(usage) = self.workspaces.iter_mut().find(|usage| name.as_os_str() == usage.name.as_str()) {
+                usage.items += 1;
+                usage.freed = usage.freed.saturating_add(removal.bytes);
+            }
+        }
+    }
+
+    /// Removals outside every workspace's targets and outside the store: scratch, metadata, locks and history.
+    pub fn outside_targets(&self, dirs: &Dirs) -> (usize, u64) {
+        self.removals
+            .iter()
+            .filter(|r| !r.path.starts_with(dirs.targets()) && !r.path.starts_with(dirs.store()))
+            .fold((0, 0), |(n, b), r| (n + 1, b + r.bytes))
+    }
+
+    pub fn store_removals(&self, dirs: &Dirs) -> (usize, u64) {
+        self.removals.iter().filter(|r| r.path.starts_with(dirs.store())).fold((0, 0), |(n, b), r| (n + 1, b + r.bytes))
+    }
+
     pub fn target_categories(&self) -> Vec<(Category, u64)> {
         let mut by: std::collections::BTreeMap<Category, u64> = std::collections::BTreeMap::new();
         for r in self.removals.iter().filter(|r| matches!(r.class, Class::StaleVariant | Class::IncrementalSession)) {
@@ -164,13 +206,29 @@ impl Plan {
 }
 
 pub fn plan(dirs: &Dirs, opts: &GcOptions) -> Plan {
+    plan_with(dirs, opts, &mut Silent)
+}
+
+type PlanStep<'a> = (&'static str, &'a dyn Fn(&mut Plan));
+
+/// Covers the whole home: the store, every workspace's central targets and the shared metadata.
+pub fn plan_with(dirs: &Dirs, opts: &GcOptions, progress: &mut dyn Progress) -> Plan {
     let mut plan = Plan { lock_max_idle: opts.lock_max_idle, ..Plan::default() };
-    let evicted = plan_cache(dirs, opts, &mut plan, true);
-    plan_targets(dirs, opts, &mut plan);
-    plan_scratch(dirs, &mut plan);
-    plan_retired_entries(dirs, &mut plan);
-    plan_store_temps(dirs, opts, &mut plan);
-    plan_metadata(dirs, opts, &evicted, &mut plan);
+    let evicted = plan_cache(dirs, opts, &mut plan, true, progress);
+    plan_targets(dirs, opts, &mut plan, progress);
+    let steps: [PlanStep<'_>; 4] = [
+        ("scratch", &|plan| plan_scratch(dirs, plan)),
+        ("evicted entries", &|plan| plan_retired_entries(dirs, plan)),
+        ("store temporaries", &|plan| plan_store_temps(dirs, opts, plan)),
+        ("manifests, locks, history and memos", &|plan| plan_metadata(dirs, opts, &evicted, plan)),
+    ];
+    progress.phase("plan home", Some(steps.len() as u64), "reclaimable");
+    for (name, step) in steps {
+        let before = plan.bytes();
+        step(&mut plan);
+        progress.item(name, plan.bytes().saturating_sub(before));
+    }
+    plan.attribute(dirs);
     plan
 }
 
@@ -179,8 +237,8 @@ pub fn plan_maintenance(dirs: &Dirs, opts: &GcOptions) -> Plan {
         lock_max_idle: opts.lock_max_idle,
         ..Plan::default()
     };
-    let evicted = plan_cache(dirs, opts, &mut plan, false);
-    plan_idle_targets(dirs, opts, &mut plan, AUTO_TARGET_RETIREMENTS);
+    let evicted = plan_cache(dirs, opts, &mut plan, false, &mut Silent);
+    plan_idle_targets(dirs, opts, &mut plan, AUTO_TARGET_RETIREMENTS, &mut Silent);
     plan_scratch(dirs, &mut plan);
     plan_retired_entries(dirs, &mut plan);
     plan_store_temps(dirs, opts, &mut plan);
@@ -302,10 +360,17 @@ fn unit_records(dirs: &Dirs) -> HashMap<String, String> {
 }
 
 fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
+    scan_entries_with(dirs, &mut Silent)
+}
+
+fn scan_entries_with(dirs: &Dirs, progress: &mut dyn Progress) -> Vec<ScannedEntry> {
     let mut out = Vec::new();
     let store = cache::Cache::new(dirs);
     let records = unit_records(dirs);
-    for path in cache::keyed_items(&dirs.store()) {
+    let items = cache::keyed_items(&dirs.store());
+    progress.phase("scan store", Some(items.len() as u64), "");
+    for path in items {
+        progress.item(stats::STORE_SCOPE, 0);
         let Some(key) = path.file_name().and_then(|name| name.to_str()).filter(|key| cache::valid_key(key)) else { continue };
         if path != store.entry_dir(key) { continue; }
         let retirement = store.retirement_snapshot(key);
@@ -408,10 +473,10 @@ fn expired(used: SystemTime, max_age: Duration) -> bool {
 }
 
 /// With `exact` false, sizes come from the recorded byte counts unless an explicit size cap is exceeded, when they are measured so eviction stays exact.
-fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> HashSet<String> {
+fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool, progress: &mut dyn Progress) -> HashSet<String> {
     let mut evicted = HashSet::new();
     let mut protection = EntryGuard::new(dirs);
-    let scanned = scan_entries(dirs);
+    let scanned = scan_entries_with(dirs, progress);
     let superseded: Vec<_> = superseded_among(&scanned, opts.unit_versions.clamp(1, INCREMENTAL_ENTRIES_KEPT))
         .into_iter().filter(|(path, _)| !protection.protects(path)).collect();
     let doomed: HashSet<&Path> = superseded.iter().map(|s| s.0.as_path()).collect();
@@ -422,17 +487,20 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
     }
     let shared: HashMap<PathBuf, u64> = scanned.iter().map(|e| (e.path.clone(), e.link.shared_alloc)).collect();
     let measured = |path: &Path| fsx::allocated_size(path).saturating_sub(shared.get(path).copied().unwrap_or(0));
-    let entries: Vec<(SystemTime, PathBuf, u64)> = scanned
-        .iter()
-        .filter(|e| !doomed.contains(e.path.as_path()))
+    let sized: Vec<&ScannedEntry> = scanned.iter().filter(|e| !doomed.contains(e.path.as_path())).collect();
+    progress.phase("size store entries", Some(sized.len() as u64), "sized");
+    let entries: Vec<(SystemTime, PathBuf, u64)> = sized
+        .into_iter()
         .map(|e| {
             let bytes = match e.estimate {
                 Some(estimate) if !exact => estimate,
                 _ => measured(&e.path),
             };
+            progress.item(stats::STORE_SCOPE, bytes);
             (e.used, e.path.clone(), bytes)
         })
         .collect();
+    plan.store_bytes = entries.iter().map(|e| e.2).chain(superseded.iter().map(|s| s.1)).fold(0u64, u64::saturating_add);
     for (path, bytes) in superseded.iter().cloned() {
         plan.removals.push(Removal { class: Class::CacheEntry, path, bytes });
     }
@@ -475,21 +543,33 @@ fn plan_cache(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, exact: bool) -> Ha
     evicted
 }
 
-fn plan_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
-    plan_idle_targets(dirs, opts, plan, usize::MAX);
-    for target in stats::targets(dirs) {
-        if !target_path_safe(dirs, &target.path).unwrap_or(false) {
-            continue;
-        }
-        if plan.target_retirements.contains_key(&target.path) {
-            continue;
-        }
-        let Ok(profiles) = fs::read_dir(&target.path) else {
-            continue;
+fn plan_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, progress: &mut dyn Progress) {
+    plan_idle_targets(dirs, opts, plan, usize::MAX, progress);
+    let targets = stats::targets_with(dirs, progress);
+    for target in &targets {
+        let usage = match plan.workspaces.iter().position(|usage| usage.name == target.workspace) {
+            Some(at) => &mut plan.workspaces[at],
+            None => {
+                let root = fs::read_to_string(dirs.targets().join(&target.workspace).join("workspace")).ok().map(|root| root.trim().to_string());
+                plan.workspaces.push(WorkspaceUsage { name: target.workspace.clone(), root, ..WorkspaceUsage::default() });
+                plan.workspaces.last_mut().unwrap()
+            }
         };
-        for profile in profiles.flatten() {
-            plan_profile(&profile.path(), opts, plan);
+        usage.bytes = usage.bytes.saturating_add(target.allocated_bytes);
+    }
+    plan.workspaces.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    progress.phase("plan targets", Some(targets.len() as u64), "reclaimable");
+    for target in targets {
+        let before = plan.bytes();
+        if target_path_safe(dirs, &target.path).unwrap_or(false)
+            && !plan.target_retirements.contains_key(&target.path)
+            && let Ok(profiles) = fs::read_dir(&target.path)
+        {
+            for profile in profiles.flatten() {
+                plan_profile(&profile.path(), opts, plan);
+            }
         }
+        progress.item(&target.workspace, plan.bytes().saturating_sub(before));
     }
 }
 
@@ -538,7 +618,7 @@ fn idle_target_candidates(dirs: &Dirs, idle: Duration) -> Vec<(SystemTime, PathB
     candidates
 }
 
-fn plan_idle_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, limit: usize) {
+fn plan_idle_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, limit: usize, progress: &mut dyn Progress) {
     let mut candidates = idle_target_candidates(dirs, opts.target_max_idle);
     if limit != usize::MAX && !candidates.is_empty() {
         let offset = (fsx::unix_now() / 86_400) as usize % candidates.len();
@@ -546,12 +626,16 @@ fn plan_idle_targets(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan, limit: usiz
     }
     let attempts = limit.saturating_mul(4);
     let mut planned = 0;
+    progress.phase("check idle targets", Some(candidates.len().min(attempts) as u64), "reclaimable");
     for (_, target) in candidates.into_iter().take(attempts) {
+        let scope = stats::workspace_of(dirs, &target).unwrap_or_default();
         let Ok(Some(snapshot)) =
             retirement_snapshot(dirs, &target, opts.target_max_idle, limit != usize::MAX)
         else {
+            progress.item(&scope, 0);
             continue;
         };
+        progress.item(&scope, snapshot.bytes);
         if snapshot.bytes == 0 {
             continue;
         }
@@ -1572,10 +1656,16 @@ fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
 }
 
 pub fn execute(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
-    let (mut freed, failures) = execute_removals(dirs, plan);
-    if let Some(age) = plan.hashmemo_log_age {
-        freed += cache::hashing::compact_memo_log(&dirs.hashmemo(), age.as_secs());
-    }
+    execute_with(dirs, plan, &mut Silent)
+}
+
+/// The bytes of every `remove` and `tidy` item add up to the freed total returned.
+pub fn execute_with(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u64, Vec<(PathBuf, std::io::Error)>) {
+    let (mut freed, failures) = execute_removals(dirs, plan, progress);
+    progress.phase("tidy", Some(1), "freed");
+    let compacted = plan.hashmemo_log_age.map_or(0, |age| cache::hashing::compact_memo_log(&dirs.hashmemo(), age.as_secs()));
+    freed += compacted;
+    progress.item("hash memo log", compacted);
     cache::Cache::new(dirs).migrate_legacy_layout();
     prune_empty_shards(&dirs.hashmemo());
     prune_empty_shards(&dirs.keylocks());
@@ -1609,143 +1699,156 @@ fn remove_retired_child(path: &Path, before_delete: impl FnOnce() -> bool) -> io
     }
 }
 
-fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
+fn execute_removals(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u64, Vec<(PathBuf, std::io::Error)>) {
     let mut freed = 0;
     let mut failures = Vec::new();
     let locks = dirs.locks();
     let store = cache::Cache::new(dirs);
+    let first_pass = |removal: &Removal| removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
+        || plan.manifest_retirements.contains_key(&removal.path) || plan.keylock_retirements.contains(&removal.path);
+    let scope_of = |removal: &Removal| match stats::workspace_of(dirs, &removal.path) {
+        Some(workspace) => format!("{workspace}: {}", removal.class.label()),
+        None => removal.class.label().to_string(),
+    };
+    progress.phase("remove", Some(plan.removals.len() as u64), "freed");
     // Finish cache and metadata retirement before acquiring any profile locks.
-    for removal in &plan.removals {
-        if removal.class == Class::CacheEntry {
-            let Some(snapshot) = plan.cache_retirements.get(&removal.path) else { continue };
-            let protection = wrapper::deferred_protection(dirs);
-            if protection.protects(&removal.path) { continue; }
-            match store.try_retire_entry(snapshot) {
-                Ok(cache::EntryRetirementOutcome::Retired) => freed += removal.bytes,
-                Ok(cache::EntryRetirementOutcome::Busy | cache::EntryRetirementOutcome::Stale) => {}
+    for removal in plan.removals.iter().filter(|removal| first_pass(removal)) {
+        let before = freed;
+        'one: {
+            if removal.class == Class::CacheEntry {
+                let Some(snapshot) = plan.cache_retirements.get(&removal.path) else { break 'one };
+                let protection = wrapper::deferred_protection(dirs);
+                if protection.protects(&removal.path) { break 'one; }
+                match store.try_retire_entry(snapshot) {
+                    Ok(cache::EntryRetirementOutcome::Retired) => freed += removal.bytes,
+                    Ok(cache::EntryRetirementOutcome::Busy | cache::EntryRetirementOutcome::Stale) => {}
+                    Err(error) => failures.push((removal.path.clone(), error)),
+                }
+                break 'one;
+            }
+            if removal.path == store.unit_pack_path() {
+                if store.retire_idle_unit_records(&plan.pack_retirements, plan.pack_max_idle) > 0 { freed += removal.bytes; }
+                break 'one;
+            }
+            if plan.keylock_retirements.contains(&removal.path) {
+                match retire_key_lock(&removal.path) {
+                    Ok(true) => freed += removal.bytes,
+                    Ok(false) => {}
+                    Err(error) => failures.push((removal.path.clone(), error)),
+                }
+                break 'one;
+            }
+            let unit = plan.unit_retirements.get(&removal.path);
+            let manifest = plan.manifest_retirements.get(&removal.path);
+            if unit.is_none() && manifest.is_none() { break 'one; }
+            let Ok(Some(_guard)) = cache::UnitRecordsGuard::try_acquire(dirs) else { break 'one };
+            if unit.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path))
+                || manifest.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path)) { break 'one; }
+            match fs::remove_file(&removal.path) {
+                Ok(()) => freed += removal.bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => failures.push((removal.path.clone(), error)),
             }
-            continue;
         }
-        if removal.path == store.unit_pack_path() {
-            if store.retire_idle_unit_records(&plan.pack_retirements, plan.pack_max_idle) > 0 { freed += removal.bytes; }
-            continue;
-        }
-        if plan.keylock_retirements.contains(&removal.path) {
-            match retire_key_lock(&removal.path) {
-                Ok(true) => freed += removal.bytes,
-                Ok(false) => {}
-                Err(error) => failures.push((removal.path.clone(), error)),
-            }
-            continue;
-        }
-        let unit = plan.unit_retirements.get(&removal.path);
-        let manifest = plan.manifest_retirements.get(&removal.path);
-        if unit.is_none() && manifest.is_none() { continue; }
-        let Ok(Some(_guard)) = cache::UnitRecordsGuard::try_acquire(dirs) else { continue };
-        if unit.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path))
-            || manifest.is_some_and(|snapshot| !snapshot.still_eligible(&store, &removal.path)) { continue; }
-        match fs::remove_file(&removal.path) {
-            Ok(()) => freed += removal.bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => failures.push((removal.path.clone(), error)),
-        }
+        progress.item(&scope_of(removal), freed.saturating_sub(before));
     }
     // Cargo's locks stay held on each profile for the rest of the run, and variants are rechecked under them.
     let mut profiles: HashMap<PathBuf, Option<ProfileGuard>> = HashMap::new();
-    for removal in &plan.removals {
-        if removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
-            || plan.manifest_retirements.contains_key(&removal.path) || plan.keylock_retirements.contains(&removal.path) { continue; }
-        if removal.path.parent() == Some(dirs.deferred().as_path()) {
-            let Some(expected) = plan.deferred_retirements.get(&removal.path) else { continue };
-            match retire_deferred_with(&removal.path, expected, || deferred_file_guard(&removal.path)) {
-                Ok(true) => freed += removal.bytes,
-                Ok(false) => {},
-                Err(error) => failures.push((removal.path.clone(), error)),
+    for removal in plan.removals.iter().filter(|removal| !first_pass(removal)) {
+        let before = freed;
+        'one: {
+            if removal.path.parent() == Some(dirs.deferred().as_path()) {
+                let Some(expected) = plan.deferred_retirements.get(&removal.path) else { break 'one };
+                match retire_deferred_with(&removal.path, expected, || deferred_file_guard(&removal.path)) {
+                    Ok(true) => freed += removal.bytes,
+                    Ok(false) => {}
+                    Err(error) => failures.push((removal.path.clone(), error)),
+                }
+                break 'one;
             }
-            continue;
-        }
-        if let Some(proof) = plan.broker_retirements.get(&removal.path) {
-            if let Err(error) = store_broker::retire_stale_run(dirs, &removal.path, proof, &mut freed) {
-                failures.push((removal.path.clone(), error));
-            }
-            continue;
-        }
-        if removal.path.parent() == Some(cache::evicted_dir(dirs).as_path()) {
-            let Some(proof) = plan.retired_entries.get(&removal.path) else { continue };
-            if !proof.valid(dirs, &removal.path) { continue; }
-            match remove_retired_child(&removal.path, || proof.valid(dirs, &removal.path)) {
-                Ok(bytes) => freed += bytes,
-                Err(error) => failures.push((removal.path.clone(), error)),
-            }
-            continue;
-        }
-        let mut incremental_root = None;
-        let mut deferred_protection = None;
-        if removal.class == Class::TargetDir {
-            if let Some(snapshot) = plan.target_retirements.get(&removal.path) {
-                let mut bytes = 0;
-                let result = retire_target(dirs, &removal.path, snapshot, &mut bytes);
-                freed += bytes;
-                if let Err(error) = result {
+            if let Some(proof) = plan.broker_retirements.get(&removal.path) {
+                if let Err(error) = store_broker::retire_stale_run(dirs, &removal.path, proof, &mut freed) {
                     failures.push((removal.path.clone(), error));
                 }
+                break 'one;
             }
-            continue;
-        }
-        let profile = compact::profile_of(&removal.path);
-        if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession)
-            || removal.class == Class::Scratch && profile.is_some()
-        {
-            let Some(profile) = profile else { continue };
-            let guard = profiles
-                .entry(profile.clone())
-                .or_insert_with(|| ProfileGuard::acquire(&profile));
-            let Some(guard) = guard else {
-                failures.push((
-                    removal.path.clone(),
-                    std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "a build holds this target directory; skipped",
-                    ),
-                ));
-                continue;
+            if removal.path.parent() == Some(cache::evicted_dir(dirs).as_path()) {
+                let Some(proof) = plan.retired_entries.get(&removal.path) else { break 'one };
+                if !proof.valid(dirs, &removal.path) { break 'one; }
+                match remove_retired_child(&removal.path, || proof.valid(dirs, &removal.path)) {
+                    Ok(bytes) => freed += bytes,
+                    Err(error) => failures.push((removal.path.clone(), error)),
+                }
+                break 'one;
+            }
+            let mut incremental_root = None;
+            let mut deferred_protection = None;
+            if removal.class == Class::TargetDir {
+                if let Some(snapshot) = plan.target_retirements.get(&removal.path) {
+                    let mut bytes = 0;
+                    let result = retire_target(dirs, &removal.path, snapshot, &mut bytes);
+                    freed += bytes;
+                    if let Err(error) = result {
+                        failures.push((removal.path.clone(), error));
+                    }
+                }
+                break 'one;
+            }
+            let profile = compact::profile_of(&removal.path);
+            if matches!(removal.class, Class::StaleVariant | Class::IncrementalSession)
+                || removal.class == Class::Scratch && profile.is_some()
+            {
+                let Some(profile) = profile else { break 'one };
+                let guard = profiles
+                    .entry(profile.clone())
+                    .or_insert_with(|| ProfileGuard::acquire(&profile));
+                let Some(guard) = guard else {
+                    failures.push((
+                        removal.path.clone(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "a build holds this target directory; skipped",
+                        ),
+                    ));
+                    break 'one;
+                };
+                let protection = wrapper::deferred_protection(dirs);
+                let protected = match sys::lstat(&removal.path) {
+                    Ok(meta) if meta.is_file() => protection.protects_file(&removal.path, &meta),
+                    _ => protection.protects(&removal.path),
+                };
+                if protected { break 'one; }
+                deferred_protection = Some(protection);
+                if removal.class == Class::StaleVariant && !guard.still_superseded(&removal.path) {
+                    break 'one;
+                }
+                if removal.class == Class::IncrementalSession && !guard.incremental.contains(&removal.path) {
+                    break 'one;
+                }
+                let root = profile.join("incremental");
+                if removal.path.starts_with(&root) {
+                    incremental_root = Some(root);
+                }
+            }
+            // A build may have started using a lock directory since planning.
+            if removal.class == Class::Metadata
+                && removal.path.parent() == Some(locks.as_path())
+                && (removal.path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b"store-queue-"))
+                    || !lock_dir_stale(&removal.path, plan.lock_max_idle))
+            {
+                break 'one;
+            }
+            let result = match incremental_root {
+                Some(root) => compact::remove_incremental_payload(&root, &removal.path),
+                None => fsx::remove_any(&removal.path),
             };
-            let protection = wrapper::deferred_protection(dirs);
-            let protected = match sys::lstat(&removal.path) {
-                Ok(meta) if meta.is_file() => protection.protects_file(&removal.path, &meta),
-                _ => protection.protects(&removal.path),
-            };
-            if protected { continue; }
-            deferred_protection = Some(protection);
-            if removal.class == Class::StaleVariant && !guard.still_superseded(&removal.path) {
-                continue;
+            match result {
+                Ok(()) => freed += removal.bytes,
+                Err(err) => failures.push((removal.path.clone(), err)),
             }
-            if removal.class == Class::IncrementalSession && !guard.incremental.contains(&removal.path) {
-                continue;
-            }
-            let root = profile.join("incremental");
-            if removal.path.starts_with(&root) {
-                incremental_root = Some(root);
-            }
+            drop(deferred_protection);
         }
-        // A build may have started using a lock directory since planning.
-        if removal.class == Class::Metadata
-            && removal.path.parent() == Some(locks.as_path())
-            && (removal.path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b"store-queue-"))
-                || !lock_dir_stale(&removal.path, plan.lock_max_idle))
-        {
-            continue;
-        }
-        let result = match incremental_root {
-            Some(root) => compact::remove_incremental_payload(&root, &removal.path),
-            None => fsx::remove_any(&removal.path),
-        };
-        match result {
-            Ok(()) => freed += removal.bytes,
-            Err(err) => failures.push((removal.path.clone(), err)),
-        }
-        drop(deferred_protection);
+        progress.item(&scope_of(removal), freed.saturating_sub(before));
     }
     drop(profiles);
     if plan.trim_ledger {
@@ -1901,14 +2004,14 @@ fn drain_idle_targets(dirs: &Dirs, opts: &GcOptions) {
             });
             plan.target_retirements.insert(target.clone(), snapshot);
         }
-        let _ = execute_removals(dirs, &plan);
+        let _ = execute_removals(dirs, &plan, &mut Silent);
     }
 }
 
 fn run_maintenance(dirs: &Dirs, cfg: &Config, drain: bool) {
     let opts = GcOptions::from_config(cfg);
     let plan = plan_maintenance(dirs, &opts);
-    let _ = execute_removals(dirs, &plan);
+    let _ = execute_removals(dirs, &plan, &mut Silent);
     if drain {
         drain_idle_targets(dirs, &opts);
     }
@@ -1950,12 +2053,31 @@ fn spawn_collector(dirs: &Dirs, cfg: &Config) -> bool {
     sys::spawn_detached(&mut cmd, &[]).is_ok()
 }
 
+/// Never recursive: a build may create its target between the check and the removal, which then fails as not empty.
 fn prune_empty_workspaces(dirs: &Dirs) {
     let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return };
     for ws in workspaces.flatten() {
-        let has_target = fs::read_dir(ws.path()).map(|rd| rd.flatten().any(|e| e.path().is_dir())).unwrap_or(false);
-        if !has_target {
-            let _ = fsx::remove_any(&ws.path());
+        if !ws.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = ws.path();
+        let files = fs::read_dir(&path).and_then(|entries| {
+            entries.map(|entry| entry.and_then(|entry| Ok((entry.path(), entry.file_type()?.is_file())))).collect::<io::Result<Vec<_>>>()
+        });
+        let Ok(files) = files else { continue };
+        if !files.iter().all(|(_, file)| *file) {
+            continue;
+        }
+        let marker = path.join("workspace");
+        let recorded = fs::read(&marker).ok();
+        for (file, _) in &files {
+            let _ = fs::remove_file(file);
+        }
+        if fs::remove_dir(&path).is_err()
+            && let Some(recorded) = recorded
+            && !marker.exists()
+        {
+            let _ = fsx::write_atomic(&marker, &recorded);
         }
     }
 }
@@ -1988,6 +2110,112 @@ mod tests {
         assert_eq!(variant_of("libserde-0123456789abcdef.rmeta"), Some(("serde".into(), "0123456789abcdef".into())));
         assert_eq!(variant_of("build-script-build"), None);
         assert_eq!(variant_of("README.md"), None);
+    }
+
+    #[test]
+    fn workspace_pruning_never_removes_a_target_a_build_creates_after_the_check() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = home("prune-race");
+        let dirs = Dirs::at(&root);
+        fs::create_dir_all(dirs.targets()).unwrap();
+        let (stop, lost, built) = (AtomicBool::new(false), AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| while !stop.load(Ordering::Relaxed) { prune_empty_workspaces(&dirs); });
+            for round in 0..4000 {
+                // fcargo creates the workspace with its marker, then cargo creates and locks the profile it writes into.
+                let workspace = dirs.targets().join(format!("ws-{}", round % 8));
+                let _ = fs::create_dir_all(&workspace);
+                let _ = fs::write(workspace.join("workspace"), "/w");
+                let profile = workspace.join("tc").join("harness");
+                if fs::create_dir_all(profile.join("deps")).is_err() { continue; }
+                let Ok(lock) = File::options().read(true).write(true).create(true).truncate(false).open(profile.join(".cargo-lock")) else { continue };
+                if sys::try_lock(&lock, LockKind::Exclusive).is_err() { continue; }
+                built.fetch_add(1, Ordering::Relaxed);
+                for unit in 0..4 {
+                    if fs::write(profile.join("deps").join(format!("libu{unit}.rmeta")), b"m").is_err() {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                drop(lock);
+                let _ = fs::remove_dir_all(workspace.join("tc"));
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(built.load(Ordering::Relaxed) > 0);
+        assert_eq!(lost.load(Ordering::Relaxed), 0, "gc removed a profile while cargo held its lock");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_covers_every_phase_in_order_and_adds_up_to_the_plan_and_the_freed_total() {
+        use crate::progress::Recorder;
+        let root = home("progress-events");
+        let dirs = Dirs::at(&root);
+        for key in ["aa", "bb"] {
+            store_entry(&root, &key.repeat(20), &[("artifact", 16384)], 5000);
+        }
+        for ws in ["alpha-0000", "beta-0000"] {
+            let profile = dirs.targets().join(ws).join("tc").join("harness");
+            fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+            fs::create_dir_all(profile.join("deps")).unwrap();
+            fs::write(dirs.targets().join(ws).join("workspace"), format!("/w/{ws}")).unwrap();
+            for (days, hash) in [(8, "0123456789abcde0"), (9, "0123456789abcde1"), (10, "0123456789abcde2")] {
+                let file = profile.join("deps").join(format!("libunit-{hash}.rlib"));
+                fs::write(&file, vec![7u8; 8192]).unwrap();
+                File::options().write(true).open(&file).unwrap().set_modified(SystemTime::now() - Duration::from_secs(days * 86_400)).unwrap();
+            }
+        }
+        let mut planning = Recorder::default();
+        let planned = plan_with(&dirs, &GcOptions::new(0), &mut planning);
+        assert_eq!(planning.phases(), ["scan store", "size store entries", "check idle targets", "measure targets", "plan targets", "plan home"]);
+        for phase in planning.phases() {
+            let (totals, items) = planning.items(phase);
+            assert_eq!(totals, [Some(items.len() as u64)], "{phase} announced its real item count");
+        }
+        let measured: Vec<String> = planning.items("measure targets").1.into_iter().map(|(scope, _)| scope).collect();
+        assert_eq!(measured.len(), 2);
+        assert!(measured.contains(&"alpha-0000".to_string()) && measured.contains(&"beta-0000".to_string()), "{measured:?}");
+        assert_eq!(planning.bytes("size store entries"), planned.store_bytes);
+        let names: Vec<&str> = planned.workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        for usage in &planned.workspaces {
+            assert_eq!((usage.items, usage.root.as_deref()), (1, Some(format!("/w/{}", usage.name).as_str())), "{usage:?}");
+            assert!(usage.freed > 0 && usage.bytes >= usage.freed, "{usage:?}");
+        }
+        assert_eq!(planning.bytes("plan targets"), planned.workspaces.iter().map(|w| w.freed).sum::<u64>());
+        assert_eq!(planned.store_removals(&dirs).0, 2);
+
+        let mut executing = Recorder::default();
+        let (freed, failures) = execute_with(&dirs, &planned, &mut executing);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(executing.phases(), ["remove", "tidy"]);
+        let (totals, items) = executing.items("remove");
+        assert_eq!(totals, [Some(planned.removals.len() as u64)]);
+        assert_eq!(items.len(), planned.removals.len(), "every removal is reported exactly once");
+        assert!(items.iter().any(|(scope, _)| scope.starts_with("alpha-0000: ")) && items.iter().any(|(scope, _)| scope.starts_with("beta-0000: ")), "{items:?}");
+        assert_eq!(executing.bytes("remove") + executing.bytes("tidy"), freed);
+        assert_eq!(freed, planned.bytes(), "everything planned was free to go");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_pruning_removes_only_workspaces_without_a_target() {
+        let root = home("prune-empty");
+        let dirs = Dirs::at(&root);
+        let empty = dirs.targets().join("empty");
+        let held = dirs.targets().join("held");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(held.join("tc").join("harness").join("deps")).unwrap();
+        for ws in [&empty, &held] {
+            fs::write(ws.join("workspace"), "/w").unwrap();
+        }
+        fs::write(empty.join("leftover"), "x").unwrap();
+        prune_empty_workspaces(&dirs);
+        assert!(!empty.exists());
+        assert!(held.join("tc").join("harness").join("deps").is_dir());
+        assert_eq!(fs::read_to_string(held.join("workspace")).unwrap(), "/w");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn home(tag: &str) -> PathBuf {
@@ -2043,12 +2271,12 @@ mod tests {
         let mut selected = Plan::default();
         plan_deferred(&dirs, &mut selected);
         assert!(selected.removals.is_empty(), "an accepted job does not expire by elapsed age");
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(path.exists());
         drop(held);
         plan_deferred(&dirs, &mut selected);
         assert!(selected.deferred_retirements.contains_key(&path));
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(!path.exists(), "an unowned old record remains collectible");
         fs::remove_dir_all(root).unwrap();
     }
@@ -2066,10 +2294,10 @@ mod tests {
         plan_deferred(&dirs, &mut selected);
         assert!(selected.deferred_retirements.contains_key(&path));
         let held = shared_job(&path);
-        assert_eq!(execute_removals(&dirs, &selected).0, 0);
+        assert_eq!(execute_removals(&dirs, &selected, &mut Silent).0, 0);
         assert!(path.exists());
         drop(held);
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2087,7 +2315,7 @@ mod tests {
         plan_deferred(&dirs, &mut selected);
         assert!(selected.deferred_retirements.contains_key(&path));
         File::open(&path).unwrap().set_modified(SystemTime::now()).unwrap();
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(path.exists(), "planning does not authorize deleting a refreshed record");
         fs::remove_dir_all(root).unwrap();
     }
@@ -2188,7 +2416,7 @@ mod tests {
         let reservation = dirs.locks().join("store-queue-0");
         fs::write(&reservation, []).unwrap();
         selected.removals.push(Removal { class: Class::Metadata, path: reservation.clone(), bytes: 0 });
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(!path.exists() && !stray.exists());
         assert!(canonical.exists() && noncanonical.exists() && reservation.exists());
         drop(held);
@@ -2196,7 +2424,7 @@ mod tests {
         File::open(&path).unwrap().set_modified(SystemTime::now() - DEFERRED_MAX_AGE * 2).unwrap();
         let mut selected = Plan::default();
         plan_deferred(&dirs, &mut selected);
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(!path.exists() && !noncanonical.exists() && canonical.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2249,7 +2477,7 @@ mod tests {
             // Publishing after planning exercises the execution snapshot under native profile admission.
             let path = deferred_job(&dirs, Some(&output), Some(1), Duration::ZERO);
             let held = shared_job(&path);
-            let (_, failures) = execute_removals(&dirs, &selected);
+            let (_, failures) = execute_removals(&dirs, &selected, &mut Silent);
             assert!(failures.is_empty(), "{failures:?}");
             assert!(payloads[0].exists(), "a protected descendant or inode alias retains the profile payload");
             assert!(!payloads[1].exists(), "an unrelated profile remains reclaimable");
@@ -2257,7 +2485,7 @@ mod tests {
             drop(held);
             age_gc_tree(&target);
             let selected = plan(&dirs, &GcOptions::new(u64::MAX));
-            assert!(execute_removals(&dirs, &selected).1.is_empty());
+            assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
             assert!(!payloads[0].exists());
             fs::remove_dir_all(root).unwrap();
         }
@@ -2279,13 +2507,13 @@ mod tests {
         fs::hard_link(protected.join("artifact"), &output).unwrap();
         let path = deferred_job(&dirs, Some(&output), Some(1), Duration::ZERO);
         let held = shared_job(&path);
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(protected.exists() && !unrelated.exists());
         let selected = plan(&dirs, &GcOptions::new(0));
         assert!(cache_removals(&selected).is_empty(), "observed pending aliases also filter cache planning");
         drop(held);
         let selected = plan(&dirs, &GcOptions::new(0));
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(!protected.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2324,7 +2552,7 @@ mod tests {
         assert!(superseded_cache_retirements(&dirs, 2).is_empty());
         let selected = plan(&dirs, &GcOptions::new(u64::MAX));
         assert!(cache_removals(&selected).is_empty());
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(store.has_entry(&key));
         assert!(misplaced.exists());
         fs::remove_dir_all(root).unwrap();
@@ -2354,12 +2582,12 @@ mod tests {
         let delayed = plan(&dirs, &opts);
         assert_eq!(cache_removals(&delayed), paths[..1]);
         store.mark_used(&format!("{:040x}", 1));
-        let (_, failures) = execute_removals(&dirs, &delayed);
+        let (_, failures) = execute_removals(&dirs, &delayed, &mut Silent);
         assert!(failures.is_empty());
         assert!(paths[0].exists(), "usage after planning invalidates retirement");
         let current = plan(&dirs, &opts);
         assert_eq!(cache_removals(&current), paths[1..2]);
-        let (_, failures) = execute_removals(&dirs, &current);
+        let (_, failures) = execute_removals(&dirs, &current, &mut Silent);
         assert!(failures.is_empty());
         assert!(!paths[1].exists());
         assert_eq!(store.candidates(&prekey).into_iter().map(|row| row.key).collect::<Vec<_>>(), vec![format!("{:040x}", 3), format!("{:040x}", 1)]);
@@ -2384,7 +2612,7 @@ mod tests {
         let selected = plan(&dirs, &GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) });
         assert!(selected.manifest_retirements.contains_key(&path));
         let guard = cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap();
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(path.exists(), "validation and unlink require the same guard");
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let writer = store.clone();
@@ -2393,7 +2621,7 @@ mod tests {
         ready_rx.recv().unwrap();
         drop(guard);
         worker.join().unwrap();
-        assert!(execute_removals(&dirs, &selected).1.is_empty());
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
         assert!(path.exists());
         assert_eq!(store.candidates(&prekey).len(), 1);
         fs::remove_dir_all(root).unwrap();
@@ -2762,7 +2990,7 @@ mod tests {
         fs::write(store.unit_pack_path(), pack).unwrap();
         let plan = plan(&dirs, &GcOptions::new(u64::MAX));
         assert_eq!(plan.pack_retirements.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![dead_unit.clone()]);
-        let (_, failures) = execute_removals(&dirs, &plan);
+        let (_, failures) = execute_removals(&dirs, &plan, &mut Silent);
         assert!(failures.is_empty());
         let left: Vec<String> = store.unit_records().into_iter().map(|r| r.0).collect();
         assert!(left.contains(&live_unit) && left.contains(&young_unit) && !left.contains(&dead_unit), "{left:?}");
@@ -2803,7 +3031,7 @@ mod tests {
         let mut planned = Plan::default();
         plan_keylocks(&dirs, &opts, &mut planned);
         assert_eq!(planned.removals.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![idle.clone()]);
-        let (_, failures) = execute_removals(&dirs, &planned);
+        let (_, failures) = execute_removals(&dirs, &planned, &mut Silent);
         assert!(failures.is_empty() && !idle.exists() && busy.exists());
         fs::remove_dir_all(root).unwrap();
     }
