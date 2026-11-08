@@ -346,6 +346,21 @@ entries use their own key domain, so older versions treat them as misses.
   compiler-compatible session guards before program outputs are removed. Target/profile directories, `deps` and
   `.fingerprint` roots, and Cargo lock files remain. Fresh activity, unreadable state and unknown or user-managed layouts
   are preserved.
+* `frust gc` and `frust compact` work on the whole `FRUST_HOME`: every workspace's central targets (check
+  directories included), the store and the shared metadata. The gc plan lists each workspace with its size and what
+  would be freed in it, then the store and other state; the compaction report lists each workspace's size before, its
+  profiles (and busy ones) and what was removed, compressed and deduplicated there. `frust compact --workspace NAME|PATH`
+  limits a run to one workspace (its directory name, its project name or its project path) and leaves the shared store
+  alone. gc has no such filter, because cache entries, manifests and locks are shared by every workspace.
+* Both commands report progress on stderr, so their reports on stdout stay parseable. On a terminal one status line
+  is rewritten in place with the phase, items done of the announced total, bytes measured or freed, the workspace or
+  profile at hand, elapsed time and an ETA once the phase has a total. In a log they print a line when each phase starts
+  and at most one more every 5 seconds. `--quiet` silences progress; `--progress` forces it even with
+  `FRUST_RENDER=off`, which otherwise turns it off. gc's phases are `scan store`, `size store entries`,
+  `check idle targets`, `measure targets`, `plan targets`, `plan home`, `remove` (one item per planned removal, scoped by
+  workspace and class) and `tidy`; compaction's are `measure`, `lock profiles`, `remove superseded`, `collect files`,
+  `compress and dedupe` (one item per file; the two are interleaved by size) and `measure again`. The counts come from
+  the work itself, and automatic maintenance passes report to a no-op.
 
 ## Sharing a repo between builds
 

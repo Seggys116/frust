@@ -186,6 +186,47 @@ fn gc_refuses_without_confirmation_and_frees_with_it() {
 }
 
 #[test]
+fn gc_and_compact_cover_every_workspace_and_report_progress_on_stderr() {
+    let sb = Sandbox::new("global-progress");
+    let a = project_with_leaf(&sb, "alpha");
+    let b = project_with_leaf(&sb, "beta");
+    for p in [&a, &b] {
+        assert_success(&sb.bin("fcargo").arg("build").current_dir(p).output().unwrap());
+    }
+    let workspace = |p: &std::path::Path| sb.central_target(p).parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    let (wa, wb) = (workspace(&a), workspace(&b));
+    assert_ne!(wa, wb);
+
+    let dry = sb.bin("frust").args(["gc", "--dry-run", "--max-gib", "0", "--progress"]).output().unwrap();
+    assert_success(&dry);
+    let (out, err) = (stdout(&dry), stderr(&dry));
+    assert!(out.contains("by workspace") && out.contains(&wa) && out.contains(&wb) && out.contains("cache store"), "{out}");
+    for phase in ["scan store", "size store entries", "measure targets", "plan targets", "plan home"] {
+        assert!(err.lines().any(|l| l.starts_with(&format!("frust: gc {phase}  "))), "no {phase} line: {err}");
+    }
+    assert!(!err.contains('\r'), "a log gets whole lines, not a live status: {err:?}");
+
+    let quiet = sb.bin("frust").args(["gc", "--dry-run", "--progress", "--quiet"]).output().unwrap();
+    assert_success(&quiet);
+    assert!(!stderr(&quiet).contains("frust: gc"), "{}", stderr(&quiet));
+    let default = sb.bin("frust").args(["gc", "--dry-run"]).output().unwrap();
+    assert!(!stderr(&default).contains("frust: gc"), "FRUST_RENDER=off keeps logs quiet unless --progress: {}", stderr(&default));
+
+    let compact = sb.bin("frust").args(["compact", "--dry-run", "--progress"]).output().unwrap();
+    assert_success(&compact);
+    let (out, err) = (stdout(&compact), stderr(&compact));
+    assert!(out.contains(&wa) && out.contains(&wb), "{out}");
+    assert!(err.lines().any(|l| l.starts_with("frust: compact measure  ")) && err.lines().any(|l| l.starts_with("frust: compact lock profiles  ")), "{err}");
+
+    let scoped = sb.bin("frust").args(["compact", "--dry-run", "--workspace", &a.display().to_string()]).output().unwrap();
+    assert_success(&scoped);
+    let out = stdout(&scoped);
+    assert!(out.contains(&wa) && !out.contains(&wb) && !out.contains("cache store"), "{out}");
+    let unknown = sb.bin("frust").args(["compact", "--dry-run", "--workspace", "no-such-workspace"]).output().unwrap();
+    assert_eq!(unknown.status.code(), Some(2), "{}", stderr(&unknown));
+}
+
+#[test]
 fn ui_demo_snapshot_renders_headlessly() {
     let sb = Sandbox::new("demo");
     let out = sb.bin("frust").args(["ui-demo", "--snapshot", "--width", "70"]).output().unwrap();

@@ -230,9 +230,22 @@ pub fn allocated_size(path: &Path) -> u64 {
 
 /// `du` charges each reflinked file in full; on APFS the first extent's device offset identifies whole-file clones, so they are counted once.
 pub fn physical_size(roots: &[&Path]) -> u64 {
+    physical_sizes(roots, &mut |_, _| {}).iter().sum()
+}
+
+/// Per root, in order: a block shared with an earlier root is charged to that root only, so the parts sum to the union.
+pub fn physical_sizes(roots: &[&Path], done: &mut dyn FnMut(usize, u64)) -> Vec<u64> {
     let mut seen_extents = std::collections::HashSet::new();
     let mut seen_inodes = std::collections::HashSet::new();
-    roots.iter().map(|root| physical_walk(root, &mut seen_extents, &mut seen_inodes)).sum()
+    roots
+        .iter()
+        .enumerate()
+        .map(|(at, root)| {
+            let bytes = physical_walk(root, &mut seen_extents, &mut seen_inodes);
+            done(at, bytes);
+            bytes
+        })
+        .collect()
 }
 
 fn physical_walk(
