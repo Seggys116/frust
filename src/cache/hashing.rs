@@ -398,6 +398,8 @@ pub struct Hasher {
     on_violation: Option<ViolationSink>,
     memo: Mutex<HashMap<PathBuf, Hashed>>,
     persist_dir: Option<PathBuf>,
+    log: Mutex<memolog::View>,
+    log_cap: u64,
     immutable_roots: Vec<PathBuf>,
     stamp_trust: Option<StampTrust>,
     /// Attested records are proven by content on every use instead of being believed.
@@ -418,6 +420,8 @@ impl Hasher {
             on_violation: None,
             memo: Mutex::new(HashMap::new()),
             persist_dir,
+            log: Mutex::new(memolog::View::default()),
+            log_cap: memolog::MAX_LOG_BYTES,
             immutable_roots,
             stamp_trust: None,
             audit_attested: false,
@@ -428,6 +432,12 @@ impl Hasher {
 
     pub fn audit_attested(mut self, audit: bool) -> Hasher {
         self.audit_attested = audit;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_log_cap(mut self, cap: u64) -> Hasher {
+        self.log_cap = cap;
         self
     }
 
@@ -503,9 +513,7 @@ impl Hasher {
             if attested && self.audit_attested {
                 let fresh = self.read(path, immutable)?;
                 if fresh.hash != hash || !fresh.stable || fresh.stamp != current {
-                    if let Some(record) = self.record_path(path) {
-                        let _ = fs::remove_file(record);
-                    }
+                    self.forget(path);
                     // Only a file that still carries the recorded stamp proves the stamp lied; a changed stamp is an ordinary edit.
                     if fresh.hash != hash
                         && fresh.stable
@@ -533,30 +541,22 @@ impl Hasher {
         Ok(hashed)
     }
 
-    fn record_path(&self, path: &Path) -> Option<PathBuf> {
-        let dir = self.persist_dir.as_ref()?;
-        let key = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
-        Some(dir.join(&key[..2]).join(&key[2..34]))
+    fn log_path(&self) -> Option<PathBuf> {
+        Some(self.persist_dir.as_ref()?.join(memolog::LOG_NAME))
+    }
+
+    fn view(&self) -> MutexGuard<'_, memolog::View> {
+        self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The hash and whether the record was attested by the process that produced the file.
     fn persisted(&self, path: &Path, stamp: &Stamp) -> Option<(String, bool)> {
-        let text = fs::read_to_string(self.record_path(path)?).ok()?;
-        let mut lines = text.lines();
-        if lines.next()? != "frust-hashmemo-v2" || lines.next()? != path.to_str()? {
-            return None;
-        }
-        let fields: Vec<i128> = lines.next()?.split(' ').map(|f| f.parse().ok()).collect::<Option<_>>()?;
-        let recorded = match fields[..] {
-            [dev, ino, size, mtime_ns, ctime_ns] => {
-                Stamp { dev: dev as u64, ino: ino as u64, size: size as u64, mtime_ns, ctime_ns }
-            }
-            _ => return None,
-        };
-        let hash = lines.next()?;
-        let attested = lines.next() == Some("attested");
-        (recorded == *stamp && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| (hash.to_string(), attested))
+        let log = self.log_path()?;
+        let key = path.to_str()?;
+        let mut view = self.view();
+        view.refresh(&log);
+        let live = view.get(key)?;
+        (live.stamp == *stamp).then(|| (blake3::Hash::from_bytes(live.hash).to_hex().to_string(), live.attested))
     }
 
     fn remember(&self, path: &Path, hashed: &Hashed) {
@@ -564,17 +564,28 @@ impl Hasher {
     }
 
     fn write_record(&self, path: &Path, s: &Stamp, hash: &str, attested: bool) -> bool {
-        let (Some(record), Some(text_path)) = (self.record_path(path), path.to_str()) else {
+        let (Some(log), Some(text_path)) = (self.log_path(), path.to_str()) else {
             return false;
         };
-        let mut body = format!(
-            "frust-hashmemo-v2\n{text_path}\n{} {} {} {} {}\n{hash}\n",
-            s.dev, s.ino, s.size, s.mtime_ns, s.ctime_ns
-        );
-        if attested {
-            body.push_str("attested\n");
+        let Ok(hash) = blake3::Hash::from_hex(hash) else {
+            return false;
+        };
+        let live = memolog::Live { stamp: *s, hash: *hash.as_bytes(), attested, written_s: fsx::unix_now() };
+        match memolog::encode(text_path, Some(&live)) {
+            Some(frame) => memolog::append(&log, &frame, self.log_cap),
+            None => false,
         }
-        fsx::write_atomic(&record, body.as_bytes()).is_ok()
+    }
+
+    /// A tombstone voids the key for every reader of the log, this process included.
+    fn forget(&self, path: &Path) {
+        let (Some(log), Some(text_path)) = (self.log_path(), path.to_str()) else {
+            return;
+        };
+        self.view().remove(text_path);
+        if let Some(frame) = memolog::encode(text_path, None) {
+            memolog::append(&log, &frame, self.log_cap);
+        }
     }
 
     /// Records the hash of a file this process just produced or restored, skipping the settle rule (see "Stamp trust and audits" in the docs).
@@ -696,9 +707,266 @@ impl DirWalk<'_> {
     }
 }
 
+/// The persistent memo: one append-only log of checksummed frames per memo directory, last valid frame per key wins.
+mod memolog {
+    use std::collections::HashMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    use super::Stamp;
+    use crate::fsx;
+    use crate::sys;
+
+    /// The version lives in the name, so per-file `frust-hashmemo-v2` records are never read.
+    pub const LOG_NAME: &str = "memo-v3.log";
+    pub const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+    pub const MAX_AGE_S: u64 = 30 * 86_400;
+
+    const MAGIC: [u8; 4] = *b"fh3\n";
+    const HEADER: usize = 8;
+    const SUM: usize = 8;
+    const MAX_PATH_BYTES: usize = 4096;
+    const MIN_PAYLOAD: usize = 1 + 8 + 4;
+    const MAX_PAYLOAD: usize = MAX_PATH_BYTES + 1 + 8 + 4 + 8 * 3 + 16 * 2 + 32;
+    const KIND_PLAIN: u8 = 1;
+    const KIND_ATTESTED: u8 = 2;
+    const KIND_TOMBSTONE: u8 = 3;
+
+    #[derive(Clone, Copy)]
+    pub struct Live {
+        pub stamp: Stamp,
+        pub hash: [u8; 32],
+        pub attested: bool,
+        pub written_s: u64,
+    }
+
+    /// What this process has read of the log so far.
+    #[derive(Default)]
+    pub struct View {
+        map: HashMap<String, Live>,
+        ino: u64,
+        parsed_to: u64,
+        seen: u64,
+        loaded: bool,
+    }
+
+    impl View {
+        pub fn get(&self, key: &str) -> Option<&Live> {
+            self.map.get(key)
+        }
+
+        pub fn remove(&mut self, key: &str) {
+            self.map.remove(key);
+        }
+
+        /// A stat decides whether anything is new; only the unread tail is parsed unless the file was replaced or shrank.
+        pub fn refresh(&mut self, log: &Path) {
+            let Ok(meta) = sys::lstat(log) else {
+                *self = View::default();
+                return;
+            };
+            if self.loaded && meta.ino() == self.ino && meta.len() == self.seen {
+                return;
+            }
+            if !self.loaded || meta.ino() != self.ino || meta.len() < self.parsed_to {
+                *self = View::default();
+            }
+            let start = self.parsed_to;
+            let mut buf = Vec::new();
+            let read = fs::File::open(log).and_then(|mut file| {
+                file.seek(SeekFrom::Start(start))?;
+                file.read_to_end(&mut buf)
+            });
+            if read.is_err() {
+                return;
+            }
+            let consumed = scan(&buf, |_, _, frame| match frame {
+                Frame::Record(key, live) => {
+                    self.map.insert(key, live);
+                }
+                Frame::Tombstone(key) => {
+                    self.map.remove(&key);
+                }
+            });
+            self.parsed_to = start + consumed as u64;
+            self.seen = start + buf.len() as u64;
+            self.ino = meta.ino();
+            self.loaded = true;
+        }
+    }
+
+    enum Frame {
+        Record(String, Live),
+        Tombstone(String),
+    }
+
+    /// `None` for a record means a tombstone; a path too long to be bounded is not framed.
+    pub fn encode(path: &str, live: Option<&Live>) -> Option<Vec<u8>> {
+        if path.len() > MAX_PATH_BYTES {
+            return None;
+        }
+        let kind = match live {
+            None => KIND_TOMBSTONE,
+            Some(l) if l.attested => KIND_ATTESTED,
+            Some(_) => KIND_PLAIN,
+        };
+        let mut payload = Vec::with_capacity(MAX_PAYLOAD.min(path.len() + 120));
+        payload.push(kind);
+        payload.extend_from_slice(&live.map_or_else(fsx::unix_now, |l| l.written_s).to_le_bytes());
+        payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        payload.extend_from_slice(path.as_bytes());
+        if let Some(l) = live {
+            for field in [l.stamp.dev, l.stamp.ino, l.stamp.size] {
+                payload.extend_from_slice(&field.to_le_bytes());
+            }
+            payload.extend_from_slice(&l.stamp.mtime_ns.to_le_bytes());
+            payload.extend_from_slice(&l.stamp.ctime_ns.to_le_bytes());
+            payload.extend_from_slice(&l.hash);
+        }
+        let mut frame = Vec::with_capacity(HEADER + payload.len() + SUM);
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let sum = blake3::hash(&frame[4..]);
+        frame.extend_from_slice(&sum.as_bytes()[..SUM]);
+        Some(frame)
+    }
+
+    fn decode(payload: &[u8]) -> Option<Frame> {
+        let kind = *payload.first()?;
+        let written_s = u64::from_le_bytes(payload.get(1..9)?.try_into().ok()?);
+        let path_len = u32::from_le_bytes(payload.get(9..13)?.try_into().ok()?) as usize;
+        let key = std::str::from_utf8(payload.get(13..13usize.checked_add(path_len)?)?).ok()?.to_string();
+        let rest = &payload[13 + path_len..];
+        if kind == KIND_TOMBSTONE {
+            return rest.is_empty().then_some(Frame::Tombstone(key));
+        }
+        if !matches!(kind, KIND_PLAIN | KIND_ATTESTED) || rest.len() != 24 + 32 + 32 {
+            return None;
+        }
+        let word = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
+        let wide = |at: usize| i128::from_le_bytes(rest[at..at + 16].try_into().unwrap());
+        let stamp = Stamp { dev: word(0), ino: word(8), size: word(16), mtime_ns: wide(24), ctime_ns: wide(40) };
+        let hash: [u8; 32] = rest[56..88].try_into().unwrap();
+        Some(Frame::Record(key, Live { stamp, hash, attested: kind == KIND_ATTESTED, written_s }))
+    }
+
+    /// Visits each valid frame and returns the bytes dealt with; a frame running past the end may still be arriving, so it is left.
+    fn scan(buf: &[u8], mut visit: impl FnMut(usize, usize, Frame)) -> usize {
+        let mut at = 0;
+        while at < buf.len() {
+            let Some(rel) = buf[at..].windows(MAGIC.len()).position(|w| w == MAGIC) else {
+                return buf.len().saturating_sub(MAGIC.len() - 1).max(at);
+            };
+            at += rel;
+            let Some(len_bytes) = buf.get(at + 4..at + HEADER) else {
+                return at;
+            };
+            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            if !(MIN_PAYLOAD..=MAX_PAYLOAD).contains(&len) {
+                at += 1;
+                continue;
+            }
+            let end = at + HEADER + len + SUM;
+            if end > buf.len() {
+                return at;
+            }
+            let sum = blake3::hash(&buf[at + 4..end - SUM]);
+            match decode(&buf[at + HEADER..end - SUM]) {
+                Some(frame) if sum.as_bytes()[..SUM] == buf[end - SUM..end] => {
+                    visit(at, end, frame);
+                    at = end;
+                }
+                _ => at += 1,
+            }
+        }
+        at
+    }
+
+    /// One write call on an append handle keeps frames whole across processes; a log past `cap` is compacted afterwards.
+    pub fn append(log: &Path, frame: &[u8], cap: u64) -> bool {
+        let open = || OpenOptions::new().create(true).append(true).open(log);
+        let file = match open() {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => match log.parent() {
+                Some(parent) => fs::create_dir_all(parent).and_then(|()| open()),
+                None => Err(err),
+            },
+            other => other,
+        };
+        let Ok(mut file) = file else { return false };
+        if file.write_all(frame).is_err() {
+            return false;
+        }
+        if file.metadata().is_ok_and(|m| m.len() > cap) {
+            let _ = compact(log, MAX_AGE_S, cap);
+        }
+        true
+    }
+
+    /// Keeps live, unexpired frames (oldest dropped first past `cap`) and returns the sizes before and after; skipped if the log grew meanwhile.
+    pub fn compact(log: &Path, max_age_s: u64, cap: u64) -> io::Result<(u64, u64)> {
+        let bytes = match fs::read(log) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(err) => return Err(err),
+        };
+        let now = fsx::unix_now();
+        let mut frames: Vec<(usize, usize, String, Option<Live>)> = Vec::new();
+        scan(&bytes, |start, end, frame| match frame {
+            Frame::Record(key, live) => frames.push((start, end, key, Some(live))),
+            Frame::Tombstone(key) => frames.push((start, end, key, None)),
+        });
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (index, (_, _, key, _)) in frames.iter().enumerate() {
+            last.insert(key, index);
+        }
+        let mut kept: Vec<(usize, usize)> = frames
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, _, key, live))| {
+                last[key.as_str()] == *index && live.is_some_and(|l| l.written_s > now || now - l.written_s <= max_age_s)
+            })
+            .map(|(_, (start, end, _, _))| (*start, *end))
+            .collect();
+        let mut total: u64 = kept.iter().map(|(s, e)| (e - s) as u64).sum();
+        if total > cap {
+            let target = cap / 4 * 3;
+            let mut drop = 0;
+            while total > target && drop < kept.len() {
+                total -= (kept[drop].1 - kept[drop].0) as u64;
+                drop += 1;
+            }
+            kept.drain(..drop);
+        }
+        let before = bytes.len() as u64;
+        if total >= before || fs::metadata(log).map(|m| m.len())? != before {
+            return Ok((before, before));
+        }
+        if kept.is_empty() {
+            fs::remove_file(log)?;
+            return Ok((before, 0));
+        }
+        let mut out = Vec::with_capacity(total as usize);
+        for (start, end) in kept {
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        fsx::write_atomic(log, &out)?;
+        Ok((before, total))
+    }
+}
+
+pub use memolog::LOG_NAME;
+
+/// Compacts the memo log in `dir`; returns the bytes it no longer occupies.
+pub fn compact_memo_log(dir: &Path, max_age_s: u64) -> u64 {
+    memolog::compact(&dir.join(memolog::LOG_NAME), max_age_s, memolog::MAX_LOG_BYTES).map_or(0, |(before, after)| before - after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("frust-hashing-{tag}-{}", std::process::id()));
@@ -1458,6 +1726,242 @@ mod tests {
         let later = dependent(&memo);
         assert_eq!(later.hash(&file, true).unwrap().hash, plain(&bytes));
         assert_eq!(later.tally().0, ATTESTED_LEN as u64, "the false record was discarded");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn stamp_n(n: u64) -> Stamp {
+        Stamp { dev: 1, ino: n, size: 64 * 1024 + n, mtime_ns: 1_000 + n as i128, ctime_ns: 2_000 + n as i128 }
+    }
+
+    fn live_n(n: u64, attested: bool, written_s: u64) -> memolog::Live {
+        memolog::Live { stamp: stamp_n(n), hash: *blake3::hash(&n.to_le_bytes()).as_bytes(), attested, written_s }
+    }
+
+    fn put(log: &Path, key: &str, live: Option<&memolog::Live>) {
+        assert!(memolog::append(log, &memolog::encode(key, live).unwrap(), u64::MAX));
+    }
+
+    fn loaded(log: &Path) -> memolog::View {
+        let mut view = memolog::View::default();
+        view.refresh(log);
+        view
+    }
+
+    #[test]
+    fn log_records_round_trip_with_stamp_hash_and_attestation() {
+        let dir = scratch("log-round");
+        let log = dir.join(memolog::LOG_NAME);
+        let (a, b) = (live_n(1, false, 5), live_n(2, true, 6));
+        put(&log, "/w/a.rlib", Some(&a));
+        put(&log, "/w/b.rlib", Some(&b));
+        let view = loaded(&log);
+        let got = view.get("/w/a.rlib").unwrap();
+        assert_eq!((got.stamp, got.hash, got.attested, got.written_s), (a.stamp, a.hash, false, 5));
+        let got = view.get("/w/b.rlib").unwrap();
+        assert_eq!((got.stamp, got.hash, got.attested), (b.stamp, b.hash, true));
+        assert!(view.get("/w/c.rlib").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_valid_record_for_a_key_wins() {
+        let dir = scratch("log-last");
+        let log = dir.join(memolog::LOG_NAME);
+        put(&log, "/w/a", Some(&live_n(1, false, 1)));
+        put(&log, "/w/a", Some(&live_n(2, true, 2)));
+        let view = loaded(&log);
+        assert_eq!(view.get("/w/a").unwrap().stamp, stamp_n(2));
+        assert!(view.get("/w/a").unwrap().attested);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tombstone_voids_a_key_until_it_is_recorded_again() {
+        let dir = scratch("log-tomb");
+        let log = dir.join(memolog::LOG_NAME);
+        put(&log, "/w/a", Some(&live_n(1, true, 1)));
+        put(&log, "/w/b", Some(&live_n(2, false, 1)));
+        put(&log, "/w/a", None);
+        let view = loaded(&log);
+        assert!(view.get("/w/a").is_none() && view.get("/w/b").is_some());
+        put(&log, "/w/a", Some(&live_n(3, false, 2)));
+        assert_eq!(loaded(&log).get("/w/a").unwrap().stamp, stamp_n(3));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_tail_is_a_miss_and_later_frames_are_still_read() {
+        let dir = scratch("log-torn");
+        let log = dir.join(memolog::LOG_NAME);
+        put(&log, "/w/a", Some(&live_n(1, false, 1)));
+        let torn = memolog::encode("/w/b", Some(&live_n(2, false, 1))).unwrap();
+        for cut in [1, 3, 6, 9, torn.len() - 1] {
+            let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            file.write_all(&torn[..cut]).unwrap();
+            let view = loaded(&log);
+            assert!(view.get("/w/a").is_some() && view.get("/w/b").is_none(), "cut {cut}");
+            let len = fs::metadata(&log).unwrap().len();
+            File::options().write(true).open(&log).unwrap().set_len(len - cut as u64).unwrap();
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(&torn[..torn.len() - 1]).unwrap();
+        put(&log, "/w/c", Some(&live_n(3, false, 1)));
+        let view = loaded(&log);
+        assert!(view.get("/w/a").is_some() && view.get("/w/b").is_none() && view.get("/w/c").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_middle_frame_is_skipped_and_the_rest_survive() {
+        let dir = scratch("log-corrupt");
+        let log = dir.join(memolog::LOG_NAME);
+        put(&log, "/w/a", Some(&live_n(1, false, 1)));
+        let first = fs::metadata(&log).unwrap().len() as usize;
+        put(&log, "/w/b", Some(&live_n(2, false, 1)));
+        let second = fs::metadata(&log).unwrap().len() as usize;
+        put(&log, "/w/c", Some(&live_n(3, false, 1)));
+        for at in [first + 2, first + 6, first + 20, (first + second) / 2, second - 3] {
+            let original = fs::read(&log).unwrap();
+            let mut bytes = original.clone();
+            bytes[at] ^= 0x55;
+            fs::write(&log, &bytes).unwrap();
+            let view = loaded(&log);
+            assert!(view.get("/w/b").is_none(), "flip at {at}");
+            assert!(view.get("/w/a").is_some() && view.get("/w/c").is_some(), "flip at {at}");
+            fs::write(&log, &original).unwrap();
+        }
+        fs::write(&log, b"not a log at all \xff\x00 fh3\n\xff\xff\xff\xff").unwrap();
+        assert!(loaded(&log).get("/w/a").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_view_sees_frames_a_peer_appends_after_it_loaded() {
+        let dir = scratch("log-peer");
+        let log = dir.join(memolog::LOG_NAME);
+        put(&log, "/w/a", Some(&live_n(1, false, 1)));
+        let mut view = loaded(&log);
+        assert!(view.get("/w/b").is_none());
+        put(&log, "/w/b", Some(&live_n(2, false, 1)));
+        view.refresh(&log);
+        assert!(view.get("/w/a").is_some() && view.get("/w/b").is_some());
+        let _ = memolog::compact(&log, 0, u64::MAX);
+        view.refresh(&log);
+        assert!(view.get("/w/b").is_none(), "a replaced log is read afresh");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_threads_appending_lose_no_frame() {
+        let dir = scratch("log-threads");
+        let log = dir.join(memolog::LOG_NAME);
+        let workers: Vec<_> = (0..2u64)
+            .map(|t| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for n in 0..300u64 {
+                        put(&log, &format!("/w/{t}/{n}/{}", "x".repeat(200)), Some(&live_n(n, false, 1)));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let view = loaded(&log);
+        for t in 0..2u64 {
+            for n in 0..300u64 {
+                assert_eq!(view.get(&format!("/w/{t}/{n}/{}", "x".repeat(200))).unwrap().stamp, stamp_n(n));
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_keeps_live_records_and_drops_superseded_tombstoned_and_expired_ones() {
+        let dir = scratch("log-compact");
+        let log = dir.join(memolog::LOG_NAME);
+        let now = fsx::unix_now();
+        put(&log, "/w/a", Some(&live_n(1, false, now)));
+        put(&log, "/w/a", Some(&live_n(2, true, now)));
+        put(&log, "/w/dead", Some(&live_n(3, false, now)));
+        put(&log, "/w/dead", None);
+        put(&log, "/w/old", Some(&live_n(4, false, now - 1_000)));
+        put(&log, "/w/b", Some(&live_n(5, false, now)));
+        let before = fs::metadata(&log).unwrap().len();
+        let (was, is) = memolog::compact(&log, 500, u64::MAX).unwrap();
+        assert_eq!(was, before);
+        assert_eq!(is, fs::metadata(&log).unwrap().len());
+        assert!(is < was);
+        let view = loaded(&log);
+        assert_eq!(view.get("/w/a").unwrap().stamp, stamp_n(2));
+        assert!(view.get("/w/b").is_some());
+        assert!(view.get("/w/dead").is_none() && view.get("/w/old").is_none());
+        let unchanged = memolog::compact(&log, 500, u64::MAX).unwrap();
+        assert_eq!(unchanged, (is, is), "nothing left to drop leaves the file alone");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temp file is left behind");
+        assert_eq!(compact_memo_log(&dir, 0), 0, "records written this second are not yet expired");
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert_eq!(compact_memo_log(&dir, 1), is, "once every record is older than the limit the file goes");
+        assert!(!log.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_log_stays_bounded_and_keeps_the_newest_records() {
+        let dir = scratch("log-bound");
+        let memo = dir.join("memo");
+        let cap = 16 * 1024;
+        let hasher = Hasher::new(Some(memo.clone()), Vec::new()).with_log_cap(cap);
+        let hash = plain(b"x");
+        for n in 0..600u64 {
+            assert!(hasher.write_record(&dir.join(format!("f{n}")), &stamp_n(n), &hash, false));
+            assert!(fs::metadata(memo.join(memolog::LOG_NAME)).unwrap().len() <= cap, "after record {n}");
+        }
+        let view = loaded(&memo.join(memolog::LOG_NAME));
+        assert!(view.get(dir.join("f599").to_str().unwrap()).is_some());
+        assert!(view.get(dir.join("f0").to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_hundred_records_occupy_one_file_of_frame_size() {
+        let dir = scratch("log-footprint");
+        let memo = dir.join("memo");
+        let hasher = Hasher::new(Some(memo.clone()), Vec::new());
+        let hash = plain(b"x");
+        let mut expected = 0;
+        for n in 0..300u64 {
+            let file = dir.join(format!("target/debug/deps/libcrate{n}-0123456789abcdef.rlib"));
+            assert!(hasher.write_record(&file, &stamp_n(n), &hash, n % 2 == 0));
+            expected += memolog::encode(file.to_str().unwrap(), Some(&live_n(n, false, 0))).unwrap().len() as u64;
+        }
+        let entries: Vec<_> = fs::read_dir(&memo).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].metadata().unwrap().len(), expected);
+        eprintln!("300 records: 1 file, {expected} bytes ({} per record)", expected / 300);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_per_file_records_are_never_trusted() {
+        let dir = scratch("log-legacy");
+        let file = dir.join("big.rlib");
+        let memo = dir.join("memo");
+        fs::write(&file, vec![1u8; 64 * 1024]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let stamp = Stamp::read(&file).unwrap();
+        let key = blake3::hash(file.as_os_str().as_encoded_bytes()).to_hex();
+        let legacy = memo.join(&key[..2]).join(&key[2..34]);
+        let body = format!(
+            "frust-hashmemo-v2\n{}\n{} {} {} {} {}\n{}\nattested\n",
+            file.to_str().unwrap(), stamp.dev, stamp.ino, stamp.size, stamp.mtime_ns, stamp.ctime_ns, plain(b"forged")
+        );
+        fsx::write_atomic(&legacy, body.as_bytes()).unwrap();
+        let hasher = Hasher::new(Some(memo.clone()), Vec::new());
+        assert_eq!(hasher.hash(&file, true).unwrap().hash, plain(&[1u8; 64 * 1024]));
+        assert!(legacy.exists(), "the reader leaves legacy files for gc");
+        assert!(memo.join(memolog::LOG_NAME).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -86,13 +86,10 @@ exec rustc "$@"
     let before = artifacts(&target.join("debug/deps"));
     assert_eq!(before.len(), 2);
     let mut found = false;
-    for shard in fs::read_dir(sb.home().join("store"))
-        .unwrap()
-        .map(Result::unwrap)
     {
-        for entry in fs::read_dir(shard.path()).unwrap().map(Result::unwrap) {
+        for entry in frust::cache::keyed_items(&sb.home().join("store")) {
             let meta: EntryMeta =
-                serde_json::from_slice(&fs::read(entry.path().join("meta.json")).unwrap()).unwrap();
+                serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
             if meta.crate_name != "slice_fixture" {
                 continue;
             }
@@ -117,9 +114,9 @@ exec rustc "$@"
                 2
             );
             assert_eq!(
-                fs::read_dir(entry.path()).unwrap().count(),
-                meta.files.len() + 1,
-                "only normal artifacts, stderr and metadata are stored"
+                fs::read_dir(&entry).unwrap().count(),
+                meta.files.iter().filter(|f| f.inline.is_none()).map(|f| &f.stored).collect::<std::collections::HashSet<_>>().len() + 1,
+                "only normal artifacts and metadata are stored; dep-info and diagnostics live in the record"
             );
             found = true;
         }

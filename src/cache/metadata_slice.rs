@@ -1308,6 +1308,7 @@ mod tests {
             metadata_slice: None,
             dir: false,
             mode: None,
+            inline: None,
         }
     }
 

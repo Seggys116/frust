@@ -137,15 +137,11 @@ pub struct EntryRef {
 
 pub fn entry_dirs(dirs: &Dirs) -> Vec<EntryRef> {
     let mut out = Vec::new();
-    let Ok(shards) = fs::read_dir(dirs.store()) else { return out };
-    for shard in shards.flatten() {
-        let Ok(entries) = fs::read_dir(shard.path()) else { continue };
-        for entry in entries.flatten() {
-            let used = fs::metadata(entry.path().join("meta.json"))
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            out.push(EntryRef { path: entry.path(), used });
-        }
+    for path in crate::cache::keyed_items(&dirs.store()) {
+        let used = fs::metadata(path.join("meta.json"))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push(EntryRef { path, used });
     }
     out
 }

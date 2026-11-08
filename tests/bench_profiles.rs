@@ -120,22 +120,20 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
     let expected = frust::cache::hash_file(&source).unwrap();
     let mut latest_cached = false;
     let mut lib0_records = std::collections::HashSet::new();
-    for shard in fs::read_dir(home.join("manifests")).unwrap() {
-        for manifest in fs::read_dir(shard.unwrap().path()).unwrap() {
-            let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest.unwrap().path()).unwrap()).unwrap();
-            for candidate in value["candidates"].as_array().unwrap() {
-                let key = candidate["key"].as_str().unwrap();
-                let entry = home.join("store").join(&key[..2]).join(key);
-                let Ok(bytes) = fs::read(entry.join("meta.json")) else { continue };
-                let meta: frust::cache::EntryMeta = serde_json::from_slice(&bytes).unwrap();
-                if meta.crate_name != "lib0" { continue; }
-                lib0_records.insert(key.to_string());
-                if candidate["inputs"].as_array().unwrap().iter().any(|input| input["path"] == "libs/lib0/src/lib.rs" && input["hash"] == expected) {
-                    for group in frust::cache::metadata_slice::validate_groups(&meta.files).unwrap() {
-                        frust::cache::metadata_slice::verify_group(&entry, &meta.files, &group).unwrap();
-                    }
-                    latest_cached = true;
+    for manifest in frust::cache::keyed_items(&home.join("manifests")) {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        for candidate in value["candidates"].as_array().unwrap() {
+            let key = candidate["key"].as_str().unwrap();
+            let entry = home.join("store").join(key);
+            let Ok(bytes) = fs::read(entry.join("meta.json")) else { continue };
+            let meta: frust::cache::EntryMeta = serde_json::from_slice(&bytes).unwrap();
+            if meta.crate_name != "lib0" { continue; }
+            lib0_records.insert(key.to_string());
+            if candidate["inputs"].as_array().unwrap().iter().any(|input| input["path"] == "libs/lib0/src/lib.rs" && input["hash"] == expected) {
+                for group in frust::cache::metadata_slice::validate_groups(&meta.files).unwrap() {
+                    frust::cache::metadata_slice::verify_group(&entry, &meta.files, &group).unwrap();
                 }
+                latest_cached = true;
             }
         }
     }
@@ -147,7 +145,7 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
     let retired: Vec<_> = observed.iter().filter(|key| !lib0_records.contains(**key)).collect();
     assert!(retired.len() >= 2, "named versions observed during prior builds must no longer be live");
     for key in retired {
-        assert!(!home.join("store").join(&key[..2]).join(key).exists(), "retired observed key {key} still has payload");
+        assert!(!home.join("store").join(key).exists(), "retired observed key {key} still has payload");
     }
 }
 
@@ -155,34 +153,27 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
 fn assert_retained_growth_snapshot(home: &std::path::Path, evidence: &serde_json::Value, auto: bool) {
     let mut complete = std::collections::HashSet::new();
     let mut incremental_units = std::collections::HashMap::<String, usize>::new();
-    for shard in fs::read_dir(home.join("store")).unwrap() {
-        for entry in fs::read_dir(shard.unwrap().path()).unwrap() {
-            let entry = entry.unwrap().path();
-            let metadata: frust::cache::EntryMeta = serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
-            assert!(entry.join(&metadata.stderr).is_file());
-            for group in frust::cache::metadata_slice::validate_groups(&metadata.files).unwrap() {
-                let backing = &metadata.files[group.base_index];
-                let path = entry.join(&backing.stored);
-                assert!(if backing.dir { path.is_dir() } else { path.is_file() });
-            }
-            if let Some(unit) = metadata.incremental_unit { *incremental_units.entry(unit).or_default() += 1; }
-            complete.insert(entry.file_name().unwrap().to_str().unwrap().to_owned());
+    for entry in frust::cache::keyed_items(&home.join("store")) {
+        let metadata: frust::cache::EntryMeta = serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+        assert!(metadata.stderr_present(&entry));
+        for group in frust::cache::metadata_slice::validate_groups(&metadata.files).unwrap() {
+            let backing = &metadata.files[group.base_index];
+            let path = entry.join(&backing.stored);
+            assert!(backing.inline.is_some() || if backing.dir { path.is_dir() } else { path.is_file() });
         }
+        if let Some(unit) = metadata.incremental_unit { *incremental_units.entry(unit).or_default() += 1; }
+        complete.insert(entry.file_name().unwrap().to_str().unwrap().to_owned());
     }
     let mut unit_records = 0;
     let mut unit_keys = 0;
     let mut missing = 0;
     let mut maximum = 0;
-    for shard in fs::read_dir(home.join(frust::cache::UNITS_DIR)).unwrap() {
-        for record in fs::read_dir(shard.unwrap().path()).unwrap() {
-            let text = fs::read_to_string(record.unwrap().path()).unwrap();
-            let keys: Vec<_> = text.lines().collect();
-            assert!(keys.iter().all(|key| frust::cache::valid_key(key)));
-            unit_records += 1;
-            unit_keys += keys.len();
-            missing += keys.iter().filter(|key| !complete.contains(**key)).count();
-            maximum = maximum.max(keys.len());
-        }
+    for (_, _, keys) in frust::cache::Cache::new(&frust::paths::Dirs::at(home)).unit_records() {
+        assert!(keys.iter().all(|key| frust::cache::valid_key(key)));
+        unit_records += 1;
+        unit_keys += keys.len();
+        missing += keys.iter().filter(|key| !complete.contains(key.as_str())).count();
+        maximum = maximum.max(keys.len());
     }
     let dirs = frust::paths::Dirs::at(home);
     let retired = match fs::read_dir(frust::cache::evicted_dir(&dirs)) {

@@ -45,15 +45,12 @@ fn app_output(sb: &Sandbox, project: &Path) -> String {
 
 fn entries(sb: &Sandbox, krate: &str) -> Vec<(PathBuf, EntryMeta)> {
     let mut found = Vec::new();
-    let Ok(shards) = fs::read_dir(sb.home().join("store")) else { return found };
-    for shard in shards.flatten() {
-        for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-            let Ok(bytes) = fs::read(entry.path().join("meta.json")) else { continue };
-            if let Ok(meta) = serde_json::from_slice::<EntryMeta>(&bytes)
-                && meta.crate_name == krate
-            {
-                found.push((entry.path(), meta));
-            }
+    for entry in frust::cache::keyed_items(&sb.home().join("store")) {
+        let Ok(bytes) = fs::read(entry.join("meta.json")) else { continue };
+        if let Ok(meta) = serde_json::from_slice::<EntryMeta>(&bytes)
+            && meta.crate_name == krate
+        {
+            found.push((entry, meta));
         }
     }
     found
@@ -61,12 +58,9 @@ fn entries(sb: &Sandbox, krate: &str) -> Vec<(PathBuf, EntryMeta)> {
 
 fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let Ok(shards) = fs::read_dir(sb.home().join("manifests")) else { return found };
-    for shard in shards.flatten() {
-        for file in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-            if file.path().extension().is_some_and(|e| e == "json") {
-                found.push(file.path());
-            }
+    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
+        if file.extension().is_some_and(|e| e == "json") {
+            found.push(file);
         }
     }
     found
@@ -244,9 +238,9 @@ fn a_linked_store_shares_the_target_inode_instead_of_keeping_a_second_copy() {
     assert_eq!(ino(&dir.join(&rlib.stored)), ino(&target_file), "the store file is a second name of the output");
     assert_eq!(rlib.content_hash.clone().unwrap(), frust::cache::hash_file(&target_file).unwrap());
     let dep_info = meta.files.iter().find(|file| file.text).unwrap();
-    assert!(dep_info.mode.is_none() && dir.join(&dep_info.stored).is_file(), "dep-info stays a small raw file");
+    assert!(dep_info.mode.is_none() && dep_info.inline.is_some(), "dep-info stays small text inside the entry record");
     let formats = manifest_formats(&sb);
-    assert!(formats.contains(&6) && formats.iter().all(|f| matches!(f, 5 | 6)), "{formats:?}");
+    assert!(formats.contains(&8) && formats.iter().all(|f| matches!(f, 7 | 8)), "{formats:?}");
 }
 
 #[test]
@@ -364,9 +358,9 @@ fn off_keeps_ordinary_payloads_and_older_manifests_and_entries_still_restore() {
     let (dir, meta) = leaf_entry(&sb);
     for file in &meta.files {
         assert!(file.mode.is_none() && file.encoding != Encoding::Linked, "{file:?}");
-        assert!(dir.join(&file.stored).exists(), "{} keeps its payload", file.name);
+        assert!(file.inline.is_some() || dir.join(&file.stored).exists(), "{} keeps its payload", file.name);
     }
-    assert_eq!(manifest_formats(&sb).iter().filter(|f| **f == 6).count(), 0);
+    assert_eq!(manifest_formats(&sb).iter().filter(|f| **f == 8).count(), 0);
     for path in manifests(&sb) {
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["format"] = serde_json::json!(4);

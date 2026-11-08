@@ -88,6 +88,8 @@ const ORPHAN_AGE: Duration = Duration::from_secs(30);
 const JOB_LEASE_ENV: &str = "FRUST_DEFERRED_JOB_LEASE";
 
 // A lock held by a process that is working finishes within seconds, so the poll starts fast and settles at 40 ms.
+// Re-acquisitions after gc retires a lock file under a waiter; the compile proceeds unlocked past this.
+const KEY_LOCK_ATTEMPTS: usize = 4;
 const KEY_POLL_START: Duration = Duration::from_millis(5);
 const KEY_POLL_MAX: Duration = Duration::from_millis(40);
 
@@ -135,7 +137,13 @@ pub fn run(args: Vec<OsString>) -> i32 {
         ));
         return code;
     }
+    timings::passthrough(started);
     passthrough(&args)
+}
+
+/// The last component of a path, which is all a timing record needs to name a file.
+fn file_label(path: &Path) -> String {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
 
 fn passthrough(args: &[OsString]) -> i32 {
@@ -191,6 +199,8 @@ struct Plan {
     shared: Option<Shared>,
     /// Set once the compile showed that its outputs carry no checkout path, so the entry goes under the shared key.
     use_shared: AtomicBool,
+    /// Where store outcomes are reported for `FRUST_TIMINGS`, including from a helper or broker.
+    store_sink: Option<PathBuf>,
 }
 
 struct Shared {
@@ -353,6 +363,7 @@ impl Plan {
             primary,
             shared,
             use_shared: AtomicBool::new(false),
+            store_sink: timings::configured().map(Path::to_path_buf),
         })
     }
 
@@ -435,6 +446,7 @@ impl Plan {
             primary: false,
             shared,
             use_shared: AtomicBool::new(shared_job),
+            store_sink: job.timings.clone().filter(|path| path.is_absolute()),
         })
     }
 
@@ -491,9 +503,25 @@ impl Plan {
     }
 
     /// Returns the key lock and wait state; lock failures allow compilation, while unsettled slot loans fail the build.
+    /// A lock whose file gc retired while this process waited is dropped and taken again on the replacement, so two holders never share one key.
     fn lock_key(&self) -> io::Result<(Option<File>, bool)> {
         let path = keylock_path(&self.dirs, &self.prekey);
-        let file = match open_key_lock(&self.dirs, &path) {
+        let mut waited = false;
+        for _ in 0..KEY_LOCK_ATTEMPTS {
+            let (file, waited_once) = self.lock_key_once(&path)?;
+            waited |= waited_once;
+            match file {
+                Some(file) if !key_lock_current(&file, &path) => {
+                    self.debug(&format!("key lock for {} was retired, retrying", self.parsed.crate_name));
+                }
+                other => return Ok((other, waited)),
+            }
+        }
+        Ok((None, waited))
+    }
+
+    fn lock_key_once(&self, path: &Path) -> io::Result<(Option<File>, bool)> {
+        let file = match open_key_lock(&self.dirs, path) {
             Ok(file) => file,
             Err(err) => {
                 self.debug(&format!(
@@ -525,7 +553,7 @@ impl Plan {
                         Some(watcher) => wait_key_lock_hints(file, cap, |pause| watcher.wait(pause)),
                         None => wait_key_lock(file, cap),
                     },
-                    || open_key_lock(&self.dirs, &path),
+                    || open_key_lock(&self.dirs, path),
                 );
                 let waited_ms = (begun.elapsed().as_millis() as u64).max(1);
                 self.waited_ms.store(waited_ms, Ordering::Relaxed);
@@ -595,18 +623,31 @@ impl Plan {
     }
 
     fn try_hit_under(&self, started: Instant, prekey: &str, unit: Option<&str>, root: Option<&Root>) -> bool {
-        for candidate in self.cache.candidates(prekey) {
+        let candidates = self.cache.candidates(prekey);
+        if candidates.is_empty() {
+            self.note_miss("no-candidate".to_string());
+        }
+        for candidate in candidates {
             // A row whose entry was evicted is skipped before any of its inputs is read.
-            if !self.cache.has_entry(&candidate.key) || !self.candidate_matches(&candidate, root) {
+            if !self.cache.has_entry(&candidate.key) {
+                self.note_miss("entry-gone".to_string());
+                continue;
+            }
+            if !self.candidate_matches(&candidate, root) {
                 continue;
             }
             let Some((dir, meta)) = self.cache.load_entry(&candidate.key) else {
+                self.note_miss("entry-unreadable".to_string());
                 continue;
             };
             let restore_started = Instant::now();
             match self.restore(&dir, &meta) {
                 Ok(bytes) => {
-                    self.probe.set(|r| r.restore_ms = timings::ms(restore_started));
+                    self.probe.set(|r| {
+                        r.restore_ms = timings::ms(restore_started);
+                        r.restore_key = candidate.key.clone();
+                        r.miss_reason.clear();
+                    });
                     self.cache.mark_used(&candidate.key);
                     if meta.source.is_some() && !meta.workspaces.contains(&self.user_id()) {
                         self.note_workspace(&candidate.key);
@@ -633,6 +674,14 @@ impl Plan {
                         "restore failed for {}: {err}",
                         self.parsed.crate_name
                     ));
+                    let label = if cache::payload::is_unbacked(&err) {
+                        "unbacked".to_string()
+                    } else if cache::payload::is_unstable(&err) {
+                        "unstable".to_string()
+                    } else {
+                        cache::payload::error_label(&err)
+                    };
+                    self.note_miss(format!("restore:{label}"));
                     // A linked entry whose store file was rewritten in place (or lost) cannot restore again, and a surviving one would stop the store that replaces it.
                     if cache::payload::is_unbacked(&err) {
                         self.debug(&format!(
@@ -649,10 +698,20 @@ impl Plan {
         false
     }
 
+    /// Keeps the first reason a lookup did not hit, for the timing record.
+    fn note_miss(&self, reason: String) {
+        self.probe.set(|r| {
+            if r.miss_reason.is_empty() {
+                r.miss_reason = reason;
+            }
+        });
+    }
+
     fn candidate_matches(&self, candidate: &Candidate, root: Option<&Root>) -> bool {
         for (name, expected) in &candidate.envs {
             let current = env::var(name).ok().map(|v| cache::hash_str(&self.norm_in(&v, root)));
             if &current != expected {
+                self.note_miss(format!("env:{name}"));
                 return false;
             }
         }
@@ -688,9 +747,13 @@ impl Plan {
                 confirmed.fetch_add(1, Ordering::Relaxed);
                 true
             }
-            Verdict::Mismatch => false,
+            Verdict::Mismatch => {
+                self.note_miss(format!("input:{}", file_label(path)));
+                false
+            }
             Verdict::Violation { fresh, dev } => {
                 gate.violation(krate, dev, input, &fresh);
+                self.note_miss(format!("violation:{}", file_label(path)));
                 false
             }
         };
@@ -712,9 +775,13 @@ impl Plan {
                 Verdict::Confirmed => audited += 1,
                 Verdict::Violation { fresh, dev } => {
                     gate.violation(krate, dev, input, &fresh);
+                    self.note_miss(format!("violation:{}", file_label(path)));
                     return false;
                 }
-                _ => return false,
+                _ => {
+                    self.note_miss(format!("audit:{}", file_label(path)));
+                    return false;
+                }
             }
         }
         cache::note_audits_passed(&self.dirs, audited);
@@ -730,7 +797,7 @@ impl Plan {
             .files
             .iter()
             .all(|f| cache::safe_file_name(&f.name) && cache::safe_file_name(&f.stored))
-            && cache::safe_file_name(&meta.stderr);
+            && (meta.stderr.is_empty() || cache::safe_file_name(&meta.stderr));
         if !names_ok {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -757,6 +824,7 @@ impl Plan {
             let file = &meta.files[group.base_index];
             if !group.slice_indices.is_empty() {
                 cache::metadata_slice::restore_group(entry, out_dir, &meta.files, group)?;
+                self.note_restore("group", None);
                 let mut bytes = 0;
                 for index in
                     std::iter::once(group.base_index).chain(group.slice_indices.iter().copied())
@@ -775,10 +843,16 @@ impl Plan {
                 return Ok(file.bytes);
             }
             if file.text {
-                let text = self.resolved_dep_info(&fs::read_to_string(&src)?);
+                let raw = match &file.inline {
+                    Some(inline) => inline.clone(),
+                    None => fs::read_to_string(&src)?,
+                };
+                let text = self.resolved_dep_info(&raw);
                 fsx::write_atomic(&dst, text.as_bytes())?;
+                self.note_restore("text", None);
             } else {
                 cache::payload::restore(&src, &dst, file)?;
+                self.note_restore(if file.encoding.is_raw() { "clone" } else { "decode" }, None);
                 // Clones keep the old mtime, but cargo treats outputs older than their dependencies' outputs as stale.
                 if !file.dir {
                     fsx::touch(&dst);
@@ -788,24 +862,47 @@ impl Plan {
             Ok(file.bytes)
         })?;
         let bytes = restored.iter().sum();
-        let stderr = self.detokenise(&fs::read_to_string(entry.join(&meta.stderr))?);
+        let stderr = self.detokenise(&meta.read_stderr(entry)?);
         let mut out = io::stderr().lock();
         out.write_all(stderr.as_bytes())?;
         out.flush()?;
         Ok(bytes)
     }
 
-    /// A destination already holding the bytes is kept; otherwise the store file is copied into place (never linked) and then offered to `adopt`. An `Unbacked` error means the store file no longer carries the entry.
+    /// A destination already holding the bytes is kept; otherwise the store file is linked in when no target shares it, or copied and then offered to `adopt`. An `Unbacked` error means the store file no longer carries the entry.
     fn restore_linked(&self, entry: &Path, file: &StoredFile, dst: &Path) -> io::Result<()> {
+        let store_file = entry.join(&file.stored);
         if cache::payload::verify_in_place(dst, file).is_ok() {
             fsx::touch(dst);
+            // A destination an earlier fallback left as a copy is offered to the store again, so the copy collapses here.
+            match cache::payload::adopt(&store_file, dst) {
+                Ok(false) => self.note_restore("kept", None),
+                Ok(true) => self.note_restore("kept-adopt", None),
+                Err(reason) => self.note_restore("kept-copy", Some(&format!("kept:{reason}"))),
+            }
             return Ok(());
         }
-        let store_file = entry.join(&file.stored);
-        cache::payload::restore_linked(&store_file, dst, file)?;
-        fsx::touch(dst);
-        cache::payload::adopt(&store_file, dst);
+        match cache::payload::restore_linked(&store_file, dst, file)? {
+            cache::payload::Placement::Linked => self.note_restore("link", None),
+            cache::payload::Placement::Copied(refused) => {
+                fsx::touch(dst);
+                match cache::payload::adopt(&store_file, dst) {
+                    Ok(_) => self.note_restore("adopt", Some(&format!("copy:{refused}"))),
+                    Err(reason) => self.note_restore("copy", Some(&format!("copy:{refused};adopt:{reason}"))),
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Counts one restored file under `path` in the timing record, with the reason a linked file was not linked.
+    fn note_restore(&self, path: &str, reason: Option<&str>) {
+        self.probe.set(|r| {
+            *r.restore_paths.entry(path.to_string()).or_default() += 1;
+            if let Some(reason) = reason {
+                timings::note_reason(&mut r.restore_fallbacks, reason);
+            }
+        });
     }
 
     /// Whether outputs may be stored as links to the target file: the cache volume has no clones (or the mode forces it) and compression is not off.
@@ -1095,6 +1192,7 @@ impl Plan {
                 .map(|(name, stamp)| (name.clone(), StampWire::of(stamp)))
                 .collect(),
             commitments: frozen.commitments,
+            timings: timings::configured().filter(|path| path.is_absolute()).map(Path::to_path_buf),
             inputs: frozen
                 .inputs
                 .iter()
@@ -1575,12 +1673,23 @@ impl Plan {
                         compile_ms,
                         meta.files.iter().map(|f| f.bytes).sum(),
                     );
+                    // Files large enough to link that were stored as copies: a link refused at store time.
+                    let linkable = |f: &&StoredFile| !f.text && !f.dir && f.bytes >= cache::payload::LINKED_MIN_BYTES;
+                    let copied = if self.linked_storage() {
+                        meta.files.iter().filter(linkable).filter(|f| f.encoding != cache::payload::Encoding::Linked).count()
+                    } else {
+                        0
+                    };
+                    self.note_store(&format!("stored:copied={copied}"));
                 }
                 Err(err) => {
                     let _ = fsx::remove_any(&staged);
                     return Err(err);
                 }
             }
+        } else {
+            let outcome = self.relink_existing(&key);
+            self.note_store(&outcome);
         }
         let entry_ms = started.elapsed().as_millis();
         // Covers an entry another process published first or one that already existed.
@@ -1600,9 +1709,42 @@ impl Plan {
         Ok(())
     }
 
+    /// An existing entry whose linked store file no target shares takes over this compile's identical output, so a copy left by an earlier fallback collapses.
+    fn relink_existing(&self, key: &str) -> String {
+        let Some((dir, meta)) = self.cache.load_entry(key) else {
+            return "exists".to_string();
+        };
+        let (mut adopted, mut refused) = (0, None);
+        for file in meta.files.iter().filter(|f| f.encoding == cache::payload::Encoding::Linked) {
+            let store_file = dir.join(&file.stored);
+            if !sys::lstat(&store_file).is_ok_and(|m| m.nlink() == 1) {
+                continue;
+            }
+            let output = self.output_dir_abs.join(&file.name);
+            let result = cache::payload::verify_in_place(&output, file)
+                .map_err(|_| "differs".to_string())
+                .and_then(|()| cache::payload::adopt(&store_file, &output));
+            match result {
+                Ok(_) => adopted += 1,
+                Err(reason) => refused = refused.or(Some(reason)),
+            }
+        }
+        match refused {
+            Some(reason) => format!("exists:adopted={adopted};refused={reason}"),
+            None if adopted > 0 => format!("exists:adopted={adopted}"),
+            None => "exists".to_string(),
+        }
+    }
+
+    /// Reports a store outcome to the timing sink; a helper has no record of its own, so this is its only trace.
+    fn note_store(&self, outcome: &str) {
+        timings::store_outcome(self.store_sink.as_deref(), &self.parsed.crate_name, outcome);
+    }
+
     /// Deliberately not storing: an input may not match what rustc read. The compile still replaced the unit's outputs, so earlier entries it left store-only are retired.
     fn skip_store(&self, reason: &str, compile_ms: u64) -> io::Result<()> {
         self.debug(&format!("not storing {}: {reason}", self.parsed.crate_name));
+        self.note_store(&format!("skip:{}", file_label(Path::new(reason))));
         self.retire_superseded_orphans();
         self.record_miss(&self.version(), compile_ms, 0);
         Ok(())
@@ -1694,6 +1836,7 @@ impl Plan {
             let src = out_dir.join(name);
             let stored = format!("f{i}");
             let text = name.ends_with(".d");
+            let mut inline = None;
             let (payload, proof) = if text {
                 let raw = if name == dep_info.0 {
                     dep_info.1.to_string()
@@ -1702,7 +1845,11 @@ impl Plan {
                 };
                 let body = self.tokenised_dep_info(&raw);
                 let bytes = body.len() as u64;
-                fs::write(staged.join(&stored), body)?;
+                if body.len() <= cache::INLINE_TEXT_LIMIT {
+                    inline = Some(body);
+                } else {
+                    fs::write(staged.join(&stored), body)?;
+                }
                 (
                     cache::payload::StoredPayload {
                         bytes,
@@ -1755,6 +1902,7 @@ impl Plan {
                     content_hash: payload.content_hash,
                     metadata_slice: None,
                     mode: payload.mode,
+                    inline,
                 },
                 proof,
             ))
@@ -1790,6 +1938,7 @@ impl Plan {
                 content_hash: None,
                 metadata_slice: None,
                 mode: None,
+                inline: None,
             };
             match cache::metadata_slice::build_proven(
                 &staged.join(&base.stored),
@@ -1812,7 +1961,12 @@ impl Plan {
         }?;
         cache::metadata_slice::validate_groups(&files)?;
         let stderr_text = self.norm(&String::from_utf8_lossy(captured));
-        fs::write(staged.join("stderr"), stderr_text)?;
+        let (stderr_file, stderr_inline) = if stderr_text.len() <= cache::INLINE_TEXT_LIMIT {
+            (String::new(), stderr_text)
+        } else {
+            fs::write(staged.join("stderr"), stderr_text)?;
+            ("stderr".to_string(), String::new())
+        };
         let (source, workspaces) = match self.workspace().zip(self.source()) {
             Some((workspace, source)) => (Some(source.to_owned()), vec![workspace]),
             None => (None, Vec::new()),
@@ -1831,7 +1985,8 @@ impl Plan {
                 None
             },
             files,
-            stderr: "stderr".to_string(),
+            stderr: stderr_file,
+            stderr_inline,
         };
         fs::write(
             staged.join("meta.json"),
@@ -2215,6 +2370,9 @@ struct StoreJob {
     inputs: Vec<(PathBuf, StampWire)>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     commitments: HashMap<String, cache::payload::Commitment>,
+    /// The producer's timing sink, so a broker started under another build still reports this store's outcome there; older readers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timings: Option<PathBuf>,
     /// Lock files the helper takes again itself when handles cannot be inherited.
     slot_lock: Option<PathBuf>,
     key_lock: Option<PathBuf>,
@@ -2424,12 +2582,19 @@ impl Drop for JobFile {
 }
 
 fn keylock_path(dirs: &Dirs, prekey: &str) -> PathBuf {
-    dirs.keylocks()
-        .join(prekey.get(..2).unwrap_or("00"))
-        .join(prekey)
+    dirs.keylocks().join(prekey)
 }
 
-/// The parent directory is created only when the first open finds it missing.
+/// True when the open lock file is still the file at its path; gc unlinks an idle lock file while holding it, so a lock taken on a retired file proves nothing.
+fn key_lock_current(file: &File, path: &Path) -> bool {
+    match (sys::fstat(file), sys::lstat(path)) {
+        (Ok(held), Ok(named)) => held.ino() == 0 || (named.is_file() && held.dev() == named.dev() && held.ino() == named.ino()),
+        (Ok(_), Err(error)) => error.kind() != io::ErrorKind::NotFound,
+        _ => true,
+    }
+}
+
+/// The keylocks directory is created only when the first open finds it missing.
 fn open_key_lock(dirs: &Dirs, path: &Path) -> io::Result<File> {
     let mode = lock::shared_mode(dirs);
     match lock::open_lock_file(path, mode) {
@@ -3361,9 +3526,9 @@ fn try_job_key(job: &StoreJob) -> Result<Option<File>, PathBuf> {
         return Ok(None);
     };
     match try_key_lock(&file) {
-        Ok(true) => Ok(Some(file)),
+        Ok(true) if key_lock_current(&file, &path) => Ok(Some(file)),
+        Ok(true) | Err(_) => Ok(None),
         Ok(false) => Err(path),
-        Err(_) => Ok(None),
     }
 }
 
@@ -3378,17 +3543,20 @@ fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
         Frozen::from_job(job),
         job.spawned_ns.parse::<i128>(),
     ) else {
+        timings::store_outcome(job.timings.as_deref().filter(|path| path.is_absolute()), "", "skip:job-unusable");
         return;
     };
     let dep_info = (frozen.dep_name.as_str(), frozen.dep_text.as_str());
-    let _ = plan.store_outputs(
+    if let Err(error) = plan.store_outputs(
         job.captured.as_bytes(),
         job.compile_ms,
         spawned_ns,
         &frozen.names,
         dep_info,
         Some(&frozen),
-    );
+    ) {
+        plan.note_store(&format!("error:{}", cache::payload::error_label(&error)));
+    }
 }
 
 /// Lines are forwarded as they arrive because cargo needs artifact notifications in real time.
@@ -5569,6 +5737,7 @@ mod tests {
             dep_text,
             inputs: vec![(src.clone(), wire(&src))],
             commitments: HashMap::new(),
+            timings: None,
             slot_lock: None,
             key_lock: None,
         };
@@ -5939,11 +6108,7 @@ mod tests {
                 sys::lstat(&rlib).unwrap().mode()
             );
             let dep = meta.files.iter().find(|file| file.name == "k.d").unwrap();
-            assert!(
-                fs::read_to_string(entry.join(&dep.stored))
-                    .unwrap()
-                    .contains(PROFILE_TOKEN)
-            );
+            assert!(dep.inline.as_deref().unwrap().contains(PROFILE_TOKEN));
         }
         assert_eq!(env::current_dir().unwrap(), cwd);
         assert_eq!(
@@ -6096,7 +6261,7 @@ mod tests {
         assert_eq!(sys::lstat(&stored).unwrap().ino(), original.ino(), "the store file is a second name of the output");
         assert_eq!(file.mode, Some(original.mode()));
         let dep = meta.files.iter().find(|f| f.name == "k.d").unwrap();
-        assert!(dep.mode.is_none() && entry.join(&dep.stored).is_file());
+        assert!(dep.mode.is_none() && dep.inline.is_some() && !entry.join(&dep.stored).exists());
 
         plan.restore(&entry, &meta).unwrap();
         assert_eq!(sys::lstat(&rlib).unwrap().ino(), original.ino(), "an intact destination is verified in place");
@@ -6511,15 +6676,17 @@ mod tests {
         plan.cache.publish(&staged, &key).unwrap();
         assert!(!staged.exists());
         let entry = plan.cache.entry_dir(&key);
-        let mut declared: BTreeSet<String> = meta.files.iter().map(|f| f.stored.clone()).collect();
-        declared.extend(["meta.json".to_string(), "stderr".to_string()]);
+        // The dep-info text and the empty diagnostics live inside meta.json, so neither has a file.
+        let mut declared: BTreeSet<String> = meta.files.iter().filter(|f| f.inline.is_none()).map(|f| f.stored.clone()).collect();
+        declared.insert("meta.json".to_string());
+        assert!(meta.files.iter().any(|f| f.text && f.inline.is_some()) && meta.stderr.is_empty());
         let expected: BTreeSet<_> = if compressed && cfg!(unix) {
-            ["f0", "f1", "meta.json", "stderr"]
+            ["f1", "meta.json"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
         } else {
-            ["f0", "f1", "f2", "meta.json", "stderr"]
+            ["f1", "f2", "meta.json"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
@@ -8033,12 +8200,12 @@ mod tests {
     }
 
     #[test]
-    fn key_locks_are_sharded_by_prekey_exclusive_and_waited_for() {
+    fn key_locks_are_named_by_prekey_exclusive_and_waited_for() {
         let s = Scratch::new("keylock");
         let dirs = Dirs::at(s.0.join("home"));
         let prekey = "cd".repeat(20);
         let path = keylock_path(&dirs, &prekey);
-        assert_eq!(path, dirs.keylocks().join("cd").join(&prekey));
+        assert_eq!(path, dirs.keylocks().join(&prekey));
         assert!(
             !path.starts_with(dirs.locks()),
             "gc treats everything under locks as a build lock directory"
@@ -8067,6 +8234,21 @@ mod tests {
             !try_key_lock(&open_key_lock(&dirs, &path).unwrap()).unwrap(),
             "now held by `other`"
         );
+    }
+
+    #[test]
+    fn a_lock_on_a_retired_key_file_is_not_current_until_it_is_taken_again() {
+        let s = Scratch::new("keylock-retired");
+        let dirs = Dirs::at(s.0.join("home"));
+        let path = keylock_path(&dirs, &"cd".repeat(20));
+        let first = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&first).unwrap() && key_lock_current(&first, &path));
+        fs::remove_file(&path).unwrap();
+        assert!(!key_lock_current(&first, &path), "an unlinked file proves nothing");
+        let second = open_key_lock(&dirs, &path).unwrap();
+        assert!(try_key_lock(&second).unwrap(), "the replacement is a different lock");
+        assert!(!key_lock_current(&first, &path), "a replaced file is not the named one");
+        assert!(key_lock_current(&second, &path));
     }
 
     #[test]

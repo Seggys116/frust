@@ -14,7 +14,7 @@ const DEFAULT_EDITS: usize = 20;
 const DEFAULT_REPO_RUNS: usize = 3;
 const NOOP_REPEATS: usize = 3;
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
-const REPORT_SCHEMA_VERSION: u32 = 1;
+const REPORT_SCHEMA_VERSION: u32 = 2;
 
 const GATE_NOOP_SLACK_MS: f64 = 15.0;
 const GATE_NOOP_SLACK_WINDOWS_MS: f64 = 25.0;
@@ -163,7 +163,10 @@ impl Samples {
 #[derive(Debug, Serialize)]
 struct DiskReport {
     cargo_bytes: u64,
+    // The gate uses `frust_bytes`, measured after the maintenance pass the product runs on its own; cargo has no equivalent.
     frust_bytes: u64,
+    frust_bytes_before_maintenance: u64,
+    maintenance_ms: u64,
     slack_pct: f64,
     ok: bool,
     message: Option<String>,
@@ -205,12 +208,23 @@ struct DirSize {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
+struct TreeSize {
+    name: String,
+    files: u64,
+    directories: u64,
+    physical_bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
 struct DiskBreakdown {
     cargo_physical_bytes: u64,
     cargo_logical_bytes: u64,
     frust_physical_bytes: u64,
     frust_logical_bytes: u64,
     frust_dirs: Vec<DirSize>,
+    // Top-level trees under the cache home that the named directories do not cover, each measured alone.
+    other_trees: Vec<TreeSize>,
+    frust_physical_bytes_before_maintenance: Option<u64>,
     targets_only_physical_bytes: u64,
     cache_entries: usize,
     store_shared_with_targets_bytes: u64,
@@ -231,6 +245,8 @@ fn build_breakdown(cargo_physical: u64, cargo_logical: u64, cumulative: [u64; 6]
         frust_physical_bytes: cumulative[4],
         frust_logical_bytes: logical.iter().sum(),
         frust_dirs,
+        other_trees: Vec::new(),
+        frust_physical_bytes_before_maintenance: None,
         targets_only_physical_bytes: cumulative[5],
         cache_entries,
         store_shared_with_targets_bytes: shared,
@@ -250,12 +266,34 @@ fn logical_size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
     fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+// Counts files and directories below a path without following symlinks; the root itself counts as a directory or a file.
+fn count_tree(path: &Path) -> (u64, u64) {
+    let Ok(meta) = fs::symlink_metadata(path) else { return (0, 0) };
+    if !meta.is_dir() {
+        return (1, 0);
+    }
+    let Ok(read) = fs::read_dir(path) else { return (0, 1) };
+    read.flatten().fold((0, 1), |(files, dirs), entry| {
+        let (f, d) = count_tree(&entry.path());
+        (files + f, dirs + d)
+    })
+}
+
+fn measure_other_trees(paths: &[PathBuf]) -> Result<Vec<TreeSize>, String> {
+    let singles: Vec<[&Path; 1]> = paths.iter().map(|path| [path.as_path()]).collect();
+    let sets: Vec<&[&Path]> = singles.iter().map(|one| &one[..]).collect();
+    let sizes = if sets.is_empty() { Vec::new() } else { compact::physical_sizes_checked(&sets).map_err(|e| e.to_string())? };
+    let mut trees: Vec<TreeSize> = paths.iter().zip(sizes).map(|(path, physical_bytes)| {
+        let (files, directories) = count_tree(path);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        TreeSize { name, files, directories, physical_bytes }
+    }).collect();
+    trees.sort_by(|a, b| b.physical_bytes.cmp(&a.physical_bytes).then_with(|| a.name.cmp(&b.name)));
+    Ok(trees)
+}
+
 fn count_cache_entries(store: &Path) -> usize {
-    let Ok(shards) = fs::read_dir(store) else { return 0 };
-    shards.flatten().filter_map(|shard| fs::read_dir(shard.path()).ok())
-        .flat_map(|entries| entries.flatten())
-        .filter(|entry| entry.path().join("meta.json").is_file())
-        .count()
+    crate::cache::keyed_items(store).into_iter().filter(|entry| entry.join("meta.json").is_file()).count()
 }
 
 fn measure_disk_breakdown(dirs: &Dirs, cargo_target: &Path, cargo_physical: u64) -> Result<DiskBreakdown, String> {
@@ -282,7 +320,9 @@ fn measure_disk_breakdown(dirs: &Dirs, cargo_target: &Path, cargo_physical: u64)
         *slot = group.iter().map(|path| logical_size(path, &mut seen)).sum();
     }
     let cargo_logical = logical_size(cargo_target, &mut HashSet::new());
-    Ok(build_breakdown(cargo_physical, cargo_logical, cumulative, logical, count_cache_entries(&store)))
+    let mut breakdown = build_breakdown(cargo_physical, cargo_logical, cumulative, logical, count_cache_entries(&store));
+    breakdown.other_trees = measure_other_trees(&groups[4])?;
+    Ok(breakdown)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -293,6 +333,9 @@ struct StoreFile {
     source: Option<String>,
     name: String,
     bytes: u64,
+    encoding: String,
+    // The store file is its inode's only name, so no target can share it.
+    lone: bool,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -311,6 +354,11 @@ struct EntryUse {
     kinds: Vec<String>,
     files: usize,
     bytes: u64,
+    // Encodings of the store-only files: `linked` means the restore or a later step failed to share them, anything else that the store step copied.
+    encodings: Vec<String>,
+    lone_files: usize,
+    // How the last restore of this entry placed its files, from the timing records.
+    last_restore: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -376,7 +424,7 @@ fn group_list(names: &[&str], totals: &BTreeMap<&str, (u64, usize)>) -> Vec<Grou
     }).collect()
 }
 
-fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usize) -> StoreOnly {
+fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usize, restores: &BTreeMap<String, String>) -> StoreOnly {
     let mut entries: BTreeMap<&str, Vec<&StoreFile>> = BTreeMap::new();
     for file in files {
         entries.entry(file.key.as_str()).or_default().push(file);
@@ -392,6 +440,7 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
         let total = classes.entry(class).or_default();
         *total = (total.0 + bytes, total.1 + group.len());
         let mut kinds: Vec<String> = Vec::new();
+        let mut encodings: Vec<String> = Vec::new();
         for file in group {
             let ext = extension_group(&file.name);
             let total = extensions.entry(ext).or_default();
@@ -399,8 +448,12 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
             if !kinds.iter().any(|k| k == ext) {
                 kinds.push(ext.to_string());
             }
+            if file.bytes > 0 && !encodings.contains(&file.encoding) {
+                encodings.push(file.encoding.clone());
+            }
         }
         kinds.sort();
+        encodings.sort();
         uses.push(EntryUse {
             key: key.to_string(),
             crate_name: first.krate.clone(),
@@ -409,6 +462,9 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
             kinds,
             files: group.len(),
             bytes,
+            encodings,
+            lone_files: group.iter().filter(|f| f.lone).count(),
+            last_restore: restores.get(*key).cloned(),
         });
     }
     uses.retain(|u| u.bytes > 0);
@@ -430,9 +486,7 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
 // Returns the payload files of every readable entry with their paths, plus the count of entries whose record could not be read.
 fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
     let (mut files, mut paths, mut unreadable) = (Vec::new(), Vec::new(), 0);
-    let Ok(shards) = fs::read_dir(store) else { return (files, paths, unreadable) };
-    let mut entry_dirs: Vec<PathBuf> = shards.flatten().filter_map(|shard| fs::read_dir(shard.path()).ok())
-        .flat_map(|entries| entries.flatten().map(|entry| entry.path())).filter(|path| path.is_dir()).collect();
+    let mut entry_dirs: Vec<PathBuf> = crate::cache::keyed_items(store).into_iter().filter(|path| path.is_dir()).collect();
     entry_dirs.sort();
     for dir in entry_dirs {
         let Some(key) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
@@ -446,6 +500,7 @@ fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
             if fs::symlink_metadata(&path).is_err() {
                 continue;
             }
+            let encoding = serde_json::to_value(stored.encoding).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
             files.push(StoreFile {
                 key: key.clone(),
                 krate: meta.crate_name.clone(),
@@ -453,6 +508,8 @@ fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
                 source: meta.source.clone(),
                 name: stored.name.clone(),
                 bytes: 0,
+                encoding,
+                lone: sys::lstat(&path).is_ok_and(|m| m.is_file() && m.nlink() == 1),
             });
             paths.push(path);
         }
@@ -474,14 +531,14 @@ fn store_only_bytes(targets: &Path, files: &[PathBuf]) -> Result<Vec<u64>, Strin
     Ok(out)
 }
 
-fn scan_store(dirs: &Dirs) -> StoreOnly {
+fn scan_store(dirs: &Dirs, restores: &BTreeMap<String, String>) -> StoreOnly {
     let (mut files, paths, unreadable) = collect_store_files(&dirs.store());
     match store_only_bytes(&dirs.targets(), &paths) {
         Ok(sizes) => {
             for (file, bytes) in files.iter_mut().zip(sizes) {
                 file.bytes = bytes;
             }
-            summarize_store_only(&files, unreadable, STORE_TOP_JSON)
+            summarize_store_only(&files, unreadable, STORE_TOP_JSON, restores)
         }
         Err(error) => StoreOnly::unsupported(format!("allocation sharing could not be measured: {error}")),
     }
@@ -526,6 +583,16 @@ struct TimingLine {
     extern_bytes_memo: u64,
     #[serde(default)]
     native_dir_bytes_hashed: u64,
+    #[serde(default)]
+    restore_paths: BTreeMap<String, u64>,
+    #[serde(default)]
+    restore_fallbacks: Vec<String>,
+    #[serde(default)]
+    restore_key: String,
+    #[serde(default)]
+    miss_reason: String,
+    #[serde(default)]
+    kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -537,6 +604,7 @@ struct MissUnit {
     incremental: bool,
     rustc_ms: u64,
     store_mode: String,
+    miss_reason: String,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize)]
@@ -565,6 +633,17 @@ struct TimingSummary {
     misses: Vec<MissUnit>,
     #[serde(skip)]
     miss_crate_set: BTreeSet<String>,
+    // Restored files by path (kept, link, adopt, copy, clone, ...), and the first distinct reasons a linked file was copied.
+    restore_paths: BTreeMap<String, u64>,
+    restore_fallbacks: Vec<String>,
+    // First distinct reasons a lookup missed, as `crate: reason`.
+    miss_reasons: Vec<String>,
+    // Uncached compiler calls such as Cargo's `-vV` probe, which the unit counts above exclude.
+    passthrough_spawns: usize,
+    passthrough_ms: u64,
+    // Outcomes reported by store steps and helpers, and the first distinct ones that left no linked entry, as `crate: outcome`.
+    store_outcomes: BTreeMap<String, usize>,
+    store_problems: Vec<String>,
 }
 
 impl TimingSummary {
@@ -572,6 +651,18 @@ impl TimingSummary {
         self.builds += 1;
         self.drain_ms += drain_ms;
         for r in records {
+            match r.kind.as_str() {
+                "passthrough" => {
+                    self.passthrough_spawns += 1;
+                    self.passthrough_ms += r.total_ms;
+                    continue;
+                }
+                "store" => {
+                    self.add_store_outcome(&r.krate, &r.store_mode);
+                    continue;
+                }
+                _ => {}
+            }
             self.units += 1;
             self.total_ms += r.total_ms;
             self.rustc_ms += r.rustc_ms;
@@ -588,6 +679,15 @@ impl TimingSummary {
             self.extern_bytes_memo += r.extern_bytes_memo;
             self.native_dir_bytes_hashed += r.native_dir_bytes_hashed;
             *self.store_modes.entry(r.store_mode.clone()).or_default() += 1;
+            for (path, count) in &r.restore_paths {
+                *self.restore_paths.entry(path.clone()).or_default() += count;
+            }
+            for reason in &r.restore_fallbacks {
+                crate::timings::note_reason(&mut self.restore_fallbacks, reason);
+            }
+            if r.store_mode != "hit" && !r.miss_reason.is_empty() {
+                crate::timings::note_reason(&mut self.miss_reasons, &format!("{}: {}", r.krate, r.miss_reason));
+            }
             if r.store_mode != "hit" {
                 self.miss_units += 1;
                 self.miss_crate_set.insert(r.krate.clone());
@@ -598,6 +698,7 @@ impl TimingSummary {
                     incremental: r.incremental,
                     rustc_ms: r.rustc_ms,
                     store_mode: r.store_mode.clone(),
+                    miss_reason: r.miss_reason.clone(),
                 });
             }
         }
@@ -605,6 +706,24 @@ impl TimingSummary {
         self.misses.truncate(MISS_TOP_JSON);
         self.miss_crates = self.miss_crate_set.len();
     }
+
+    // Outcome kinds stay few (`skip:<file> changed ...` collapses to `skip`); every outcome but a fully linked store or a present entry is kept as a problem.
+    fn add_store_outcome(&mut self, krate: &str, outcome: &str) {
+        *self.store_outcomes.entry(outcome.split(':').next().unwrap_or("").to_string()).or_default() += 1;
+        if outcome != "stored:copied=0" && outcome != "exists" {
+            crate::timings::note_reason(&mut self.store_problems, &format!("{krate}: {outcome}"));
+        }
+    }
+}
+
+// `clean_rebuild: link 2, copy 1 (copy:link:os32;adopt:store-nlink=2)`.
+fn restore_text(row: &str, record: &TimingLine) -> String {
+    let paths: Vec<String> = record.restore_paths.iter().map(|(path, count)| format!("{path} {count}")).collect();
+    let mut text = format!("{row}: {}", if paths.is_empty() { "none".to_string() } else { paths.join(", ") });
+    if !record.restore_fallbacks.is_empty() {
+        text.push_str(&format!(" ({})", record.restore_fallbacks.join(", ")));
+    }
+    text
 }
 
 fn parse_timings(text: &str) -> Vec<TimingLine> {
@@ -612,11 +731,12 @@ fn parse_timings(text: &str) -> Vec<TimingLine> {
 }
 
 fn miss_rows(summary: &TimingSummary, limit: usize) -> Vec<Vec<String>> {
-    let mut rows = vec![["crate", "path unit", "primary", "incremental", "rustc ms", "store mode"].iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    let mut rows = vec![["crate", "path unit", "primary", "incremental", "rustc ms", "store mode", "miss reason"].iter().map(|h| h.to_string()).collect::<Vec<_>>()];
     for m in summary.misses.iter().take(limit) {
         rows.push(vec![
             m.krate.clone(), m.path_unit.to_string(), m.primary.to_string(), m.incremental.to_string(),
             m.rustc_ms.to_string(), m.store_mode.clone(),
+            if m.miss_reason.is_empty() { "-".to_string() } else { m.miss_reason.clone() },
         ]);
     }
     rows
@@ -665,6 +785,32 @@ fn timing_rows(timings: &BTreeMap<String, TimingSummary>) -> Vec<Vec<String>> {
     rows
 }
 
+// Per row: how restores placed files, why links fell back, why lookups and stores missed, and how many uncached compiler calls ran.
+fn sharing_lines(timings: &BTreeMap<String, TimingSummary>) -> Vec<String> {
+    let counts = |map: &BTreeMap<String, u64>| map.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
+    let mut lines = Vec::new();
+    for (label, key) in TIMING_ROWS.iter().chain(&[("warm edit", "edit_warm")]) {
+        let Some(t) = timings.get(*key) else { continue };
+        if !t.restore_paths.is_empty() {
+            let mut line = format!("{label}: restored files by path: {}", counts(&t.restore_paths));
+            if !t.restore_fallbacks.is_empty() {
+                line.push_str(&format!("; link fallbacks: {}", t.restore_fallbacks.join(" | ")));
+            }
+            lines.push(line);
+        }
+        if !t.miss_reasons.is_empty() {
+            lines.push(format!("{label}: miss reasons: {}", t.miss_reasons.join(" | ")));
+        }
+        if !t.store_problems.is_empty() {
+            lines.push(format!("{label}: store outcomes without a linked entry: {}", t.store_problems.join(" | ")));
+        }
+        if t.passthrough_spawns > 0 {
+            lines.push(format!("{label}: {} uncached compiler calls, {} ms of wrapper startup", t.passthrough_spawns, t.passthrough_ms));
+        }
+    }
+    lines
+}
+
 fn store_group_text(groups: &[GroupBytes]) -> String {
     groups.iter().map(|g| format!("{} {}", g.name, human_bytes(g.bytes))).collect::<Vec<_>>().join(", ")
 }
@@ -682,11 +828,13 @@ fn store_only_lines(s: &StoreOnly) -> Vec<String> {
 }
 
 fn store_top_rows(s: &StoreOnly, limit: usize) -> Vec<Vec<String>> {
-    let mut rows = vec![["crate", "version", "source", "kinds", "files", "store-only"].iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    let header = ["crate", "version", "source", "kinds", "files", "store-only", "encodings", "lone", "last restore"];
+    let mut rows = vec![header.iter().map(|h| h.to_string()).collect::<Vec<_>>()];
     for e in s.top_entries.iter().take(limit) {
         rows.push(vec![
             e.crate_name.clone(), e.version.clone(), e.source.clone().unwrap_or_else(|| "-".to_string()),
-            e.kinds.join(","), e.files.to_string(), human_bytes(e.bytes),
+            e.kinds.join(","), e.files.to_string(), human_bytes(e.bytes), e.encodings.join(","), e.lone_files.to_string(),
+            e.last_restore.clone().unwrap_or_else(|| "-".to_string()),
         ]);
     }
     rows
@@ -913,7 +1061,10 @@ fn breakdown_lines(b: &DiskBreakdown) -> Vec<String> {
     };
     let targets_ratio = (b.cargo_physical_bytes > 0).then(|| b.targets_only_physical_bytes as f64 / b.cargo_physical_bytes as f64);
     let share = b.store_shared_share.map_or_else(|| "n/a".to_string(), |s| format!("{:.1}%", s * 100.0));
-    vec![
+    let trees: Vec<String> = b.other_trees.iter()
+        .map(|t| format!("{} {} ({} files, {} dirs)", t.name, human_bytes(t.physical_bytes), t.files, t.directories))
+        .collect();
+    let mut lines = vec![
         format!("Disk, physical: cargo target {}; frust total {} ({}).",
             human_bytes(b.cargo_physical_bytes), human_bytes(b.frust_physical_bytes), parts(true)),
         format!("Disk, logical: cargo target {}; frust total {} ({}).",
@@ -922,7 +1073,15 @@ fn breakdown_lines(b: &DiskBreakdown) -> Vec<String> {
             human_bytes(b.targets_only_physical_bytes), human_bytes(b.cargo_physical_bytes), fmt_ratio(targets_ratio)),
         format!("Cache: {} entries; {} of the store is shared with targets ({}).",
             b.cache_entries, human_bytes(b.store_shared_with_targets_bytes), share),
-    ]
+    ];
+    if let Some(before) = b.frust_physical_bytes_before_maintenance {
+        lines.push(format!("Maintenance: frust total {} before the gc and compaction pass, {} after; cargo has no equivalent.",
+            human_bytes(before), human_bytes(b.frust_physical_bytes)));
+    }
+    if !trees.is_empty() {
+        lines.push(format!("Other, by tree: {}.", trees.join(", ")));
+    }
+    lines
 }
 
 fn gate_failure_lines(report: &RepoReport) -> Vec<String> {
@@ -961,6 +1120,10 @@ fn repo_markdown(report: &RepoReport) -> String {
         out.push_str("\n#### Where the time goes (frust wrapper records, summed over the builds in each row, ms)\n\n");
         out.push_str(&markdown_table(&timing));
     }
+    for line in sharing_lines(&report.frust_timings) {
+        out.push_str(&format!("\n- {line}"));
+    }
+    out.push('\n');
     for (label, key) in [("clean rebuild", "clean_rebuild"), ("no-op", "noop")] {
         let Some(summary) = report.frust_timings.get(key).filter(|s| s.miss_units > 0) else { continue };
         out.push_str(&format!(
@@ -1009,6 +1172,9 @@ fn print_repo(report: &RepoReport) {
         for line in aligned(&timing) {
             println!("  {line}");
         }
+    }
+    for line in sharing_lines(&report.frust_timings) {
+        println!("{line}");
     }
     if let Some(message) = &report.disk.message {
         println!("{message}");
@@ -1184,6 +1350,8 @@ struct Rig<'a> {
     args: Vec<String>,
     scratch: PathBuf,
     timings: RefCell<BTreeMap<String, TimingSummary>>,
+    // The latest restore of each entry key, so store-only entries show how they were last placed.
+    restores: RefCell<BTreeMap<String, String>>,
     sequence: Cell<u64>,
 }
 
@@ -1219,6 +1387,8 @@ impl Rig<'_> {
         });
         if let Some(file) = &timing_file {
             cmd.env(crate::timings::ENV, file);
+            // Created here so passthrough calls and store helpers have somewhere to report.
+            let _ = fs::write(crate::timings::events_path(file), "");
         }
         let tool = if frust { "frust" } else { "cargo" };
         // timed() waits for the deferred stores before returning, so the next row starts quiet; the wait is recorded as drain.
@@ -1226,9 +1396,16 @@ impl Rig<'_> {
             .map(|run| (run.millis as f64, run.store_drain_millis.unwrap_or(0)))
             .map_err(|e| format!("{row} build with {tool}: {e}"))?;
         if let Some(file) = timing_file {
-            let text = fs::read_to_string(&file).unwrap_or_default();
+            let events = crate::timings::events_path(&file);
+            let text = fs::read_to_string(&file).unwrap_or_default() + &fs::read_to_string(&events).unwrap_or_default();
             let _ = fs::remove_file(&file);
-            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&parse_timings(&text), drain_ms);
+            let _ = fs::remove_file(&events);
+            let records = parse_timings(&text);
+            let mut restores = self.restores.borrow_mut();
+            for record in records.iter().filter(|r| !r.restore_key.is_empty()) {
+                restores.insert(record.restore_key.clone(), restore_text(row, record));
+            }
+            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&records, drain_ms);
         }
         Ok(ms)
     }
@@ -1292,6 +1469,18 @@ fn workspace_metadata(ctx: &Ctx, repo: &Path) -> Result<serde_json::Value, Strin
     serde_json::from_slice(&output.stdout).map_err(|e| format!("cargo metadata output: {e}"))
 }
 
+// Runs the daily gc and a full compaction pass as the product does on its own, then an explicit gc that also sweeps every idle compile lock whatever its age; returns the pass time.
+fn run_maintenance(ctx: &Ctx, dirs: &Dirs, target: &Path) -> Result<u64, String> {
+    let started = Instant::now();
+    measure_maintenance(ctx, dirs, target)?;
+    let opts = GcOptions { keylock_max_age: Duration::ZERO, ..GcOptions::from_config(&benchmark_maintenance_config()) };
+    let (_, failures) = gc::execute(dirs, &gc::plan(dirs, &opts));
+    if let Some((path, error)) = failures.first() {
+        return Err(format!("gc could not remove {}: {error}", path.display()));
+    }
+    Ok(started.elapsed().as_millis() as u64)
+}
+
 fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let repo = canonical(&opts.repo);
@@ -1336,16 +1525,22 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         args: build_args(&packages, opts.package.as_deref(), opts.features.as_deref()),
         scratch: scratch.to_path_buf(),
         timings: RefCell::new(BTreeMap::new()),
+        restores: RefCell::new(BTreeMap::new()),
         sequence: Cell::new(0),
     };
     let samples = measure(&rig, &backup, &owners, opts)?;
     rig.quiesce();
     let cargo_bytes = compact::physical_size(&[rig.cargo_target.as_path()]);
+    let frust_bytes_before_maintenance = compact::physical_size(&[ctx.home.as_path()]);
+    let central = workspace::central_target(&rig.dirs, Some(&repo), &ctx.probe_id);
+    let maintenance_ms = run_maintenance(&ctx, &rig.dirs, &central)
+        .inspect_err(|error| eprintln!("frust bench: warning: maintenance pass incomplete: {error}")).unwrap_or(0);
     let frust_bytes = compact::physical_size(&[ctx.home.as_path()]);
     let verdict = disk_verdict(cargo_bytes, frust_bytes, opts.disk_slack);
-    let store_only = scan_store(&rig.dirs);
+    let store_only = scan_store(&rig.dirs, &rig.restores.borrow());
     let disk_breakdown = measure_disk_breakdown(&rig.dirs, &rig.cargo_target, cargo_bytes)
-        .inspect_err(|error| eprintln!("frust bench: warning: disk breakdown unavailable: {error}")).ok();
+        .inspect_err(|error| eprintln!("frust bench: warning: disk breakdown unavailable: {error}")).ok()
+        .map(|breakdown| DiskBreakdown { frust_physical_bytes_before_maintenance: Some(frust_bytes_before_maintenance), ..breakdown });
     let (cargo_report, frust_report) = (samples[0].report(cargo_bytes), samples[1].report(frust_bytes));
     let display = |path: &PathBuf| path.strip_prefix(&repo).unwrap_or(path.as_path()).display().to_string();
     Ok(RepoReport {
@@ -1359,7 +1554,7 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         ratios: paired_ratios(&cargo_report, &frust_report),
         cargo: cargo_report,
         frust: frust_report,
-        disk: DiskReport { cargo_bytes, frust_bytes, slack_pct: opts.disk_slack, ok: verdict.is_ok(), message: verdict.err() },
+        disk: DiskReport { cargo_bytes, frust_bytes, frust_bytes_before_maintenance, maintenance_ms, slack_pct: opts.disk_slack, ok: verdict.is_ok(), message: verdict.err() },
         disk_breakdown,
         store_only,
         frust_timings: rig.timings.take(),
@@ -1446,7 +1641,7 @@ mod tests {
             ratios: paired_ratios(&cargo.report(disk.0), &frust.report(disk.1)),
             cargo: cargo.report(disk.0),
             frust: frust.report(disk.1),
-            disk: DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, slack_pct: 0.0, ok: verdict.is_ok(), message: verdict.err() },
+            disk: DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, frust_bytes_before_maintenance: disk.1, maintenance_ms: 0, slack_pct: 0.0, ok: verdict.is_ok(), message: verdict.err() },
             disk_breakdown: None,
             store_only: StoreOnly::unsupported("not measured in this test".to_string()),
             frust_timings: BTreeMap::new(),
@@ -1576,6 +1771,40 @@ mod tests {
     }
 
     #[test]
+    fn other_trees_report_files_directories_and_a_markdown_line() {
+        let root = std::env::temp_dir().join(format!("frust-other-trees-{}", std::process::id()));
+        let (locks, probe) = (root.join("locks"), root.join("probe"));
+        fs::create_dir_all(locks.join("a/b")).unwrap();
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(locks.join("a/one"), b"x").unwrap();
+        fs::write(locks.join("a/b/two"), b"y").unwrap();
+        fs::write(root.join("ledger"), b"z").unwrap();
+        let trees = measure_other_trees(&[locks.clone(), probe.clone(), root.join("ledger")]).unwrap();
+        let find = |name: &str| trees.iter().find(|t| t.name == name).unwrap();
+        assert_eq!((find("locks").files, find("locks").directories), (2, 3));
+        assert_eq!((find("probe").files, find("probe").directories), (0, 1));
+        assert_eq!((find("ledger").files, find("ledger").directories), (1, 0));
+        let mut b = build_breakdown(10, 10, [1; 6], [1; 5], 0);
+        b.other_trees = trees;
+        b.frust_physical_bytes_before_maintenance = Some(2048);
+        let lines = breakdown_lines(&b);
+        assert!(lines.iter().any(|line| line.starts_with("Maintenance: frust total 2.0 KiB before")));
+        assert!(lines.last().unwrap().starts_with("Other, by tree: "));
+        assert!(lines.last().unwrap().contains("locks"));
+        assert!(serde_json::to_value(&b).unwrap()["other_trees"][0]["physical_bytes"].is_u64());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_disk_gate_reads_the_post_maintenance_total_and_the_report_keeps_both() {
+        let report = report_with(&samples(1.0, 1.0, 1.0, 1.0), &samples(1.0, 1.0, 1.0, 1.0), (1000, 900), false);
+        let json = serde_json::to_value(&report.disk).unwrap();
+        assert_eq!(json["frust_bytes"], 900);
+        assert!(json["frust_bytes_before_maintenance"].is_u64() && json["maintenance_ms"].is_u64());
+        assert!(report.disk.ok);
+    }
+
+    #[test]
     fn breakdown_attributes_shared_bytes_once_and_formats_each_line() {
         let b = build_breakdown(1000, 1200, [600, 900, 910, 920, 950, 500], [650, 700, 10, 10, 30], 42);
         let physical: Vec<(&str, u64)> = b.frust_dirs.iter().map(|d| (d.name.as_str(), d.physical_bytes)).collect();
@@ -1609,7 +1838,7 @@ mod tests {
     }
 
     fn sf(key: &str, krate: &str, source: Option<&str>, name: &str, bytes: u64) -> StoreFile {
-        StoreFile { key: key.into(), krate: krate.into(), version: "1.0.0".into(), source: source.map(String::from), name: name.into(), bytes }
+        StoreFile { key: key.into(), krate: krate.into(), version: "1.0.0".into(), source: source.map(String::from), name: name.into(), bytes, encoding: "linked".into(), lone: bytes > 0 }
     }
 
     fn synthetic_store() -> Vec<StoreFile> {
@@ -1631,7 +1860,7 @@ mod tests {
 
     #[test]
     fn store_only_bytes_group_by_class_and_extension() {
-        let summary = summarize_store_only(&synthetic_store(), 2, 3);
+        let summary = summarize_store_only(&synthetic_store(), 2, 3, &BTreeMap::new());
         assert_eq!((summary.status.as_str(), summary.total_bytes, summary.entries, summary.files, summary.unreadable_entries), ("ok", 2750, 5, 8, 2));
         let classes: Vec<(&str, u64, usize)> = summary.by_class.iter().map(|g| (g.name.as_str(), g.bytes, g.files)).collect();
         assert_eq!(classes, [("registry-git", 1310, 3), ("path", 700, 2), ("unknown", 0, 1), ("build-script", 40, 1), ("proc-macro", 700, 1)]);
@@ -1642,17 +1871,22 @@ mod tests {
 
     #[test]
     fn store_only_top_entries_are_ordered_capped_and_skip_empty_entries() {
-        let summary = summarize_store_only(&synthetic_store(), 0, 3);
+        let restores = BTreeMap::from([("k1".to_string(), "clean_rebuild: copy 2 (copy:link:os32;adopt:link:os32)".to_string())]);
+        let summary = summarize_store_only(&synthetic_store(), 0, 3, &restores);
+        assert_eq!((summary.top_entries[0].encodings.as_slice(), summary.top_entries[0].lone_files), (&["linked".to_string()][..], 3));
+        assert_eq!(summary.top_entries[0].last_restore.as_deref(), restores.get("k1").map(String::as_str));
+        assert_eq!(summary.top_entries[1].last_restore, None);
         let top: Vec<(&str, u64)> = summary.top_entries.iter().map(|e| (e.key.as_str(), e.bytes)).collect();
         assert_eq!(top, [("k1", 1310), ("k2", 700), ("k3", 700)]);
         assert_eq!(summary.top_entries[0].kinds, ["d", "rlib", "rmeta"]);
         assert_eq!(summary.top_entries[1].kinds, ["bin", "rlib"]);
         assert_eq!(summary.top_entries[0].files, 3);
-        let all = summarize_store_only(&synthetic_store(), 0, 20);
+        let all = summarize_store_only(&synthetic_store(), 0, 20, &restores);
         assert_eq!(all.top_entries.len(), 4);
         let rows = store_top_rows(&all, 2);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1][..3], ["serde", "1.0.0", "registry"]);
+        assert_eq!(rows[1][6..], ["linked", "3", "clean_rebuild: copy 2 (copy:link:os32;adopt:link:os32)"]);
         assert_eq!(store_top_rows(&all, 10)[4][2], "path");
         let unsupported = StoreOnly::unsupported("no extents".into());
         assert!(store_only_lines(&unsupported)[0].contains("unsupported (no extents)"));
@@ -1783,12 +2017,41 @@ mod tests {
         assert_eq!((summary.miss_units, summary.miss_crates), (3, 2));
         let rows = miss_rows(&summary, 2);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1], ["regex", "false", "false", "false", "900", "inline:error"]);
+        assert_eq!(rows[1], ["regex", "false", "false", "false", "900", "inline:error", "-"]);
         let many: Vec<TimingLine> = (0..25).map(|i| line(&format!("c{i}"), i, "deferred")).collect();
         let mut capped = TimingSummary::default();
         capped.add_build(&many, 0);
         assert_eq!((capped.misses.len(), capped.miss_units, capped.miss_crates), (MISS_TOP_JSON, 25, 25));
         assert_eq!(capped.misses[0].krate, "c24");
+    }
+
+    #[test]
+    fn restore_paths_fallbacks_misses_spawns_and_store_outcomes_are_summarised_apart_from_units() {
+        let text = concat!(
+            r#"{"crate":"a","store_mode":"hit","restore_paths":{"link":2,"copy":1},"restore_fallbacks":["copy:link:os32;adopt:link:os32"],"restore_key":"k1"}"#, "\n",
+            r#"{"crate":"b","store_mode":"hit","restore_paths":{"link":1,"kept":2},"restore_fallbacks":["copy:link:os32;adopt:link:os32","copy:store-nlink=2;adopt:store-nlink=2"]}"#, "\n",
+            r#"{"crate":"winapi","store_mode":"deferred","miss_reason":"input:lib.rs"}"#, "\n",
+            r#"{"crate":"","store_mode":"passthrough","kind":"passthrough","total_ms":7}"#, "\n",
+            r#"{"crate":"","store_mode":"passthrough","kind":"passthrough","total_ms":5}"#, "\n",
+            r#"{"crate":"winapi","store_mode":"skip:lib.rs changed during the compile","kind":"store"}"#, "\n",
+            r#"{"crate":"serde","store_mode":"stored:copied=0","kind":"store"}"#, "\n",
+            r#"{"crate":"syn","store_mode":"exists","kind":"store"}"#, "\n",
+        );
+        let records = parse_timings(text);
+        let mut summary = TimingSummary::default();
+        summary.add_build(&records, 0);
+        assert_eq!((summary.units, summary.miss_units, summary.passthrough_spawns, summary.passthrough_ms), (3, 1, 2, 12));
+        assert_eq!(summary.restore_paths, BTreeMap::from([("copy".to_string(), 1), ("kept".to_string(), 2), ("link".to_string(), 3)]));
+        assert_eq!(summary.restore_fallbacks, ["copy:link:os32;adopt:link:os32", "copy:store-nlink=2;adopt:store-nlink=2"]);
+        assert_eq!(summary.miss_reasons, ["winapi: input:lib.rs"]);
+        assert_eq!(summary.misses[0].miss_reason, "input:lib.rs");
+        assert_eq!(summary.store_outcomes, BTreeMap::from([("exists".to_string(), 1), ("skip".to_string(), 1), ("stored".to_string(), 1)]));
+        assert_eq!(summary.store_problems, ["winapi: skip:lib.rs changed during the compile"]);
+        assert_eq!(restore_text("clean_rebuild", &records[0]), "clean_rebuild: copy 1, link 2 (copy:link:os32;adopt:link:os32)");
+        let lines = sharing_lines(&BTreeMap::from([("clean_rebuild".to_string(), summary)]));
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("clean rebuild: restored files by path: copy 1, kept 2, link 3; link fallbacks: copy:link:os32"));
+        assert!(lines[3].contains("2 uncached compiler calls, 12 ms"));
     }
 
     #[test]

@@ -147,12 +147,10 @@ impl Ws {
 
     fn stored_entries(&self, krate: &str) -> usize {
         let mut count = 0;
-        for shard in fs::read_dir(self.sb.home().join("store")).into_iter().flatten().flatten() {
-            for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-                let meta = fs::read_to_string(entry.path().join("meta.json")).unwrap_or_default();
-                if meta.contains(&format!("\"crate_name\":\"{krate}\"")) {
-                    count += 1;
-                }
+        for entry in frust::cache::keyed_items(&self.sb.home().join("store")) {
+            let meta = fs::read_to_string(entry.join("meta.json")).unwrap_or_default();
+            if meta.contains(&format!("\"crate_name\":\"{krate}\"")) {
+                count += 1;
             }
         }
         count

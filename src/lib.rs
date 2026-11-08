@@ -13,6 +13,7 @@ pub mod gc;
 pub mod history;
 pub mod linking;
 pub mod lock;
+pub mod noop;
 pub mod paths;
 pub mod run;
 pub mod share_roots;

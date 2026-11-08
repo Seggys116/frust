@@ -171,9 +171,8 @@ fn maintenance_retains_the_two_latest_incremental_states_for_restores() {
         assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), value.to_string());
         assert!(build(&sb, &project, &[]).is_empty(), "maintenance must leave the current state fresh");
     }
-    let entries = fs::read_dir(dirs.store()).unwrap().flatten()
-        .flat_map(|shard| fs::read_dir(shard.path()).unwrap().flatten())
-        .filter_map(|entry| fs::read(entry.path().join("meta.json")).ok())
+    let entries = frust::cache::keyed_items(&dirs.store()).into_iter()
+        .filter_map(|entry| fs::read(entry.join("meta.json")).ok())
         .filter_map(|bytes| serde_json::from_slice::<frust::cache::EntryMeta>(&bytes).ok())
         .filter(|meta| meta.incremental_unit.is_some())
         .count();

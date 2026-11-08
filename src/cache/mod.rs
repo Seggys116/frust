@@ -25,11 +25,17 @@ pub const PROFILE_TOKEN: &str = "{{FRUST_PROFILE_DIR}}";
 
 const MAX_CANDIDATES: usize = 8;
 
-/// Format five adds inline metadata ranges; formats three and four remain readable.
-const MANIFEST_FORMAT: u32 = 5;
+/// Format seven lists entries that keep dep-info and diagnostics inside their metadata; formats three to six remain readable.
+const MANIFEST_FORMAT: u32 = 7;
 
 /// Written only for manifests that list a backed entry, so writers that cannot restore one ignore the manifest.
-const BACKED_MANIFEST_FORMAT: u32 = 6;
+const BACKED_MANIFEST_FORMAT: u32 = 8;
+
+/// The backed format before entries held their text inline.
+const LEGACY_BACKED_MANIFEST_FORMAT: u32 = 6;
+
+/// Text kept inside the entry record stays under this size; anything larger is a separate file in the entry.
+pub const INLINE_TEXT_LIMIT: usize = 64 * 1024;
 
 /// A volume where a stamp once lied stays distrusted this long after its latest violation.
 const QUARANTINE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -49,6 +55,10 @@ const MARK_USED_INTERVAL: Duration = Duration::from_secs(3600);
 const EVICTED_DIR: &str = "evicted";
 
 const UNIT_RECORD_MAX_BYTES: u64 = 64 * 1024;
+
+/// Name of the single file under `units/` that holds the records written by this version.
+pub const UNIT_PACK: &str = "pack";
+const UNIT_PACK_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredFile {
@@ -72,6 +82,9 @@ pub struct StoredFile {
     /// Set exactly for `Encoding::Linked` files: the mode the output had, restored instead of whatever the shared inode has now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
+    /// The text of a dep-info file kept in the record itself, so the entry holds no file for it; absent for entries that store it as `stored`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +104,23 @@ pub struct EntryMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<String>,
     pub files: Vec<StoredFile>,
+    /// Name of the diagnostics file; empty when the diagnostics are `stderr_inline`, which entries stored before the inline layout never use.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stderr: String,
+    /// Diagnostics kept in the record; omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_inline: String,
+}
+
+impl EntryMeta {
+    /// True when the diagnostics are readable: inline, or a regular file of the entry.
+    pub fn stderr_present(&self, entry: &Path) -> bool {
+        self.stderr.is_empty() || (safe_file_name(&self.stderr) && sys::lstat(&entry.join(&self.stderr)).is_ok_and(|meta| meta.is_file()))
+    }
+
+    pub fn read_stderr(&self, entry: &Path) -> io::Result<String> {
+        if self.stderr.is_empty() { Ok(self.stderr_inline.clone()) } else { fs::read_to_string(entry.join(&self.stderr)) }
+    }
 }
 
 /// One input file of a candidate: its content hash and, when the hash was taken after the file had settled, the stamp it had.
@@ -128,16 +157,35 @@ impl Cache {
         Cache { dirs: dirs.clone() }
     }
 
-    fn shard(root: PathBuf, key: &str) -> PathBuf {
+    // Entries, manifests and unit records live directly under their tree.
+    fn keyed(root: PathBuf, key: &str) -> PathBuf {
+        root.join(key)
+    }
+
+    // Older homes filed the same names under a two character directory.
+    fn legacy(root: &Path, key: &str) -> PathBuf {
         root.join(&key[..2.min(key.len())]).join(key)
     }
 
+    // The existing flat or legacy location of a name, else the flat location where a new one is written.
+    fn resolve(root: PathBuf, key: &str, extension: Option<&str>) -> PathBuf {
+        let name = |key: &str| extension.map_or_else(|| key.to_owned(), |ext| format!("{key}.{ext}"));
+        let flat = root.join(name(key));
+        if fs::symlink_metadata(&flat).is_ok() { return flat; }
+        let legacy = root.join(&key[..2.min(key.len())]).join(name(key));
+        if fs::symlink_metadata(&legacy).is_ok() { legacy } else { flat }
+    }
+
     pub fn entry_dir(&self, key: &str) -> PathBuf {
-        Self::shard(self.dirs.store(), key)
+        Self::resolve(self.dirs.store(), key, None)
     }
 
     fn manifest_path(&self, prekey: &str) -> PathBuf {
-        Self::shard(self.dirs.manifests(), prekey).with_extension("json")
+        Self::resolve(self.dirs.manifests(), prekey, Some("json"))
+    }
+
+    fn unit_record_path(units: PathBuf, unit: &str) -> PathBuf {
+        Self::resolve(units, unit, None)
     }
 
     /// Empty for a missing, unreadable or other-format manifest.
@@ -150,7 +198,7 @@ impl Cache {
     fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
         let bytes = fs::read(self.manifest_path(prekey)).ok()?;
         let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
-        matches!(manifest.format, 3 | 4 | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
+        matches!(manifest.format, 3 | 4 | 5 | LEGACY_BACKED_MANIFEST_FORMAT | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
     }
 
     /// Reads `meta.json` for the one marker a manifest format depends on; an unreadable entry counts as not linked.
@@ -176,7 +224,7 @@ impl Cache {
         self.mark_used_guarded(guard, &candidate.key);
         let manifest = self.read_manifest(prekey);
         // A manifest that ever listed a backed entry stays in the backed format.
-        let format = if manifest.as_ref().is_some_and(|m| m.format == BACKED_MANIFEST_FORMAT)
+        let format = if manifest.as_ref().is_some_and(|m| matches!(m.format, LEGACY_BACKED_MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT))
             || self.entry_is_linked(&candidate.key)
         { BACKED_MANIFEST_FORMAT } else { MANIFEST_FORMAT };
         let current_format = manifest.as_ref().is_some_and(|m| m.format == format);
@@ -238,9 +286,9 @@ impl Cache {
         let result = (|| {
             if !valid_key(key) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid entry key")); }
             let _guard = UnitRecordsGuard::acquire(&self.dirs)?;
-            let dest = self.entry_dir(key);
+            let dest = Self::keyed(self.dirs.store(), key);
             let mut renamed = sys::rename(staged, &dest);
-            // The shard directory is created only when the first rename finds it missing.
+            // The store directory is created only when the first rename finds it missing.
             if renamed.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                 && let Some(parent) = dest.parent()
                 && fs::create_dir_all(parent).is_ok()
@@ -273,16 +321,142 @@ impl Cache {
         if !self.recently_used(key) { fsx::touch(&self.entry_dir(key).join("meta.json")); }
     }
 
+    /// Moves entries, manifests and unit records out of legacy two character directories into their flat trees and removes the emptied directories; a busy metadata lock defers the whole pass.
+    pub fn migrate_legacy_layout(&self) {
+        let Ok(Some(_guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return };
+        for root in [self.dirs.store(), self.dirs.manifests(), self.units_dir()] {
+            let Ok(read) = fs::read_dir(&root) else { continue };
+            for shard in read.flatten() {
+                let path = shard.path();
+                let is_shard = shard.file_name().to_str().is_some_and(is_shard_name)
+                    && sys::lstat(&path).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
+                if !is_shard { continue; }
+                let Ok(children) = fs::read_dir(&path) else { continue };
+                for child in children.flatten() {
+                    let dest = root.join(child.file_name());
+                    match sys::lstat(&dest) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => { let _ = sys::rename(&child.path(), &dest); }
+                        // A complete flat entry supersedes its legacy twin.
+                        Ok(_) if root == self.dirs.store() && dest.join("meta.json").is_file() => { let _ = fsx::remove_any(&child.path()); }
+                        _ => {}
+                    }
+                }
+                let _ = fs::remove_dir(&path);
+            }
+        }
+    }
+
+    /// False only when a pack file exists but cannot be trusted.
+    pub fn unit_pack_valid(&self) -> bool {
+        self.read_unit_pack().is_some()
+    }
+
+    /// The pack lines for gc planning; empty when the pack is missing or untrusted.
+    pub(crate) fn read_unit_pack_for_gc(&self) -> Option<Vec<(String, u64, Vec<String>)>> {
+        let pack = self.read_unit_pack()?;
+        (!pack.is_empty()).then(|| pack.into_iter().map(|(unit, (stamp, keys))| (unit, stamp, keys)).collect())
+    }
+
+    /// Drops pack records that list no present entry and have not been written for `max_idle`, only while every line still reads as the caller saw it; returns the number removed.
+    pub(crate) fn retire_idle_unit_records(&self, expected: &[(String, u64, Vec<String>)], max_idle: Duration) -> usize {
+        let Ok(Some(_guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return 0 };
+        let Some(mut pack) = self.read_unit_pack() else { return 0 };
+        let now = fsx::unix_now();
+        let mut removed = 0;
+        for (unit, stamp, keys) in expected {
+            let unchanged = pack.get(unit).is_some_and(|(current, current_keys)| current == stamp && current_keys == keys);
+            if unchanged && now.saturating_sub(*stamp) > max_idle.as_secs() && keys.iter().all(|key| self.unit_reference_absent(key)) {
+                pack.remove(unit);
+                removed += 1;
+            }
+        }
+        if removed > 0 && self.write_unit_pack(&pack).is_err() { return 0; }
+        removed
+    }
+
     pub fn units_dir(&self) -> PathBuf {
         self.dirs.root().join(UNITS_DIR)
+    }
+
+    /// The file holding every unit record written by this version: one line per unit, `unit unix_seconds key...`, newest key first.
+    pub fn unit_pack_path(&self) -> PathBuf {
+        self.units_dir().join(UNIT_PACK)
+    }
+
+    /// `None` when the pack exists but cannot be trusted (unreadable, oversized or malformed), so callers leave it alone; a missing pack is empty.
+    fn read_unit_pack(&self) -> Option<std::collections::BTreeMap<String, (u64, Vec<String>)>> {
+        let path = self.unit_pack_path();
+        let mut map = std::collections::BTreeMap::new();
+        let meta = match sys::lstat(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(map),
+            Err(_) => return None,
+        };
+        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > UNIT_PACK_MAX_BYTES { return None; }
+        let text = fs::read_to_string(&path).ok()?;
+        for line in text.lines() {
+            let mut fields = line.split(' ');
+            let unit = fields.next().filter(|unit| valid_key(unit))?;
+            let stamp = fields.next()?.parse::<u64>().ok()?;
+            let keys: Vec<String> = fields.map(str::to_owned).collect();
+            if keys.iter().any(|key| !valid_key(key)) { return None; }
+            map.insert(unit.to_owned(), (stamp, keys));
+        }
+        Some(map)
+    }
+
+    fn write_unit_pack(&self, map: &std::collections::BTreeMap<String, (u64, Vec<String>)>) -> io::Result<()> {
+        let path = self.unit_pack_path();
+        if map.is_empty() {
+            return match fs::remove_file(&path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
+        }
+        let mut text = String::new();
+        for (unit, (stamp, keys)) in map {
+            text.push_str(unit);
+            text.push(' ');
+            text.push_str(&stamp.to_string());
+            for key in keys {
+                text.push(' ');
+                text.push_str(key);
+            }
+            text.push('\n');
+        }
+        crate::lock::write_shared(&path, text.as_bytes(), crate::lock::shared_mode(&self.dirs))
+    }
+
+    /// The legacy per-unit file of this unit, if one exists, as its valid keys.
+    fn legacy_unit_keys(&self, unit: &str) -> Vec<String> {
+        fs::read_to_string(Self::unit_record_path(self.units_dir(), unit))
+            .map(|text| text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every unit record with its last write time in unix seconds: the pack first, then legacy per-unit files for units the pack does not list.
+    pub fn unit_records(&self) -> Vec<(String, u64, Vec<String>)> {
+        let mut out: Vec<(String, u64, Vec<String>)> = self.read_unit_pack().unwrap_or_default()
+            .into_iter().map(|(unit, (stamp, keys))| (unit, stamp, keys)).collect();
+        let listed: std::collections::HashSet<String> = out.iter().map(|record| record.0.clone()).collect();
+        for path in keyed_items(&self.units_dir()) {
+            let Some(unit) = path.file_name().and_then(|name| name.to_str()).filter(|name| valid_key(name)).map(str::to_owned) else { continue };
+            if listed.contains(&unit) { continue; }
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let stamp = fs::metadata(&path).and_then(|meta| meta.modified()).ok()
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |age| age.as_secs());
+            out.push((unit, stamp, text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect()));
+        }
+        out
     }
 
     /// The entry keys the unit record lists, newest first; empty when the record is missing or unreadable.
     pub fn unit_keys(&self, unit: &str) -> Vec<String> {
         if !valid_key(unit) { return Vec::new(); }
-        fs::read_to_string(Self::shard(self.units_dir(), unit))
-            .map(|text| text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect())
-            .unwrap_or_default()
+        match self.read_unit_pack().and_then(|mut pack| pack.remove(unit)) {
+            Some((_, keys)) => keys,
+            None => self.legacy_unit_keys(unit),
+        }
     }
 
     /// Serialize version commits and retirement renames; returned retired keys are for logging.
@@ -310,23 +484,29 @@ impl Cache {
         let Ok(guard) = UnitRecordsGuard::acquire(&self.dirs) else { return Vec::new() };
         after_lock();
         if key.is_some_and(|key| !self.has_entry(key)) { return Vec::new(); }
-        let path = Self::shard(self.units_dir(), unit);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(_) => return Vec::new(),
+        let Some(mut pack) = self.read_unit_pack() else { return Vec::new() };
+        let legacy = Self::unit_record_path(self.units_dir(), unit);
+        let previous: Vec<String> = match pack.get(unit) {
+            Some((_, keys)) => keys.clone(),
+            None => match fs::read_to_string(&legacy) {
+                Ok(text) => text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => return Vec::new(),
+            },
         };
-        let previous: Vec<String> = text.lines().filter(|line| valid_key(line)).map(str::to_owned).collect();
+        let in_pack = pack.contains_key(unit);
         let mut seen = std::collections::HashSet::new();
         let mut keys: Vec<String> = previous.iter().filter(|old| Some(old.as_str()) != key && self.has_entry(old)
             && seen.insert(old.as_str())).cloned().collect();
         if let Some(key) = key { keys.insert(0, key.to_owned()); }
         let evicted = if keys.len() > keep { keys.split_off(keep) } else { Vec::new() };
-        if keys == previous && evicted.is_empty() { return Vec::new(); }
+        if keys == previous && evicted.is_empty() && (in_pack || !legacy.exists()) { return Vec::new(); }
+        let path = self.unit_pack_path();
         before_commit(&path);
-        if crate::lock::write_shared(&path, format!("{}\n", keys.join("\n")).as_bytes(), crate::lock::shared_mode(&self.dirs)).is_err() {
-            return Vec::new();
-        }
+        pack.insert(unit.to_owned(), (fsx::unix_now(), keys));
+        if self.write_unit_pack(&pack).is_err() { return Vec::new(); }
+        // The pack now owns the unit, so its older per-unit file is redundant.
+        let _ = fs::remove_file(&legacy);
         let retired: Vec<_> = evicted.into_iter().filter_map(|old| self.retire_entry_guarded(&guard, &old, None).ok().flatten().map(|entry| (old, entry))).collect();
         drop(guard);
         for (_, entry) in &retired {
@@ -376,6 +556,17 @@ impl Cache {
     }
 
     fn prune_unit_record_guarded(&self, guard: &UnitRecordsGuard, unit: &str, retired: &str) {
+        if let Some(mut pack) = self.read_unit_pack()
+            && let Some((_, keys)) = pack.get(unit)
+        {
+            if !keys.iter().any(|key| key == retired) { return; }
+            let mut seen = std::collections::HashSet::new();
+            let kept: Vec<String> = keys.iter().filter(|key| !self.unit_reference_absent(key)).filter(|key| seen.insert(key.as_str())).cloned().collect();
+            if kept.len() == keys.len() { return; }
+            if kept.is_empty() { pack.remove(unit); } else { pack.insert(unit.to_owned(), (fsx::unix_now(), kept)); }
+            let _ = self.write_unit_pack(&pack);
+            return;
+        }
         self.prune_unit_record_with(guard, unit, retired, |path, contents| match contents {
             Some(contents) => crate::lock::write_shared(path, contents, crate::lock::shared_mode(&self.dirs)),
             None => fs::remove_file(path),
@@ -413,56 +604,20 @@ impl Cache {
     }
 
     fn reference_absent(&self, key: &str) -> bool {
-        let entry = self.entry_dir(key);
-        let shard = entry.parent().unwrap();
-        let storage = shard.parent().unwrap();
-        let home = storage.parent().unwrap();
-        let Ok(meta) = sys::stat(home) else { return false };
-        if !meta.is_dir() { return false; }
-        let mut parents = vec![(home, true, meta.dev(), meta.ino())];
-        let meta_path = entry.join("meta.json");
-        let mut absent = meta_path.as_path();
-        for path in [storage, shard, entry.as_path()] {
-            match sys::lstat(path) {
-                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => parents.push((path, false, meta.dev(), meta.ino())),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
-                _ => return false,
-            }
-        }
-        // Recheck proven parent identities before treating portable NotFound as absence.
-        if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
-        parents.iter().all(|&(path, follow, dev, ino)| {
-            let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
-            meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
-        })
+        let storage = self.dirs.store();
+        let flat = Self::keyed(storage.clone(), key);
+        let legacy = Self::legacy(&storage, key);
+        prove_absent(&storage, &[&storage, &flat], &flat.join("meta.json"))
+            && prove_absent(&storage, &[&storage, legacy.parent().unwrap(), &legacy], &legacy.join("meta.json"))
     }
 
     /// Unit records retain existing entry roots, including incomplete entries and uncertain filesystem states.
     pub(crate) fn unit_reference_absent(&self, key: &str) -> bool {
         if !valid_key(key) { return false; }
-        let entry = self.entry_dir(key);
-        let shard = entry.parent().unwrap();
-        let storage = shard.parent().unwrap();
-        let home = storage.parent().unwrap();
-        let Ok(meta) = sys::stat(home) else { return false };
-        if !meta.is_dir() { return false; }
-        let mut parents = vec![(home, true, meta.dev(), meta.ino())];
-        let mut absent = entry.as_path();
-        for path in [storage, shard] {
-            match sys::lstat(path) {
-                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                    parents.push((path, false, meta.dev(), meta.ino()));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
-                _ => return false,
-            }
-        }
-        // Prove component types before interpreting portable NotFound, then recheck parent identities.
-        if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
-        parents.iter().all(|&(path, follow, dev, ino)| {
-            let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
-            meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
-        })
+        let storage = self.dirs.store();
+        let flat = Self::keyed(storage.clone(), key);
+        let legacy = Self::legacy(&storage, key);
+        prove_absent(&storage, &[&storage], &flat) && prove_absent(&storage, &[&storage, legacy.parent().unwrap()], &legacy)
     }
 
     pub(crate) fn retirement_snapshot(&self, key: &str) -> Option<EntryRetirementSnapshot> {
@@ -516,6 +671,48 @@ impl Cache {
 
 }
 
+/// Every item of a keyed tree: the flat names and the contents of legacy two character shard directories.
+pub fn keyed_items(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(read) = fs::read_dir(root) else { return out };
+    for item in read.flatten() {
+        let is_shard = item.file_name().to_str().is_some_and(is_shard_name) && item.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_shard {
+            out.push(item.path());
+        } else if let Ok(inner) = fs::read_dir(item.path()) {
+            out.extend(inner.flatten().map(|file| file.path()));
+        }
+    }
+    out
+}
+
+/// True for the two character directory names older homes used to shard entries.
+pub fn is_shard_name(name: &str) -> bool {
+    name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// Walks the chain from the parent of its first path, which must be real directories until one is missing, then proves the leaf absent and the parents unchanged.
+fn prove_absent(first: &Path, chain: &[&Path], leaf: &Path) -> bool {
+    let Some(home) = first.parent() else { return false };
+    let Ok(meta) = sys::stat(home) else { return false };
+    if !meta.is_dir() { return false; }
+    let mut parents = vec![(home, true, meta.dev(), meta.ino())];
+    let mut absent = leaf;
+    for path in chain {
+        match sys::lstat(path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => parents.push((path, false, meta.dev(), meta.ino())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => { absent = path; break; }
+            _ => return false,
+        }
+    }
+    // Recheck proven parent identities before treating portable NotFound as absence.
+    if !matches!(sys::lstat(absent), Err(error) if error.kind() == io::ErrorKind::NotFound) { return false; }
+    parents.iter().all(|&(path, follow, dev, ino)| {
+        let meta = if follow { sys::stat(path) } else { sys::lstat(path) };
+        meta.is_ok_and(|meta| meta.is_dir() && (follow || !meta.file_type().is_symlink()) && meta.dev() == dev && meta.ino() == ino)
+    })
+}
+
 /// A per-codegen-unit object of an incremental compile, whose stale names rustc leaves in the target (split debuginfo).
 pub fn is_incremental_object(name: &str) -> bool {
     name.ends_with(".rcgu.o") && name.split('.').count() == 5 && !name.contains("-cgu.")
@@ -549,7 +746,7 @@ struct UnitRecordSnapshot {
     path: PathBuf,
     root: (u64, u64),
     units: (u64, u64),
-    shard: (u64, u64),
+    parent: (u64, u64),
     identity: EntryIdentity,
     keys: Vec<String>,
 }
@@ -557,11 +754,11 @@ struct UnitRecordSnapshot {
 impl UnitRecordSnapshot {
     fn read(dirs: &Dirs, unit: &str) -> Option<Self> {
         if !valid_key(unit) { return None; }
-        let path = Cache::shard(dirs.root().join(UNITS_DIR), unit);
+        let path = Cache::unit_record_path(dirs.root().join(UNITS_DIR), unit);
         let root = sys::stat(dirs.root()).ok()?;
         if !root.is_dir() { return None; }
         let units = checked_directory(&dirs.root().join(UNITS_DIR)).ok()?;
-        let shard = checked_directory(path.parent()?).ok()?;
+        let parent = checked_directory(path.parent()?).ok()?;
         let meta = sys::lstat(&path).ok()?;
         if !meta.is_file() || meta.file_type().is_symlink() { return None; }
         let identity = EntryIdentity::read(&meta)?;
@@ -573,7 +770,7 @@ impl UnitRecordSnapshot {
         if contents.len() as u64 > UNIT_RECORD_MAX_BYTES { return None; }
         let keys: Vec<String> = if contents == "\n" { Vec::new() } else { contents.lines().map(str::to_owned).collect() };
         if keys.iter().any(|key| !valid_key(key)) || contents != format!("{}\n", keys.join("\n")) { return None; }
-        let record = Self { path, root: (root.dev(), root.ino()), units, shard, identity, keys };
+        let record = Self { path, root: (root.dev(), root.ino()), units, parent, identity, keys };
         record.unchanged(dirs).then_some(record)
     }
 
@@ -581,7 +778,7 @@ impl UnitRecordSnapshot {
         // The global guard serializes writers; these identities reject changed paths and unsafe boundaries.
         sys::stat(dirs.root()).is_ok_and(|meta| meta.is_dir() && (meta.dev(), meta.ino()) == self.root)
             && checked_directory(&dirs.root().join(UNITS_DIR)).ok() == Some(self.units)
-            && self.path.parent().and_then(|path| checked_directory(path).ok()) == Some(self.shard)
+            && self.path.parent().and_then(|path| checked_directory(path).ok()) == Some(self.parent)
             && sys::lstat(&self.path).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink()
                 && EntryIdentity::read(&meta).as_ref() == Some(&self.identity))
     }
@@ -611,7 +808,7 @@ impl UnitRecordsGuard {
     fn open(dirs: &Dirs) -> io::Result<File> {
         let mode = crate::lock::shared_mode(dirs);
         crate::lock::ensure_dir(&dirs.keylocks(), mode)?;
-        // This stable unsharded name stays outside per-prekey lock garbage collection.
+        // This stable name stays outside per-prekey lock garbage collection.
         crate::lock::open_lock_file(&dirs.keylocks().join("unit-records"), mode)
     }
 
@@ -972,12 +1169,12 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let linked = |name: &str, stored: &str| StoredFile {
             name: name.into(), stored: stored.into(), text: false, bytes: 8192, encoding: payload::Encoding::Linked,
-            stored_bytes: None, decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None,
+            stored_bytes: None, decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None, inline: None,
         };
         let object = "k-0123456789abcdef.0a1b2c3d4e5f.1x2y3z.rcgu.o";
         let meta = EntryMeta {
             crate_name: "k".into(), version: "0.1.0".into(), compile_ms: 1, created_unix: 0, incremental_unit: None, prekey: None,
-            source: None, workspaces: Vec::new(), files: vec![linked("libk.rlib", "f0"), linked(object, "f1")], stderr: "stderr".into(),
+            source: None, workspaces: Vec::new(), files: vec![linked("libk.rlib", "f0"), linked(object, "f1")], stderr: "stderr".into(), stderr_inline: String::new(),
         };
         for (stored, name) in [("f0", "libk.rlib"), ("f1", object)] {
             fs::write(entry.join(stored), vec![1u8; 8192]).unwrap();
@@ -1063,8 +1260,7 @@ mod tests {
         fs::write(first_marker.with_extension("release"), b"release").unwrap();
         assert!(first.wait().unwrap().success());
         assert!(second.wait().unwrap().success());
-        let record = fs::read_to_string(Cache::shard(cache.units_dir(), &key(0xaa))).unwrap();
-        assert_eq!(record.lines().collect::<Vec<_>>(), vec![key(3), key(2)]);
+        assert_eq!(cache.unit_keys(&key(0xaa)), vec![key(3), key(2)]);
         assert!(!cache.has_entry(&key(1)));
         assert!(cache.has_entry(&key(2)) && cache.has_entry(&key(3)));
         fs::remove_dir_all(dir).unwrap();
@@ -1099,7 +1295,7 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(handle.join().unwrap(), vec![key(1)]);
         assert_eq!(fs::read(cache.entry_dir(&key(1)).join("f0")).unwrap(), b"republished bytes");
-        assert_eq!(fs::read_to_string(Cache::shard(cache.units_dir(), &key(0xaa))).unwrap(), format!("{}\n", key(1)));
+        assert_eq!(cache.unit_keys(&key(0xaa)), vec![key(1)]);
         assert!(cache.has_entry(&key(3)));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1110,7 +1306,7 @@ mod tests {
         for entry in 1..=3 { publish_entry(&cache, entry); }
         let unit = key(0xaa);
         cache.note_unit_entry(&unit, &key(1), 1);
-        let record = Cache::shard(cache.units_dir(), &unit);
+        let record = cache.unit_pack_path();
         let original = fs::read(&record).unwrap();
         let denied = Dirs::at(&dir).keylocks().join("unit-records");
         let saved = denied.with_extension("saved");
@@ -1139,11 +1335,10 @@ mod tests {
         assert!(cache.note_unit_entry(&unit, &key(1), 2).is_empty());
         publish_entry(&cache, 2);
         cache.note_unit_entry(&unit, &key(2), 2);
-        let path = Cache::shard(cache.units_dir(), &unit);
-        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(2)));
+        assert_eq!(cache.unit_keys(&unit), vec![key(2)]);
         assert_eq!(cache.note_unit_entry(&unit, &key(2), 0), vec![key(2)]);
         assert!(!cache.has_entry(&key(2)));
-        assert!(fs::read_to_string(path).unwrap().trim().is_empty());
+        assert!(cache.unit_keys(&unit).is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1182,7 +1377,7 @@ mod tests {
         publish_entry(&cache, 1);
         publish_entry(&cache, 2);
         assert!(cache.note_unit_entry(&unit, &key(1), 2).is_empty());
-        let record = Cache::shard(cache.units_dir(), &unit);
+        let record = Cache::keyed(cache.units_dir(), &unit);
         fs::write(&record, format!("../../outside\n{}\n", key(1))).unwrap();
         assert_eq!(cache.note_unit_entry(&unit, &key(2), 1), vec![key(1)]);
         assert!(outside.is_dir());
@@ -1248,10 +1443,101 @@ mod tests {
     }
 
     fn write_unit_record(cache: &Cache, unit: &str, keys: &[u8]) -> PathBuf {
-        let path = Cache::shard(cache.units_dir(), unit);
+        let path = Cache::keyed(cache.units_dir(), unit);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, format!("{}\n", keys.iter().map(|n| key(*n)).collect::<Vec<_>>().join("\n"))).unwrap();
         path
+    }
+
+    #[test]
+    fn unit_records_share_one_pack_and_a_write_folds_the_legacy_file_into_it() {
+        let (dir, cache) = scratch("pack");
+        let (first, second) = (key(0xa1), key(0xa2));
+        for n in 1..=3 { publish_unit_entry(&cache, n, &first); }
+        let legacy = write_unit_record(&cache, &first, &[1, 2]);
+        assert_eq!(cache.unit_keys(&first), vec![key(1), key(2)], "a legacy file is read until the pack lists the unit");
+        assert_eq!(cache.note_unit_entry(&first, &key(3), 3), Vec::<String>::new());
+        assert_eq!(cache.unit_keys(&first), vec![key(3), key(1), key(2)]);
+        assert!(!legacy.exists(), "the pack owns the unit once written");
+        cache.note_unit_entry(&second, &key(2), 1);
+        let files: Vec<_> = fs::read_dir(cache.units_dir()).unwrap().flatten().map(|entry| entry.file_name()).collect();
+        assert_eq!(files, vec![std::ffi::OsString::from(UNIT_PACK)], "every unit lives in the one file");
+        let mut listed: Vec<_> = cache.unit_records().into_iter().map(|(unit, stamp, keys)| (unit, stamp > 0, keys)).collect();
+        listed.sort();
+        assert_eq!(listed, vec![(first.clone(), true, vec![key(3), key(1), key(2)]), (second.clone(), true, vec![key(2)])]);
+        cache.remove_entry(&key(1));
+        assert_eq!(cache.unit_keys(&first), vec![key(3), key(2)], "retirement prunes the pack line");
+        cache.remove_entry(&key(3));
+        cache.remove_entry(&key(2));
+        assert!(!cache.unit_records().iter().any(|record| record.0 == first), "a record with no entries left is dropped");
+        assert!(cache.unit_keys(&second) == vec![key(2)] || cache.unit_keys(&second).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_untrusted_pack_is_left_alone_and_blocks_writes() {
+        let (dir, cache) = scratch("pack-bad");
+        publish_unit_entry(&cache, 1, &key(0xa1));
+        fs::create_dir_all(cache.units_dir()).unwrap();
+        fs::write(cache.unit_pack_path(), b"not a record\n").unwrap();
+        assert!(!cache.unit_pack_valid());
+        assert!(cache.note_unit_entry(&key(0xa1), &key(1), 1).is_empty());
+        assert_eq!(fs::read(cache.unit_pack_path()).unwrap(), b"not a record\n");
+        assert!(cache.unit_keys(&key(0xa1)).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_names_are_flat_and_legacy_shard_locations_still_resolve() {
+        let (dir, cache) = scratch("flat-legacy");
+        publish_entry(&cache, 1);
+        assert_eq!(cache.entry_dir(&key(1)), dir.join("store").join(key(1)));
+        let legacy = Cache::legacy(&cache.dirs.store(), &key(2));
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("meta.json"), b"{}").unwrap();
+        assert!(cache.has_entry(&key(2)) && cache.entry_dir(&key(2)) == legacy);
+        assert!(!cache.reference_absent(&key(2)) && !cache.unit_reference_absent(&key(2)));
+        assert!(cache.reference_absent(&key(3)) && cache.unit_reference_absent(&key(3)));
+        let manifest = Cache::legacy(&cache.dirs.manifests(), &key(9)).with_extension("json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, serde_json::to_vec(&Manifest { format: 4, candidates: vec![empty_candidate(1)] }).unwrap()).unwrap();
+        assert_eq!(cache.candidates(&key(9)), vec![empty_candidate(1)]);
+        assert_eq!(cache.manifest_path(&key(9)), manifest);
+        let record = Cache::legacy(&cache.units_dir(), &key(8));
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, format!("{}\n", key(1))).unwrap();
+        assert_eq!(cache.unit_keys(&key(8)), vec![key(1)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_moves_legacy_names_flat_and_drops_emptied_shards() {
+        let (dir, cache) = scratch("migrate");
+        let legacy = Cache::legacy(&cache.dirs.store(), &key(2));
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("meta.json"), b"{}").unwrap();
+        publish_entry(&cache, 3);
+        let twin = Cache::legacy(&cache.dirs.store(), &key(3));
+        fs::create_dir_all(&twin).unwrap();
+        fs::write(twin.join("meta.json"), b"{}").unwrap();
+        let manifest = Cache::legacy(&cache.dirs.manifests(), &key(9)).with_extension("json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, serde_json::to_vec(&Manifest { format: 4, candidates: vec![empty_candidate(2)] }).unwrap()).unwrap();
+        let record = Cache::legacy(&cache.units_dir(), &key(8));
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, format!("{}\n", key(2))).unwrap();
+        fs::create_dir_all(cache.dirs.store().join("zz")).unwrap();
+        cache.migrate_legacy_layout();
+        assert_eq!(cache.entry_dir(&key(2)), cache.dirs.store().join(key(2)));
+        assert!(cache.has_entry(&key(2)) && cache.has_entry(&key(3)));
+        assert!(cache.dirs.store().join(key(3)).join("f0").is_file(), "the flat twin is kept");
+        assert_eq!(cache.candidates(&key(9)), vec![empty_candidate(2)]);
+        assert_eq!(cache.unit_keys(&key(8)), vec![key(2)]);
+        assert!(!legacy.parent().unwrap().exists() && !twin.parent().unwrap().exists());
+        assert!(!manifest.parent().unwrap().exists() && !record.parent().unwrap().exists());
+        assert!(cache.dirs.store().join("zz").exists(), "only hex shard names are touched");
+        assert_eq!(keyed_items(&cache.dirs.store()).len(), 3);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1284,10 +1570,12 @@ mod tests {
         assert!(!path.exists());
         publish_unit_entry(&cache, 1, &unit);
         assert!(cache.note_unit_entry(&unit, &key(1), 1).is_empty());
-        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(1)));
+        assert_eq!(cache.unit_keys(&unit), vec![key(1)]);
         publish_unit_entry(&cache, 2, &unit);
         assert_eq!(cache.note_unit_entry(&unit, &key(2), 1), vec![key(1)]);
-        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", key(2)));
+        assert_eq!(cache.unit_keys(&unit), vec![key(2)]);
+        cache.remove_entry(&key(2));
+        assert!(cache.unit_keys(&unit).is_empty() && !cache.unit_records().iter().any(|record| record.0 == unit), "a pruned empty record leaves the pack");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1385,7 +1673,7 @@ mod tests {
         assert!(!snapshot.unchanged(&cache.dirs));
         let snapshot = UnitRecordSnapshot::read(&cache.dirs, &unit).unwrap();
         let parent = path.parent().unwrap();
-        sys::rename(parent, &dir.join("previous-unit-shard")).unwrap();
+        sys::rename(parent, &dir.join("previous-unit-parent")).unwrap();
         fs::create_dir(parent).unwrap();
         fs::write(&path, &original).unwrap();
         assert!(!snapshot.unchanged(&cache.dirs));
@@ -1445,7 +1733,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), format!("{}\n", key(1)));
         let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
         let parent = path.parent().unwrap();
-        let outside_parent = dir.join("outside-unit-shard");
+        let outside_parent = dir.join("outside-unit-parent");
         sys::rename(parent, &outside_parent).unwrap();
         sys::link_tool(&outside_parent, parent).unwrap();
         assert!(UnitRecordSnapshot::read(&cache.dirs, &unit).is_none());
@@ -1709,8 +1997,8 @@ mod tests {
     }
 
     #[test]
-    fn manifest_format_five_writes_and_legacy_formats_migrate_without_losing_raw_entries() {
-        assert_eq!(MANIFEST_FORMAT, 5);
+    fn manifest_format_seven_writes_and_legacy_formats_migrate_without_losing_raw_entries() {
+        assert_eq!((MANIFEST_FORMAT, BACKED_MANIFEST_FORMAT), (7, 8));
         let (dir, cache) = scratch("format-bump");
         publish_entry(&cache, 1);
         let prekey = key(0x7b);
@@ -1743,13 +2031,13 @@ mod tests {
         };
         cache.add_candidate(&prekey, candidate.clone());
         let current = fs::read_to_string(&path).unwrap();
-        assert!(current.contains("\"format\":5"));
+        assert!(current.contains("\"format\":7"));
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
-        for legacy_format in [3, 4] {
-            fs::write(&path, current.replace("\"format\":5", &format!("\"format\":{legacy_format}"))).unwrap();
+        for legacy_format in [3, 4, 5] {
+            fs::write(&path, current.replace("\"format\":7", &format!("\"format\":{legacy_format}"))).unwrap();
             assert_eq!(cache.candidates(&prekey), vec![candidate.clone()], "format {legacy_format} entries remain reusable");
             cache.add_candidate(&prekey, candidate.clone());
-            assert!(fs::read_to_string(&path).unwrap().contains("\"format\":5"),
+            assert!(fs::read_to_string(&path).unwrap().contains("\"format\":7"),
                 "even an unchanged legacy candidate migrates");
         }
         let stored: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1758,7 +2046,7 @@ mod tests {
         assert_eq!(
             manifest_keys(&path),
             Some(vec![key(1)]),
-            "gc can list format five"
+            "gc can list format seven"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2052,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_capped_and_a_missing_shard_directory_is_created_on_demand() {
+    fn candidates_are_capped_and_a_missing_store_directory_is_created_on_demand() {
         let (dir, cache) = scratch("cap");
         let prekey = key(0x7a);
         for n in 1..=(MAX_CANDIDATES as u8 + 3) {

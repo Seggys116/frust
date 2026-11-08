@@ -716,7 +716,7 @@ fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> i
         return Err(invalid("artifact changed after commitment"));
     }
     // The link adds a name to the inode just hashed and checked, and Cargo's uplift only adds names, so the bytes it exposes are the hashed ones.
-    fs::hard_link(src, dst)?;
+    link_retrying(src, dst)?;
     if !commitment.matches(&sys::lstat(dst)?) {
         return Err(invalid("linked artifact differs from commitment"));
     }
@@ -728,6 +728,56 @@ fn link_commitment(src: &Path, dst: &Path, commitment: Option<&Commitment>) -> i
         content_hash: Some(commitment.hash.clone()),
         mode: Some(commitment.mode),
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static LINK_FAULTS: std::cell::RefCell<std::collections::VecDeque<io::Error>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Makes the next hard links on this thread fail with `errors`, in order, as another process's handle would.
+#[cfg(test)]
+pub(crate) fn inject_link_faults(errors: impl IntoIterator<Item = io::Error>) {
+    LINK_FAULTS.with(|faults| faults.borrow_mut().extend(errors));
+}
+
+fn hard_link(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = LINK_FAULTS.with(|faults| faults.borrow_mut().pop_front()) {
+        return Err(error);
+    }
+    fs::hard_link(src, dst)
+}
+
+// About 155 ms in all: a scanner or indexer that opened the file on Windows usually lets go within that.
+const LINK_RETRY_MS: [u64; 5] = [5, 10, 20, 40, 80];
+
+fn link_retrying(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut delays = LINK_RETRY_MS.iter();
+    loop {
+        match hard_link(src, dst) {
+            Err(error) if sys::transient_share_error(&error) => match delays.next() {
+                Some(&ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+                None => return Err(error),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// A short, stable label for timing records: the OS error code when there is one, else the error kind.
+pub fn error_label(error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("os{code}"),
+        None => format!("{:?}", error.kind()),
+    }
+}
+
+/// How `restore_linked` placed a file: as the store file's own inode, or as a verified copy, with why it was not linked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Linked,
+    Copied(String),
 }
 
 /// Stores a large output as a second name of the target file; any link failure leaves no staged name and falls back to a copy.
@@ -787,12 +837,13 @@ pub fn verify_in_place(path: &Path, file: &StoredFile) -> io::Result<()> {
     Ok(())
 }
 
-/// Copies the store file to `dst` (never a link) and publishes it only if the bytes copied hash to the recorded content hash; the mode is the recorded one, since a chmod through any name changes them all.
-pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::Result<()> {
+/// Links a store file no target shares into `dst`, else copies it and publishes the copy only if the bytes copied hash to the recorded content hash; the mode is the recorded one, since a chmod through any name changes them all.
+pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::Result<Placement> {
     let (len, expected, mode) = linked_expectation(file)?;
-    if restore_by_link(store_file, dst, len, expected, mode)? {
-        return Ok(());
-    }
+    let refused = match restore_by_link(store_file, dst, len, expected, mode)? {
+        Ok(()) => return Ok(Placement::Linked),
+        Err(reason) => reason,
+    };
     // Only the bytes copied count: a touch or an adopt during the copy may move mtime or the name, so a copy that hashes right is published, and one that does not is retried once before it is called unstable.
     for _ in 0..2 {
         let source = lost(File::open(store_file))?;
@@ -811,7 +862,7 @@ pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::R
             if fs::symlink_metadata(dst).is_ok_and(|m| m.is_dir()) {
                 fs::remove_dir_all(dst)?;
             }
-            return sys::rename(&tmp.0, dst);
+            return sys::rename(&tmp.0, dst).map(|()| Placement::Copied(refused));
         }
         let after = lost(sys::fstat(&source))?;
         // The open handle kept its inode, so a length or mtime change means a writer was active during the read.
@@ -822,12 +873,15 @@ pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::R
     Err(io::Error::other(Unstable("the store file kept changing during the copy")))
 }
 
-/// Moves the store file's only name-free inode into the target through a private temporary link, so nothing is copied; `false` means the caller must copy instead.
-fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode: u32) -> io::Result<bool> {
+/// Moves the store file's only name-free inode into the target through a private temporary link, so nothing is copied; an inner `Err` is why the caller must copy instead.
+fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode: u32) -> io::Result<Result<(), String>> {
     let source = lost(File::open(store_file))?;
     let before = lost(sys::fstat(&source))?;
-    if !before.is_file() || before.nlink() != 1 || before.len() != len {
-        return Ok(false);
+    if !before.is_file() || before.len() != len {
+        return Ok(Err("store-not-entry".into()));
+    }
+    if before.nlink() != 1 {
+        return Ok(Err(format!("store-nlink={}", before.nlink())));
     }
     // The bytes are read once and must match the record: an in-place writer may have changed them.
     let (read, hash) = hash_open(&source, len)?;
@@ -836,19 +890,25 @@ fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode
         if after.len() == before.len() && after.mtime() == before.mtime() {
             return Err(unbacked("stored bytes differ from the record"));
         }
-        return Ok(false);
+        return Ok(Err("store-changed".into()));
     }
     let tmp = Temporary(fsx::temp_sibling(dst));
-    if fs::hard_link(store_file, &tmp.0).is_err() {
-        return Ok(false);
+    if let Err(error) = link_retrying(store_file, &tmp.0) {
+        return Ok(Err(format!("link:{}", error_label(&error))));
     }
     // Exactly the store name and our temporary: any other restorer or target that holds a name makes this a copy case, so no two targets share an inode.
-    let linked = sys::lstat(store_file);
-    let private = linked.as_ref().is_ok_and(|now| {
-        now.is_file() && now.nlink() == 2 && now.ino() == before.ino() && now.dev() == before.dev() && now.len() == len && now.mtime() == before.mtime()
-    });
-    if !private || !sys::lstat(&tmp.0).is_ok_and(|held| held.ino() == before.ino() && held.dev() == before.dev()) {
-        return Ok(false);
+    let now = match sys::lstat(store_file) {
+        Ok(now) => now,
+        Err(error) => return Ok(Err(format!("relstat:{}", error_label(&error)))),
+    };
+    if now.nlink() != 2 {
+        return Ok(Err(format!("linked-nlink={}", now.nlink())));
+    }
+    if !now.is_file() || now.ino() != before.ino() || now.dev() != before.dev() || now.len() != len || now.mtime() != before.mtime() {
+        return Ok(Err("store-moved".into()));
+    }
+    if !sys::lstat(&tmp.0).is_ok_and(|held| held.ino() == before.ino() && held.dev() == before.dev()) {
+        return Ok(Err("temp-moved".into()));
     }
     if before.mode() != mode {
         sys::set_path_mode(&tmp.0, mode & 0o7777)?;
@@ -856,28 +916,39 @@ fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode
     if fs::symlink_metadata(dst).is_ok_and(|m| m.is_dir()) {
         fs::remove_dir_all(dst)?;
     }
-    Ok(sys::rename(&tmp.0, dst).is_ok())
+    Ok(sys::rename(&tmp.0, dst).map_err(|error| format!("rename:{}", error_label(&error))))
 }
 
-/// Best effort: when no target name shares the store file any more, the freshly verified destination replaces it, so the store and that one target keep a single copy.
-pub fn adopt(store_file: &Path, dst: &Path) {
-    let (Ok(stored), Ok(placed)) = (sys::lstat(store_file), sys::lstat(dst)) else { return };
-    if !stored.is_file() || stored.nlink() != 1 || !placed.is_file() || stored.dev() != placed.dev() || stored.len() != placed.len() {
-        return;
+/// Best effort: when no target name shares the store file any more, the freshly verified destination replaces it, so the store and that one target keep a single copy; `Ok(false)` means they already share it and `Err` says why it did not.
+pub fn adopt(store_file: &Path, dst: &Path) -> Result<bool, String> {
+    let stored = sys::lstat(store_file).map_err(|error| format!("store:{}", error_label(&error)))?;
+    let placed = sys::lstat(dst).map_err(|error| format!("target:{}", error_label(&error)))?;
+    if stored.is_file() && placed.is_file() && stored.dev() == placed.dev() && stored.ino() == placed.ino() {
+        return Ok(false);
+    }
+    if stored.nlink() != 1 {
+        return Err(format!("store-nlink={}", stored.nlink()));
+    }
+    if !stored.is_file() || !placed.is_file() || stored.dev() != placed.dev() || stored.len() != placed.len() {
+        return Err("target-differs".into());
     }
     let tmp = Temporary(fsx::temp_sibling(store_file));
-    if fs::hard_link(dst, &tmp.0).is_err() || !sys::lstat(&tmp.0).is_ok_and(|linked| same_content(&linked, &placed)) {
-        return;
+    link_retrying(dst, &tmp.0).map_err(|error| format!("link:{}", error_label(&error)))?;
+    if !sys::lstat(&tmp.0).is_ok_and(|linked| same_content(&linked, &placed)) {
+        return Err("target-moved".into());
     }
     // A sharing violation on Windows (a scanner holding the store file) usually passes within moments; giving up only leaves a copy.
+    let mut last = None;
     for attempt in 0..3 {
-        if sys::rename(&tmp.0, store_file).is_ok() {
-            return;
+        match sys::rename(&tmp.0, store_file) {
+            Ok(()) => return Ok(true),
+            Err(error) => last = Some(error),
         }
         if attempt < 2 {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
+    Err(format!("rename:{}", last.map_or_else(String::new, |error| error_label(&error))))
 }
 
 #[cfg(test)]
@@ -946,6 +1017,7 @@ mod tests {
             content_hash: payload.content_hash,
             metadata_slice: None,
             mode: payload.mode,
+            inline: None,
         }
     }
 
@@ -1006,14 +1078,15 @@ mod tests {
         assert_ne!(sys::lstat(&first).unwrap().ino(), sys::lstat(&staged).unwrap().ino(), "a restore always copies");
         assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)), "no temporary is left behind");
 
-        adopt(&staged, &first);
+        assert_eq!(adopt(&staged, &first), Err("store-nlink=2".to_string()));
         assert_ne!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "the store is still shared with the source name");
         fs::remove_file(source).unwrap();
-        adopt(&staged, &first);
+        assert_eq!(adopt(&staged, &first), Ok(true));
         assert_eq!(sys::lstat(&staged).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "an orphaned store file is replaced by the verified destination");
+        assert_eq!(adopt(&staged, &first), Ok(false), "an already shared destination needs nothing");
         let second = scratch.0.join("second");
-        restore_linked(&staged, &second, &file).unwrap();
-        adopt(&staged, &second);
+        assert_eq!(restore_linked(&staged, &second, &file).unwrap(), Placement::Copied("store-nlink=2".into()));
+        assert_eq!(adopt(&staged, &second), Err("store-nlink=2".to_string()));
         assert_ne!(sys::lstat(&second).unwrap().ino(), sys::lstat(&first).unwrap().ino(), "no two destinations ever share an inode");
         assert_ne!(sys::lstat(&second).unwrap().ino(), sys::lstat(&staged).unwrap().ino());
 
@@ -1057,7 +1130,7 @@ mod tests {
         let (staged, file) = exclusive(&scratch.0, &bytes);
         let before = sys::lstat(&staged).unwrap();
         let dst = scratch.0.join("dst");
-        restore_linked(&staged, &dst, &file).unwrap();
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Linked);
         let after = sys::lstat(&staged).unwrap();
         assert_eq!(sys::lstat(&dst).unwrap().ino(), before.ino(), "the destination is the store inode");
         assert_eq!((after.len(), after.mtime(), after.nlink()), (before.len(), before.mtime(), 2), "no data was written");
@@ -1065,6 +1138,42 @@ mod tests {
         let other = scratch.0.join("other");
         restore_linked(&staged, &other, &file).unwrap();
         assert_ne!(sys::lstat(&other).unwrap().ino(), before.ino(), "a store file that already has a target name is copied");
+        assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)));
+    }
+
+    fn busy() -> io::Error {
+        io::Error::from(io::ErrorKind::ResourceBusy)
+    }
+
+    #[test]
+    fn a_link_refused_while_another_handle_holds_the_file_is_retried_before_copying() {
+        let scratch = Scratch::new();
+        let bytes = pattern(70_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let dst = scratch.0.join("dst");
+        inject_link_faults([busy(), busy()]);
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Linked, "a passing sharing violation still links");
+        assert_eq!(sys::lstat(&dst).unwrap().ino(), sys::lstat(&staged).unwrap().ino());
+        assert!(LINK_FAULTS.with(|faults| faults.borrow().is_empty()));
+    }
+
+    #[test]
+    fn a_copy_fallback_names_its_reason_and_a_later_adopt_collapses_it() {
+        let scratch = Scratch::new();
+        let bytes = pattern(70_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let dst = scratch.0.join("dst");
+        inject_link_faults((0..=LINK_RETRY_MS.len()).map(|_| busy()));
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Copied("link:ResourceBusy".into()));
+        assert_eq!(fs::read(&dst).unwrap(), bytes);
+        assert_ne!(sys::lstat(&dst).unwrap().ino(), sys::lstat(&staged).unwrap().ino(), "the store file is held, so the target is a copy");
+        inject_link_faults([io::Error::from(io::ErrorKind::PermissionDenied)]);
+        assert_eq!(adopt(&staged, &dst), Err("link:PermissionDenied".to_string()), "a lasting refusal is reported, not retried");
+        assert!(LINK_FAULTS.with(|faults| faults.borrow().is_empty()));
+        verify_in_place(&dst, &file).unwrap();
+        assert_eq!(adopt(&staged, &dst), Ok(true));
+        assert_eq!(sys::lstat(&dst).unwrap().ino(), sys::lstat(&staged).unwrap().ino(), "the next opportunity leaves one copy");
+        assert_eq!(sys::lstat(&staged).unwrap().nlink(), 2);
         assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)));
     }
 
@@ -1105,9 +1214,9 @@ mod tests {
     }
 
     // Exact bytes, or a miss that leaves the entry alone: never a verdict that the entry is corrupt.
-    fn assert_sound(result: io::Result<()>, dst: &Path, bytes: &[u8]) {
+    fn assert_sound(result: io::Result<Placement>, dst: &Path, bytes: &[u8]) {
         match result {
-            Ok(()) => assert_eq!(fs::read(dst).unwrap(), bytes),
+            Ok(_) => assert_eq!(fs::read(dst).unwrap(), bytes),
             Err(error) => assert!(!is_unbacked(&error), "{error}"),
         }
     }
@@ -1157,7 +1266,7 @@ mod tests {
                     if let Some(old) = previous.take() {
                         fs::remove_file(old).unwrap();
                     }
-                    adopt(&staged, &placed);
+                    let _ = adopt(&staged, &placed);
                     previous = Some(placed);
                 }
             });

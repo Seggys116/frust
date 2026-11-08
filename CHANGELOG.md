@@ -6,6 +6,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Added
 
+* No-op fast path: when nothing changed since the last successful `fcargo build` or `check` of the same invocation, `fcargo` prints cargo's output (replayed warnings and the `Finished` line) without launching cargo. Inputs, outputs, fingerprints, config, environment and toolchain are stamped; any difference, an active build or an untrusted volume falls back to cargo. `FRUST_NOOP=off|on|audit` (default `on`) and `FRUST_NOOP_TRACE=<file>` control and trace it.
 * `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's. `--gate` also fails on time regressions against cargo.
 * `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
 * `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
@@ -26,6 +27,11 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Changed
 
+* Cache entries, manifests, unit records and key lock files now live directly under `store/`, `manifests/`, `units/` and `keylocks/` instead of in two character shard directories, which cost a directory block each on ext4. Older layouts stay readable and `frust gc` moves them flat and removes the emptied shard directories.
+* New entries keep their dep-info text and diagnostics inside `meta.json` (`inline` on a file record, `stderr_inline` on the entry; each falls back to a separate file above 64 KiB), so an entry holds only its payload files besides `meta.json`. Manifests that list such entries use format 7 (backed: 8); formats 3 to 6 and the older entry layout stay readable, and older versions treat the new manifests as misses.
+* Unit version records are written as lines of one file, `units/pack` (`unit unix_seconds key...`), rewritten atomically under the same metadata lock, instead of one file per unit. A legacy per-unit file is still read until the pack lists its unit; a write folds it into the pack, and gc retires pack lines by their recorded write time.
+* Idle compile key lock files older than ten minutes are unlinked by `frust gc` while it holds them, and a process that locked a file gc retired takes the lock again on the replacement, so a key never has two holders.
+* `frust bench --repo` measures the final disk totals after one explicit gc and compaction pass on the frust home (the work the product runs on its own), gates on that figure, and reports the pre-maintenance total, the pass time and a per-tree split of `other` beside it.
 * Test and bench harness executables (`rustc --test`) are compiled but not stored unless `FRUST_CACHE_TESTS=on`, so a rebuild of many test targets no longer pays for storing each one.
 * A finished compile with no free store slot queues its store as a job file that any helper drains, instead of storing inline on the compile's critical path. `FRUST_TIMINGS` reports it as `queued:slots`; inline stores remain only where the outputs cannot be frozen.
 * Cache entries are evicted by age, not by size. `FRUST_CACHE_MAX_GIB` and `FRUST_TARGET_MAX_GIB` are unlimited unless set.

@@ -2859,7 +2859,7 @@ struct CoverageEntry {
 impl CoverageEntry {
     fn current(&self) -> bool {
         regular_key(&self.path.join("meta.json")) == Some(self.manifest)
-            && regular_key(&self.path.join(&self.stderr)).is_some()
+            && (self.stderr.is_empty() || regular_key(&self.path.join(&self.stderr)).is_some())
     }
 }
 
@@ -2960,8 +2960,7 @@ impl StoreIndex {
                     if let Ok(bytes) = fs::read(path)
                         && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
                         && let Some(parent) = path.parent()
-                        && crate::cache::safe_file_name(&entry.stderr)
-                        && sys::lstat(&parent.join(&entry.stderr)).is_ok_and(|m| m.is_file())
+                        && entry.stderr_present(parent)
                         && let Ok(groups) = crate::cache::metadata_slice::validate_groups(&entry.files)
                         && (cfg!(unix) || groups.iter().all(|group| group.slice_indices.is_empty()))
                         && regular_key(path) == Some(FileKey::of(meta))
@@ -3512,8 +3511,8 @@ mod tests {
             crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(),
             files: vec![crate::cache::StoredFile {
                 name: source.file_name().unwrap().to_str().unwrap().into(), stored: "f0".into(), text: false, bytes: file.bytes, dir: false,
-                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None, mode: None,
-            }], stderr: "stderr".into(),
+                encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None, mode: None, inline: None,
+            }], stderr: "stderr".into(), stderr_inline: String::new(),
         };
         fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         fs::write(entry.join("stderr"), b"").unwrap();
@@ -3543,17 +3542,17 @@ mod tests {
         let base = crate::cache::StoredFile {
             name: "libapp-0123456789abcdef.rlib".into(), stored: "f0".into(), text: false, bytes: stored.bytes,
             encoding: stored.encoding, stored_bytes: stored.stored_bytes, decoded_bytes: stored.decoded_bytes,
-            content_hash: stored.content_hash, metadata_slice: None, dir: false, mode: None,
+            content_hash: stored.content_hash, metadata_slice: None, dir: false, mode: None, inline: None,
         };
         let target = crate::cache::StoredFile {
             name: artifact.file_name().unwrap().to_string_lossy().into_owned(), stored: "f1".into(), text: false,
             bytes: fsx::allocated_size(&artifact), encoding: crate::cache::payload::Encoding::Raw, stored_bytes: None,
-            decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None,
+            decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None, inline: None,
         };
         let slice = crate::cache::metadata_slice::build(&entry.join("f0"), &base, &artifact, &target, None).unwrap().unwrap();
         let meta = crate::cache::EntryMeta {
             crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(),
-            files: vec![base, slice], stderr: "stderr".into(),
+            files: vec![base, slice], stderr: "stderr".into(), stderr_inline: String::new(),
         };
         fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         fs::write(entry.join("stderr"), b"").unwrap();

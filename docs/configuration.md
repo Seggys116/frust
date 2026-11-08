@@ -29,6 +29,8 @@ For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` tur
 | `FRUST_TARGET` | `central` | `local` leaves `CARGO_TARGET_DIR` alone |
 | `FRUST_TUNE` | `off` | Opt-in dependency debuginfo reduction |
 | `FRUST_LINK` | `off` | `smart` invokes Apple’s native linker directly for eligible macOS host dev binaries, avoiding the default compiler-driver process. Keeps static Rust linkage and current incremental state. Explicit linker options, custom drivers, cross targets, tests and release builds keep their existing link path |
+| `FRUST_NOOP` | `on` | No-op fast path: an unchanged repeat of a recorded `fcargo build` or `check` prints cargo's output without launching cargo. `off` always runs cargo; `audit` runs cargo whenever the fast path would have answered and fails the build if cargo compiled anything or printed different output. See [no-op fast path](how-it-works.md#no-op-fast-path) |
+| `FRUST_NOOP_TRACE` | unset | A file that receives one JSON line per `build` or `check` with the fast-path decision, the recording outcome and what differed |
 | `FRUST_LOCK` | `on` | Queued build lock |
 | `FRUST_LOCK_TIMEOUT_SECS` | none | Give up waiting for the lock |
 | `FRUST_RENDER` | `auto` | `auto`, `ansi`, `plain`, `off` |

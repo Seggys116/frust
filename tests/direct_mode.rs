@@ -13,12 +13,9 @@ const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
 
 fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let Ok(shards) = fs::read_dir(sb.home().join("manifests")) else { return found };
-    for shard in shards.flatten() {
-        for file in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-            if file.path().extension().is_some_and(|e| e == "json") {
-                found.push(file.path());
-            }
+    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
+        if file.extension().is_some_and(|e| e == "json") {
+            found.push(file);
         }
     }
     found
@@ -67,7 +64,7 @@ fn settled_inputs_are_recorded_with_stamps_and_serve_the_next_build() {
     assert_eq!(sb.count_cache("miss", "leaf"), 1);
     assert!(recorded_stamps(&sb) > 0, "settled inputs carry stamps: {:#?}", manifest_values(&sb));
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 5, "manifests are written in the current format");
+        assert_eq!(manifest["format"], 7, "manifests are written in the current format");
     }
 
     clean(&sb, &a);
@@ -134,7 +131,7 @@ fn manifests_in_an_older_format_are_ignored_and_rewritten() {
     assert_eq!(sb.count_cache("hit", "leaf"), 0, "a manifest without the current format serves nothing");
     assert_eq!(app_output(&sb, &a), "41");
     for manifest in manifest_values(&sb) {
-        assert_eq!(manifest["format"], 5, "the manifest is rewritten in the current format");
+        assert_eq!(manifest["format"], 7, "the manifest is rewritten in the current format");
     }
 
     clean(&sb, &a);
@@ -151,10 +148,8 @@ fn a_row_whose_entry_was_evicted_does_not_serve_and_the_unit_recompiles() {
     build(&sb, &a);
 
     let store = sb.home().join("store");
-    for shard in fs::read_dir(&store).unwrap().flatten() {
-        for entry in fs::read_dir(shard.path()).unwrap().flatten() {
-            fs::remove_dir_all(entry.path()).unwrap();
-        }
+    for entry in frust::cache::keyed_items(&store) {
+        fs::remove_dir_all(entry).unwrap();
     }
     clean(&sb, &a);
     build(&sb, &a);

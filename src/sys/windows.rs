@@ -68,6 +68,7 @@ const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_MORE_DATA: i32 = 234;
 const ERROR_NOT_LOCKED: i32 = 158;
 const ERROR_LOCK_VIOLATION: i32 = 33;
+const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
 const WAIT_TIMEOUT: u32 = 258;
@@ -570,13 +571,18 @@ pub fn home_var() -> Option<OsString> {
     std::env::home_dir().map(PathBuf::into_os_string)
 }
 
+// Access denied, sharing violation and lock violation: what a scanner or indexer holding the file causes.
+pub fn transient_share_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
+}
+
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     let mut delay = 5u64;
     let mut attempt = 1;
     loop {
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(e) if attempt < 8 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+            Err(e) if attempt < 8 && transient_share_error(&e) => {
                 std::thread::sleep(Duration::from_millis(delay));
                 delay = (delay * 2).min(100);
                 attempt += 1;

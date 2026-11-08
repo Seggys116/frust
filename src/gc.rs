@@ -22,6 +22,7 @@ const METADATA_GRACE: Duration = Duration::from_secs(3600);
 const AUTO_GC_EVERY: Duration = Duration::from_secs(86_400);
 /// Unheld prekey locks and stale deferred metadata become collectible after this age; canonical slots persist.
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(86_400);
+const KEYLOCK_MAX_AGE: Duration = Duration::from_secs(600);
 /// Hidden flag of `frust gc` that runs one daily collection and prints nothing.
 pub const AUTO_CHILD_FLAG: &str = "--auto-background";
 /// Room for an entry's directory and `meta.json` on top of the stored files when sizes come from the recorded byte counts.
@@ -43,6 +44,8 @@ pub struct GcOptions {
     pub lock_max_idle: Duration,
     pub history_max_age: Duration,
     pub hashmemo_max_age: Duration,
+    /// Idle compile key lock files older than this are unlinked; an idle file is recreated on its next use.
+    pub keylock_max_age: Duration,
     pub startup_memo_max_age: Duration,
     pub temp_min_age: Duration,
     /// Older temp files go even if their creator's pid exists, because pids are reused.
@@ -63,6 +66,7 @@ impl GcOptions {
             lock_max_idle: Duration::from_secs(7 * 86_400),
             history_max_age: Duration::from_secs(90 * 86_400),
             hashmemo_max_age: Duration::from_secs(30 * 86_400),
+            keylock_max_age: KEYLOCK_MAX_AGE,
             startup_memo_max_age: Duration::from_secs(30 * 86_400),
             temp_min_age: Duration::from_secs(3600),
             temp_max_age: Duration::from_secs(86_400),
@@ -131,6 +135,12 @@ pub struct Plan {
     cache_retirements: HashMap<PathBuf, cache::EntryRetirementSnapshot>,
     broker_retirements: HashMap<PathBuf, store_broker::StaleRunProof>,
     deferred_retirements: HashMap<PathBuf, DeferredMetadata>,
+    keylock_retirements: HashSet<PathBuf>,
+    /// Pack lines that listed no present entry when planned, with the age they had to exceed.
+    pack_retirements: Vec<(String, u64, Vec<String>)>,
+    pack_max_idle: Duration,
+    /// The age beyond which the hash memo log drops its records, set when a log exists.
+    hashmemo_log_age: Option<Duration>,
 }
 
 impl Plan {
@@ -257,6 +267,7 @@ fn estimate_entry_bytes(meta: &cache::EntryMeta) -> Option<u64> {
             + meta
                 .files
                 .iter()
+                .filter(|f| f.inline.is_none())
                 .map(|f| f.stored_bytes.unwrap_or(f.bytes).div_ceil(4096) * 4096)
                 .sum::<u64>(),
     )
@@ -282,15 +293,9 @@ fn unit_identity(meta: &cache::EntryMeta) -> Option<IncrementalUnit> {
 /// Entry key to unit key from the `units/` records, the authoritative grouping of a unit's versions.
 fn unit_records(dirs: &Dirs) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let Ok(shards) = fs::read_dir(cache::Cache::new(dirs).units_dir()) else { return map };
-    for shard in shards.flatten() {
-        let Ok(files) = fs::read_dir(shard.path()) else { continue };
-        for file in files.flatten() {
-            let Some(unit) = file.file_name().to_str().filter(|name| cache::valid_key(name)).map(str::to_owned) else { continue };
-            let Ok(text) = fs::read_to_string(file.path()) else { continue };
-            for line in text.lines().filter(|line| cache::valid_key(line)) {
-                map.insert(line.to_owned(), unit.clone());
-            }
+    for (unit, _, keys) in cache::Cache::new(dirs).unit_records() {
+        for key in keys {
+            map.insert(key, unit.clone());
         }
     }
     map
@@ -300,37 +305,32 @@ fn scan_entries(dirs: &Dirs) -> Vec<ScannedEntry> {
     let mut out = Vec::new();
     let store = cache::Cache::new(dirs);
     let records = unit_records(dirs);
-    let Ok(shards) = fs::read_dir(dirs.store()) else { return out };
-    for shard in shards.flatten() {
-        let Ok(entries) = fs::read_dir(shard.path()) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(key) = path.file_name().and_then(|name| name.to_str()).filter(|key| cache::valid_key(key)) else { continue };
-            if path != store.entry_dir(key) { continue; }
-            let retirement = store.retirement_snapshot(key);
-            let (used, meta) = match File::open(path.join("meta.json")) {
-                Ok(mut file) => {
-                    let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-                    let mut bytes = Vec::new();
-                    let meta = file.read_to_end(&mut bytes).ok().and_then(|_| serde_json::from_slice::<cache::EntryMeta>(&bytes).ok());
-                    (used, meta)
-                }
-                Err(_) => (SystemTime::UNIX_EPOCH, None),
-            };
-            let unit = meta.as_ref().and_then(unit_identity);
-            let link = meta.as_ref().map(|meta| link_state(&path, meta)).unwrap_or_default();
-            let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| bytes.saturating_sub(link.shared_estimate));
-            let group = meta
-                .as_ref()
-                .and_then(|meta| meta.incremental_unit.clone().filter(|unit| cache::valid_key(unit)))
-                .or_else(|| records.get(key).cloned())
-                .or_else(|| meta.as_ref().and_then(|meta| meta.prekey.clone()));
-            let retirement = retirement.filter(|snapshot| snapshot.used() == used
-                && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
-            let unreferenced_path = !records.contains_key(key)
-                && meta.as_ref().is_some_and(|meta| meta.source.as_deref() == Some(cache::clean::SOURCE_PATH));
-            out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group, unreferenced_path });
-        }
+    for path in cache::keyed_items(&dirs.store()) {
+        let Some(key) = path.file_name().and_then(|name| name.to_str()).filter(|key| cache::valid_key(key)) else { continue };
+        if path != store.entry_dir(key) { continue; }
+        let retirement = store.retirement_snapshot(key);
+        let (used, meta) = match File::open(path.join("meta.json")) {
+            Ok(mut file) => {
+                let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                let mut bytes = Vec::new();
+                let meta = file.read_to_end(&mut bytes).ok().and_then(|_| serde_json::from_slice::<cache::EntryMeta>(&bytes).ok());
+                (used, meta)
+            }
+            Err(_) => (SystemTime::UNIX_EPOCH, None),
+        };
+        let unit = meta.as_ref().and_then(unit_identity);
+        let link = meta.as_ref().map(|meta| link_state(&path, meta)).unwrap_or_default();
+        let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| bytes.saturating_sub(link.shared_estimate));
+        let group = meta
+            .as_ref()
+            .and_then(|meta| meta.incremental_unit.clone().filter(|unit| cache::valid_key(unit)))
+            .or_else(|| records.get(key).cloned())
+            .or_else(|| meta.as_ref().and_then(|meta| meta.prekey.clone()));
+        let retirement = retirement.filter(|snapshot| snapshot.used() == used
+            && path.file_name().and_then(|name| name.to_str()).and_then(|key| store.retirement_snapshot(key)).as_ref() == Some(snapshot));
+        let unreferenced_path = !records.contains_key(key)
+            && meta.as_ref().is_some_and(|meta| meta.source.as_deref() == Some(cache::clean::SOURCE_PATH));
+        out.push(ScannedEntry { path, used, unit, estimate, retirement, link, group, unreferenced_path });
     }
     out
 }
@@ -962,10 +962,11 @@ fn plan_store_temps(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
             }
         }
     }
-    let Ok(shards) = fs::read_dir(dirs.store()) else { return };
-    for shard in shards.flatten() {
-        if shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            below(&shard.path(), 3, opts, plan);
+    let Ok(children) = fs::read_dir(dirs.store()) else { return };
+    for child in children.flatten() {
+        if child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let legacy = child.file_name().to_str().is_some_and(cache::is_shard_name);
+            below(&child.path(), if legacy { 3 } else { 2 }, opts, plan);
         }
     }
 }
@@ -1071,7 +1072,7 @@ fn plan_target_temps(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
 fn plan_metadata(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan: &mut Plan) {
     plan_manifests(dirs, opts, evicted, plan);
     plan_locks(dirs, opts, plan);
-    plan_keylocks(dirs, plan);
+    plan_keylocks(dirs, opts, plan);
     plan_deferred(dirs, plan);
     plan_history(dirs, opts, plan);
     plan_hashmemo(dirs, opts, plan);
@@ -1123,7 +1124,14 @@ fn push_metadata(plan: &mut Plan, path: PathBuf) {
     plan.removals.push(Removal { class: Class::Metadata, path, bytes });
 }
 
-fn sharded_files(root: &Path) -> Vec<(String, PathBuf)> {
+// Flat names plus the contents of legacy shard directories.
+fn keyed_files(root: &Path) -> Vec<(String, PathBuf)> {
+    cache::keyed_items(root).into_iter()
+        .filter_map(|path| Some((path.file_name()?.to_string_lossy().into_owned(), path)))
+        .collect()
+}
+
+fn legacy_shard_files(root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     let Ok(shards) = fs::read_dir(root) else { return out };
     for shard in shards.flatten() {
@@ -1256,7 +1264,7 @@ impl ManifestRetirement {
 
 fn plan_manifests(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan: &mut Plan) {
     let store = cache::Cache::new(dirs);
-    for (name, path) in sharded_files(&dirs.manifests()) {
+    for (name, path) in keyed_files(&dirs.manifests()) {
         if fsx::temp_owner(&name).is_some() {
             if stale_temp(&path, &name, opts) {
                 plan.removals.push(Removal {
@@ -1341,13 +1349,32 @@ fn plan_locks(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
     }
 }
 
-/// Unlinking a lock someone waits on only loses the de-duplication of one compile, never correctness.
-fn plan_keylocks(dirs: &Dirs, plan: &mut Plan) {
-    for (_, path) in sharded_files(&dirs.keylocks()) {
-        if mtime_age(&path).is_some_and(|age| age > DEFERRED_MAX_AGE) && flock_held(&path) == Some(false) {
+/// An idle lock file is unlinked while gc holds it, and every acquirer re-checks that its file is still the one named, so retirement never lets two processes hold one key.
+fn plan_keylocks(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
+    for (name, path) in keyed_files(&dirs.keylocks()) {
+        if cache::valid_key(&name) && mtime_age(&path).is_some_and(|age| age >= opts.keylock_max_age) && flock_held(&path) == Some(false) {
+            plan.keylock_retirements.insert(path.clone());
             push_metadata(plan, path);
         }
     }
+}
+
+fn retire_key_lock(path: &Path) -> io::Result<bool> {
+    let file = match sys::open_existing_lock_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match sys::try_lock(&file, LockKind::Exclusive) {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(false),
+        Err(fs::TryLockError::Error(error)) => return Err(error),
+    }
+    let (held, named) = (sys::fstat(&file)?, sys::lstat(path)?);
+    let same = named.is_file() && held.ino() != 0 && held.dev() == named.dev() && held.ino() == named.ino();
+    let removed = if same { fs::remove_file(path).map(|()| true) } else { Ok(false) };
+    let _ = sys::unlock(&file);
+    removed
 }
 
 /// Every slot index a store may use is canonical, so the shared worker bound never loses a lock identity.
@@ -1497,7 +1524,18 @@ impl UnitRetirement {
 }
 
 fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
-    for (name, path) in sharded_files(&dirs.hashmemo()) {
+    if let Ok(entries) = fs::read_dir(dirs.hashmemo()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if fsx::temp_owner(&name).is_some() && stale_temp(&entry.path(), &name, opts) {
+                plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&entry.path()), path: entry.path() });
+            }
+        }
+    }
+    if dirs.hashmemo().join(cache::hashing::LOG_NAME).is_file() {
+        plan.hashmemo_log_age = Some(opts.hashmemo_max_age);
+    }
+    for (name, path) in legacy_shard_files(&dirs.hashmemo()) {
         if fsx::temp_owner(&name).is_some() {
             if stale_temp(&path, &name, opts) {
                 plan.removals.push(Removal { class: Class::Scratch, bytes: fsx::allocated_size(&path), path });
@@ -1509,8 +1547,20 @@ fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
         }
     }
     let store = cache::Cache::new(dirs);
-    for (name, path) in sharded_files(&store.units_dir()) {
-        if !cache::valid_key(&name) || path.parent() != Some(store.units_dir().join(&name[..2]).as_path()) { continue; }
+    if let Some(pack) = store.read_unit_pack_for_gc() {
+        let stale: Vec<_> = pack.into_iter()
+            .filter(|(_, stamp, keys)| fsx::unix_now().saturating_sub(*stamp) > opts.hashmemo_max_age.as_secs() && keys.iter().all(|key| store.unit_reference_absent(key)))
+            .collect();
+        if !stale.is_empty() {
+            let path = store.unit_pack_path();
+            plan.pack_retirements = stale;
+            plan.pack_max_idle = opts.hashmemo_max_age;
+            plan.removals.push(Removal { class: Class::Metadata, bytes: fsx::allocated_size(&path).min(4096), path });
+        }
+    }
+    for (name, path) in keyed_files(&store.units_dir()) {
+        let units = store.units_dir();
+        if !cache::valid_key(&name) || (path.parent() != Some(units.as_path()) && path.parent() != Some(units.join(&name[..2]).as_path())) { continue; }
         if !mtime_age(&path).is_some_and(|age| age > opts.hashmemo_max_age) { continue; }
         let Ok(snapshot) = unit_snapshot(&store, &path, opts.hashmemo_max_age) else { continue };
         if snapshot.eligible(&store) {
@@ -1522,9 +1572,25 @@ fn plan_hashmemo(dirs: &Dirs, opts: &GcOptions, plan: &mut Plan) {
 }
 
 pub fn execute(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>) {
-    let (freed, failures) = execute_removals(dirs, plan);
+    let (mut freed, failures) = execute_removals(dirs, plan);
+    if let Some(age) = plan.hashmemo_log_age {
+        freed += cache::hashing::compact_memo_log(&dirs.hashmemo(), age.as_secs());
+    }
+    cache::Cache::new(dirs).migrate_legacy_layout();
+    prune_empty_shards(&dirs.hashmemo());
+    prune_empty_shards(&dirs.keylocks());
     prune_empty_workspaces(dirs);
     (freed, failures)
+}
+
+/// Legacy records lived in two character shard directories; once emptied they go, and a directory that still holds anything stays.
+fn prune_empty_shards(root: &Path) {
+    let Ok(shards) = fs::read_dir(root) else { return };
+    for shard in shards.flatten() {
+        if shard.file_type().is_ok_and(|kind| kind.is_dir()) && shard.file_name().to_str().is_some_and(cache::is_shard_name) {
+            let _ = fs::remove_dir(shard.path());
+        }
+    }
 }
 
 // Count the size estimate only when this attempt actually removes the child root.
@@ -1561,6 +1627,18 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
             }
             continue;
         }
+        if removal.path == store.unit_pack_path() {
+            if store.retire_idle_unit_records(&plan.pack_retirements, plan.pack_max_idle) > 0 { freed += removal.bytes; }
+            continue;
+        }
+        if plan.keylock_retirements.contains(&removal.path) {
+            match retire_key_lock(&removal.path) {
+                Ok(true) => freed += removal.bytes,
+                Ok(false) => {}
+                Err(error) => failures.push((removal.path.clone(), error)),
+            }
+            continue;
+        }
         let unit = plan.unit_retirements.get(&removal.path);
         let manifest = plan.manifest_retirements.get(&removal.path);
         if unit.is_none() && manifest.is_none() { continue; }
@@ -1577,7 +1655,7 @@ fn execute_removals(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Er
     let mut profiles: HashMap<PathBuf, Option<ProfileGuard>> = HashMap::new();
     for removal in &plan.removals {
         if removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
-            || plan.manifest_retirements.contains_key(&removal.path) { continue; }
+            || plan.manifest_retirements.contains_key(&removal.path) || plan.keylock_retirements.contains(&removal.path) { continue; }
         if removal.path.parent() == Some(dirs.deferred().as_path()) {
             let Some(expected) = plan.deferred_retirements.get(&removal.path) else { continue };
             match retire_deferred_with(&removal.path, expected, || deferred_file_guard(&removal.path)) {
@@ -2213,7 +2291,7 @@ mod tests {
     }
 
     fn store_entry(home: &Path, key: &str, files: &[(&str, u64)], age_secs: u64) -> PathBuf {
-        let dir = home.join("store").join(&key[..2]).join(key);
+        let dir = home.join("store").join(key);
         fs::create_dir_all(&dir).unwrap();
         let recorded: Vec<_> = files.iter().map(|(n, b)| serde_json::json!({"name": n, "stored": n, "text": false, "bytes": b})).collect();
         let meta = serde_json::json!({"crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "files": recorded, "stderr": ""});
@@ -2285,8 +2363,7 @@ mod tests {
         assert!(failures.is_empty());
         assert!(!paths[1].exists());
         assert_eq!(store.candidates(&prekey).into_iter().map(|row| row.key).collect::<Vec<_>>(), vec![format!("{:040x}", 3), format!("{:040x}", 1)]);
-        let unit_path = store.units_dir().join(&unit[..2]).join(&unit);
-        assert_eq!(fs::read_to_string(unit_path).unwrap(), format!("{:040x}\n{:040x}\n", 3, 1));
+        assert_eq!(store.unit_keys(&unit), vec![format!("{:040x}", 3), format!("{:040x}", 1)]);
         assert!(paths[0].exists() && paths[2].exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2301,7 +2378,7 @@ mod tests {
         let entry = store_entry(&root, &key, &[("f0", 64)], 0);
         let row = cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() };
         store.add_candidate(&prekey, row.clone());
-        let path = dirs.manifests().join("bb").join(format!("{prekey}.json"));
+        let path = dirs.manifests().join(format!("{prekey}.json"));
         let old = SystemTime::now() - Duration::from_secs(60 * 86_400);
         for path in [&path, &entry.join("meta.json")] { File::options().write(true).open(path).unwrap().set_modified(old).unwrap(); }
         let selected = plan(&dirs, &GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) });
@@ -2511,7 +2588,7 @@ mod tests {
     }
 
     fn linked_entry_of(home: &Path, key: &str, target: &Path, age_secs: u64, prekey: &str) -> PathBuf {
-        let dir = home.join("store").join(&key[..2]).join(key);
+        let dir = home.join("store").join(key);
         fs::create_dir_all(&dir).unwrap();
         fs::hard_link(target, dir.join("f0")).unwrap();
         let len = fs::metadata(target).unwrap().len();
@@ -2583,7 +2660,7 @@ mod tests {
         let dropped: Vec<PathBuf> = superseded_incremental_entries(&dirs, 2).into_iter().map(|s| s.0).collect();
         assert_eq!(dropped, vec![entries[0].clone()], "only the entry past the grace goes");
         let unit = "cd".repeat(20);
-        let record = cache::Cache::new(&dirs).units_dir().join(&unit[..2]).join(&unit);
+        let record = cache::Cache::new(&dirs).units_dir().join(&unit);
         fs::create_dir_all(record.parent().unwrap()).unwrap();
         fs::write(&record, format!("{}\n", entries[0].file_name().unwrap().to_string_lossy())).unwrap();
         assert!(superseded_incremental_entries(&dirs, 2).is_empty(), "a listed entry is the unit's head and stays");
@@ -2604,7 +2681,7 @@ mod tests {
             entries.push(linked_entry_of(&home, &format!("{i:02x}{}", "1".repeat(38)), &target, age, &format!("{i:02x}").repeat(20)));
             targets.push(target);
         }
-        let record = cache::Cache::new(&dirs).units_dir().join(&unit[..2]).join(&unit);
+        let record = cache::Cache::new(&dirs).units_dir().join(&unit);
         fs::create_dir_all(record.parent().unwrap()).unwrap();
         fs::write(&record, format!("{}\n{}\n", entries[1].file_name().unwrap().to_string_lossy(), entries[0].file_name().unwrap().to_string_lossy())).unwrap();
         fs::remove_file(&targets[0]).unwrap();
@@ -2668,5 +2745,113 @@ mod tests {
             IncrementalUnit::Legacy(vec!["ab".repeat(20)])
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn idle_pack_records_without_present_entries_are_retired_and_live_ones_stay() {
+        let root = home("pack-retire");
+        let dirs = Dirs::at(&root);
+        let store = cache::Cache::new(&dirs);
+        let (live_unit, dead_unit, young_unit) = ("a1".repeat(20), "a2".repeat(20), "a3".repeat(20));
+        let live_key = "11".repeat(20);
+        store_entry(&root, &live_key, &[("f0", 64)], 0);
+        let dead_key = "22".repeat(20);
+        let old = fsx::unix_now() - 90 * 86_400;
+        let pack = format!("{live_unit} {old} {live_key}\n{dead_unit} {old} {dead_key}\n{young_unit} {} {dead_key}\n", fsx::unix_now());
+        fs::create_dir_all(store.units_dir()).unwrap();
+        fs::write(store.unit_pack_path(), pack).unwrap();
+        let plan = plan(&dirs, &GcOptions::new(u64::MAX));
+        assert_eq!(plan.pack_retirements.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![dead_unit.clone()]);
+        let (_, failures) = execute_removals(&dirs, &plan);
+        assert!(failures.is_empty());
+        let left: Vec<String> = store.unit_records().into_iter().map(|r| r.0).collect();
+        assert!(left.contains(&live_unit) && left.contains(&young_unit) && !left.contains(&dead_unit), "{left:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flat_key_locks_age_out_but_the_metadata_lock_and_young_locks_stay() {
+        let root = home("flat-keylocks");
+        let dirs = Dirs::at(&root);
+        fs::create_dir_all(dirs.keylocks()).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3 * 86_400);
+        let stale = dirs.keylocks().join("ab".repeat(20));
+        let young = dirs.keylocks().join("cd".repeat(20));
+        let records = dirs.keylocks().join("unit-records");
+        for path in [&stale, &young, &records] { File::create(path).unwrap(); }
+        for path in [&stale, &records] { File::options().write(true).open(path).unwrap().set_modified(old).unwrap(); }
+        let mut plan = Plan::default();
+        plan_keylocks(&dirs, &GcOptions::new(u64::MAX), &mut plan);
+        let planned: Vec<&PathBuf> = plan.removals.iter().map(|r| &r.path).collect();
+        assert_eq!(planned, vec![&stale]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retiring_a_key_lock_unlinks_only_an_idle_file_and_executes_through_the_plan() {
+        let root = home("retire-keylock");
+        let dirs = Dirs::at(&root);
+        fs::create_dir_all(dirs.keylocks()).unwrap();
+        let idle = dirs.keylocks().join("ab".repeat(20));
+        let busy = dirs.keylocks().join("cd".repeat(20));
+        for path in [&idle, &busy] { File::create(path).unwrap(); }
+        let held = File::open(&busy).unwrap();
+        sys::try_lock(&held, LockKind::Exclusive).unwrap();
+        assert!(!retire_key_lock(&busy).unwrap() && busy.exists());
+        assert!(!retire_key_lock(&dirs.keylocks().join("ef".repeat(20))).unwrap());
+        let opts = GcOptions { keylock_max_age: Duration::ZERO, ..GcOptions::new(u64::MAX) };
+        let mut planned = Plan::default();
+        plan_keylocks(&dirs, &opts, &mut planned);
+        assert_eq!(planned.removals.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![idle.clone()]);
+        let (_, failures) = execute_removals(&dirs, &planned);
+        assert!(failures.is_empty() && !idle.exists() && busy.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_moves_legacy_layout_flat_and_prunes_emptied_shards_everywhere() {
+        let root = home("legacy-migration");
+        let dirs = Dirs::at(&root);
+        let key = "ab".repeat(20);
+        let legacy_entry = dirs.store().join("ab").join(&key);
+        fs::create_dir_all(&legacy_entry).unwrap();
+        fs::write(legacy_entry.join("meta.json"), b"{}").unwrap();
+        let legacy_lock_dir = dirs.keylocks().join("cd");
+        fs::create_dir_all(&legacy_lock_dir).unwrap();
+        let (_, failures) = execute(&dirs, &Plan::default());
+        assert!(failures.is_empty());
+        assert!(dirs.store().join(&key).join("meta.json").is_file());
+        assert!(!dirs.store().join("ab").exists() && !legacy_lock_dir.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_hashmemo_files_age_out_with_their_shards_and_the_log_is_compacted() {
+        let root = home("hashmemo-legacy");
+        let dirs = Dirs::at(&root);
+        let memo = dirs.hashmemo();
+        let old_shard = memo.join("ab");
+        let young_shard = memo.join("cd");
+        fs::create_dir_all(&old_shard).unwrap();
+        fs::create_dir_all(&young_shard).unwrap();
+        let (old, young) = (old_shard.join("0".repeat(32)), young_shard.join("1".repeat(32)));
+        fs::write(&old, b"frust-hashmemo-v2\n").unwrap();
+        fs::write(&young, b"frust-hashmemo-v2\n").unwrap();
+        File::open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(90 * 86_400)).unwrap();
+        let log = memo.join(cache::hashing::LOG_NAME);
+        fs::write(&log, b"nothing in here is a valid frame").unwrap();
+        let outside = root.join("outside");
+        fs::write(&outside, b"keep").unwrap();
+
+        let mut plan = Plan::default();
+        plan_hashmemo(&dirs, &GcOptions::new(u64::MAX), &mut plan);
+        assert!(plan.removals.iter().any(|r| r.path == old) && plan.removals.iter().all(|r| r.path != young && r.path != log));
+        let (freed, failures) = execute(&dirs, &plan);
+        assert!(failures.is_empty() && freed > 0);
+        assert!(!old.exists() && !old_shard.exists(), "an aged legacy record and its emptied shard are removed");
+        assert!(young.exists() && young_shard.exists());
+        assert!(!log.exists(), "a log with no live frame is compacted away");
+        assert!(outside.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

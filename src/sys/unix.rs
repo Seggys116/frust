@@ -408,6 +408,10 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
+pub fn transient_share_error(_error: &io::Error) -> bool {
+    false
+}
+
 fn cstr(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 }

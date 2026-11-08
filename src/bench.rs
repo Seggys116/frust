@@ -2064,6 +2064,19 @@ fn growth_directory_entries(path: &Path) -> Result<Vec<PathBuf>, String> {
         .map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())).collect()
 }
 
+// Flat entries plus the contents of legacy two character directories, each level checked like any growth evidence directory.
+fn growth_keyed_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    for item in growth_directory_entries(root)? {
+        if item.file_name().and_then(|name| name.to_str()).is_some_and(crate::cache::is_shard_name) && sys::lstat(&item).is_ok_and(|meta| meta.is_dir()) {
+            out.extend(growth_directory_entries(&item)?);
+        } else {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
 struct GrowthLedgerSnapshot {
     text: String,
     identity: Option<(u64, u64)>,
@@ -2106,31 +2119,29 @@ fn growth_ledger_added<'a>(before: &GrowthLedgerSnapshot, after: &'a GrowthLedge
 
 fn growth_store_records(dirs: &Dirs) -> Result<Vec<(String, crate::cache::EntryMeta)>, String> {
     let mut records = Vec::new();
-    for shard in growth_directory_entries(&dirs.store())? {
-        for entry in growth_directory_entries(&shard)? {
-            let key = entry.file_name().and_then(|name| name.to_str()).ok_or("non-UTF-8 growth entry key")?;
-            if !crate::cache::valid_key(key) { return Err("invalid growth cache entry key".into()); }
-            if !sys::lstat(&entry).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) {
-                return Err("invalid growth cache entry directory".into());
-            }
-            let metadata = entry.join("meta.json");
-            if !sys::lstat(&metadata).is_ok_and(|meta| meta.is_file()) { return Err(format!("missing growth entry record {}", metadata.display())); }
-            let record: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&metadata).map_err(|error| error.to_string())?)
-                .map_err(|error| format!("{}: {error}", metadata.display()))?;
-            let groups = crate::cache::metadata_slice::validate_groups(&record.files).map_err(|error| error.to_string())?;
-            if !crate::cache::safe_file_name(&record.stderr)
-                || !sys::lstat(&entry.join(&record.stderr)).is_ok_and(|meta| meta.is_file()) {
-                return Err("invalid growth entry stderr".into());
-            }
-            for group in groups {
-                let backing = &record.files[group.base_index];
-                let meta = sys::lstat(&entry.join(&backing.stored)).map_err(|error| error.to_string())?;
-                if meta.file_type().is_symlink() || if backing.dir { !meta.is_dir() } else { !meta.is_file() } {
-                    return Err("invalid growth entry backing".into());
-                }
-            }
-            records.push((key.to_string(), record));
+    for entry in growth_keyed_entries(&dirs.store())? {
+        let key = entry.file_name().and_then(|name| name.to_str()).ok_or("non-UTF-8 growth entry key")?;
+        if !crate::cache::valid_key(key) { return Err("invalid growth cache entry key".into()); }
+        if !sys::lstat(&entry).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) {
+            return Err("invalid growth cache entry directory".into());
         }
+        let metadata = entry.join("meta.json");
+        if !sys::lstat(&metadata).is_ok_and(|meta| meta.is_file()) { return Err(format!("missing growth entry record {}", metadata.display())); }
+        let record: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&metadata).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("{}: {error}", metadata.display()))?;
+        let groups = crate::cache::metadata_slice::validate_groups(&record.files).map_err(|error| error.to_string())?;
+        if !record.stderr_present(&entry) {
+            return Err("invalid growth entry stderr".into());
+        }
+        for group in groups {
+            let backing = &record.files[group.base_index];
+            if backing.inline.is_some() { continue; }
+            let meta = sys::lstat(&entry.join(&backing.stored)).map_err(|error| error.to_string())?;
+            if meta.file_type().is_symlink() || if backing.dir { !meta.is_dir() } else { !meta.is_file() } {
+                return Err("invalid growth entry backing".into());
+            }
+        }
+        records.push((key.to_string(), record));
     }
     Ok(records)
 }
@@ -2144,17 +2155,21 @@ fn growth_cache_retention(dirs: &Dirs, evidence: &mut GrowthCacheEvidence) -> Re
     let mut unit_keys = 0;
     let mut missing = 0;
     let mut maximum = 0;
-    for shard in growth_directory_entries(&dirs.root().join(crate::cache::UNITS_DIR))? {
-        for path in growth_directory_entries(&shard)? {
-            if !sys::lstat(&path).is_ok_and(|meta| meta.is_file()) { return Err("invalid growth unit record".into()); }
-            let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-            let keys: Vec<_> = text.lines().collect();
-            if keys.iter().any(|key| !crate::cache::valid_key(key)) { return Err("invalid growth unit entry key".into()); }
-            unit_records += 1;
-            unit_keys += keys.len();
-            missing += keys.iter().filter(|key| !current.contains(**key)).count();
-            maximum = maximum.max(keys.len());
+    let cache = crate::cache::Cache::new(dirs);
+    for path in growth_keyed_entries(&dirs.root().join(crate::cache::UNITS_DIR))? {
+        if !sys::lstat(&path).is_ok_and(|meta| meta.is_file()) { return Err("invalid growth unit record".into()); }
+        if path.file_name().is_some_and(|name| name == crate::cache::UNIT_PACK) {
+            if !cache.unit_pack_valid() { return Err("invalid growth unit record pack".into()); }
+            continue;
         }
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        if text.lines().any(|key| !crate::cache::valid_key(key)) { return Err("invalid growth unit entry key".into()); }
+    }
+    for (_, _, keys) in cache.unit_records() {
+        unit_records += 1;
+        unit_keys += keys.len();
+        missing += keys.iter().filter(|key| !current.contains(key.as_str())).count();
+        maximum = maximum.max(keys.len());
     }
     if maximum > crate::wrapper::UNIT_VERSIONS { return Err("growth unit version retention exceeded its limit".into()); }
     evidence.retained_unit_records = unit_records;

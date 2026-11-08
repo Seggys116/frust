@@ -146,17 +146,15 @@ fn crafted_entry_metadata_cannot_escape_the_output_directory() {
     assert_success(&sb.bin("fcargo").arg("build").current_dir(&a).output().unwrap());
 
     let mut patched = 0;
-    for shard in fs::read_dir(sb.home().join("store")).unwrap().flatten() {
-        for entry in fs::read_dir(shard.path()).unwrap().flatten() {
-            let meta_path = entry.path().join("meta.json");
-            let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
-            let files = meta["files"].as_array_mut().unwrap();
-            let mut evil = files[0].clone();
-            evil["name"] = serde_json::Value::String("../../escaped-by-frust".into());
-            files.push(evil);
-            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-            patched += 1;
-        }
+    for entry in frust::cache::keyed_items(&sb.home().join("store")) {
+        let meta_path = entry.join("meta.json");
+        let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let files = meta["files"].as_array_mut().unwrap();
+        let mut evil = files[0].clone();
+        evil["name"] = serde_json::Value::String("../../escaped-by-frust".into());
+        files.push(evil);
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        patched += 1;
     }
     assert!(patched > 0, "the first build stored entries");
 
@@ -230,7 +228,7 @@ fn dead_pid() -> u32 {
 }
 
 fn fake_entry(home: &Path, key: &str) -> PathBuf {
-    let dir = home.join("store").join(&key[..2]).join(key);
+    let dir = home.join("store").join(key);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("meta.json"), b"{}").unwrap();
     fs::write(dir.join("f0"), vec![7u8; 64 * 1024]).unwrap();
@@ -238,7 +236,7 @@ fn fake_entry(home: &Path, key: &str) -> PathBuf {
 }
 
 fn fake_manifest(home: &Path, prekey: &str, keys: &[&str]) -> PathBuf {
-    let path = home.join("manifests").join(&prekey[..2]).join(format!("{prekey}.json"));
+    let path = home.join("manifests").join(format!("{prekey}.json"));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let candidates: Vec<_> = keys.iter().map(|k| serde_json::json!({"inputs": [], "envs": [], "key": k})).collect();
     fs::write(&path, serde_json::to_vec(&serde_json::json!({ "format": 4, "candidates": candidates })).unwrap()).unwrap();
@@ -343,15 +341,13 @@ fn gc_retains_old_manifests_that_still_serve_current_cache_entries() {
     );
     let dirs = Dirs::at(sb.home());
     let mut manifests = Vec::new();
-    for shard in fs::read_dir(dirs.manifests()).unwrap().flatten() {
-        for manifest in fs::read_dir(shard.path()).unwrap().flatten() {
-            let path = manifest.path();
-            let data: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(data["format"], 5);
-            age(&path, Duration::from_secs(40 * 86_400));
-            manifests.push(path);
-        }
+    for manifest in frust::cache::keyed_items(&dirs.manifests()) {
+        let path = manifest;
+        let data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(data["format"], 7);
+        age(&path, Duration::from_secs(40 * 86_400));
+        manifests.push(path);
     }
     assert!(!manifests.is_empty());
     let plan = gc::plan(&dirs, &GcOptions::new(u64::MAX));
@@ -481,7 +477,7 @@ fn gc_preserves_manifests_when_reference_metadata_cannot_be_read_as_a_file() {
     let home = sb.home();
     let dirs = Dirs::at(&home);
     let key = "aa11111111111111111111111111111111111111";
-    let entry = home.join("store").join(&key[..2]).join(key);
+    let entry = home.join("store").join(key);
     fs::create_dir_all(entry.join("meta.json")).unwrap();
     let manifest = fake_manifest(&home, "bb22222222222222222222222222222222222222", &[key]);
     age(&manifest, Duration::from_secs(40 * 86_400));
@@ -701,7 +697,7 @@ fn retired_child_identity_replacement_invalidates_its_planned_removal() {
 }
 
 fn unit_record(dirs: &Dirs, unit: &str, keys: &[&str]) -> PathBuf {
-    let path = dirs.root().join(frust::cache::UNITS_DIR).join(&unit[..2]).join(unit);
+    let path = dirs.root().join(frust::cache::UNITS_DIR).join(unit);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, format!("{}\n", keys.join("\n"))).unwrap();
     age(&path, Duration::from_secs(40 * 86_400));
@@ -752,13 +748,19 @@ fn gc_unit_record_plan_is_invalidated_by_revived_entries_or_a_serialized_writer(
         assert!(plan_has(&plan, Class::Metadata, &record));
         let expected = if update_record {
             fake_entry(&sb.home(), new);
-            frust::cache::Cache::new(&dirs).note_unit_entry(unit, new, 2);
-            age(&record, Duration::from_secs(40 * 86_400));
+            let cache = frust::cache::Cache::new(&dirs);
+            cache.note_unit_entry(unit, new, 2);
+            age(&cache.unit_pack_path(), Duration::from_secs(40 * 86_400));
             new
         } else { fake_entry(&sb.home(), old); old };
         let (_, errors) = gc::execute(&dirs, &plan);
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(fs::read_to_string(&record).unwrap(), format!("{expected}\n"));
+        if update_record {
+            assert!(!record.exists(), "the writer folded the legacy file into the pack");
+            assert_eq!(frust::cache::Cache::new(&dirs).unit_keys(unit), vec![expected.to_string()]);
+        } else {
+            assert_eq!(fs::read_to_string(&record).unwrap(), format!("{expected}\n"));
+        }
     }
 }
 
@@ -814,7 +816,7 @@ fn gc_retains_unit_records_when_reference_permissions_are_denied() {
     let unit = "bb22222222222222222222222222222222222222";
     fake_entry(&sb.home(), key);
     let record = unit_record(&dirs, unit, &[key]);
-    let shard = dirs.store().join(&key[..2]);
+    let shard = dirs.store();
     frust::sys::set_path_mode(&shard, 0).unwrap();
     let plan = gc::plan_maintenance(&dirs, &GcOptions::new(u64::MAX));
     frust::sys::set_path_mode(&shard, 0o755).unwrap();
@@ -886,7 +888,7 @@ fn gc_unit_record_absence_allows_an_explicit_symlinked_home() {
     let linked = sb.root.join("linked-home");
     std::os::unix::fs::symlink(sb.home(), &linked).unwrap();
     let dirs = Dirs::at(linked);
-    let linked_record = dirs.root().join(frust::cache::UNITS_DIR).join(&unit[..2]).join(unit);
+    let linked_record = dirs.root().join(frust::cache::UNITS_DIR).join(unit);
     let plan = gc::plan_maintenance(&dirs, &GcOptions::new(u64::MAX));
     assert!(plan_has(&plan, Class::Metadata, &linked_record));
     let (_, errors) = gc::execute(&dirs, &plan);

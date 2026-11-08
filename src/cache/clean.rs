@@ -98,16 +98,12 @@ impl Cache {
         if workspace.is_empty() || workspace == LOOSE {
             return (0, 0);
         }
-        let Ok(shards) = fs::read_dir(self.dirs.store()) else { return (0, 0) };
         let (mut entries, mut bytes) = (0, 0);
-        for shard in shards.flatten() {
-            let Ok(children) = fs::read_dir(shard.path()) else { continue };
-            for child in children.flatten() {
-                let Some(key) = child.file_name().to_str().filter(|name| valid_key(name)).map(str::to_owned) else { continue };
-                if let Some(released) = self.release_entry(&key, workspace, evict_registry) {
-                    entries += 1;
-                    bytes += released;
-                }
+        for child in super::keyed_items(&self.dirs.store()) {
+            let Some(key) = child.file_name().and_then(|name| name.to_str()).filter(|name| valid_key(name)).map(str::to_owned) else { continue };
+            if let Some(released) = self.release_entry(&key, workspace, evict_registry) {
+                entries += 1;
+                bytes += released;
             }
         }
         (entries, bytes)

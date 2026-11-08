@@ -145,7 +145,7 @@ Related lookup behaviour:
   without waiting. If none is available, work stays on the caller. Without a jobserver, CPU and worker-count caps
   still apply. Each detached store uses one worker without borrowing Cargo tokens; shared slots bound active stores.
 * A current-format manifest is not rewritten when its first candidate is unchanged and no row was dropped. Manifests carry a
-  format number: new writes use 5, legacy formats 3 and 4 remain readable, and other formats are ignored and rewritten.
+  format number: new writes use 7 (8 when a linked entry is listed), legacy formats 3 to 6 remain readable, and other formats are ignored and rewritten. Entries and manifests are flat files or directories named by their key, and unit version records are lines of the single file `units/pack` (older per-unit files are read until a write folds them in); the two character shard directories of older homes are read as a fallback and `frust gc` moves them flat. A new entry keeps its dep-info text and diagnostics inside `meta.json` (a separate file only above 64 KiB), so besides `meta.json` it holds payload files only; older entries with separate `f<N>` text files and a `stderr` file restore as before.
 * Evicting an entry is one rename into `tmp/evicted` under `FRUST_HOME`, so a concurrent restore fails cleanly
   and recompiles. The remover immediately deletes only its unique retired child. Failed deletions remain queued;
   `frust gc` and daily maintenance retry individual children without an age delay and preserve the queue directory.
@@ -162,7 +162,7 @@ dependency), only one should compile it.
   the OS lock; notifications never grant ownership. Timed retries start at 5 ms and double to 40 ms, providing
   the fallback on unsupported platforms, watcher errors and missed notifications.
   This is fail-open: if the lock file cannot be opened or locked, or the wait runs out, the wrapper compiles
-  anyway. Every acquired key lock triggers another lookup, including an immediate acquisition. The lock is
+  anyway. Idle lock files are unlinked by gc after ten minutes while it holds the lock, and a wrapper that finds its locked file no longer named by its path retries on the new file, so two holders never share a key. Every acquired key lock triggers another lookup, including an immediate acquisition. The lock is
   held until the entry is published (for primary incremental units, until the store is queued). Matching compiler units can share results across profile and target
   directories; different compiler flags keep separate identities.
 * Publication, manifest updates, usage refreshes, version-record updates and retirement renames share a short
@@ -416,6 +416,73 @@ frust used 225.5 MiB in total: 174.4 MiB of target allocation, 48.1 MiB of addit
 3.1 MiB of other managed storage with automatic compression; values are rounded independently. That
 experiment assessed compaction after every build, rather than the default ten-minute interval. Its final unchanged
 rebuilds made zero compiler calls and cache events. These workload measurements are not a bound on other projects.
+
+## No-op fast path
+
+When nothing changed since the last successful `fcargo build` or `fcargo check` of the same invocation, `fcargo`
+answers in-process without launching cargo: it prints what cargo's own no-op would print (the replayed warnings and
+the `Finished` line with a fresh elapsed time; stdout stays empty) and exits 0. Any doubt falls back to cargo, which
+records again after it succeeds. `FRUST_NOOP=off` disables it.
+
+**What is recorded.** Only after a successful, uninterrupted `build` or `check` whose arguments are all known flags
+(packages, targets, features, profile, `--target`, `--target-dir`, `-j`, `--manifest-path`, `--config`, `-C`,
+`--color`, `--locked`/`--offline`/`--frozen`, `--keep-going`); `run`, `test`, `-v`, `-q`, `--message-format`,
+`--timings`, `-Z` and anything else are never recorded, nor are runs with `CARGO_TERM_VERBOSE`/`QUIET`, forced
+progress, `CARGO_LOG` or `FRUST_CACHE_TRUST_STAMPS=off`. Units come from cargo's JSON messages, which frust already
+requests for the display and otherwise adds while the plain output is being logged anyway (cargo's stderr is the same
+in both formats; the JSON never reaches stdout). The replay is either the exact stderr of a cargo run that reported
+every unit fresh, or, for a build that printed nothing but status lines, its `Finished` line alone, which is what
+cargo prints for the following no-op. A run that printed lock contention or index updates is not recorded.
+
+**What is stamped.** Each entry is a path with its device, inode, size and modification and change times in
+nanoseconds, or the fact that it did not exist:
+
+* for every path package: every file of each unit's rustc dep-info, the manifest, the package directory and its `src`,
+  `src/bin`, `examples`, `tests` and `benches` directories (and their subdirectories), and every directory between
+  the package and the workspace root, so a new target, member or build script is noticed;
+* environment variables a compile observed (`# env-dep:` lines) whose value cargo vouched for; a value that differs
+  from the environment is one cargo sets itself and follows from the stamped inputs;
+* build scripts: `rerun-if-changed` paths (whole trees for directories), `rerun-if-env-changed` values, and for a path
+  package without `rerun-if-changed` its whole directory tree (except `.git`, `target`, nested packages and the
+  target directory), as cargo then reruns the script on any change;
+* every output cargo lists, the hashed original of each uplifted output, each unit's fingerprint directory and its
+  files, build script `output` files, the root `Cargo.toml` and `Cargo.lock`, every cargo config file (absent ones as
+  absent) and `rust-toolchain(.toml)` in the working directory and its ancestors.
+
+The record is keyed by the build lock's identity (cargo, toolchain, directory, target directory, arguments and every
+build-affecting variable) plus what shapes cargo's stderr (forced colour and terminal variables), so the display and
+plain output share one record.
+
+**Refusals.** Nothing is recorded if a source, manifest, config or directory changed after shortly before cargo
+started (the compile cache's "file too new" rule, 100 ms or 2 s for coarse timestamps), so a file saved during a build,
+or one with a future modification time that cargo would rebuild every time, is never vouched for. Recording also
+refuses a missing dep-info input or `rerun-if-changed` path (cargo reruns those every time), a dep-info file that
+does not name the unit's source, coarse or missing timestamps, a volume outside the stamp-trust allow-list or one
+that is quarantined, a symlinked directory inside a watched tree, a tree over 20,000 entries, output it cannot replay
+(progress bars, non-UTF-8, plain text on stdout) and an observed variable that frust sets per run.
+
+**The check.** Before the build lock is requested: the record must exist, decode, and match the key, the display
+and the environment values; no frust build may hold or queue for the build lock of that target and profile; and
+every cargo profile lock of the recorded profiles must be free; they are held while every entry is stat'ed and
+compared exactly. Any difference declines, and quarantined volumes decline too. Uplifted copies of build scripts are
+not stamped, since every cargo run copies them again and only cargo runs them.
+
+**Housekeeping.** Records live under `noop/` in `FRUST_HOME`, written atomically (temporary file and rename) in a
+versioned binary format with a checksum, so a torn or foreign file is ignored and replaced. At most 256 records are
+kept, each at most 16 MiB; records written more than 30 days ago, stale temporary files and, once a day, records whose
+workspace or target directory vanished are removed when a record is written. A run that the fast path answers still
+runs the daily automatic gc at startup, runs automatic compaction when due as after a cargo no-op, records its run in
+the event log when the display is on, and may print the update notice.
+
+**Audit.** `FRUST_NOOP=audit` runs cargo anyway whenever the fast path would have answered, and fails the build with
+`frust: no-op audit failed: ...` (also appended to `noop/audit.jsonl`) if cargo compiled any unit, failed, or printed
+different output. The test suite uses it as the oracle. `FRUST_NOOP_TRACE=<file>` appends one JSON line per build
+or check with the decision (`fast`, `miss:<reason>`, `audit:ok`, `audit:failed`, or why it was not eligible), the
+recording outcome (`build`, `noop` or `skip:<reason>`) and the path or variable that differed.
+
+Residual risks: an edit that preserves a file's inode, size and both timestamps to the nanosecond is not seen (the
+change time cannot be set by ordinary tools); a crate whose compile observed a variable frust passes only to cargo is
+handled as cargo-provided; a registry or git source edited in place is ignored, as cargo ignores it.
 
 ## Platforms
 

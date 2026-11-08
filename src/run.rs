@@ -631,7 +631,7 @@ impl Session {
 
     fn build_and_maybe_exec(&self, class: Class) -> i32 {
         let (phase_sub, phase_rest) = self.build_phase_command(class);
-        let code = self.build_phase(&phase_sub, &phase_rest);
+        let code = self.build_phase(class, &phase_sub, &phase_rest);
         if code != 0 || matches!(class, Class::Compile) {
             return code;
         }
@@ -777,7 +777,7 @@ impl Session {
         vec![format!("{workspace_key}-{sub}-{digest}"), format!("{workspace_key}-{sub}")]
     }
 
-    fn build_phase(&self, sub: &str, rest: &[OsString]) -> i32 {
+    fn build_phase(&self, class: Class, sub: &str, rest: &[OsString]) -> i32 {
         let started = Instant::now();
         let style = self.render_style();
         let workspace_name = workspace::display_name(self.root.as_deref());
@@ -808,6 +808,28 @@ impl Session {
         let scope = self.lock_scope(sub, rest);
         trace(&self.cfg, started, &format!("lock scope: {}", scope.label()));
 
+        let mut noop = crate::noop::Gate::new(crate::noop::Invocation {
+            dirs: &self.dirs,
+            compile: class == Class::Compile,
+            args: &phase_args,
+            fingerprint: &fingerprint,
+            cwd: &self.cwd,
+            root: self.root.as_deref(),
+            target: &self.lock_target,
+            scope: &scope,
+            style: style.map(|s| if s == Style::Ansi { "ansi" } else { "plain" }),
+            colour: term::colour_enabled(),
+            locking: self.cfg.lock,
+            env_vars: &self.env_vars,
+            configs: self.noop_configs(),
+            debug: self.cfg.debug,
+        });
+        // Decided before the lock wait: an unchanged repeat never queues behind anything or launches cargo.
+        if let Some(replay) = noop.check() {
+            trace(&self.cfg, started, "no-op fast path");
+            return self.serve_noop(&noop, &replay, ui.as_mut(), started, sub, workspace_name, &history_keys);
+        }
+
         let mut joining = Joining::new(style);
         let mut guard = match self.acquire_lock(sub, &fingerprint, &scope, ui.as_mut(), &mut joining) {
             Ok(Some(Acquired::Lock(guard))) => Some(*guard),
@@ -826,9 +848,11 @@ impl Session {
         };
         let joined = guard.as_ref().and_then(|g| g.joined().cloned());
 
+        // Plain output is observed through cargo's JSON only when it is logged anyway; stderr is identical in both formats.
+        let mut recorder = (noop.wants_capture() && (style.is_some() || guard.is_some())).then(crate::noop::Recorder::default);
         let mut cmd = Command::new(&self.cargo);
         cmd.args(&command);
-        if style.is_some() {
+        if style.is_some() || recorder.is_some() {
             cmd.arg("--message-format=json-render-diagnostics");
         }
         cmd.args(rest);
@@ -853,6 +877,7 @@ impl Session {
             ..Progress::default()
         };
         trace(&self.cfg, started, "lock acquired, starting cargo");
+        let launched_ns = crate::cache::hashing::now_ns();
         let code = match (style, ui.as_mut()) {
             (Some(style), Some(ui)) => {
                 cmd.env("CARGO_TERM_PROGRESS_WHEN", "never");
@@ -860,10 +885,10 @@ impl Session {
                 if style == Style::Ansi && term::colour_enabled() {
                     cmd.env("CARGO_TERM_COLOR", "always");
                 }
-                self.supervise_rendered(cmd, ui, &mut feed, &mut progress, guard.as_mut(), &mut joining.shown)
+                self.supervise_rendered(cmd, ui, &mut feed, &mut progress, guard.as_mut(), &mut joining.shown, recorder.as_mut())
             }
             _ => match guard.as_mut() {
-                Some(lock) => supervise_plain_logged(cmd, &mut feed, &mut progress, lock),
+                Some(lock) => supervise_plain_logged(cmd, &mut feed, &mut progress, lock, recorder.as_mut()),
                 None => supervise_plain(cmd),
             },
         };
@@ -878,12 +903,19 @@ impl Session {
                 eprintln!("frust: auto-compact {report:?}");
             }
         }
+        let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
+        // Recorded after compaction and before the lock passes on, so no other build changes the target in between.
+        let audit_failure = noop.finish(code, interrupted, launched_ns, recorder.as_ref());
+        let code = if audit_failure.is_some() && code == 0 { 1 } else { code };
         // A signalled build is not a result to share.
         if let Some(guard) = guard.take() {
-            let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
             guard.finish(BuildResult { code, units: progress.done, interrupted });
         }
         let stats = ui.as_mut().map(|ui| ui.finish(Outcome { success: code == 0, exit_code: code }, Instant::now()));
+        if let Some(failure) = &audit_failure {
+            eprintln!("frust: {failure}");
+        }
+        noop.trace();
         if let Some(path) = feed_path {
             let _ = fs::remove_file(path);
         }
@@ -918,6 +950,77 @@ impl Session {
             crate::update::notice(&self.dirs);
         }
         code
+    }
+
+    /// Every config file cargo may read, including `--config` files, absent ones as well.
+    fn noop_configs(&self) -> Vec<PathBuf> {
+        let mut files = self.configs.files.clone();
+        files.extend(cli_configs(&self.parsed).iter().filter_map(|value| cli_config_file(&value.to_string_lossy(), &self.cwd)));
+        files
+    }
+
+    /// Prints what cargo would for an unchanged build; daily gc already ran at startup and due compaction runs afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_noop(
+        &self,
+        noop: &crate::noop::Gate,
+        replay: &[(crate::noop::Stream, String)],
+        ui: Option<&mut Ui>,
+        started: Instant,
+        sub: &str,
+        workspace_name: String,
+        history_keys: &[String],
+    ) -> i32 {
+        let elapsed = started.elapsed();
+        match ui {
+            Some(ui) => {
+                let (mut progress, mut shown) = (Progress::default(), Shown::default());
+                let now = Instant::now();
+                for (stream, line) in replay {
+                    let line = vec![crate::noop::retime(line, elapsed).into_bytes()];
+                    match stream {
+                        crate::noop::Stream::Out => render_lines(ui, &mut progress, &mut shown, &line, &[], now),
+                        crate::noop::Stream::Err => render_lines(ui, &mut progress, &mut shown, &[], &line, now),
+                    }
+                }
+                let stats = ui.finish(Outcome { success: true, exit_code: 0 }, Instant::now());
+                history::remember_units(&self.dirs, history_keys, stats.units);
+                events::record(
+                    &self.dirs,
+                    &Event::Run {
+                        t: events::now_ms(),
+                        workspace: workspace_name,
+                        command: sub.to_string(),
+                        wall_ms: started.elapsed().as_millis() as u64,
+                        units: stats.units,
+                        cached: stats.cached,
+                        compiled: stats.compiled,
+                        fresh: stats.fresh,
+                        saved_ms: stats.saved_ms,
+                        success: true,
+                    },
+                );
+            }
+            None => {
+                let mut stderr = io::stderr().lock();
+                for (stream, line) in replay {
+                    if *stream == crate::noop::Stream::Err {
+                        let _ = writeln!(stderr, "{}", crate::noop::retime(line, elapsed));
+                    }
+                }
+                let _ = stderr.flush();
+            }
+        }
+        // The compaction schedule is kept as after a cargo no-op; a pass that changes the target only makes the next check decline.
+        if self.lock_target.starts_with(self.dirs.targets()) {
+            let report = crate::compact::auto_compact(&self.dirs, &self.lock_target, &self.cfg);
+            if self.cfg.debug {
+                eprintln!("frust: auto-compact {report:?}");
+            }
+        }
+        noop.trace();
+        crate::update::notice(&self.dirs);
+        0
     }
 
     fn acquire_lock(&self, sub: &str, fingerprint: &str, scope: &Scope, mut ui: Option<&mut Ui>, joining: &mut Joining) -> Result<Option<Acquired>, LockError> {
@@ -977,6 +1080,7 @@ impl Session {
     }
 
     /// Both pipes are polled on this thread, so a slow terminal back-pressures cargo and a lingering grandchild cannot hang the build (see [`LINGER`]).
+    #[allow(clippy::too_many_arguments)]
     fn supervise_rendered(
         &self,
         mut cmd: Command,
@@ -985,6 +1089,7 @@ impl Session {
         progress: &mut Progress,
         mut lock: Option<&mut BuildLock>,
         shown: &mut Shown,
+        mut recorder: Option<&mut crate::noop::Recorder>,
     ) -> i32 {
         let planning_args: Vec<OsString> = cmd.get_args()
             .filter(|arg| *arg != "--message-format=json-render-diagnostics")
@@ -1053,6 +1158,9 @@ impl Session {
                 ui.tick(now);
             }
             let [out, err] = lines;
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.take(&out, &err);
+            }
             log_lines(lock.as_deref_mut(), &out, &err);
             render_lines(ui, progress, shown, &out, &err, now);
             if let Some(lock) = lock.as_deref_mut() {
@@ -1064,6 +1172,9 @@ impl Session {
         let tails: Vec<Vec<Vec<u8>>> = streams.iter_mut().map(|s| s.take_partial().into_iter().collect()).collect();
         drop(streams);
         let now = Instant::now();
+        if let Some(recorder) = recorder {
+            recorder.take(&tails[0], &tails[1]);
+        }
         log_lines(lock.as_deref_mut(), &tails[0], &tails[1]);
         render_lines(ui, progress, shown, &tails[0], &tails[1], now);
         for ev in feed.poll(false) {
@@ -1453,20 +1564,45 @@ fn supervise_plain(mut cmd: Command) -> i32 {
 }
 
 /// Output not going to a terminal passes through byte for byte so it can be logged; terminal output stays cargo's own, so followers get no output.
-fn supervise_plain_logged(cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock) -> i32 {
+fn supervise_plain_logged(cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock, mut recorder: Option<&mut crate::noop::Recorder>) -> i32 {
     let capture_out = !io::stdout().is_terminal();
     let capture_err = !io::stderr().is_terminal();
-    lock.log_start(false, capture_out && capture_err);
-    if capture_out || capture_err {
-        supervise_tee(cmd, feed, progress, lock, capture_out, capture_err)
+    // With a recorder, stdout is cargo's JSON (requested by frust), never shown, but complete for followers.
+    let json = recorder.is_some();
+    if let Some(recorder) = recorder.as_deref_mut()
+        && !capture_err
+    {
+        recorder.refuse("stderr not captured");
+    }
+    lock.log_start(json, (capture_out || json) && capture_err);
+    if capture_out || capture_err || json {
+        supervise_tee(cmd, feed, progress, lock, capture_out, capture_err, recorder)
     } else {
         supervise_plain_publishing(cmd, feed, progress, lock)
     }
 }
 
-fn supervise_tee(mut cmd: Command, feed: &mut SupervisionFeed, progress: &mut Progress, lock: &mut BuildLock, capture_out: bool, capture_err: bool) -> i32 {
+/// Without a recorder stdout is passed through as bytes; with one only non-JSON lines are forwarded.
+fn forward_plain_stdout(stdout: &mut io::Stdout, lines: &[Vec<u8>]) {
+    for line in lines.iter().filter(|l| !l.trim_ascii_start().starts_with(b"{")) {
+        let _ = stdout.write_all(line);
+        let _ = stdout.write_all(b"\n");
+    }
+    let _ = stdout.flush();
+}
+
+fn supervise_tee(
+    mut cmd: Command,
+    feed: &mut SupervisionFeed,
+    progress: &mut Progress,
+    lock: &mut BuildLock,
+    capture_out: bool,
+    capture_err: bool,
+    mut recorder: Option<&mut crate::noop::Recorder>,
+) -> i32 {
+    let json = recorder.is_some();
     cmd.stdin(Stdio::inherit());
-    cmd.stdout(if capture_out { Stdio::piped() } else { Stdio::inherit() });
+    cmd.stdout(if capture_out || json { Stdio::piped() } else { Stdio::inherit() });
     cmd.stderr(if capture_err { Stdio::piped() } else { Stdio::inherit() });
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -1494,7 +1630,11 @@ fn supervise_tee(mut cmd: Command, feed: &mut SupervisionFeed, progress: &mut Pr
         let ready = wait_readable(&streams, TICK);
         let mut lines: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
         if ready[0] {
-            streams[0].read_tee(&mut chunk, &mut lines[0], &mut stdout);
+            if json {
+                streams[0].read_lines(&mut chunk, &mut lines[0]);
+            } else {
+                streams[0].read_tee(&mut chunk, &mut lines[0], &mut stdout);
+            }
         }
         if ready[1] {
             streams[1].read_tee(&mut chunk, &mut lines[1], &mut stderr);
@@ -1506,12 +1646,20 @@ fn supervise_tee(mut cmd: Command, feed: &mut SupervisionFeed, progress: &mut Pr
         for line in &lines[1] {
             track_stderr(progress, &String::from_utf8_lossy(line));
         }
+        if let Some(recorder) = recorder.as_deref_mut() {
+            forward_plain_stdout(&mut stdout, &lines[0]);
+            recorder.take(&lines[0], &lines[1]);
+        }
         log_lines(Some(&mut *lock), &lines[0], &lines[1]);
         lock.publish(progress);
         lock.flush_log();
     }
     let tails: Vec<Vec<Vec<u8>>> = streams.iter_mut().map(|s| s.take_partial().into_iter().collect()).collect();
     drop(streams);
+    if let Some(recorder) = recorder {
+        forward_plain_stdout(&mut stdout, &tails[0]);
+        recorder.take(&tails[0], &tails[1]);
+    }
     log_lines(Some(&mut *lock), &tails[0], &tails[1]);
     for ev in feed.poll(false) {
         track_cache(progress, &ev, true);

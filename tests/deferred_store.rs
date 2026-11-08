@@ -52,11 +52,9 @@ fn clean(sb: &Sandbox, project: &Path) {
 
 fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for shard in fs::read_dir(sb.home().join("manifests")).into_iter().flatten().flatten() {
-        for file in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-            if file.path().extension().is_some_and(|e| e == "json") {
-                found.push(file.path());
-            }
+    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
+        if file.extension().is_some_and(|e| e == "json") {
+            found.push(file);
         }
     }
     found
@@ -101,12 +99,9 @@ fn broker_directories(sb: &Sandbox) -> Vec<PathBuf> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn published_entries(sb: &Sandbox) -> usize {
-    fs::read_dir(sb.home().join("store"))
+    frust::cache::keyed_items(&sb.home().join("store"))
         .into_iter()
-        .flatten()
-        .flatten()
-        .flat_map(|shard| fs::read_dir(shard.path()).into_iter().flatten().flatten())
-        .filter(|entry| entry.path().join("meta.json").is_file())
+        .filter(|entry| entry.join("meta.json").is_file())
         .count()
 }
 

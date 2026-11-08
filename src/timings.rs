@@ -1,5 +1,6 @@
 //! Per-process timing records: with `FRUST_TIMINGS=<file>` set, each wrapper appends one JSON line at exit.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -33,6 +34,30 @@ pub struct Record {
     pub store_mode: String,
     pub inline_store_ms: u64,
     pub total_ms: u64,
+    /// Restored files by path: `kept`, `link`, `adopt` (a copy the store then took over), `copy`, `clone`, `text` or `group`.
+    #[serde(default)]
+    pub restore_paths: BTreeMap<String, u64>,
+    /// The first distinct reasons a linked file was copied instead of linked, such as `link:os32` or `store-nlink=2`.
+    #[serde(default)]
+    pub restore_fallbacks: Vec<String>,
+    /// The entry restored, so a store-only entry can be traced to its last restore.
+    #[serde(default)]
+    pub restore_key: String,
+    /// Why the lookup found nothing to restore: `no-candidate`, `entry-gone`, `input:<file>`, `env:<name>` or `restore:<error>`.
+    #[serde(default)]
+    pub miss_reason: String,
+    /// Empty for a unit; `passthrough` for an uncached compiler call and `store` for a store helper's outcome.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+}
+
+pub const FALLBACKS_KEPT: usize = 8;
+
+/// Adds `reason` unless it is already listed or the list is full.
+pub fn note_reason(list: &mut Vec<String>, reason: &str) {
+    if list.len() < FALLBACKS_KEPT && !list.iter().any(|known| known == reason) {
+        list.push(reason.to_string());
+    }
 }
 
 impl Record {
@@ -56,6 +81,11 @@ impl Record {
             store_mode: "skip:incomplete".to_string(),
             inline_store_ms: 0,
             total_ms: 0,
+            restore_paths: BTreeMap::new(),
+            restore_fallbacks: Vec::new(),
+            restore_key: String::new(),
+            miss_reason: String::new(),
+            kind: String::new(),
         }
     }
 
@@ -82,6 +112,44 @@ fn target() -> Option<&'static Path> {
 fn append(path: &Path, record: &Record) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(record.line().as_bytes())
+}
+
+/// The sink this process writes to, handed to a store helper that may not inherit the environment.
+pub fn configured() -> Option<&'static Path> {
+    target()
+}
+
+/// Passthrough calls and store outcomes go beside the unit records, so the sink keeps exactly one line per compiled unit.
+pub fn events_path(sink: &Path) -> PathBuf {
+    let mut name = sink.as_os_str().to_owned();
+    name.push(".events");
+    PathBuf::from(name)
+}
+
+// Only a file the reader created is appended to, so a helper holding a stale path never recreates a consumed one.
+fn append_event(sink: Option<&Path>, record: &Record) {
+    let Some(path) = sink else { return };
+    if let Ok(mut file) = OpenOptions::new().append(true).open(events_path(path)) {
+        let _ = file.write_all(record.line().as_bytes());
+    }
+}
+
+/// Records an uncached compiler call, such as Cargo's `-vV` probe, so no-op builds count their spawns.
+pub fn passthrough(begun: Instant) {
+    let Some(sink) = target() else { return };
+    let mut record = Record::new("", false, false, false);
+    record.kind = "passthrough".to_string();
+    record.store_mode = "passthrough".to_string();
+    record.total_ms = ms(begun);
+    append_event(Some(sink), &record);
+}
+
+/// Records a store step's outcome; a helper has no unit record, so this is its only trace.
+pub fn store_outcome(sink: Option<&Path>, krate: &str, outcome: &str) {
+    let mut record = Record::new(krate, false, false, false);
+    record.kind = "store".to_string();
+    record.store_mode = outcome.to_string();
+    append_event(sink, &record);
 }
 
 /// Appends the record of a unit that ran uncached before any plan existed.
@@ -169,7 +237,43 @@ mod tests {
         record.extern_bytes_hashed = 11;
         record.extern_bytes_memo = 12;
         record.native_dir_bytes_hashed = 13;
+        record.restore_paths.insert("link".to_string(), 2);
+        note_reason(&mut record.restore_fallbacks, "link:os32");
+        record.restore_key = "abc".to_string();
         record
+    }
+
+    #[test]
+    fn reasons_are_distinct_and_capped() {
+        let mut list = Vec::new();
+        for n in 0..20 {
+            note_reason(&mut list, &format!("r{}", n % 10));
+            note_reason(&mut list, "r0");
+        }
+        assert_eq!(list.len(), FALLBACKS_KEPT);
+        assert_eq!(list[..3], ["r0", "r1", "r2"]);
+    }
+
+    #[test]
+    fn records_from_older_wrappers_parse_with_empty_new_fields() {
+        let old = r#"{"crate":"a","path_unit":false,"primary":false,"incremental":false,"prekey_ms":0,"extern_files":0,"extern_bytes_hashed":0,"extern_bytes_memo":0,"native_dir_bytes_hashed":0,"lookup_ms":0,"keywait_ms":0,"restore_ms":0,"rustc_ms":0,"freeze_ms":0,"spawn_ms":0,"store_mode":"hit","inline_store_ms":0,"total_ms":0}"#;
+        let record: Record = serde_json::from_str(old).unwrap();
+        assert!(record.restore_paths.is_empty() && record.restore_fallbacks.is_empty() && record.kind.is_empty());
+    }
+
+    #[test]
+    fn store_outcomes_go_beside_the_unit_records_and_only_into_an_existing_file() {
+        let s = Scratch::new("store");
+        let path = s.0.join("timings.jsonl");
+        let events = events_path(&path);
+        assert_eq!(events, s.0.join("timings.jsonl.events"));
+        store_outcome(Some(&path), "winapi", "skip:input-changed");
+        assert!(!events.exists() && !path.exists(), "a consumed sink is not recreated");
+        std::fs::write(&events, "").unwrap();
+        store_outcome(Some(&path), "winapi", "skip:input-changed");
+        assert!(!path.exists(), "the unit records stay one line per unit");
+        let record: Record = serde_json::from_str(std::fs::read_to_string(&events).unwrap().trim_end()).unwrap();
+        assert_eq!((record.kind.as_str(), record.krate.as_str(), record.store_mode.as_str()), ("store", "winapi", "skip:input-changed"));
     }
 
     #[test]
@@ -182,11 +286,14 @@ mod tests {
         for name in [
             "crate", "path_unit", "primary", "incremental", "prekey_ms", "extern_files", "extern_bytes_hashed",
             "extern_bytes_memo", "native_dir_bytes_hashed", "lookup_ms", "keywait_ms", "restore_ms", "rustc_ms",
-            "freeze_ms", "spawn_ms", "store_mode", "inline_store_ms", "total_ms",
+            "freeze_ms", "spawn_ms", "store_mode", "inline_store_ms", "total_ms", "restore_paths", "restore_fallbacks",
+            "restore_key", "miss_reason",
         ] {
             assert!(object.contains_key(name), "missing {name}");
         }
-        assert_eq!(object.len(), 18);
+        assert_eq!(object.len(), 22, "a unit record carries no kind");
+        assert_eq!(object["restore_paths"]["link"], 2);
+        assert_eq!(object["restore_fallbacks"][0], "link:os32");
         assert_eq!(object["crate"], "serde");
         assert_eq!(object["path_unit"], true);
         assert_eq!(serde_json::from_str::<Record>(line.trim_end()).unwrap(), record);

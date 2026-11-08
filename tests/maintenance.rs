@@ -13,7 +13,7 @@ use frust::gc;
 use frust::paths::Dirs;
 
 fn fake_entry(home: &Path, key: &str) -> PathBuf {
-    let dir = home.join("store").join(&key[..2]).join(key);
+    let dir = home.join("store").join(key);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("meta.json"), b"{}").unwrap();
     fs::write(dir.join("f0"), vec![7u8; 64 * 1024]).unwrap();

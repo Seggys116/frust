@@ -490,6 +490,11 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename(from, to)
 }
 
+/// A failure another process's open handle causes, which passes once that handle closes.
+pub fn transient_share_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ResourceBusy || imp::transient_share_error(error)
+}
+
 pub fn open_directory_for_times(path: &Path) -> io::Result<File> {
     imp::open_directory_for_times(path)
 }

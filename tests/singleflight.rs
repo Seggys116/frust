@@ -36,9 +36,9 @@ fn slow_leaf() -> String {
 
 fn key_lock_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for shard in fs::read_dir(root).into_iter().flatten().flatten() {
-        for file in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-            found.push(file.path());
+    for file in frust::cache::keyed_items(root) {
+        if file.file_name().and_then(|name| name.to_str()).is_some_and(frust::cache::valid_key) {
+            found.push(file);
         }
     }
     found.sort();
@@ -463,7 +463,7 @@ fn a_lock_held_past_the_wait_cap_is_compiled_through() {
     assert_success(&run);
 }
 
-/// Only unheld locks older than a day are collected, whether the plan is an explicit one or the automatic one.
+/// Only unheld locks past the idle age are collected, whether the plan is an explicit one or the automatic one.
 #[test]
 fn gc_removes_stale_unheld_key_locks_and_keeps_held_and_recent_ones() {
     let sb = Sandbox::new("sf-gc");
