@@ -149,6 +149,29 @@ fn store_only_linked_files(sb: &Sandbox, krates: &[&str]) -> usize {
         .count()
 }
 
+// A linked restore keeps the store file's old mtime unless touched, and cargo then finds the dependency newer on every run.
+#[test]
+fn units_restored_by_link_leave_cargo_nothing_to_rebuild() {
+    let sb = Sandbox::new("lk-fresh");
+    let root = path_workspace(&sb);
+    build(&sb, &root, "force");
+    sb.lose_target(&root);
+    build(&sb, &root, "force");
+    // The same bytes rewritten: cargo recompiles leaf and its dependents, and every one is a store hit.
+    edit_leaf(&root, 0);
+    build(&sb, &root, "force");
+    let out = sb.bin("fcargo").args(["build", "--message-format=json"]).env("FRUST_CACHE_BACKED", "force").current_dir(&root).output().unwrap();
+    assert_success(&out);
+    let rebuilt: Vec<String> = stdout(&out)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|msg| msg["reason"] == "compiler-artifact" && msg["fresh"] != true)
+        .map(|msg| msg["target"]["name"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert!(rebuilt.is_empty(), "cargo rebuilt {rebuilt:?} on a no-op");
+    assert_eq!(app_output(&sb, &root), "1");
+}
+
 #[test]
 fn edits_keep_one_version_per_unit_and_leave_no_store_only_linked_bytes() {
     let sb = Sandbox::new("lk-versions");
@@ -380,4 +403,54 @@ fn auto_links_outputs_exactly_when_the_cache_volume_has_no_clones() {
     let linked = meta.files.iter().any(|file| file.encoding == Encoding::Linked);
     assert_eq!(linked, frust::cache::payload::clones_unavailable(&sb.home().join("tmp")), "{meta:#?}");
     assert_eq!(app_output(&sb, &a), "41");
+}
+
+// A vendored crate whose build script is big enough to be stored as a link.
+fn scene_with_build_script(tag: &str) -> (Sandbox, PathBuf) {
+    let sb = Sandbox::new(tag);
+    sb.vendor_crate("leaf", "1.0.0", &leaf_source());
+    let build_rs = format!("fn main() {{ println!(\"cargo:rerun-if-changed=build.rs\"); let mut s = 0u64; {} println!(\"{{}}\", s); }}\n", (0..400).map(|n| format!("s = s.wrapping_mul({}).wrapping_add({n});", n + 7)).collect::<String>());
+    fs::write(sb.vendor().join("leaf-1.0.0").join("build.rs"), build_rs).unwrap();
+    let a = sb.project("a", &[("leaf", "1.0.0")], MAIN);
+    (sb, a)
+}
+
+fn script_entry_files(sb: &Sandbox) -> Vec<(PathBuf, frust::cache::StoredFile)> {
+    entries(sb, "build_script_build")
+        .into_iter()
+        .flat_map(|(dir, meta)| meta.files.into_iter().filter(|f| f.encoding == Encoding::Linked).map(move |f| (dir.clone(), f)).collect::<Vec<_>>())
+        .collect()
+}
+
+#[test]
+fn a_restore_beside_cargos_alias_of_a_removed_output_links_instead_of_copying() {
+    let (sb, a) = scene_with_build_script("lk-alias");
+    build(&sb, &a, "force");
+    let profile = sb.central_target(&a).join("debug");
+    let script = walk(&profile.join("build")).into_iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("build_script_build-") && p.extension().is_none())).expect("the build script executable");
+    let hashed = script.file_name().unwrap().to_string_lossy().rsplit_once('-').unwrap().1.to_string();
+    // Cargo hard-links the executable to `build-script-build` and removes the hashed name before the next compile of the unit.
+    let alias = script.with_file_name("build-script-build");
+    let _ = fs::remove_file(&alias);
+    fs::hard_link(&script, &alias).unwrap();
+    fs::remove_file(&script).unwrap();
+    for entry in fs::read_dir(profile.join(".fingerprint")).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(&hashed) {
+            fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+    build(&sb, &a, "force");
+    let stored = script_entry_files(&sb);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let (dir, file) = &stored[0];
+    assert_eq!(ino(&dir.join(&file.stored)), ino(&script), "the restored executable is the store file's inode, not a copy");
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() { out.extend(walk(&p)) } else { out.push(p) }
+    }
+    out
 }

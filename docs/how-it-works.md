@@ -258,7 +258,9 @@ temporary sibling of the destination while hashing, the length, hash and file id
 the recorded mode is applied, and the copy is renamed into place. If the store file has no other name (the target was
 deleted), nothing is copied: the store file is hashed once, a private temporary link is made next to the destination,
 and the link is renamed into place only when the store file then has exactly two names; a concurrent restorer or a
-target that already holds a name makes it a copy instead, so no two targets share an inode. A copied destination is
+target that already holds a name makes it a copy instead, so no two targets share an inode. Every placed output, kept,
+linked or copied, gets a fresh modification time, as a compile would give it: a linked file would otherwise keep the
+store's older time, and cargo treats an output older than a dependency's output as stale on every run. A copied destination is
 offered to the store the same way (the store file is replaced by the verified destination, retrying briefly on
 Windows sharing violations and otherwise leaving the copy). A store whose outputs were already replaced by a newer
 compile retires the unit's earlier entries that no target name shares, and gc sweeps unreferenced store-only path
@@ -277,9 +279,14 @@ entries use their own key domain, so older versions treat them as misses.
 
 ## Smaller build directories
 
-* Opt-in `FRUST_TUNE=on` builds dependencies without debug info in dev profiles (about a tenth smaller, no
-  compile-time cost). `line-tables-only` was measured to be both slower and larger, so it is not used. Skipped
-  when your project or cargo config defines any profile.
+* `FRUST_TUNE` (on by default) builds dependencies without debug info in the dev and test profiles (about a
+  quarter to a tenth smaller, no compile-time cost); workspace crates keep full debug info, and build scripts and
+  proc macros already compile without it. `line-tables-only` was measured to be both slower and larger, so it is
+  not used. Skipped when your project or cargo config defines any profile, or with `FRUST_TUNE=off`. The debuginfo
+  level reaches rustc as an argument, so tuned and untuned builds key the compile cache separately.
+* On Windows (MSVC) hosts frust sets `CARGO_TARGET_<HOST>_LINKER` to the toolchain's `rust-lld.exe` for build
+  commands, unless you configured a linker anywhere or set `FRUST_LINKER=system`; it falls back to `link.exe` when
+  the sysroot has no `rust-lld.exe`.
 * Raw artifacts are restored as copy-on-write clones where supported, including APFS (macOS), btrfs and XFS
   (Linux) and ReFS, including Dev Drive (Windows). Elsewhere they are copied. Encoded payloads are restored to
   ordinary compiler artifacts with their original bytes and permissions.
@@ -444,8 +451,11 @@ nanoseconds, or the fact that it did not exist:
   from the environment is one cargo sets itself and follows from the stamped inputs;
 * build scripts: `rerun-if-changed` paths (whole trees for directories), `rerun-if-env-changed` values, and for a path
   package without `rerun-if-changed` its whole directory tree (except `.git`, `target`, nested packages and the
-  target directory), as cargo then reruns the script on any change;
-* every output cargo lists, the hashed original of each uplifted output, each unit's fingerprint directory and its
+  target directory; a symlinked directory is stamped through the link and followed, each directory once), as cargo
+  then reruns the script on any change;
+* every output cargo lists, the original of each uplifted output (hashed, or under cargo's plain name in `deps` for a
+  path package's `cdylib` or `dylib` and its executables on windows-msvc, whose rustc dep-info is then `<crate>.d`),
+  each unit's fingerprint directory and its
   files, build script `output` files, the root `Cargo.toml` and `Cargo.lock`, every cargo config file (absent ones as
   absent) and `rust-toolchain(.toml)` in the working directory and its ancestors.
 
@@ -458,7 +468,7 @@ started (the compile cache's "file too new" rule, 100 ms or 2 s for coarse times
 or one with a future modification time that cargo would rebuild every time, is never vouched for. Recording also
 refuses a missing dep-info input or `rerun-if-changed` path (cargo reruns those every time), a dep-info file that
 does not name the unit's source, coarse or missing timestamps, a volume outside the stamp-trust allow-list or one
-that is quarantined, a symlinked directory inside a watched tree, a tree over 20,000 entries, output it cannot replay
+that is quarantined, a tree over 20,000 entries, output it cannot replay
 (progress bars, non-UTF-8, plain text on stdout) and an observed variable that frust sets per run.
 
 **The check.** Before the build lock is requested: the record must exist, decode, and match the key, the display

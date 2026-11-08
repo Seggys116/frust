@@ -910,6 +910,44 @@ fn build_in_flight(dirs: &Dirs, target: &Path, scope: &Scope) -> bool {
     busy
 }
 
+/// The lexical components of a path as written by cargo, rustc or a dep-info file; Windows forms unify separators, drop the verbatim prefix and fold case.
+fn components(path: &str, windows: bool) -> Vec<String> {
+    let mut text = if windows { path.replace('\\', "/") } else { path.to_string() };
+    if windows {
+        for (prefix, keep) in [("//?/UNC/", "//"), ("//?/", ""), ("//./", "")] {
+            if let Some(rest) = text.strip_prefix(prefix) {
+                text = format!("{keep}{rest}");
+                break;
+            }
+        }
+        text = text.to_lowercase();
+    }
+    let rooted = text.starts_with('/');
+    let mut parts: Vec<String> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| last != "..") && !(windows && parts.len() == 1 && parts[0].ends_with(':')) => {
+                parts.pop();
+            }
+            ".." if rooted || (windows && parts.len() == 1 && parts[0].ends_with(':')) => {}
+            other => parts.push(other.to_string()),
+        }
+    }
+    if text.starts_with("//") && windows {
+        parts.insert(0, "//".into());
+    } else if rooted {
+        parts.insert(0, "/".into());
+    }
+    parts
+}
+
+/// Whether `path` is `base` or lies below it, compared lexically.
+fn within(path: &str, base: &str, windows: bool) -> bool {
+    let (path, base) = (components(path, windows), components(base, windows));
+    !base.is_empty() && path.starts_with(&base)
+}
+
 fn is_hash(text: &str) -> bool {
     text.len() == 16 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -999,6 +1037,7 @@ fn locate_unit(msg: &serde_json::Value, outputs: &[PathBuf]) -> Result<Unit, &'s
         }
     }
     // Uplifted outputs are copies or links of the hashed original, which keeps its size and modification time.
+    let mut unhashed = Vec::new();
     for out in outputs {
         let (Some(dir), Some(name)) = (out.parent(), name_of(out)) else { continue };
         let profile_dir = if name_of(dir).as_deref() == Some("examples") { dir.parent().unwrap_or(dir) } else { dir };
@@ -1028,9 +1067,16 @@ fn locate_unit(msg: &serde_json::Value, outputs: &[PathBuf]) -> Result<Unit, &'s
         {
             return Ok(unit);
         }
+        // A path package's cdylib or dylib, and its executables on windows-msvc, keep cargo's name without a hash in `deps`.
+        let original = profile_dir.join("deps").join(&name);
+        if found.is_empty() && dir != original.parent().unwrap_or(dir) && original.is_file() {
+            unhashed.push(original);
+        }
     }
     let profile = profile.ok_or("unit without outputs")?;
-    candidates(msg, &profile, &package, &crate_name)
+    let mut unit = candidates(msg, &profile, &package, &crate_name)?;
+    unit.extra_outputs.extend(unhashed);
+    Ok(unit)
 }
 
 /// Every fingerprint directory of the package holding this unit's fingerprint file; a superset only adds stamps.
@@ -1051,7 +1097,12 @@ fn candidates(msg: &serde_json::Value, profile: &Path, package: &str, crate_name
             _ => profile.join("deps"),
         };
         unit.fingerprints.push(entry.path());
-        unit.depinfos.push(depdir.join(format!("{crate_name}-{hash}.d")));
+        let hashed = depdir.join(format!("{crate_name}-{hash}.d"));
+        let plain = depdir.join(format!("{crate_name}.d"));
+        let depinfo = if !hashed.exists() && plain.is_file() { plain } else { hashed };
+        if !unit.depinfos.contains(&depinfo) {
+            unit.depinfos.push(depinfo);
+        }
     }
     if unit.fingerprints.is_empty() || unit.fingerprints.len() > MAX_CANDIDATES {
         return Err("unit not found");
@@ -1198,10 +1249,10 @@ impl<'a> Collector<'a> {
                 }
             }
         }
-        let root = self.gate.root.clone();
-        if dir.starts_with(&root) {
+        let root = self.gate.root.to_string_lossy().into_owned();
+        if within(&dir.to_string_lossy(), &root, cfg!(windows)) {
             for ancestor in dir.ancestors().skip(1) {
-                if !ancestor.starts_with(&root) {
+                if !within(&ancestor.to_string_lossy(), &root, cfg!(windows)) {
                     break;
                 }
                 self.input(ancestor, false)?;
@@ -1266,11 +1317,17 @@ impl<'a> Collector<'a> {
         Ok(())
     }
 
+    /// Every entry below `top`; a symlinked directory is followed (each directory once) and stamped through the link, so a retarget or an edit behind it is seen.
     fn tree(&mut self, top: &Path, package: bool) -> Result<(), &'static str> {
         let mut stack = vec![(top.to_path_buf(), 0usize)];
+        let mut walked = HashSet::new();
         let mut count = 0usize;
         while let Some((dir, depth)) = stack.pop() {
             self.file(&dir, false)?;
+            let meta = sys::stat(&dir).map_err(|_| "unreadable directory")?;
+            if !walked.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
             let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir).map_err(|_| "unreadable directory")?.flatten().collect();
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
@@ -1280,24 +1337,20 @@ impl<'a> Collector<'a> {
                 }
                 let path = entry.path();
                 let kind = entry.file_type().map_err(|_| "unreadable directory")?;
-                if kind.is_symlink() {
-                    if path.is_dir() {
-                        return Err("symlinked directory");
-                    }
-                    self.file(&path, false)?;
-                    continue;
-                }
-                if !kind.is_dir() {
+                let linked_dir = kind.is_symlink() && path.is_dir();
+                if !kind.is_dir() && !linked_dir {
                     self.file(&path, false)?;
                     continue;
                 }
                 let name = entry.file_name();
+                let real = if linked_dir { fs::canonicalize(&path).map_err(|_| "unreadable directory")? } else { path.clone() };
                 let skip = name == ".git"
-                    || path.starts_with(&self.gate.target)
-                    || self.profiles.iter().any(|p| path.starts_with(p))
+                    || [&path, &real].iter().any(|p| self.under_target(p))
                     || (package && depth == 0 && name == "target")
                     || (package && path.join("Cargo.toml").exists());
-                if !skip {
+                if skip && linked_dir {
+                    self.file(&path, false)?;
+                } else if !skip {
                     stack.push((path, depth + 1));
                 }
             }
@@ -1326,7 +1379,9 @@ impl<'a> Collector<'a> {
     }
 
     fn under_target(&self, path: &Path) -> bool {
-        path.starts_with(&self.gate.target) || self.profiles.iter().any(|p| path.starts_with(p))
+        let windows = cfg!(windows);
+        let path = path.to_string_lossy();
+        within(&path, &self.gate.target.to_string_lossy(), windows) || self.profiles.iter().any(|p| within(&path, &p.to_string_lossy(), windows))
     }
 
     fn file(&mut self, path: &Path, absent_ok: bool) -> Result<(), &'static str> {
@@ -1544,6 +1599,35 @@ mod tests {
         let (files, vars) = build_directives("cargo:rerun-if-changed=build.rs\ncargo::rerun-if-env-changed=X\ncargo:warning=hi\ncargo::rerun-if-changed=data\n");
         assert_eq!(files, vec!["build.rs", "data"]);
         assert_eq!(vars, vec!["X"]);
+    }
+
+    #[test]
+    fn paths_compare_lexically_in_windows_and_unix_forms() {
+        let target = r"C:\Users\runneradmin\AppData\Local\frust\targets\ws-1";
+        for path in [
+            r"C:\Users\runneradmin\AppData\Local\frust\targets\ws-1\debug\build\app-0123456789abcdef\out/gen.rs",
+            r"c:\users\RUNNERADMIN\appdata\local\frust\targets\ws-1\debug",
+            r"\\?\C:\Users\runneradmin\AppData\Local\frust\targets\ws-1\debug\deps\app.d",
+            "C:/Users/runneradmin/AppData/Local/frust/targets/ws-1/./debug/../debug/deps",
+            r"C:\Users\runneradmin\AppData\Local\frust\targets\ws-1",
+        ] {
+            assert!(within(path, target, true), "{path}");
+        }
+        for path in [
+            r"C:\Users\runneradmin\AppData\Local\frust\targets\ws-10\debug",
+            r"D:\Users\runneradmin\AppData\Local\frust\targets\ws-1\debug",
+            r"C:\Users\runneradmin\AppData\Local\frust\targets\ws-1\..\ws-2",
+            r"src\main.rs",
+        ] {
+            assert!(!within(path, target, true), "{path}");
+        }
+        assert!(within(r"\\?\UNC\server\share\t\debug", r"\\server\share\t", true));
+        assert!(within(r"C:\..\t\debug", r"C:\t", true), "a drive root has no parent");
+        assert!(within("/w/t/debug/./deps", "/w/t", false));
+        assert!(!within("/w/T/debug", "/w/t", false), "unix paths keep their case");
+        assert!(!within("/w/t/../u", "/w/t", false));
+        assert!(!within(r"\w\t\debug", "/w/t", false), "a backslash is a file name character on unix");
+        assert!(!within("/w/t", "", false));
     }
 
     #[test]

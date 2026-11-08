@@ -60,7 +60,15 @@ pub fn run(cfg: &Config, dirs: &Dirs, cwd: &Path) -> Vec<Check> {
     });
 
     let sysroot = probe.as_ref().filter(|p| !p.sysroot.is_empty()).map(|p| (Path::new(p.sysroot.as_str()), p.host.as_str()));
-    checks.extend(linker_check(&configured_linkers(cwd), cwd, sysroot));
+    let linkers = configured_linkers(cwd);
+    checks.extend(linker_check(&linkers, cwd, sysroot));
+    if let Some(probe) = &probe {
+        let user = !linkers.is_empty() || toolchain::env_sets_linker(env::vars_os());
+        let linker = toolchain::default_linker(&probe.host, toolchain::linker_opted_out(), user, sysroot.map(|(root, _)| root), |p| p.is_file());
+        checks.push(check("default linker", Status::Ok, linker.describe()));
+        let deps = cfg.tune && probe.cargo_version >= (1, 63, 0);
+        checks.push(check("tuning", Status::Ok, format!("{} (FRUST_TUNE={}, FRUST_LINKER={}; dependency debuginfo is skipped when a project defines profiles)", toolchain::tuning_label(deps, &linker), on_off(cfg.tune), if toolchain::linker_opted_out() { "system" } else { "auto" })));
+    }
 
     // A foreign RUSTC_WRAPPER (such as sccache) wins over frust-wrap, so the compile cache cannot run.
     match env::var("RUSTC_WRAPPER") {
@@ -184,6 +192,11 @@ fn config_linkers(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// True when one cargo config file (or `--config` value) names a linker.
+pub(crate) fn config_sets_linker(text: &str) -> bool {
+    !config_linkers(text).is_empty()
 }
 
 /// Every explicit linker that applies to `cwd`: cargo config files, `RUSTFLAGS` and `CARGO_BUILD_RUSTFLAGS`.

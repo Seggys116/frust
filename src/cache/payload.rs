@@ -873,6 +873,42 @@ pub fn restore_linked(store_file: &Path, dst: &Path, file: &StoredFile) -> io::R
     Err(io::Error::other(Unstable("the store file kept changing during the copy")))
 }
 
+/// The names Cargo itself gives an output inode after the compile: the hash-less uplift (`debug/bat` for `deps/bat-HASH`) and a build script's `build-script-build`. Cargo removes the hashed name before every compile and relinks these afterwards.
+fn cargo_aliases(dst: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (dst.parent(), dst.file_name().and_then(|n| n.to_str())) else { return Vec::new() };
+    let (stem, suffix) = match name.find('.') {
+        Some(dot) => name.split_at(dot),
+        None => (name, ""),
+    };
+    let Some((base, _)) = stem.rsplit_once('-').filter(|(_, hash)| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())) else {
+        return Vec::new();
+    };
+    if base == "build_script_build" {
+        return vec![dir.join(format!("build-script-build{suffix}"))];
+    }
+    let uplifted = format!("{base}{suffix}");
+    let mut names = vec![dir.join(&uplifted)];
+    names.extend(dir.parent().map(|up| up.join(&uplifted)));
+    names
+}
+
+/// How many of Cargo's alias names of `dst` are names of the store file's own inode.
+fn held_aliases(dst: &Path, stored: &sys::Meta) -> u64 {
+    if stored.ino() == 0 {
+        return 0;
+    }
+    let aliases = cargo_aliases(dst);
+    aliases
+        .iter()
+        .filter(|alias| sys::lstat(alias).is_ok_and(|m| m.is_file() && m.dev() == stored.dev() && m.ino() == stored.ino()))
+        .count() as u64
+}
+
+/// True when no target name but Cargo's own aliases of `dst` shares the store file.
+pub fn unshared_by_targets(store_file: &Path, dst: &Path) -> bool {
+    sys::lstat(store_file).is_ok_and(|stored| stored.nlink() == 1 + held_aliases(dst, &stored))
+}
+
 /// Moves the store file's only name-free inode into the target through a private temporary link, so nothing is copied; an inner `Err` is why the caller must copy instead.
 fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode: u32) -> io::Result<Result<(), String>> {
     let source = lost(File::open(store_file))?;
@@ -880,7 +916,9 @@ fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode
     if !before.is_file() || before.len() != len {
         return Ok(Err("store-not-entry".into()));
     }
-    if before.nlink() != 1 {
+    // Cargo's alias of a removed output (a bin's uplift, `build-script-build`) holds the inode too and is relinked to the restored name afterwards.
+    let aliases = held_aliases(dst, &before);
+    if before.nlink() != 1 + aliases {
         return Ok(Err(format!("store-nlink={}", before.nlink())));
     }
     // The bytes are read once and must match the record: an in-place writer may have changed them.
@@ -901,7 +939,7 @@ fn restore_by_link(store_file: &Path, dst: &Path, len: u64, expected: &str, mode
         Ok(now) => now,
         Err(error) => return Ok(Err(format!("relstat:{}", error_label(&error)))),
     };
-    if now.nlink() != 2 {
+    if now.nlink() != 2 + aliases {
         return Ok(Err(format!("linked-nlink={}", now.nlink())));
     }
     if !now.is_file() || now.ino() != before.ino() || now.dev() != before.dev() || now.len() != len || now.mtime() != before.mtime() {
@@ -926,7 +964,7 @@ pub fn adopt(store_file: &Path, dst: &Path) -> Result<bool, String> {
     if stored.is_file() && placed.is_file() && stored.dev() == placed.dev() && stored.ino() == placed.ino() {
         return Ok(false);
     }
-    if stored.nlink() != 1 {
+    if stored.nlink() != 1 + held_aliases(dst, &stored) {
         return Err(format!("store-nlink={}", stored.nlink()));
     }
     if !stored.is_file() || !placed.is_file() || stored.dev() != placed.dev() || stored.len() != placed.len() {
@@ -1139,6 +1177,30 @@ mod tests {
         restore_linked(&staged, &other, &file).unwrap();
         assert_ne!(sys::lstat(&other).unwrap().ino(), before.ino(), "a store file that already has a target name is copied");
         assert!(fs::read_dir(&scratch.0).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(fsx::TEMP_MARKER)));
+    }
+
+    #[test]
+    fn cargos_alias_of_a_removed_output_does_not_force_a_copy_but_a_stranger_does() {
+        let scratch = Scratch::new();
+        let bytes = pattern(300_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let deps = scratch.0.join("deps");
+        fs::create_dir(&deps).unwrap();
+        let stranger = scratch.0.join("stranger");
+        fs::hard_link(&staged, &stranger).unwrap();
+        let dst = deps.join("build_script_build-0123456789abcdef");
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Copied("store-nlink=2".into()), "an unrelated name still forces a copy");
+        fs::remove_file(&stranger).unwrap();
+        fs::remove_file(&dst).unwrap();
+        let alias = deps.join("build-script-build");
+        fs::hard_link(&staged, &alias).unwrap();
+        assert!(unshared_by_targets(&staged, &dst));
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Linked);
+        let stored = sys::lstat(&staged).unwrap();
+        assert_eq!((stored.ino(), stored.nlink()), (sys::lstat(&dst).unwrap().ino(), 3));
+        assert!(!unshared_by_targets(&staged, &dst));
+        assert_eq!(cargo_aliases(&deps.join("bat-0123456789abcdef")), [deps.join("bat"), scratch.0.join("bat")]);
+        assert!(cargo_aliases(&deps.join("plain")).is_empty());
     }
 
     fn busy() -> io::Error {

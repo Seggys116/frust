@@ -500,6 +500,7 @@ fn env_cmd(dirs: &Dirs) -> i32 {
     }
     let (root, _) = workspace::locate_cached(dirs, &cwd, None, None, &probe.id);
     println!("export CARGO_TARGET_DIR='{}'", workspace::central_target(dirs, root.as_deref(), &probe.id).display());
+    println!("export FRUST_TUNING='{}'", crate::run::effective_tuning(dirs, &cwd));
     0
 }
 

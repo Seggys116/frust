@@ -883,7 +883,11 @@ impl Plan {
             return Ok(());
         }
         match cache::payload::restore_linked(&store_file, dst, file)? {
-            cache::payload::Placement::Linked => self.note_restore("link", None),
+            cache::payload::Placement::Linked => {
+                // The linked inode keeps the store's old mtime, which cargo would see as older than a dependency's output on every run.
+                fsx::touch(dst);
+                self.note_restore("link", None);
+            }
             cache::payload::Placement::Copied(refused) => {
                 fsx::touch(dst);
                 match cache::payload::adopt(&store_file, dst) {
@@ -1717,10 +1721,10 @@ impl Plan {
         let (mut adopted, mut refused) = (0, None);
         for file in meta.files.iter().filter(|f| f.encoding == cache::payload::Encoding::Linked) {
             let store_file = dir.join(&file.stored);
-            if !sys::lstat(&store_file).is_ok_and(|m| m.nlink() == 1) {
+            let output = self.output_dir_abs.join(&file.name);
+            if !cache::payload::unshared_by_targets(&store_file, &output) {
                 continue;
             }
-            let output = self.output_dir_abs.join(&file.name);
             let result = cache::payload::verify_in_place(&output, file)
                 .map_err(|_| "differs".to_string())
                 .and_then(|()| cache::payload::adopt(&store_file, &output));

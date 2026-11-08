@@ -21,7 +21,7 @@ use crate::lock::{self, Acquired, BuildLock, BuildResult, Joined, LockError, Loc
 use crate::paths::Dirs;
 use crate::signals;
 use crate::sys::{self, StdStream};
-use crate::toolchain::{Probe, resolve_tool};
+use crate::toolchain::{self, DefaultLinker, Probe, env_sets_linker, linker_opted_out, resolve_tool, target_linker_var, tuning_label};
 use crate::ui::{Outcome, RunStats, Style, Ui, UiOptions, term};
 use crate::workspace;
 
@@ -81,6 +81,11 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
         }
     }
     let tuning = tuning_args(&cfg, &probe, &parsed, root.as_deref(), &cwd, class, &configs);
+    if matches!(class, Class::Compile | Class::Exec(_))
+        && let Some((key, value)) = default_linker(&probe, &parsed, &cwd, &configs).1
+    {
+        env_vars.push((key, value));
+    }
     let owns_clean = class == Class::Clean && target.central.is_some() && parsed.cleans_whole_target();
 
     let session = Session {
@@ -517,6 +522,45 @@ fn tuning_args(cfg: &Config, probe: &Probe, parsed: &CargoArgs, root: Option<&Pa
     vec![os("--config"), os("profile.dev.package.\"*\".debug=0")]
 }
 
+/// The default linker choice and, when frust picks one, the cargo variable that carries it.
+fn default_linker(probe: &Probe, parsed: &CargoArgs, cwd: &Path, configs: &ConfigInputs) -> (DefaultLinker, Option<(OsString, OsString)>) {
+    let user = || user_linker(parsed, cwd, configs);
+    let sysroot = (!probe.sysroot.is_empty()).then(|| Path::new(probe.sysroot.as_str()));
+    let opted_out = linker_opted_out();
+    let msvc = probe.host.ends_with("-windows-msvc");
+    let choice = toolchain::default_linker(&probe.host, opted_out, msvc && !opted_out && user(), sysroot, |p| p.is_file());
+    let var = match &choice {
+        DefaultLinker::Lld(path) => Some((os(&target_linker_var(&probe.host)), path.as_os_str().to_os_string())),
+        _ => None,
+    };
+    (choice, var)
+}
+
+/// A linker named in the environment, a cargo config file or `--config` always wins over frust's default.
+fn user_linker(parsed: &CargoArgs, cwd: &Path, configs: &ConfigInputs) -> bool {
+    env_sets_linker(env::vars_os())
+        || configs.files.iter().any(|p| crate::doctor::config_sets_linker(&configs.read(p)))
+        || cli_configs(parsed).iter().any(|value| {
+            let text = value.to_string_lossy();
+            match cli_config_file(&text, cwd) {
+                Some(file) => crate::doctor::config_sets_linker(&configs.read(&file)),
+                None => crate::doctor::config_sets_linker(&text),
+            }
+        })
+}
+
+/// The tuning frust applies to a plain `build` in `cwd`, such as `deps-debug0,lld-link`, or `none`.
+pub fn effective_tuning(dirs: &Dirs, cwd: &Path) -> String {
+    let cfg = Config::from_env();
+    let Some((probe, _)) = Probe::cached(dirs, None, cwd) else { return "none".to_string() };
+    let parsed = CargoArgs::parse([os("build")]);
+    let (root, _) = workspace::locate_cached(dirs, cwd, None, None, &probe.id);
+    let configs = ConfigInputs::new(root.as_deref(), cwd);
+    let deps = !tuning_args(&cfg, &probe, &parsed, root.as_deref(), cwd, Class::Compile, &configs).is_empty();
+    let (linker, _) = default_linker(&probe, &parsed, cwd, &configs);
+    tuning_label(deps, &linker)
+}
+
 fn user_profiles(parsed: &CargoArgs, root: Option<&Path>, cwd: &Path, configs: &ConfigInputs) -> bool {
     let read = |p: &Path| configs.read(p);
     let cli = cli_configs(parsed).iter().any(|value| {
@@ -562,6 +606,7 @@ fn affects_build(key: &str) -> bool {
                 | "FRUST_CACHE"
                 | "FRUST_CACHE_PRIMARY"
                 | "FRUST_TUNE"
+                | "FRUST_LINKER"
                 | "FRUST_TARGET"
                 | "FRUST_LINK"
                 | "CC"

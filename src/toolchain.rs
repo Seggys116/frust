@@ -56,6 +56,76 @@ pub fn resolve_linker_env(name: &str) -> Option<PathBuf> {
     resolve_linker(name, root.as_deref().zip(host.as_deref()))
 }
 
+/// The linker frust picks when the user has not: rust-lld on windows-msvc hosts, nothing elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultLinker {
+    NotApplicable,
+    OptedOut,
+    UserConfigured,
+    Missing,
+    Lld(PathBuf),
+}
+
+impl DefaultLinker {
+    /// The label recorded in the tuning string; `None` when the system linker stays in use.
+    pub fn label(&self) -> Option<&'static str> {
+        matches!(self, DefaultLinker::Lld(_)).then_some("lld-link")
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            DefaultLinker::NotApplicable => "the platform default; frust only picks rust-lld on windows-msvc".to_string(),
+            DefaultLinker::OptedOut => "link.exe (FRUST_LINKER=system)".to_string(),
+            DefaultLinker::UserConfigured => "your configured linker; frust leaves it alone".to_string(),
+            DefaultLinker::Missing => "link.exe; rust-lld.exe is not in the toolchain sysroot".to_string(),
+            DefaultLinker::Lld(path) => format!("rust-lld ({}); FRUST_LINKER=system restores link.exe", path.display()),
+        }
+    }
+}
+
+/// `FRUST_LINKER=system` keeps the platform linker.
+pub fn linker_opted_out() -> bool {
+    env::var("FRUST_LINKER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("system"))
+}
+
+/// The cargo environment variable that sets the linker for one target triple.
+pub fn target_linker_var(triple: &str) -> String {
+    let upper: String = triple.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+    format!("CARGO_TARGET_{upper}_LINKER")
+}
+
+/// True when an environment variable already chooses a linker, directly or through rustflags.
+pub fn env_sets_linker(vars: impl IntoIterator<Item = (OsString, OsString)>) -> bool {
+    vars.into_iter().any(|(key, value)| {
+        let key = key.to_string_lossy();
+        (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER") && !value.is_empty())
+            || (key.ends_with("RUSTFLAGS") && value.to_string_lossy().contains("linker"))
+    })
+}
+
+/// Pure choice of the default linker; the sysroot lookup is injected so it can be tested off Windows.
+pub fn default_linker(host: &str, opted_out: bool, user_configured: bool, sysroot: Option<&Path>, exists: impl Fn(&Path) -> bool) -> DefaultLinker {
+    if !host.ends_with("-windows-msvc") {
+        return DefaultLinker::NotApplicable;
+    }
+    if opted_out {
+        return DefaultLinker::OptedOut;
+    }
+    if user_configured {
+        return DefaultLinker::UserConfigured;
+    }
+    let Some(root) = sysroot else { return DefaultLinker::Missing };
+    let [bin, ..] = sysroot_linker_dirs(root, host);
+    let path = bin.join("rust-lld.exe");
+    if exists(&path) { DefaultLinker::Lld(path) } else { DefaultLinker::Missing }
+}
+
+/// The effective tuning as one string such as `deps-debug0,lld-link`, or `none`.
+pub fn tuning_label(deps_debug0: bool, linker: &DefaultLinker) -> String {
+    let parts: Vec<&str> = [deps_debug0.then_some("deps-debug0"), linker.label()].into_iter().flatten().collect();
+    if parts.is_empty() { "none".to_string() } else { parts.join(",") }
+}
+
 fn probe_rustc() -> Option<PathBuf> {
     env::var_os("RUSTC").map(PathBuf::from).or_else(|| resolve_tool("rustc"))
 }
@@ -472,6 +542,43 @@ pub fn parse_version(text: &str) -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_linker_is_rust_lld_only_on_windows_msvc_without_user_choice() {
+        let sysroot = Path::new("sys");
+        let lld = sysroot.join("lib").join("rustlib").join("x86_64-pc-windows-msvc").join("bin").join("rust-lld.exe");
+        let present = |p: &Path| p == lld;
+        let msvc = "x86_64-pc-windows-msvc";
+        assert_eq!(default_linker(msvc, false, false, Some(sysroot), present), DefaultLinker::Lld(lld.clone()));
+        assert_eq!(default_linker(msvc, true, false, Some(sysroot), present), DefaultLinker::OptedOut);
+        assert_eq!(default_linker(msvc, false, true, Some(sysroot), present), DefaultLinker::UserConfigured);
+        assert_eq!(default_linker(msvc, false, false, Some(sysroot), |_| false), DefaultLinker::Missing);
+        assert_eq!(default_linker(msvc, false, false, None, |_| true), DefaultLinker::Missing);
+        for host in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"] {
+            assert_eq!(default_linker(host, false, false, Some(sysroot), |_| true), DefaultLinker::NotApplicable);
+        }
+        assert_eq!(default_linker("aarch64-pc-windows-msvc", false, false, Some(sysroot), |_| true).label(), Some("lld-link"));
+    }
+
+    #[test]
+    fn linker_variable_and_user_detection_follow_cargo_naming() {
+        assert_eq!(target_linker_var("x86_64-pc-windows-msvc"), "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER");
+        let var = |k: &str, v: &str| vec![(OsString::from(k), OsString::from(v))];
+        assert!(env_sets_linker(var("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "lld-link")));
+        assert!(!env_sets_linker(var("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "")));
+        assert!(env_sets_linker(var("RUSTFLAGS", "-C linker=foo")));
+        assert!(env_sets_linker(var("CARGO_BUILD_RUSTFLAGS", "-Clinker-flavor=lld-link")));
+        assert!(!env_sets_linker(var("RUSTFLAGS", "-C target-cpu=native")));
+        assert!(!env_sets_linker(var("PATH", "linker")));
+    }
+
+    #[test]
+    fn tuning_label_lists_active_tuning() {
+        assert_eq!(tuning_label(true, &DefaultLinker::Lld(PathBuf::from("x"))), "deps-debug0,lld-link");
+        assert_eq!(tuning_label(true, &DefaultLinker::NotApplicable), "deps-debug0");
+        assert_eq!(tuning_label(false, &DefaultLinker::Lld(PathBuf::from("x"))), "lld-link");
+        assert_eq!(tuning_label(false, &DefaultLinker::OptedOut), "none");
+    }
 
     #[test]
     fn parses_release_and_prerelease_versions() {

@@ -388,6 +388,58 @@ fn a_workspace_with_a_vendored_registry_dependency_is_served() {
     fx.fast(&["build"]);
 }
 
+// Cargo names a path package's cdylib, and its executables on windows-msvc, without a hash: `deps/libcdy.dylib` beside `deps/cdy.d`.
+#[test]
+fn units_cargo_names_without_a_hash_are_tracked() {
+    let files = [
+        ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"cdy\"]\n"),
+        ("src/main.rs", "fn main() {\n    println!(\"1\");\n}\n"),
+        ("cdy/Cargo.toml", "[package]\nname = \"cdy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n"),
+        ("cdy/src/lib.rs", "#[no_mangle]\npub extern \"C\" fn cdy_value() -> u32 {\n    1\n}\n"),
+    ];
+    let fx = Fixture::new("noop-unhashed", &files);
+    let (out, trace) = fx.run(&["build", "--workspace"], "on");
+    assert_success(&out);
+    assert_eq!(trace["record"], "build", "{trace}");
+    fx.fast(&["build", "--workspace"]);
+    fx.audited(&["build", "--workspace"]);
+    fx.edit("cdy/src/lib.rs", "#[no_mangle]\npub extern \"C\" fn cdy_value() -> u32 {\n    2\n}\n");
+    fx.declines_then_fast(&["build", "--workspace"]);
+    let name = format!("{}cdy{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+    fs::remove_file(fx.target().join("debug").join("deps").join(&name)).unwrap();
+    fx.declines_then_fast(&["build", "--workspace"]);
+    fx.audited(&["build", "--workspace"]);
+}
+
+// Cargo lists the files behind a symlinked directory of a package whose build script has no rerun directives.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_in_a_watched_package_is_followed() {
+    let files = [
+        ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"),
+        ("build.rs", "fn main() {}\n"),
+        ("src/main.rs", "fn main() {\n    println!(\"{}\", env!(\"NOOP_EVAR\"));\n}\n"),
+        ("pkg/brew/formula.rb", "one\n"),
+        ("pkg/other/formula.rb", "other\n"),
+    ];
+    let fx = Fixture::new("noop-symlinked", &files);
+    std::os::unix::fs::symlink("pkg/brew", fx.dir.join("Formula")).unwrap();
+    std::os::unix::fs::symlink("Formula", fx.dir.join("Again")).unwrap();
+    fx.settle_all();
+    let (out, trace) = fx.run(&["build"], "on");
+    assert_success(&out);
+    assert_eq!(trace["record"], "build", "{trace}");
+    fx.fast(&["build"]);
+    fx.edit("pkg/brew/formula.rb", "two\n");
+    fx.declines_then_fast(&["build"]);
+    fs::remove_file(fx.dir.join("Formula")).unwrap();
+    std::os::unix::fs::symlink("pkg/other", fx.dir.join("Formula")).unwrap();
+    fx.settle_all();
+    fx.declines_then_fast(&["build"]);
+    fx.audited(&["build"]);
+    assert_eq!(fx.app_output("debug"), "e1");
+}
+
 impl Fixture {
     fn with_vendor(tag: &str, files: &[(&str, &str)], crates: &[(&str, &str, &str)]) -> Fixture {
         let sb = Sandbox::new(tag);

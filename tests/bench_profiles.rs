@@ -602,3 +602,25 @@ fn checked_allocation_reports_unreadable_directories_when_access_is_denied() {
         assert!(measured.is_err());
     }
 }
+
+#[test]
+fn repo_benchmark_validates_the_untuned_run_count_before_building() {
+    let sb = Sandbox::new("bench-repo-untuned-runs");
+    for flags in [vec!["--untuned-runs", "0"], vec!["--untuned-runs=abc"], vec!["--untuned-runs"]] {
+        let output = sb.bin("frust").arg("bench").arg("--repo").arg(&sb.root).args(&flags).output().unwrap();
+        assert!(!output.status.success(), "{flags:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--untuned-runs"), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn repo_benchmark_needs_a_cargo_manifest_even_with_both_columns_configured() {
+    let sb = Sandbox::new("bench-repo-no-manifest");
+    let empty = sb.root.join("not-a-repo");
+    fs::create_dir_all(&empty).unwrap();
+    let output = sb.bin("frust").arg("bench").arg("--repo").arg(&empty).args(["--runs", "1", "--untuned-runs", "1", "--gate"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo.toml"), "{output:?}");
+    assert!(output.stdout.is_empty());
+}

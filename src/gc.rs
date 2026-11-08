@@ -2837,7 +2837,7 @@ mod tests {
         let (old, young) = (old_shard.join("0".repeat(32)), young_shard.join("1".repeat(32)));
         fs::write(&old, b"frust-hashmemo-v2\n").unwrap();
         fs::write(&young, b"frust-hashmemo-v2\n").unwrap();
-        File::open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(90 * 86_400)).unwrap();
+        File::options().write(true).open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(90 * 86_400)).unwrap();
         let log = memo.join(cache::hashing::LOG_NAME);
         fs::write(&log, b"nothing in here is a valid frame").unwrap();
         let outside = root.join("outside");

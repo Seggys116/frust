@@ -14,17 +14,19 @@ const DEFAULT_EDITS: usize = 20;
 const DEFAULT_REPO_RUNS: usize = 3;
 const NOOP_REPEATS: usize = 3;
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
-const REPORT_SCHEMA_VERSION: u32 = 2;
+const REPORT_SCHEMA_VERSION: u32 = 3;
+const SCHEMA_NOTE: &str = "Schema 3: `frust` is untuned (FRUST_TUNE=off, FRUST_LINKER=system), `frust_tuned` is the shipped default, `cargo_tuned` is cargo with dependency debuginfo off (cold and disk only). `gate` and `disk_tuned` judge the tuned column; `frust_timings`, `store_only` and `disk_breakdown` describe it too. `disk` and `ratios` keep their schema 2 meaning for the untuned column and are informational.";
+const CARGO_TUNED_CONFIG: [&str; 2] = ["--config", "profile.dev.package.\"*\".debug=0"];
 
 const GATE_NOOP_SLACK_MS: f64 = 15.0;
 const GATE_NOOP_SLACK_WINDOWS_MS: f64 = 25.0;
-const GATE_NOOP_RATIO: f64 = 1.25;
-const GATE_EDIT_RATIO: f64 = 1.05;
+const GATE_NOOP_RATIO: f64 = 0.5;
+const GATE_EDIT_RATIO: f64 = 1.0;
 const GATE_EDIT_SLACK_MS: f64 = 25.0;
-const GATE_EDIT_P90_RATIO: f64 = 1.15;
+const GATE_EDIT_P90_RATIO: f64 = 1.05;
 const GATE_EDIT_P90_SLACK_MS: f64 = 40.0;
-const GATE_COLD_RATIO: f64 = 1.05;
-const GATE_COLD_SLACK_MS: f64 = 150.0;
+const GATE_COLD_RATIO: f64 = 1.0;
+const GATE_COLD_SLACK_MS: f64 = 100.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
 const GATE_CLEAN_SLACK_MS: f64 = 100.0;
 
@@ -40,7 +42,7 @@ const MISS_TOP_JSON: usize = 20;
 const MISS_TOP_MARKDOWN: usize = 10;
 
 const TABLE_HEADER: [&str; 8] = ["tool", "cold", "clean rebuild", "no-op", "first edit", "warm edit", "edit p90", "disk"];
-const EDIT_NOTE: &str = "First edit is the first touch of a crate after a restore (no incremental session); warm edit and p90 cover later edits. The ratio row is the median of per-pair frust/cargo ratios.";
+const EDIT_NOTE: &str = "First edit is the first touch of a crate after a restore (no incremental session); warm edit and p90 cover later edits. Ratio rows are medians of per-pair ratios against plain cargo; the frust-tuned disk cell is against cargo-tuned (cargo with dependency debuginfo off, measured for cold and disk only). Pass or fail is judged on frust-tuned, the shipped default, against plain cargo; frust is the untuned like-for-like column.";
 const FRUST_DIRS: [&str; 5] = ["store", "targets", "manifests", "tmp", "other"];
 
 #[derive(Debug, PartialEq)]
@@ -55,6 +57,7 @@ struct RepoOptions {
     gate: bool,
     features: Option<String>,
     disk_slack: f64,
+    untuned_runs: Option<usize>,
 }
 
 fn positive(name: &str, value: &str) -> Result<usize, String> {
@@ -69,6 +72,7 @@ impl RepoOptions {
         let mut out = None;
         let mut features = None;
         let mut disk_slack = 0.0;
+        let mut untuned_runs = None;
         let (mut edits, mut runs) = (DEFAULT_EDITS, DEFAULT_REPO_RUNS);
         let (mut json, mut markdown, mut gate) = (false, false, false);
         let mut index = 0;
@@ -82,7 +86,7 @@ impl RepoOptions {
                 "--json" if inline.is_none() => json = true,
                 "--markdown" if inline.is_none() => markdown = true,
                 "--gate" if inline.is_none() => gate = true,
-                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" => {
+                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -97,6 +101,7 @@ impl RepoOptions {
                         "--repo" => repo = Some(PathBuf::from(value)),
                         "--edits" => edits = positive(name, value)?,
                         "--runs" => runs = positive(name, value)?,
+                        "--untuned-runs" => untuned_runs = Some(positive(name, value)?),
                         "--package" => package = Some(value.to_string()),
                         "--features" => features = Some(value.to_string()),
                         "--disk-slack" => {
@@ -111,7 +116,12 @@ impl RepoOptions {
             index += 1;
         }
         let repo = repo.ok_or("--repo PATH is required")?;
-        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack })
+        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs })
+    }
+
+    // The untuned column is a reference, so it may run on fewer of the paired runs than the gated columns.
+    fn untuned_runs(&self) -> usize {
+        self.untuned_runs.unwrap_or(self.runs).min(self.runs)
     }
 }
 
@@ -181,6 +191,25 @@ struct Ratios {
     edit_warm: Option<f64>,
     edit_p90: Option<f64>,
     disk: Option<f64>,
+}
+
+// Frust-tuned against cargo-tuned, the like-for-like reference for the tuned column.
+#[derive(Debug, Serialize)]
+struct TunedReference {
+    cold: Option<f64>,
+    disk: Option<f64>,
+}
+
+fn tuned_reference(cargo_tuned: &ToolReport, frust_tuned: &ToolReport) -> TunedReference {
+    TunedReference {
+        cold: median_ratio(&cargo_tuned.cold.raw_ms, &frust_tuned.cold.raw_ms),
+        disk: (cargo_tuned.disk_bytes > 0).then(|| frust_tuned.disk_bytes as f64 / cargo_tuned.disk_bytes as f64),
+    }
+}
+
+// Time ratios of the tuned column are against plain cargo; its disk ratio is against cargo-tuned.
+fn tuned_ratios(cargo: &ToolReport, frust_tuned: &ToolReport, reference: &TunedReference) -> Ratios {
+    Ratios { disk: reference.disk, ..paired_ratios(cargo, frust_tuned) }
 }
 
 fn paired_ratios(cargo: &ToolReport, frust: &ToolReport) -> Ratios {
@@ -644,9 +673,25 @@ struct TimingSummary {
     // Outcomes reported by store steps and helpers, and the first distinct ones that left no linked entry, as `crate: outcome`.
     store_outcomes: BTreeMap<String, usize>,
     store_problems: Vec<String>,
+    // The no-op fast path's decision per build with what that build recorded, and the first distinct changed paths or variables behind a decline.
+    noop_decisions: BTreeMap<String, usize>,
+    noop_details: Vec<String>,
 }
 
 impl TimingSummary {
+    fn add_noop_trace(&mut self, text: &str) {
+        for line in text.lines() {
+            let Ok(trace) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+            let field = |name: &str| trace.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let (decision, record, detail) = (field("noop"), field("record"), field("detail"));
+            let key = if record.is_empty() || record == "none" { decision.clone() } else { format!("{decision} (record {record})") };
+            *self.noop_decisions.entry(key).or_default() += 1;
+            if !detail.is_empty() {
+                crate::timings::note_reason(&mut self.noop_details, &format!("{decision}: {detail}"));
+            }
+        }
+    }
+
     fn add_build(&mut self, records: &[TimingLine], drain_ms: u64) {
         self.builds += 1;
         self.drain_ms += drain_ms;
@@ -807,6 +852,13 @@ fn sharing_lines(timings: &BTreeMap<String, TimingSummary>) -> Vec<String> {
         if t.passthrough_spawns > 0 {
             lines.push(format!("{label}: {} uncached compiler calls, {} ms of wrapper startup", t.passthrough_spawns, t.passthrough_ms));
         }
+        if *key == "noop" && !t.noop_decisions.is_empty() {
+            let mut line = format!("{label}: no-op fast path: {}", t.noop_decisions.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", "));
+            if !t.noop_details.is_empty() {
+                line.push_str(&format!("; declined on: {}", t.noop_details.join(" | ")));
+            }
+            lines.push(line);
+        }
     }
     lines
 }
@@ -861,15 +913,41 @@ struct RepoReport {
     edits: usize,
     package: Option<String>,
     edit_files: Vec<String>,
+    schema_note: &'static str,
+    untuned_runs: usize,
+    tuning: Tuning,
     cargo: ToolReport,
+    cargo_tuned: ToolReport,
     frust: ToolReport,
+    frust_tuned: ToolReport,
     disk: DiskReport,
+    disk_tuned: DiskReport,
     ratios: Ratios,
+    ratios_tuned: Ratios,
+    tuned_vs_cargo_tuned: TunedReference,
     disk_breakdown: Option<DiskBreakdown>,
     store_only: StoreOnly,
     frust_timings: BTreeMap<String, TimingSummary>,
+    frust_untuned_timings: BTreeMap<String, TimingSummary>,
     features: Option<String>,
     gate: Option<Vec<GateCheck>>,
+    gate_untuned: Option<Vec<GateCheck>>,
+}
+
+// The effective tuning each frust column reported through `frust env`; absent when that build does not print it.
+#[derive(Debug, Default, Serialize)]
+struct Tuning {
+    untuned: Option<String>,
+    tuned: Option<String>,
+}
+
+fn parse_tuning(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches("export ").trim();
+        let (key, value) = line.split_once('=').or_else(|| line.split_once(':'))?;
+        let value = value.trim().trim_matches(['\'', '"']).trim();
+        (key.trim().to_ascii_lowercase().ends_with("tuning") && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn median_of(values: &[f64]) -> Option<f64> {
@@ -937,8 +1015,10 @@ fn evaluate_gate_for(cargo: &Samples, frust: &Samples, windows: bool) -> Vec<Gat
     }
     if let Some((ratio, base)) = paired(&cargo.noop, &frust.noop) {
         let slack = if windows { GATE_NOOP_SLACK_WINDOWS_MS } else { GATE_NOOP_SLACK_MS };
-        checks.push(with_spread(ratio_check("noop-slack", ratio, base, 1.0, slack), &cargo.noop, &frust.noop));
-        checks.push(with_spread(ratio_check("noop-ratio", ratio, base, GATE_NOOP_RATIO, 0.0), &cargo.noop, &frust.noop));
+        checks.push(with_spread(ratio_check("noop", ratio, base, GATE_NOOP_RATIO, slack), &cargo.noop, &frust.noop));
+    }
+    if let Some((ratio, base)) = paired(&cargo.first, &frust.first) {
+        checks.push(with_spread(ratio_check("edit-first", ratio, base, GATE_EDIT_RATIO, GATE_EDIT_SLACK_MS), &cargo.first, &frust.first));
     }
     if let Some((ratio, base)) = paired(&cargo.warm, &frust.warm) {
         checks.push(with_spread(ratio_check("edit-median", ratio, base, GATE_EDIT_RATIO, GATE_EDIT_SLACK_MS), &cargo.warm, &frust.warm));
@@ -967,7 +1047,7 @@ fn disk_verdict(cargo_bytes: u64, frust_bytes: u64, slack_pct: f64) -> Result<()
 }
 
 fn exit_code(report: &RepoReport) -> i32 {
-    if !report.disk.ok {
+    if !report.disk_tuned.ok {
         1
     } else if report.gate.as_ref().is_some_and(|checks| checks.iter().any(|c| !c.pass)) {
         2
@@ -978,7 +1058,7 @@ fn exit_code(report: &RepoReport) -> i32 {
 
 fn overall_status(report: &RepoReport) -> String {
     let mut failed: Vec<&str> = Vec::new();
-    if !report.disk.ok {
+    if !report.disk_tuned.ok {
         failed.push("disk");
     }
     if let Some(checks) = &report.gate {
@@ -1016,9 +1096,9 @@ fn table_cells(tool: &str, report: &ToolReport, status: Option<&str>) -> Vec<Str
     cells
 }
 
-fn ratio_cells(ratios: &Ratios, status: Option<&str>) -> Vec<String> {
+fn ratio_cells(label: &str, ratios: &Ratios, status: Option<&str>) -> Vec<String> {
     let mut cells = vec![
-        "frust / cargo".to_string(),
+        label.to_string(),
         fmt_ratio(ratios.cold),
         fmt_ratio(ratios.clean_rebuild),
         fmt_ratio(ratios.noop),
@@ -1044,12 +1124,26 @@ fn table_rows(report: &RepoReport) -> Vec<Vec<String>> {
         header.push("gate".to_string());
     }
     let dash = status.as_ref().map(|_| "-");
+    // Cargo-tuned is timed for cold builds only, so its other cells read as not measured.
+    let reference: Vec<String> = table_cells("cargo-tuned", &report.cargo_tuned, dash).into_iter()
+        .enumerate().map(|(i, cell)| if i > 1 && cell == "n/a" { "-".to_string() } else { cell }).collect();
     vec![
         header,
         table_cells("cargo", &report.cargo, dash),
-        table_cells("frust", &report.frust, status.as_deref()),
-        ratio_cells(&report.ratios, dash),
+        reference,
+        table_cells("frust", &report.frust, dash),
+        table_cells("frust-tuned", &report.frust_tuned, status.as_deref()),
+        ratio_cells("frust / cargo", &report.ratios, dash),
+        ratio_cells("frust-tuned / cargo", &report.ratios_tuned, dash),
     ]
+}
+
+fn tuning_line(report: &RepoReport) -> String {
+    let show = |value: &Option<String>| value.clone().unwrap_or_else(|| "not reported".to_string());
+    format!(
+        "Tuning: frust {}; frust-tuned {}; the frust column ran on {} of {} runs.",
+        show(&report.tuning.untuned), show(&report.tuning.tuned), report.untuned_runs, report.runs
+    )
 }
 
 fn breakdown_lines(b: &DiskBreakdown) -> Vec<String> {
@@ -1086,7 +1180,7 @@ fn breakdown_lines(b: &DiskBreakdown) -> Vec<String> {
 
 fn gate_failure_lines(report: &RepoReport) -> Vec<String> {
     report.gate.iter().flatten().filter(|c| !c.pass).map(|c| {
-        format!("{}: frust {:.1} ms against cargo {:.1} ms is {:.2}x, limit {}", c.name, c.frust_ms, c.cargo_ms, c.ratio, c.limit)
+        format!("{}: frust-tuned {:.1} ms against cargo {:.1} ms is {:.2}x, limit {}", c.name, c.frust_ms, c.cargo_ms, c.ratio, c.limit)
     }).collect()
 }
 
@@ -1106,7 +1200,13 @@ fn repo_markdown(report: &RepoReport) -> String {
         out.push('\n');
     }
     out.push_str(&format!("\n{}\n", store_mode_line(std::env::consts::OS, report.frust_timings.get("cold"))));
-    out.push_str(&format!("\n{EDIT_NOTE}\n"));
+    out.push_str(&format!("\n{EDIT_NOTE}\n\n{}\n", tuning_line(report)));
+    if let Some(message) = &report.disk.message {
+        out.push_str(&format!("\nUntuned disk (informational): {message}\n"));
+    }
+    if report.disk_breakdown.is_some() {
+        out.push_str("\nThe disk lines below describe frust-tuned against cargo-tuned.\n");
+    }
     for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         out.push_str(&format!("\n- {line}"));
     }
@@ -1132,7 +1232,7 @@ fn repo_markdown(report: &RepoReport) -> String {
         ));
         out.push_str(&markdown_table(&miss_rows(summary, MISS_TOP_MARKDOWN)));
     }
-    if let Some(message) = &report.disk.message {
+    if let Some(message) = &report.disk_tuned.message {
         out.push_str(&format!("\n{message}\n"));
     }
     for line in gate_failure_lines(report) {
@@ -1157,6 +1257,10 @@ fn print_repo(report: &RepoReport) {
         println!("  {line}");
     }
     println!("{EDIT_NOTE}");
+    println!("{}", tuning_line(report));
+    if let Some(message) = &report.disk.message {
+        println!("Untuned disk (informational): {message}");
+    }
     println!("{}", store_mode_line(std::env::consts::OS, report.frust_timings.get("cold")));
     for line in report.disk_breakdown.iter().flat_map(breakdown_lines).chain(store_only_lines(&report.store_only)) {
         println!("{line}");
@@ -1176,7 +1280,7 @@ fn print_repo(report: &RepoReport) {
     for line in sharing_lines(&report.frust_timings) {
         println!("{line}");
     }
-    if let Some(message) = &report.disk.message {
+    if let Some(message) = &report.disk_tuned.message {
         println!("{message}");
     }
 }
@@ -1342,113 +1446,258 @@ impl Drop for EditBackup {
     }
 }
 
-struct Rig<'a> {
-    ctx: &'a Ctx,
-    repo: &'a Path,
-    cargo_target: PathBuf,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tool {
+    Cargo,
+    CargoTuned,
+    Frust,
+    FrustTuned,
+}
+
+impl Tool {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn is_frust(self) -> bool {
+        matches!(self, Tool::Frust | Tool::FrustTuned)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Cargo => "cargo",
+            Tool::CargoTuned => "cargo-tuned",
+            Tool::Frust => "frust",
+            Tool::FrustTuned => "frust-tuned",
+        }
+    }
+}
+
+// A frust build configuration with its own home, so the two columns never share a store or a central target.
+struct Column {
+    ctx: Ctx,
     dirs: Dirs,
-    args: Vec<String>,
-    scratch: PathBuf,
+    tuned: bool,
     timings: RefCell<BTreeMap<String, TimingSummary>>,
     // The latest restore of each entry key, so store-only entries show how they were last placed.
     restores: RefCell<BTreeMap<String, String>>,
+}
+
+impl Column {
+    fn new(ctx: &Ctx, home: PathBuf, tuned: bool) -> Self {
+        let ctx = Ctx { home, ..ctx.clone() };
+        let dirs = Dirs::at(&ctx.home);
+        Self { ctx, dirs, tuned, timings: RefCell::new(BTreeMap::new()), restores: RefCell::new(BTreeMap::new()) }
+    }
+}
+
+// The untuned column pins tuning and the linker off; the tuned column leaves both unset so the shipped defaults apply.
+fn apply_tuning(cmd: &mut Command, tuned: bool) {
+    if tuned {
+        cmd.env_remove("FRUST_TUNE").env_remove("FRUST_LINKER");
+    } else {
+        cmd.env("FRUST_TUNE", "off").env("FRUST_LINKER", "system");
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DiskSnapshot {
+    cargo_bytes: u64,
+    frust_before_maintenance: u64,
+    frust_bytes: u64,
+    maintenance_ms: u64,
+}
+
+struct Rig<'a> {
+    repo: &'a Path,
+    cargo_ctx: Ctx,
+    cargo_target: PathBuf,
+    cargo_tuned_target: PathBuf,
+    untuned: Column,
+    tuned: Column,
+    args: Vec<String>,
+    scratch: PathBuf,
     sequence: Cell<u64>,
 }
 
 impl Rig<'_> {
+    fn column(&self, tool: Tool) -> Option<&Column> {
+        match tool {
+            Tool::Frust => Some(&self.untuned),
+            Tool::FrustTuned => Some(&self.tuned),
+            _ => None,
+        }
+    }
+
     // A background store from the previous build must not run during the next timed row.
-    fn quiesce(&self) {
-        if let Err(error) = drain_deferred_for(self.ctx, QUIESCE_TIMEOUT) {
+    fn quiesce(&self, column: &Column) {
+        if let Err(error) = drain_deferred_for(&column.ctx, QUIESCE_TIMEOUT) {
             eprintln!("frust bench: warning: {error}");
         }
     }
 
-    fn reset(&self, frust: bool, cold: bool) -> Result<(), String> {
-        if !frust {
-            return clear(&self.cargo_target);
+    fn reset(&self, tool: Tool, cold: bool) -> Result<(), String> {
+        match (tool, self.column(tool)) {
+            (Tool::CargoTuned, _) => clear(&self.cargo_tuned_target),
+            (_, None) => clear(&self.cargo_target),
+            (_, Some(column)) => {
+                self.quiesce(column);
+                clear(&if cold { column.ctx.home.clone() } else { column.dirs.targets() })
+            }
         }
-        self.quiesce();
-        let path = if cold { self.ctx.home.clone() } else { self.dirs.targets() };
-        clear(&path)
     }
 
     // `row` names the table row; frust builds also record per-wrapper timings under it.
-    fn build(&self, frust: bool, row: &str) -> Result<f64, String> {
-        if frust {
-            self.quiesce();
+    fn build(&self, tool: Tool, row: &str) -> Result<f64, String> {
+        let column = self.column(tool);
+        if let Some(column) = column {
+            self.quiesce(column);
         }
-        let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
-        let target = (!frust).then_some(self.cargo_target.as_path());
-        let mut cmd = build_command(self.ctx, frust, self.repo, target, &args, "off");
+        let mut args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        if tool == Tool::CargoTuned {
+            args.extend(CARGO_TUNED_CONFIG);
+        }
+        let ctx = column.map_or(&self.cargo_ctx, |c| &c.ctx);
+        let target = match tool {
+            Tool::Cargo => Some(self.cargo_target.as_path()),
+            Tool::CargoTuned => Some(self.cargo_tuned_target.as_path()),
+            _ => None,
+        };
+        let mut cmd = build_command(ctx, tool.is_frust(), self.repo, target, &args, "off");
         cmd.env("CARGO_NET_OFFLINE", "false");
-        let timing_file = frust.then(|| {
+        if let Some(column) = column {
+            apply_tuning(&mut cmd, column.tuned);
+        }
+        let timing_file = column.map(|_| {
             self.sequence.set(self.sequence.get() + 1);
-            self.scratch.join(format!("timings-{row}-{}.jsonl", self.sequence.get()))
+            self.scratch.join(format!("timings-{}-{row}-{}.jsonl", tool.label(), self.sequence.get()))
         });
+        let noop_trace = timing_file.as_ref().map(|file| file.with_extension("noop.jsonl"));
+        if let Some(trace) = &noop_trace {
+            cmd.env("FRUST_NOOP_TRACE", trace);
+        }
         if let Some(file) = &timing_file {
             cmd.env(crate::timings::ENV, file);
             // Created here so passthrough calls and store helpers have somewhere to report.
             let _ = fs::write(crate::timings::events_path(file), "");
         }
-        let tool = if frust { "frust" } else { "cargo" };
         // timed() waits for the deferred stores before returning, so the next row starts quiet; the wait is recorded as drain.
-        let (ms, drain_ms) = timed(self.ctx, frust, &mut cmd)
+        let (ms, drain_ms) = timed(ctx, tool.is_frust(), &mut cmd)
             .map(|run| (run.millis as f64, run.store_drain_millis.unwrap_or(0)))
-            .map_err(|e| format!("{row} build with {tool}: {e}"))?;
-        if let Some(file) = timing_file {
+            .map_err(|e| format!("{row} build with {}: {e}", tool.label()))?;
+        if let (Some(file), Some(column)) = (timing_file, column) {
             let events = crate::timings::events_path(&file);
             let text = fs::read_to_string(&file).unwrap_or_default() + &fs::read_to_string(&events).unwrap_or_default();
             let _ = fs::remove_file(&file);
             let _ = fs::remove_file(&events);
             let records = parse_timings(&text);
-            let mut restores = self.restores.borrow_mut();
+            let mut restores = column.restores.borrow_mut();
             for record in records.iter().filter(|r| !r.restore_key.is_empty()) {
                 restores.insert(record.restore_key.clone(), restore_text(row, record));
             }
-            self.timings.borrow_mut().entry(row.to_string()).or_default().add_build(&records, drain_ms);
+            let mut timings = column.timings.borrow_mut();
+            let summary = timings.entry(row.to_string()).or_default();
+            summary.add_build(&records, drain_ms);
+            if let Some(trace) = noop_trace {
+                summary.add_noop_trace(&fs::read_to_string(&trace).unwrap_or_default());
+                let _ = fs::remove_file(&trace);
+            }
         }
         Ok(ms)
     }
+
+    // Sizes cargo's target and one frust home after the explicit maintenance pass the product runs on its own.
+    fn snapshot(&self, column: &Column, cargo_target: &Path) -> DiskSnapshot {
+        self.quiesce(column);
+        let cargo_bytes = compact::physical_size(&[cargo_target]);
+        let frust_before_maintenance = compact::physical_size(&[column.ctx.home.as_path()]);
+        let central = workspace::central_target(&column.dirs, Some(self.repo), &column.ctx.probe_id);
+        let maintenance_ms = run_maintenance(&column.ctx, &column.dirs, &central)
+            .inspect_err(|error| eprintln!("frust bench: warning: maintenance pass incomplete: {error}")).unwrap_or(0);
+        let frust_bytes = compact::physical_size(&[column.ctx.home.as_path()]);
+        DiskSnapshot { cargo_bytes, frust_before_maintenance, frust_bytes, maintenance_ms }
+    }
+
+    // The effective tuning string `frust env` reports for a column, when this build prints one.
+    fn reported_tuning(&self, exe: &Path, column: &Column) -> Option<String> {
+        let mut cmd = Command::new(exe);
+        controlled_environment(&mut cmd);
+        cmd.arg("env").current_dir(self.repo).env("FRUST_HOME", &column.ctx.home).stdin(Stdio::null());
+        apply_tuning(&mut cmd, column.tuned);
+        let output = cmd.output().ok().filter(|o| o.status.success())?;
+        parse_tuning(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 
-fn tool_order(flip: usize) -> [bool; 2] {
-    if flip.is_multiple_of(2) { [false, true] } else { [true, false] }
+// Rotates the starting tool each time so no tool always builds first; cargo-tuned joins only when asked.
+fn tool_order(flip: usize, untuned: bool, cargo_tuned: bool) -> Vec<Tool> {
+    let mut tools = vec![Tool::Cargo];
+    if untuned {
+        tools.push(Tool::Frust);
+    }
+    tools.push(Tool::FrustTuned);
+    if cargo_tuned {
+        tools.push(Tool::CargoTuned);
+    }
+    let by = flip % tools.len();
+    tools.rotate_left(by);
+    tools
 }
 
-fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions) -> Result<[Samples; 2], String> {
-    let mut samples = [Samples::default(), Samples::default()];
+struct Measured {
+    samples: [Samples; 4],
+    untuned_disk: DiskSnapshot,
+}
+
+fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions) -> Result<Measured, String> {
+    let mut samples: [Samples; 4] = Default::default();
+    let mut untuned_disk = DiskSnapshot::default();
     for run in 0..opts.runs {
         eprintln!("frust bench: run {} of {}", run + 1, opts.runs);
-        let order = tool_order(run);
-        for frust in order {
-            rig.reset(frust, true)?;
-            samples[usize::from(frust)].cold.push(rig.build(frust, "cold")?);
+        let untuned = run < opts.untuned_runs();
+        let last = run + 1 == opts.runs;
+        for tool in tool_order(run, untuned, true) {
+            rig.reset(tool, true)?;
+            samples[tool.index()].cold.push(rig.build(tool, "cold")?);
+            // Only the final run keeps cargo-tuned's target, which the disk guard sizes after the same edits.
+            if tool == Tool::CargoTuned && !last {
+                rig.reset(tool, true)?;
+            }
         }
-        for frust in order {
-            rig.reset(frust, false)?;
-            samples[usize::from(frust)].clean.push(rig.build(frust, "clean_rebuild")?);
+        for tool in tool_order(run, untuned, false) {
+            rig.reset(tool, false)?;
+            samples[tool.index()].clean.push(rig.build(tool, "clean_rebuild")?);
         }
-        for frust in order {
+        for tool in tool_order(run, untuned, false) {
             let mut repeats = Vec::new();
             for _ in 0..NOOP_REPEATS {
-                repeats.push(rig.build(frust, "noop")?);
+                repeats.push(rig.build(tool, "noop")?);
             }
-            samples[usize::from(frust)].noop.extend(median_of(&repeats));
+            samples[tool.index()].noop.extend(median_of(&repeats));
         }
         let mut touched = HashSet::new();
         for edit in 0..opts.edits {
             let slot = edit % owners.len();
             backup.apply(slot, edit + 1)?;
             let first = touched.insert(owners[slot]);
-            for frust in tool_order(run + edit) {
-                let ms = rig.build(frust, if first { "edit_first" } else { "edit_warm" })?;
-                let target = &mut samples[usize::from(frust)];
+            for tool in tool_order(run + edit, untuned, last) {
+                let ms = rig.build(tool, if first { "edit_first" } else { "edit_warm" })?;
+                // Cargo-tuned only replays the edits so its target matches the others when sized.
+                if tool == Tool::CargoTuned {
+                    continue;
+                }
+                let target = &mut samples[tool.index()];
                 if first { target.first.push(ms) } else { target.warm.push(ms) }
             }
         }
         backup.restore()?;
+        if run + 1 == opts.untuned_runs() {
+            untuned_disk = rig.snapshot(&rig.untuned, &rig.cargo_target);
+            // The untuned home is no longer needed once sized, which keeps peak disk use down.
+            clear(&rig.untuned.ctx.home)?;
+        }
     }
-    Ok(samples)
+    Ok(Measured { samples, untuned_disk })
 }
 
 fn fetch_dependencies(ctx: &Ctx, repo: &Path) -> Result<(), String> {
@@ -1517,31 +1766,43 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
     guard_disk(scratch)?;
 
     let backup = EditBackup::create(&scratch.join("edit-backup"), &files)?;
+    // Cargo builds get their own home so their bookkeeping never lands in a frust home that is sized later.
+    let cargo_ctx = Ctx { home: scratch.join("cargo-home"), ..ctx.clone() };
     let rig = Rig {
-        ctx: &ctx,
         repo: &repo,
+        cargo_ctx,
         cargo_target: scratch.join("cargo-target"),
-        dirs: Dirs::at(&ctx.home),
+        cargo_tuned_target: scratch.join("cargo-tuned-target"),
+        untuned: Column::new(&ctx, scratch.join("frust-home"), false),
+        tuned: Column::new(&ctx, scratch.join("frust-tuned-home"), true),
         args: build_args(&packages, opts.package.as_deref(), opts.features.as_deref()),
         scratch: scratch.to_path_buf(),
-        timings: RefCell::new(BTreeMap::new()),
-        restores: RefCell::new(BTreeMap::new()),
         sequence: Cell::new(0),
     };
-    let samples = measure(&rig, &backup, &owners, opts)?;
-    rig.quiesce();
-    let cargo_bytes = compact::physical_size(&[rig.cargo_target.as_path()]);
-    let frust_bytes_before_maintenance = compact::physical_size(&[ctx.home.as_path()]);
-    let central = workspace::central_target(&rig.dirs, Some(&repo), &ctx.probe_id);
-    let maintenance_ms = run_maintenance(&ctx, &rig.dirs, &central)
-        .inspect_err(|error| eprintln!("frust bench: warning: maintenance pass incomplete: {error}")).unwrap_or(0);
-    let frust_bytes = compact::physical_size(&[ctx.home.as_path()]);
-    let verdict = disk_verdict(cargo_bytes, frust_bytes, opts.disk_slack);
-    let store_only = scan_store(&rig.dirs, &rig.restores.borrow());
-    let disk_breakdown = measure_disk_breakdown(&rig.dirs, &rig.cargo_target, cargo_bytes)
+    let tuning = Tuning { untuned: rig.reported_tuning(&exe, &rig.untuned), tuned: rig.reported_tuning(&exe, &rig.tuned) };
+    let Measured { samples, untuned_disk } = measure(&rig, &backup, &owners, opts)?;
+    let tuned_disk = rig.snapshot(&rig.tuned, &rig.cargo_tuned_target);
+    let untuned_verdict = disk_verdict(untuned_disk.cargo_bytes, untuned_disk.frust_bytes, opts.disk_slack);
+    let tuned_verdict = disk_verdict(tuned_disk.cargo_bytes, tuned_disk.frust_bytes, opts.disk_slack);
+    let store_only = scan_store(&rig.tuned.dirs, &rig.tuned.restores.borrow());
+    let disk_breakdown = measure_disk_breakdown(&rig.tuned.dirs, &rig.cargo_tuned_target, tuned_disk.cargo_bytes)
         .inspect_err(|error| eprintln!("frust bench: warning: disk breakdown unavailable: {error}")).ok()
-        .map(|breakdown| DiskBreakdown { frust_physical_bytes_before_maintenance: Some(frust_bytes_before_maintenance), ..breakdown });
-    let (cargo_report, frust_report) = (samples[0].report(cargo_bytes), samples[1].report(frust_bytes));
+        .map(|breakdown| DiskBreakdown { frust_physical_bytes_before_maintenance: Some(tuned_disk.frust_before_maintenance), ..breakdown });
+    let disk_report = |snapshot: &DiskSnapshot, verdict: &Result<(), String>| DiskReport {
+        cargo_bytes: snapshot.cargo_bytes,
+        frust_bytes: snapshot.frust_bytes,
+        frust_bytes_before_maintenance: snapshot.frust_before_maintenance,
+        maintenance_ms: snapshot.maintenance_ms,
+        slack_pct: opts.disk_slack,
+        ok: verdict.is_ok(),
+        message: verdict.as_ref().err().cloned(),
+    };
+    let report_of = |tool: Tool, disk: u64| samples[tool.index()].report(disk);
+    let cargo_report = report_of(Tool::Cargo, untuned_disk.cargo_bytes);
+    let cargo_tuned_report = report_of(Tool::CargoTuned, tuned_disk.cargo_bytes);
+    let frust_report = report_of(Tool::Frust, untuned_disk.frust_bytes);
+    let frust_tuned_report = report_of(Tool::FrustTuned, tuned_disk.frust_bytes);
+    let reference = tuned_reference(&cargo_tuned_report, &frust_tuned_report);
     let display = |path: &PathBuf| path.strip_prefix(&repo).unwrap_or(path.as_path()).display().to_string();
     Ok(RepoReport {
         schema_version: REPORT_SCHEMA_VERSION,
@@ -1551,15 +1812,25 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         edits: opts.edits,
         package: opts.package.clone(),
         edit_files: files.iter().map(display).collect(),
+        schema_note: SCHEMA_NOTE,
+        untuned_runs: opts.untuned_runs(),
+        tuning,
         ratios: paired_ratios(&cargo_report, &frust_report),
+        ratios_tuned: tuned_ratios(&cargo_report, &frust_tuned_report, &reference),
+        tuned_vs_cargo_tuned: reference,
         cargo: cargo_report,
+        cargo_tuned: cargo_tuned_report,
         frust: frust_report,
-        disk: DiskReport { cargo_bytes, frust_bytes, frust_bytes_before_maintenance, maintenance_ms, slack_pct: opts.disk_slack, ok: verdict.is_ok(), message: verdict.err() },
+        frust_tuned: frust_tuned_report,
+        disk: disk_report(&untuned_disk, &untuned_verdict),
+        disk_tuned: disk_report(&tuned_disk, &tuned_verdict),
         disk_breakdown,
         store_only,
-        frust_timings: rig.timings.take(),
+        frust_timings: rig.tuned.timings.take(),
+        frust_untuned_timings: rig.untuned.timings.take(),
         features: opts.features.clone(),
-        gate: opts.gate.then(|| evaluate_gate(&samples[0], &samples[1])),
+        gate: opts.gate.then(|| evaluate_gate(&samples[Tool::Cargo.index()], &samples[Tool::FrustTuned.index()])),
+        gate_untuned: opts.gate.then(|| evaluate_gate(&samples[Tool::Cargo.index()], &samples[Tool::Frust.index()])),
     })
 }
 
@@ -1599,7 +1870,7 @@ pub(super) fn run(flags: &[String]) -> i32 {
     } else {
         print_repo(&report);
     }
-    if let Some(message) = &report.disk.message {
+    if let Some(message) = &report.disk_tuned.message {
         eprintln!("frust bench: {message}");
         for line in report.disk_breakdown.iter().flat_map(breakdown_lines) {
             eprintln!("frust bench: {line}");
@@ -1629,7 +1900,15 @@ mod tests {
     }
 
     fn report_with(cargo: &Samples, frust: &Samples, disk: (u64, u64), gate: bool) -> RepoReport {
+        report_with_untuned(cargo, frust, frust, disk, gate)
+    }
+
+    // The untuned column is informational, so tests can vary it apart from the gated tuned column.
+    fn report_with_untuned(cargo: &Samples, untuned: &Samples, tuned: &Samples, disk: (u64, u64), gate: bool) -> RepoReport {
         let verdict = disk_verdict(disk.0, disk.1, 0.0);
+        let disk_report = || DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, frust_bytes_before_maintenance: disk.1, maintenance_ms: 0, slack_pct: 0.0, ok: verdict.is_ok(), message: verdict.clone().err() };
+        let cargo_tuned = Samples { cold: vec![cargo.cold[0] * 0.9; 3], ..Samples::default() };
+        let reference = tuned_reference(&cargo_tuned.report(disk.0), &tuned.report(disk.1));
         RepoReport {
             schema_version: REPORT_SCHEMA_VERSION,
             repo: "demo".into(),
@@ -1638,15 +1917,25 @@ mod tests {
             edits: 20,
             package: None,
             edit_files: Vec::new(),
-            ratios: paired_ratios(&cargo.report(disk.0), &frust.report(disk.1)),
+            schema_note: SCHEMA_NOTE,
+            untuned_runs: 3,
+            tuning: Tuning { untuned: Some("off, linker system".into()), tuned: None },
+            ratios: paired_ratios(&cargo.report(disk.0), &untuned.report(disk.1)),
+            ratios_tuned: tuned_ratios(&cargo.report(disk.0), &tuned.report(disk.1), &reference),
+            tuned_vs_cargo_tuned: reference,
             cargo: cargo.report(disk.0),
-            frust: frust.report(disk.1),
-            disk: DiskReport { cargo_bytes: disk.0, frust_bytes: disk.1, frust_bytes_before_maintenance: disk.1, maintenance_ms: 0, slack_pct: 0.0, ok: verdict.is_ok(), message: verdict.err() },
+            cargo_tuned: cargo_tuned.report(disk.0),
+            frust: untuned.report(disk.1),
+            frust_tuned: tuned.report(disk.1),
+            disk: disk_report(),
+            disk_tuned: disk_report(),
             disk_breakdown: None,
             store_only: StoreOnly::unsupported("not measured in this test".to_string()),
             frust_timings: BTreeMap::new(),
+            frust_untuned_timings: BTreeMap::new(),
             features: None,
-            gate: gate.then(|| evaluate_gate_for(cargo, frust, false)),
+            gate: gate.then(|| evaluate_gate_for(cargo, tuned, false)),
+            gate_untuned: gate.then(|| evaluate_gate_for(cargo, untuned, false)),
         }
     }
 
@@ -1660,16 +1949,22 @@ mod tests {
         assert_eq!(parsed, RepoOptions {
             repo: PathBuf::from("/work/rg"), edits: 20, runs: 3, package: None,
             json: false, markdown: false, out: None, gate: false, features: None, disk_slack: 0.0,
+            untuned_runs: None,
         });
+        assert_eq!(parsed.untuned_runs(), 3);
         let full = RepoOptions::parse(&flags(&[
             "--repo=/work/tokio", "--edits", "5", "--runs=2", "--package", "tokio",
             "--json", "--markdown", "--out", "r.json", "--gate", "--features", "full", "--disk-slack=2.5",
+            "--untuned-runs", "9",
         ])).unwrap();
         assert_eq!(full, RepoOptions {
             repo: PathBuf::from("/work/tokio"), edits: 5, runs: 2, package: Some("tokio".into()),
             json: true, markdown: true, out: Some(PathBuf::from("r.json")), gate: true,
-            features: Some("full".into()), disk_slack: 2.5,
+            features: Some("full".into()), disk_slack: 2.5, untuned_runs: Some(9),
         });
+        assert_eq!(full.untuned_runs(), 2);
+        let fewer = RepoOptions::parse(&flags(&["--repo", "x", "--runs", "5", "--untuned-runs=3"])).unwrap();
+        assert_eq!(fewer.untuned_runs(), 3);
     }
 
     #[test]
@@ -1679,6 +1974,7 @@ mod tests {
         assert!(RepoOptions::parse(&flags(&["--repo", "x", "--runs=abc"])).unwrap_err().contains("--runs"));
         assert!(RepoOptions::parse(&flags(&["--repo", "x", "--quick"])).unwrap_err().contains("--quick"));
         assert!(RepoOptions::parse(&flags(&["--repo", "x", "--gate=1"])).is_err());
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--untuned-runs", "0"])).unwrap_err().contains("--untuned-runs"));
         assert!(RepoOptions::parse(&flags(&["--repo"])).unwrap_err().contains("needs a value"));
         assert!(RepoOptions::parse(&flags(&["--repo=", "--gate"])).is_err());
         assert!(RepoOptions::parse(&flags(&["--repo", "x", "--disk-slack", "-1"])).unwrap_err().contains("--disk-slack"));
@@ -2026,6 +2322,29 @@ mod tests {
     }
 
     #[test]
+    fn noop_fast_path_decisions_are_counted_per_reason_and_reported_for_the_noop_row() {
+        let text = concat!(
+            r#"{"detail":"","noop":"miss:none","record":"skip:symlinked directory","t":1}"#, "\n",
+            r#"{"detail":"/w/src/main.rs","noop":"miss:changed","record":"noop","t":2}"#, "\n",
+            r#"{"detail":"","noop":"fast","record":"none","t":3}"#, "\n",
+            r#"{"detail":"","noop":"fast","record":"none","t":4}"#, "\n",
+            "not json\n",
+        );
+        let mut summary = TimingSummary::default();
+        summary.add_noop_trace(text);
+        let expected = [("fast", 2), ("miss:changed (record noop)", 1), ("miss:none (record skip:symlinked directory)", 1)];
+        assert_eq!(summary.noop_decisions, expected.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<_, _>>());
+        assert_eq!(summary.noop_details, ["miss:changed: /w/src/main.rs"]);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["noop_decisions"]["fast"], 2);
+        let lines = sharing_lines(&BTreeMap::from([("noop".to_string(), summary)]));
+        assert_eq!(lines, ["no-op: no-op fast path: fast 2, miss:changed (record noop) 1, miss:none (record skip:symlinked directory) 1; declined on: miss:changed: /w/src/main.rs"]);
+        let mut cold = TimingSummary::default();
+        cold.add_noop_trace(r#"{"detail":"","noop":"miss:none","record":"build","t":1}"#);
+        assert!(sharing_lines(&BTreeMap::from([("cold".to_string(), cold)])).is_empty(), "only the no-op row reports the fast path");
+    }
+
+    #[test]
     fn restore_paths_fallbacks_misses_spawns_and_store_outcomes_are_summarised_apart_from_units() {
         let text = concat!(
             r#"{"crate":"a","store_mode":"hit","restore_paths":{"link":2,"copy":1},"restore_fallbacks":["copy:link:os32;adopt:link:os32"],"restore_key":"k1"}"#, "\n",
@@ -2124,7 +2443,7 @@ mod tests {
         );
         let ratios = paired_ratios(&report, &report);
         assert_eq!(
-            markdown_row(&ratio_cells(&ratios, Some("-"))),
+            markdown_row(&ratio_cells("frust / cargo", &ratios, Some("-"))),
             "| frust / cargo | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x | - |"
         );
         let empty = Samples::default().report(0);
@@ -2169,7 +2488,7 @@ mod tests {
         let frust = samples(1040.0, 400.0, 24.0, 110.0);
         let checks = evaluate_gate_for(&cargo, &frust, false);
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["cold", "clean-rebuild", "noop-slack", "noop-ratio", "edit-median", "edit-p90"]);
+        assert_eq!(names, ["cold", "clean-rebuild", "noop", "edit-first", "edit-median", "edit-p90"]);
         assert!(failing(&checks).is_empty(), "{checks:?}");
     }
 
@@ -2179,28 +2498,28 @@ mod tests {
         let gate = |frust: &Samples| evaluate_gate_for(&cargo, frust, false);
         assert_eq!(failing(&gate(&samples(1300.0, 400.0, 20.0, 100.0))), ["cold"]);
         assert_eq!(failing(&gate(&samples(1000.0, 700.0, 20.0, 100.0))), ["clean-rebuild"]);
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 40.0, 100.0))), ["noop-slack", "noop-ratio"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 40.0, 100.0))), ["noop"]);
         assert_eq!(failing(&gate(&samples(1000.0, 400.0, 24.0, 100.0))), Vec::<&str>::new());
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 140.0))), ["edit-median"]);
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 160.0))), ["edit-median", "edit-p90"]);
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 120.0))), Vec::<&str>::new());
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 140.0))), ["edit-first", "edit-median"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 160.0))), ["edit-first", "edit-median", "edit-p90"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 110.0))), Vec::<&str>::new());
     }
 
     #[test]
     fn gate_floors_absorb_small_absolute_differences_on_short_builds() {
         let cargo = samples(200.0, 100.0, 20.0, 50.0);
-        let frust = samples(340.0, 140.0, 20.0, 70.0);
+        let frust = samples(290.0, 140.0, 20.0, 60.0);
         assert!(failing(&evaluate_gate_for(&cargo, &frust, false)).is_empty());
         let slower = samples(380.0, 170.0, 20.0, 100.0);
-        assert_eq!(failing(&evaluate_gate_for(&cargo, &slower, false)), ["cold", "clean-rebuild", "edit-median", "edit-p90"]);
+        assert_eq!(failing(&evaluate_gate_for(&cargo, &slower, false)), ["cold", "clean-rebuild", "edit-first", "edit-median", "edit-p90"]);
     }
 
     #[test]
     fn noop_slack_is_wider_on_windows_only() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
-        let frust = samples(1000.0, 400.0, 38.0, 100.0);
-        assert_eq!(failing(&evaluate_gate_for(&cargo, &frust, false)), ["noop-slack", "noop-ratio"]);
-        assert_eq!(failing(&evaluate_gate_for(&cargo, &frust, true)), ["noop-ratio"]);
+        let frust = samples(1000.0, 400.0, 33.0, 100.0);
+        assert_eq!(failing(&evaluate_gate_for(&cargo, &frust, false)), ["noop"]);
+        assert!(failing(&evaluate_gate_for(&cargo, &frust, true)).is_empty());
     }
 
     #[test]
@@ -2213,11 +2532,15 @@ mod tests {
     }
 
     #[test]
-    fn gate_skips_edit_checks_without_warm_samples() {
+    fn gate_skips_edit_checks_without_edit_samples() {
         let mut cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let mut frust = cargo.clone();
         cargo.warm.clear();
         frust.warm.clear();
+        let with_first: Vec<String> = evaluate_gate_for(&cargo, &frust, false).into_iter().map(|c| c.name).collect();
+        assert!(with_first.contains(&"edit-first".to_string()) && !with_first.contains(&"edit-median".to_string()));
+        cargo.first.clear();
+        frust.first.clear();
         let names: Vec<String> = evaluate_gate_for(&cargo, &frust, false).into_iter().map(|c| c.name).collect();
         assert!(!names.iter().any(|n| n.starts_with("edit")));
     }
@@ -2232,6 +2555,128 @@ mod tests {
         assert_eq!(exit_code(&report_with(&cargo, &slow, (100, 80), false)), 0);
         assert_eq!(exit_code(&report_with(&cargo, &good, (100, 101), false)), 1);
         assert_eq!(exit_code(&report_with(&cargo, &slow, (100, 101), true)), 1);
+    }
+
+    #[test]
+    fn the_strict_gate_demands_faster_or_equal_within_the_noise_allowance() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let at = |cold: f64, warm: f64| failing(&evaluate_gate_for(&cargo, &samples(cold, 400.0, 20.0, warm), false)).len();
+        assert_eq!(at(1099.0, 100.0), 0);
+        assert_eq!(at(1101.0, 100.0), 1);
+        let names = |frust: &Samples| failing(&evaluate_gate_for(&cargo, frust, false)).join(",");
+        assert_eq!(names(&samples(1000.0, 400.0, 20.0, 124.0)), "edit-first");
+        assert_eq!(names(&samples(1000.0, 500.0, 25.0, 100.0)), "");
+        assert_eq!(names(&samples(1000.0, 500.0, 26.0, 100.0)), "noop");
+        assert_eq!(names(&samples(1000.0, 601.0, 20.0, 100.0)), "clean-rebuild");
+    }
+
+    #[test]
+    fn the_tuned_column_decides_the_gate_and_the_exit_code() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let good = samples(1000.0, 400.0, 20.0, 100.0);
+        let slow = samples(2000.0, 400.0, 20.0, 100.0);
+        let tuned_slow = report_with_untuned(&cargo, &good, &slow, (100, 80), true);
+        assert_eq!(exit_code(&tuned_slow), 2);
+        assert_eq!(overall_status(&tuned_slow), "fail: cold");
+        let untuned_slow = report_with_untuned(&cargo, &slow, &good, (100, 80), true);
+        assert_eq!(exit_code(&untuned_slow), 0);
+        assert!(untuned_slow.gate_untuned.as_ref().unwrap().iter().any(|c| !c.pass));
+        assert!(gate_failure_lines(&tuned_slow)[0].starts_with("cold: frust-tuned "));
+    }
+
+    #[test]
+    fn tool_order_rotates_and_adds_only_the_requested_tools() {
+        assert_eq!(tool_order(0, true, false), [Tool::Cargo, Tool::Frust, Tool::FrustTuned]);
+        assert_eq!(tool_order(1, true, false), [Tool::Frust, Tool::FrustTuned, Tool::Cargo]);
+        assert_eq!(tool_order(2, true, false), [Tool::FrustTuned, Tool::Cargo, Tool::Frust]);
+        assert_eq!(tool_order(3, true, false), tool_order(0, true, false));
+        assert_eq!(tool_order(0, false, false), [Tool::Cargo, Tool::FrustTuned]);
+        let cold = tool_order(5, true, true);
+        assert_eq!(cold.len(), 4);
+        for tool in [Tool::Cargo, Tool::CargoTuned, Tool::Frust, Tool::FrustTuned] {
+            assert!(cold.contains(&tool));
+        }
+        let first: BTreeSet<usize> = (0..4).map(|flip| tool_order(flip, true, true)[0].index()).collect();
+        assert_eq!(first.len(), 4);
+    }
+
+    #[test]
+    fn tuning_is_pinned_off_for_the_untuned_column_and_left_unset_for_the_tuned_one() {
+        let env = |tuned: bool| {
+            let mut cmd = Command::new("true");
+            cmd.env("FRUST_TUNE", "off").env("FRUST_LINKER", "system");
+            apply_tuning(&mut cmd, tuned);
+            cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect::<BTreeMap<_, _>>()
+        };
+        let untuned = env(false);
+        assert_eq!(untuned["FRUST_TUNE"].as_deref(), Some("off"));
+        assert_eq!(untuned["FRUST_LINKER"].as_deref(), Some("system"));
+        let tuned = env(true);
+        assert_eq!(tuned["FRUST_TUNE"], None);
+        assert_eq!(tuned["FRUST_LINKER"], None);
+        assert_eq!(CARGO_TUNED_CONFIG, ["--config", "profile.dev.package.\"*\".debug=0"]);
+    }
+
+    #[test]
+    fn the_reported_tuning_is_read_from_env_output_and_tolerates_absence() {
+        assert_eq!(parse_tuning("export FRUST_RUSTC_ID='abc'\nexport FRUST_TUNING='deps debug=0, rust-lld'\n"), Some("deps debug=0, rust-lld".to_string()));
+        assert_eq!(parse_tuning("tuning: off\n"), Some("off".to_string()));
+        assert_eq!(parse_tuning("tuning=\"\"\n"), None);
+        assert_eq!(parse_tuning("export CARGO_TARGET_DIR='/x'\nexport FRUST_HOST='h'\n"), None);
+        assert_eq!(parse_tuning(""), None);
+    }
+
+    #[test]
+    fn the_tuned_disk_ratio_is_against_cargo_tuned_and_times_against_plain_cargo() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0).report(400);
+        let cargo_tuned = Samples { cold: vec![900.0; 3], ..Samples::default() }.report(200);
+        let tuned = samples(950.0, 300.0, 4.0, 90.0).report(150);
+        let reference = tuned_reference(&cargo_tuned, &tuned);
+        assert_eq!(reference.disk, Some(0.75));
+        assert!((reference.cold.unwrap() - 950.0 / 900.0).abs() < 1e-12);
+        let ratios = tuned_ratios(&cargo, &tuned, &reference);
+        assert_eq!(ratios.cold, Some(0.95));
+        assert_eq!(ratios.noop, Some(0.2));
+        assert_eq!(ratios.disk, Some(0.75));
+        let empty = tuned_reference(&Samples::default().report(0), &tuned);
+        assert_eq!((empty.cold, empty.disk), (None, None));
+    }
+
+    #[test]
+    fn the_report_carries_schema_three_with_both_columns_and_the_old_fields() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let json = serde_json::to_value(report_with_untuned(&cargo, &samples(1100.0, 400.0, 30.0, 105.0), &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true)).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        assert!(json["schema_note"].as_str().unwrap().contains("Schema 3"));
+        for key in ["cargo", "cargo_tuned", "frust", "frust_tuned", "disk", "disk_tuned", "ratios", "ratios_tuned", "tuned_vs_cargo_tuned", "frust_timings", "frust_untuned_timings", "gate", "gate_untuned", "tuning", "untuned_runs"] {
+            assert!(!json[key].is_null(), "{key}");
+        }
+        assert_eq!(json["tuning"]["untuned"], "off, linker system");
+        assert!(json["tuning"]["tuned"].is_null());
+        let gate = json["gate"].as_array().unwrap();
+        assert_eq!(gate[0]["name"], "cold");
+        assert!(gate[0]["limit"].as_str().unwrap().contains("1.00x + 100 ms"));
+        assert!(gate.iter().any(|c| c["name"] == "noop" && c["limit"].as_str().unwrap().contains("0.50x + 15 ms")));
+        assert_eq!(json["ratios_tuned"]["cold"], 0.9);
+        assert_eq!(json["ratios"]["cold"], 1.1);
+    }
+
+    #[test]
+    fn markdown_lists_all_four_tools_ratio_rows_and_the_tuned_gate_status() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let markdown = repo_markdown(&report_with_untuned(&cargo, &samples(1200.0, 400.0, 30.0, 105.0), &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true));
+        let line = |prefix: &str| markdown.lines().find(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix}\n{markdown}")).to_string();
+        assert!(line("| cargo |").ends_with("| - |"));
+        let reference = line("| cargo-tuned |");
+        assert!(reference.contains("| 900 ms | - | - | - | - | - |"), "{reference}");
+        assert!(line("| frust |").ends_with("| - |"));
+        assert!(line("| frust-tuned |").ends_with("| pass |"));
+        assert!(line("| frust / cargo |").contains("1.20x"));
+        assert!(line("| frust-tuned / cargo |").contains("0.90x"));
+        assert!(markdown.contains("Tuning: frust off, linker system; frust-tuned not reported; the frust column ran on 3 of 3 runs."));
+        let slow = repo_markdown(&report_with_untuned(&cargo, &samples(900.0, 300.0, 5.0, 90.0), &samples(1300.0, 300.0, 5.0, 90.0), (100, 80), true));
+        assert!(slow.contains("fail: cold"));
+        assert!(slow.contains("cold: frust-tuned"));
     }
 
     #[test]

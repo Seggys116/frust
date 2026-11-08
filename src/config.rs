@@ -59,7 +59,7 @@ impl Config {
                 Ok("local") | Ok("off") => TargetMode::Local,
                 _ => TargetMode::Central,
             },
-            tune: flag("FRUST_TUNE", false),
+            tune: flag("FRUST_TUNE", true),
             render: match env::var("FRUST_RENDER").as_deref() {
                 Ok("ansi") | Ok("always") => RenderMode::Ansi,
                 Ok("plain") => RenderMode::Plain,

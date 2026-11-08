@@ -6,8 +6,9 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Added
 
+* `FRUST_LINKER` (`auto` or `system`): on Windows (MSVC) hosts builds link with the toolchain's `rust-lld` unless a linker is configured or `FRUST_LINKER=system`. `frust doctor` reports the default linker and the effective tuning.
 * No-op fast path: when nothing changed since the last successful `fcargo build` or `check` of the same invocation, `fcargo` prints cargo's output (replayed warnings and the `Finished` line) without launching cargo. Inputs, outputs, fingerprints, config, environment and toolchain are stamped; any difference, an active build or an untrusted volume falls back to cargo. `FRUST_NOOP=off|on|audit` (default `on`) and `FRUST_NOOP_TRACE=<file>` control and trace it.
-* `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's. `--gate` also fails on time regressions against cargo.
+* `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's. `--gate` also fails when the shipped default (tuned) configuration is not faster than or equal to cargo within a small noise allowance. The report carries cargo, cargo-tuned (cold and disk only), untuned frust and tuned frust columns (schema version 3), and the disk guard compares tuned frust against cargo built with the same dependency debuginfo setting. `--untuned-runs N` runs the untuned column on fewer runs.
 * `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
 * `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
 * `FRUST_CACHE_SHARE_ROOTS=on` (off by default) lets eligible workspace crates, incremental ones included, share cache entries across git worktrees and clones; crates that embed a checkout path stay specific to their checkout.
@@ -27,6 +28,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Changed
 
+* Dependency debuginfo tuning (`FRUST_TUNE`) is now on by default; `FRUST_TUNE=off` restores cargo's defaults. User-defined profiles still disable it.
 * Cache entries, manifests, unit records and key lock files now live directly under `store/`, `manifests/`, `units/` and `keylocks/` instead of in two character shard directories, which cost a directory block each on ext4. Older layouts stay readable and `frust gc` moves them flat and removes the emptied shard directories.
 * New entries keep their dep-info text and diagnostics inside `meta.json` (`inline` on a file record, `stderr_inline` on the entry; each falls back to a separate file above 64 KiB), so an entry holds only its payload files besides `meta.json`. Manifests that list such entries use format 7 (backed: 8); formats 3 to 6 and the older entry layout stay readable, and older versions treat the new manifests as misses.
 * Unit version records are written as lines of one file, `units/pack` (`unit unix_seconds key...`), rewritten atomically under the same metadata lock, instead of one file per unit. A legacy per-unit file is still read until the pack lists its unit; a write folds it into the pack, and gc retires pack lines by their recorded write time.
@@ -42,6 +44,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+* A restore that links a store file into the target gives it a fresh modification time like every other restore, so cargo no longer finds a linked build script or binary older than its dependencies and rebuilds it on every no-op build (ext4, NTFS).
+* The no-op fast path records units cargo names without a hash (a path package's `cdylib` or `dylib`, and executables on windows-msvc, whose dep-info is `deps/<crate>.d`) and follows a symlinked directory in a package whose build script has no rerun directives, instead of declining every build of such workspaces; `frust bench --repo` reports the fast path's decisions for the no-op row (`noop_decisions`).
 * `frust env` and `frust doctor` look for `frust-wrap.exe` on Windows, so `frust env` prints its `RUSTC_WRAPPER` line and doctor finds the wrapper.
 * A bare explicit linker such as `rust-lld` (from `-C linker`, cargo config or `RUSTFLAGS`) is also resolved in the toolchain sysroot, so those units are cached instead of silently compiled uncached.
 * A cache bypass caused by an unresolved linker is now visible: one stderr line per reason, `skip:linker` in `FRUST_TIMINGS`, and a `frust doctor` warning that names the linker.
