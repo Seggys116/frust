@@ -293,9 +293,18 @@ fn walk_parallel<T: Send>(root: &Path, skip: Skip<'_>, init: &(dyn Fn() -> T + S
 
 /// Runs `f` on its own thread at background CPU and I/O priority, so the settings end with the thread.
 pub fn at_background_priority<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    on_lowered_thread(sys::lower_thread_priority, f)
+}
+
+/// Like `at_background_priority`, at the milder priority of work that something waits on.
+pub fn at_store_priority<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    on_lowered_thread(sys::lower_store_priority, f)
+}
+
+fn on_lowered_thread<R: Send>(lower: fn(), f: impl FnOnce() -> R + Send) -> R {
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
-            sys::lower_thread_priority();
+            lower();
             f()
         });
         match handle.join() {

@@ -182,11 +182,6 @@ pub fn plan_maintenance(dirs: &Dirs, opts: &GcOptions) -> Plan {
 /// The current source state and one other, so switching between two branches stays warm.
 pub const INCREMENTAL_ENTRIES_KEPT: usize = 2;
 
-/// Incremental objects are `<crate>-<hash>.<cgu>.<tag>.rcgu.o`; non-incremental ones contain `-cgu.`.
-fn is_incremental_object(name: &str) -> bool {
-    name.ends_with(".rcgu.o") && name.split('.').count() == 5 && !name.contains("-cgu.")
-}
-
 /// Explicit unit identities work on every platform; legacy entries are recognised by their incremental objects.
 pub fn superseded_incremental_entries(dirs: &Dirs, keep: usize) -> Vec<(PathBuf, u64)> {
     superseded_among(&scan_entries(dirs), keep)
@@ -237,7 +232,7 @@ fn link_state(entry: &Path, meta: &cache::EntryMeta) -> LinkState {
             && stored.nlink() > 1
         {
             // A stale incremental object name left in a target must not keep a superseded entry from being orphaned.
-            state.orphaned &= is_incremental_object(&file.name);
+            state.orphaned &= cache::is_incremental_object(&file.name);
             state.shared_alloc += stored.allocated();
             state.shared_estimate += file.stored_bytes.unwrap_or(file.bytes).div_ceil(4096) * 4096;
         }
@@ -271,7 +266,7 @@ fn unit_identity(meta: &cache::EntryMeta) -> Option<IncrementalUnit> {
     if let Some(unit) = &meta.incremental_unit {
         return cache::valid_key(unit).then(|| IncrementalUnit::Explicit(unit.clone()));
     }
-    if !meta.files.iter().any(|f| is_incremental_object(&f.name)) {
+    if !meta.files.iter().any(|f| cache::is_incremental_object(&f.name)) {
         return None;
     }
     let mut unit: Vec<String> = meta

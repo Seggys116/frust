@@ -504,11 +504,18 @@ impl Cache {
 
 }
 
-/// True for an entry with linked files, every one of which has lost its target name, so the store holds the only copy.
+/// A per-codegen-unit object of an incremental compile, whose stale names rustc leaves in the target (split debuginfo).
+pub fn is_incremental_object(name: &str) -> bool {
+    name.ends_with(".rcgu.o") && name.split('.').count() == 5 && !name.contains("-cgu.")
+}
+
+/// True for an entry with linked files, every one of which has lost its target name, so the store holds the only copy; a stale incremental object name left in a target does not count as live.
 pub fn orphaned_linked(entry: &Path, meta: &EntryMeta) -> bool {
     let mut linked = meta.files.iter().filter(|file| file.encoding == payload::Encoding::Linked && safe_file_name(&file.stored)).peekable();
     linked.peek().is_some()
-        && linked.all(|file| sys::lstat(&entry.join(&file.stored)).is_ok_and(|stored| stored.is_file() && stored.nlink() == 1))
+        && linked.all(|file| {
+            sys::lstat(&entry.join(&file.stored)).is_ok_and(|stored| stored.is_file() && (stored.nlink() == 1 || is_incremental_object(&file.name)))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -943,6 +950,31 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let cache = Cache::new(&Dirs::at(&dir));
         (dir, cache)
+    }
+
+    #[test]
+    fn a_stale_incremental_object_name_does_not_keep_an_entry_from_being_orphaned() {
+        let (dir, _) = scratch("orphan-objects");
+        let (entry, target) = (dir.join("entry"), dir.join("target"));
+        fs::create_dir_all(&entry).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let linked = |name: &str, stored: &str| StoredFile {
+            name: name.into(), stored: stored.into(), text: false, bytes: 8192, encoding: payload::Encoding::Linked,
+            stored_bytes: None, decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None,
+        };
+        let object = "k-0123456789abcdef.0a1b2c3d4e5f.1x2y3z.rcgu.o";
+        let meta = EntryMeta {
+            crate_name: "k".into(), version: "0.1.0".into(), compile_ms: 1, created_unix: 0, incremental_unit: None, prekey: None,
+            source: None, workspaces: Vec::new(), files: vec![linked("libk.rlib", "f0"), linked(object, "f1")], stderr: "stderr".into(),
+        };
+        for (stored, name) in [("f0", "libk.rlib"), ("f1", object)] {
+            fs::write(entry.join(stored), vec![1u8; 8192]).unwrap();
+            fs::hard_link(entry.join(stored), target.join(name)).unwrap();
+        }
+        assert!(!orphaned_linked(&entry, &meta), "the library is still a target file");
+        fs::remove_file(target.join("libk.rlib")).unwrap();
+        assert!(orphaned_linked(&entry, &meta), "only a leftover object name shares the entry once the library is replaced");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

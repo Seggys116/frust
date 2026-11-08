@@ -99,6 +99,11 @@ pub fn cache_tests() -> bool {
     flag("FRUST_CACHE_TESTS", false)
 }
 
+/// `FRUST_CACHE_SHARE_ROOTS`: lets eligible workspace crates share cache entries across checkouts of the same repository; off by default.
+pub fn share_roots() -> bool {
+    flag("FRUST_CACHE_SHARE_ROOTS", false)
+}
+
 /// The most slot lock files a store can ever use; gc treats every slot below it as canonical.
 pub const MAX_STORE_SLOTS: usize = 16;
 

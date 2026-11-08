@@ -676,8 +676,14 @@ pub fn inheritable_clear_of_stdio(files: &[&File]) -> bool {
     imp::inheritable_clear_of_stdio(files)
 }
 
+/// Lowest priority, for maintenance nothing waits on; it may not run at all while the machine is busy.
 pub fn lower_thread_priority() {
     imp::lower_thread_priority()
+}
+
+/// Below builds but never starved, for stores that builds and drains wait on.
+pub fn lower_store_priority() {
+    imp::lower_store_priority()
 }
 
 pub fn fs_type_name(path: &Path) -> Option<String> {

@@ -9,6 +9,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's. `--gate` also fails on time regressions against cargo.
 * `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
 * `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
+* `FRUST_CACHE_SHARE_ROOTS=on` (off by default) lets eligible workspace crates, incremental ones included, share cache entries across git worktrees and clones; crates that embed a checkout path stay specific to their checkout.
 * `frust gc --max-age-days N` and `FRUST_CACHE_MAX_AGE_DAYS` (default 14) set how long an unused cache entry is kept.
 * Cache entries record whether they came from a registry, git or path source and which central-target workspaces used them (optional `source` and `workspaces` fields in `meta.json`; entries stored by earlier versions read as unattributed).
 * `fcargo clean` of a whole central target also retires the path-crate cache entries only that workspace used. Registry and git entries stay in the shared store; `--frust-evict-registry` also retires the ones only that workspace used.

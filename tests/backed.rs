@@ -169,6 +169,34 @@ fn edits_keep_one_version_per_unit_and_leave_no_store_only_linked_bytes() {
     assert_eq!(store_only_linked_files(&sb, &["leaf", "mid", "app"]), 0, "every kept linked file is still a name of a live target file");
 }
 
+// An edit saved just before the build is too new to store, as in an editor-driven loop; a future mtime makes that certain.
+fn edit_leaf_unsettled(root: &Path, value: u32) {
+    let path = root.join("leaf").join("src").join("lib.rs");
+    fs::write(&path, leaf_source_with(value)).unwrap();
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    OpenOptions::new().write(true).open(&path).unwrap().set_modified(future).unwrap();
+}
+
+#[test]
+fn a_store_skipped_for_a_fresh_edit_retires_the_entry_its_compile_superseded() {
+    let sb = Sandbox::new("lk-unsettled");
+    let ws = path_workspace(&sb);
+    let envs = [("FRUST_CACHE_BACKED", "force"), ("FRUST_CACHE_UNIT_VERSIONS", "1")];
+    edit_leaf(&ws, 1);
+    build_with(&sb, &ws, &envs);
+    assert_eq!(entries(&sb, "leaf").len(), 1);
+    for value in 2..=4 {
+        edit_leaf_unsettled(&ws, value);
+        build_with(&sb, &ws, &envs);
+    }
+    assert!(entries(&sb, "leaf").is_empty(), "the stored state was recompiled away and no newer state could be stored");
+    assert_eq!(store_only_linked_files(&sb, &["leaf", "mid", "app"]), 0, "a skipped store leaves no store-only copy of the state it replaced");
+    edit_leaf(&ws, 5);
+    build_with(&sb, &ws, &envs);
+    assert_eq!(entries(&sb, "leaf").len(), 1, "a settled edit stores again");
+    assert_eq!(store_only_linked_files(&sb, &["leaf", "mid", "app"]), 0);
+}
+
 #[test]
 fn the_unit_versions_setting_keeps_that_many_states() {
     let sb = Sandbox::new("lk-versions-two");

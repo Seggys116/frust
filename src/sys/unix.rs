@@ -1156,24 +1156,43 @@ pub fn inheritable_clear_of_stdio(files: &[&File]) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub fn lower_thread_priority() {
-    const QOS_CLASS_BACKGROUND: u32 = 0x09;
+const QOS_CLASS_BACKGROUND: u32 = 0x09;
+#[cfg(target_os = "macos")]
+const QOS_CLASS_UTILITY: u32 = 0x11;
+#[cfg(target_os = "macos")]
+const IOPOL_THROTTLE: libc::c_int = 3;
+#[cfg(target_os = "macos")]
+const IOPOL_UTILITY: libc::c_int = 4;
+
+#[cfg(target_os = "macos")]
+fn set_thread_qos(qos_class: u32, io_policy: libc::c_int) {
     const IOPOL_TYPE_DISK: libc::c_int = 0;
     const IOPOL_SCOPE_THREAD: libc::c_int = 1;
-    const IOPOL_THROTTLE: libc::c_int = 3;
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: libc::c_int) -> libc::c_int;
         fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;
     }
     // SAFETY: both calls only change scheduling attributes of the calling thread.
     unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-        setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
+        pthread_set_qos_class_self_np(qos_class, 0);
+        setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, io_policy);
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Background QoS may never run on a busy machine, so only deferrable maintenance uses it.
+#[cfg(target_os = "macos")]
 pub fn lower_thread_priority() {
+    set_thread_qos(QOS_CLASS_BACKGROUND, IOPOL_THROTTLE);
+}
+
+/// Utility QoS yields to builds but is never starved, which stores that builds and drains wait for need.
+#[cfg(target_os = "macos")]
+pub fn lower_store_priority() {
+    set_thread_qos(QOS_CLASS_UTILITY, IOPOL_UTILITY);
+}
+
+#[cfg(target_os = "linux")]
+fn set_thread_nice(nice: libc::c_int) {
     const IOPRIO_WHO_PROCESS: libc::c_long = 1;
     // Best-effort class with the lowest priority level: idle could starve behind a build.
     const IOPRIO_BEST_EFFORT_LOWEST: libc::c_long = (2 << 13) | 7;
@@ -1181,12 +1200,25 @@ pub fn lower_thread_priority() {
     // SAFETY: ioprio_set and setpriority only change the scheduling attributes of the calling thread.
     unsafe {
         libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, this_thread, IOPRIO_BEST_EFFORT_LOWEST);
-        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        libc::setpriority(libc::PRIO_PROCESS, 0, nice);
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn lower_thread_priority() {
+    set_thread_nice(19);
+}
+
+#[cfg(target_os = "linux")]
+pub fn lower_store_priority() {
+    set_thread_nice(10);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn lower_thread_priority() {}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn lower_store_priority() {}
 
 #[cfg(target_os = "macos")]
 pub fn fs_type_name(path: &Path) -> Option<String> {
@@ -1263,6 +1295,7 @@ mod compact_hashing_tests {
     #[test]
     fn lowering_priority_on_a_spawned_thread_returns() {
         std::thread::spawn(lower_thread_priority).join().unwrap();
+        std::thread::spawn(lower_store_priority).join().unwrap();
     }
 
     #[test]

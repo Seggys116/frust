@@ -340,8 +340,8 @@ fn serve_with_worker_start(
                 before_start(index, &queue)?;
                 let queue = Arc::clone(&queue);
                 thread::Builder::new().spawn_scoped(scope, move || {
-                    // Workers already own their threads, so background priority ends with this loop.
-                    sys::lower_thread_priority();
+                    // Workers already own their threads, so the lowered priority ends with this loop.
+                    sys::lower_store_priority();
                     worker(dirs, config, &queue);
                 })?;
             }

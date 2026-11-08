@@ -3,10 +3,10 @@
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -26,6 +26,7 @@ use crate::events::{self, CacheResult, Event};
 use crate::fsx;
 use crate::lock;
 use crate::paths::{DEFERRED_SLOT_PREFIX, Dirs};
+use crate::share_roots::{self, ROOT_TOKEN, Root};
 use crate::sys::{self, LockKind};
 use crate::timings;
 
@@ -91,7 +92,10 @@ const KEY_POLL_START: Duration = Duration::from_millis(5);
 const KEY_POLL_MAX: Duration = Duration::from_millis(40);
 
 /// Bumped whenever `StoreJob` changes incompatibly; a helper meeting another format stores nothing.
-const JOB_FORMAT: u32 = 3;
+const JOB_FORMAT: u32 = 4;
+
+/// The previous format lacks only the shared-key fields, so it still reads, as a job that is not shared.
+const LEGACY_JOB_FORMAT: u32 = 3;
 
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
 static DETACHED_STORE: AtomicBool = AtomicBool::new(false);
@@ -180,6 +184,23 @@ struct Plan {
     probe: timings::Probe,
     /// Cargo marked this invocation as a package the user asked to build.
     primary: bool,
+    /// The key under which this unit may share entries across checkouts, when `FRUST_CACHE_SHARE_ROOTS` allows it.
+    shared: Option<Shared>,
+    /// Set once the compile showed that its outputs carry no checkout path, so the entry goes under the shared key.
+    use_shared: AtomicBool,
+}
+
+struct Shared {
+    root: Root,
+    prekey: String,
+    unit: String,
+}
+
+/// Where a finished compile is filed: its key, unit identity and the root its paths are tokenised against.
+struct Target<'a> {
+    prekey: &'a str,
+    unit: Option<&'a str>,
+    root: Option<&'a Root>,
 }
 
 impl Plan {
@@ -243,6 +264,15 @@ impl Plan {
         .with_stamp_trust(stamp_policy(&trust))
         .audit_attested(trust.mode == TrustMode::Audit)
         .with_violation_sink(violation_sink(&trust, &dirs, &parsed.crate_name));
+        let share_root = match share_candidate(&hasher, &cwd, (profile.as_str(), profile_abs.as_path()), args, &parsed) {
+            Ok(root) => Some(root),
+            Err(reason) => {
+                if !reason.is_empty() {
+                    debug(format!("not shared: {} ({reason})", parsed.crate_name));
+                }
+                None
+            }
+        };
         let key = KeyContext {
             hasher: &hasher,
             cwd: &cwd,
@@ -250,13 +280,24 @@ impl Plan {
             profile_abs: &profile_abs,
         };
         let keyed = Instant::now();
+        let shared = share_root.and_then(|root| {
+            match key.prekey_in(&args[0], &args[1..], &parsed, KeyMode::Shared(&root)) {
+                Ok(keyed) => Some(Shared { prekey: keyed.key, unit: keyed.unit, root }),
+                Err(reason) => {
+                    debug(format!("not shared: {} ({reason})", parsed.crate_name));
+                    None
+                }
+            }
+        });
+        // Only a unit that really gets the remap flag keeps its specific entries apart from unremapped ones.
+        let specific = KeyMode::specific(shared.as_ref());
         let PreKey {
             key: prekey,
             unit,
             watched,
             extern_hashes,
             stats,
-        } = match key.prekey(&args[0], &args[1..], &parsed) {
+        } = match key.prekey_in(&args[0], &args[1..], &parsed, specific) {
             Ok(found) => found,
             Err(reason) => {
                 debug(format!("not cacheable: {} ({reason})", parsed.crate_name));
@@ -307,13 +348,15 @@ impl Plan {
             deferred: false,
             probe,
             primary,
+            shared,
+            use_shared: AtomicBool::new(false),
         })
     }
 
     /// Rebuilds the plan a deferred store needs from the job; the key pieces come from the job, never recomputed.
     fn from_job(job: &StoreJob, worker_config: &Config) -> Option<Plan> {
         // Serialized paths retain the producer's lexical identity across every job.
-        if job.format != JOB_FORMAT
+        if !job.readable()
             || job.args.len() < 2
             || !job.cwd.is_absolute()
             || job
@@ -358,6 +401,14 @@ impl Plan {
         )
         .with_stamp_trust(stamp_policy(&trust));
         let cache = Cache::new(&dirs);
+        let shared = job.root.as_deref().and_then(|root| {
+            Some(Shared { root: Root::new(Path::new(root))?, prekey: job.prekey.clone(), unit: job.unit.clone()? })
+        });
+        // A job filed under the shared key must tokenise against its root, or it would poison that key.
+        if job.root.is_some() && shared.is_none() {
+            return None;
+        }
+        let shared_job = shared.is_some();
         Some(Plan {
             cfg,
             context: job.context.clone(),
@@ -379,6 +430,8 @@ impl Plan {
             deferred: true,
             probe: timings::Probe::off(),
             primary: false,
+            shared,
+            use_shared: AtomicBool::new(shared_job),
         })
     }
 
@@ -494,23 +547,54 @@ impl Plan {
         self.waited_ms.load(Ordering::Relaxed)
     }
 
+    /// The key, unit and root this unit's entry is filed under; the shared ones once the compile has proven it may.
+    fn target(&self) -> Target<'_> {
+        match &self.shared {
+            Some(shared) if self.use_shared.load(Ordering::Relaxed) => Target {
+                prekey: &shared.prekey,
+                unit: Some(shared.unit.as_str()),
+                root: Some(&shared.root),
+            },
+            _ => Target { prekey: &self.prekey, unit: self.unit.as_deref(), root: None },
+        }
+    }
+
     fn norm(&self, text: &str) -> String {
-        text.replace(&self.profile, PROFILE_TOKEN)
+        self.norm_in(text, self.target().root)
+    }
+
+    fn norm_in(&self, text: &str, root: Option<&Root>) -> String {
+        let text = text.replace(&self.profile, PROFILE_TOKEN);
+        root.map_or(text.clone(), |root| root.tokenise(&text))
+    }
+
+    /// Undoes both tokens with this checkout's values; an entry stored without a root token passes through unchanged.
+    fn detokenise(&self, text: &str) -> String {
+        let text = text.replace(PROFILE_TOKEN, &self.profile);
+        self.shared.as_ref().map_or(text.clone(), |shared| shared.root.resolve(&text))
     }
 
     fn resolve(&self, normalised: &str) -> PathBuf {
-        self.cwd
-            .join(normalised.replace(PROFILE_TOKEN, &self.profile))
+        self.cwd.join(self.detokenise(normalised))
     }
 
     fn version(&self) -> String {
         self.context.package_version.clone()
     }
 
+    /// The shared key is tried first; entries under the checkout-specific key serve units that could not share.
     fn try_hit(&self, started: Instant) -> bool {
-        for candidate in self.cache.candidates(&self.prekey) {
+        let shared = self.shared.as_ref().map(|s| (s.prekey.as_str(), Some(s.unit.as_str()), Some(&s.root)));
+        shared
+            .into_iter()
+            .chain([(self.prekey.as_str(), self.unit.as_deref(), None)])
+            .any(|(prekey, unit, root)| self.try_hit_under(started, prekey, unit, root))
+    }
+
+    fn try_hit_under(&self, started: Instant, prekey: &str, unit: Option<&str>, root: Option<&Root>) -> bool {
+        for candidate in self.cache.candidates(prekey) {
             // A row whose entry was evicted is skipped before any of its inputs is read.
-            if !self.cache.has_entry(&candidate.key) || !self.candidate_matches(&candidate) {
+            if !self.cache.has_entry(&candidate.key) || !self.candidate_matches(&candidate, root) {
                 continue;
             }
             let Some((dir, meta)) = self.cache.load_entry(&candidate.key) else {
@@ -524,7 +608,7 @@ impl Plan {
                     if meta.source.is_some() && !meta.workspaces.contains(&self.user_id()) {
                         self.note_workspace(&candidate.key);
                     }
-                    self.note_unit(&candidate.key);
+                    self.note_unit_as(unit, &candidate.key);
                     let elapsed = started.elapsed().as_millis() as u64;
                     events::record_waited(
                         &self.dirs,
@@ -562,9 +646,9 @@ impl Plan {
         false
     }
 
-    fn candidate_matches(&self, candidate: &Candidate) -> bool {
+    fn candidate_matches(&self, candidate: &Candidate, root: Option<&Root>) -> bool {
         for (name, expected) in &candidate.envs {
-            let current = env::var(name).ok().map(|v| cache::hash_str(&self.norm(&v)));
+            let current = env::var(name).ok().map(|v| cache::hash_str(&self.norm_in(&v, root)));
             if &current != expected {
                 return false;
             }
@@ -665,7 +749,7 @@ impl Plan {
             fs::create_dir_all(&self.parsed.out_dir)?;
         }
         // A temp name plus rename per file lets them be restored concurrently.
-        let (out_dir, profile) = (&self.parsed.out_dir, &self.profile);
+        let out_dir = &self.parsed.out_dir;
         let restored = parallel(&groups, |_, group| {
             let file = &meta.files[group.base_index];
             if !group.slice_indices.is_empty() {
@@ -688,7 +772,7 @@ impl Plan {
                 return Ok(file.bytes);
             }
             if file.text {
-                let text = dep_info_resolved(&fs::read_to_string(&src)?, profile);
+                let text = self.resolved_dep_info(&fs::read_to_string(&src)?);
                 fsx::write_atomic(&dst, text.as_bytes())?;
             } else {
                 cache::payload::restore(&src, &dst, file)?;
@@ -701,8 +785,7 @@ impl Plan {
             Ok(file.bytes)
         })?;
         let bytes = restored.iter().sum();
-        let stderr =
-            fs::read_to_string(entry.join(&meta.stderr))?.replace(PROFILE_TOKEN, &self.profile);
+        let stderr = self.detokenise(&fs::read_to_string(entry.join(&meta.stderr))?);
         let mut out = io::stderr().lock();
         out.write_all(stderr.as_bytes())?;
         out.flush()?;
@@ -755,11 +838,13 @@ impl Plan {
             started.elapsed().as_millis()
         ));
         let rustc_started = Instant::now();
-        let mut child = match compiler_command(&self.args[0])
-            .args(&self.args[1..])
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+        let mut compiler = compiler_command(&self.args[0]);
+        compiler.args(&self.args[1..]);
+        // Added here, below cargo, so a unit that may share embeds a placeholder instead of the checkout path and no fingerprint changes.
+        if let Some(shared) = &self.shared {
+            compiler.args(shared.root.remap_args());
+        }
+        let mut child = match compiler.stderr(Stdio::piped()).spawn() {
             Ok(child) => child,
             Err(err) => {
                 eprintln!(
@@ -786,6 +871,7 @@ impl Plan {
         if status.success() {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
+            self.settle(&captured, &preexisting);
             if self.skips_store() {
                 self.probe.mode(|| "skip:test".to_string());
                 let _ = self.skip_store("test executables are not stored", compile_ms);
@@ -806,6 +892,7 @@ impl Plan {
                         "store failed for {}: {err}",
                         self.parsed.crate_name
                     ));
+                    self.retire_superseded_orphans();
                 }
                 self.probe.set(|r| r.inline_store_ms = timings::ms(store_started));
                 self.debug(&format!(
@@ -821,6 +908,38 @@ impl Plan {
             self.wake_queue();
         }
         code
+    }
+
+    /// Files the entry under the shared key only when nothing the compile read or produced carries a checkout path.
+    fn settle(&self, captured: &[u8], preexisting: &HashMap<String, Stamp>) {
+        let Some(shared) = &self.shared else { return };
+        let verdict = self.carries_no_path(shared, captured, preexisting);
+        self.use_shared.store(verdict.is_ok(), Ordering::Relaxed);
+        match verdict {
+            Ok(()) => self.debug(&format!("{} stores under the shared key", self.parsed.crate_name)),
+            Err(reason) => self.debug(&format!("{} stays under the checkout-specific key ({reason})", self.parsed.crate_name)),
+        }
+    }
+
+    /// `Err` names what ties the compile to this checkout.
+    fn carries_no_path(&self, shared: &Shared, captured: &[u8], preexisting: &HashMap<String, Stamp>) -> Result<(), String> {
+        let names = self.output_files(captured, preexisting);
+        let dep_name = names.iter().find(|name| name.ends_with(".d")).ok_or("no dep-info file")?;
+        let dep_text = fs::read_to_string(self.output_dir_abs.join(dep_name)).map_err(|err| format!("unreadable dep-info: {err}"))?;
+        let profile_abs = self.profile_abs.to_string_lossy();
+        let mut paths: Vec<&str> = shared.root.forms().iter().map(String::as_str).collect();
+        paths.push(&profile_abs);
+        if !share_roots::env_clean(&cache::depinfo::parse(&dep_text).env, &paths) {
+            return Err("dep-info records a path variable".to_string());
+        }
+        for name in names.iter().filter(|name| !name.ends_with(".d")) {
+            match share_roots::embeds_any(&[self.output_dir_abs.join(name)], &paths) {
+                Ok(false) => {}
+                Ok(true) => return Err(format!("{name} embeds a checkout path")),
+                Err(err) => return Err(format!("{name} unreadable: {err}")),
+            }
+        }
+        Ok(())
     }
 
     /// Test and bench executables are rebuilt on nearly every edit and rarely restored, so they are stored only with `FRUST_CACHE_TESTS=on`.
@@ -943,8 +1062,10 @@ impl Plan {
             home: self.cwd.join(self.dirs.root()),
             cwd: self.cwd.clone(),
             args,
-            prekey: self.prekey.clone(),
-            unit: self.unit.clone(),
+            prekey: self.target().prekey.to_string(),
+            unit: self.target().unit.map(str::to_string),
+            root: self.target().root.map(|root| root.as_str().to_string()),
+            lock_prekey: (self.target().prekey != self.prekey).then(|| self.prekey.clone()),
             trust: self.trust.mode.name().to_string(),
             compile_ms,
             spawned_ns: spawned_ns.to_string(),
@@ -1413,15 +1534,14 @@ impl Plan {
             })
             .collect();
         let key = if self.linked_storage() {
-            backed_entry_key(&self.prekey, &inputs, &envs)
+            backed_entry_key(self.target().prekey, &inputs, &envs)
         } else {
-            entry_key(&self.prekey, &inputs, &envs)
+            entry_key(self.target().prekey, &inputs, &envs)
         };
         let hashed_ms = started.elapsed().as_millis();
 
         if !self.cache.has_entry(&key) {
             if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) {
-                self.retire_superseded_orphans();
                 return self.skip_store("an output changed after the compile", compile_ms);
             }
             let staged = self.cache.stage()?;
@@ -1437,7 +1557,6 @@ impl Plan {
                 // Checked again once cloned: an output replaced while being cloned must not be published.
                 Ok(_) if frozen.is_some_and(|f| !f.outputs_unchanged(&self.output_dir_abs)) => {
                     let _ = fsx::remove_any(&staged);
-                    self.retire_superseded_orphans();
                     return self.skip_store("an output changed while being stored", compile_ms);
                 }
                 Ok(meta) => {
@@ -1462,7 +1581,7 @@ impl Plan {
         self.note_workspace(&key);
         self.note_unit(&key);
         self.cache
-            .add_candidate(&self.prekey, Candidate { inputs, envs, key });
+            .add_candidate(self.target().prekey, Candidate { inputs, envs, key });
         self.debug(&format!(
             "store {}: {} inputs hashed in {hashed_ms}ms, entry at {entry_ms}ms, manifest at {}ms",
             self.parsed.crate_name,
@@ -1472,9 +1591,10 @@ impl Plan {
         Ok(())
     }
 
-    /// Deliberately not storing: an input may not match what rustc read.
+    /// Deliberately not storing: an input may not match what rustc read. The compile still replaced the unit's outputs, so earlier entries it left store-only are retired.
     fn skip_store(&self, reason: &str, compile_ms: u64) -> io::Result<()> {
         self.debug(&format!("not storing {}: {reason}", self.parsed.crate_name));
+        self.retire_superseded_orphans();
         self.record_miss(&self.version(), compile_ms, 0);
         Ok(())
     }
@@ -1498,6 +1618,16 @@ impl Plan {
         );
     }
 
+    fn tokenised_dep_info(&self, raw: &str) -> String {
+        let text = dep_info_tokenised(raw, &self.profile);
+        self.target().root.map_or(text.clone(), |root| root.tokenise_dep_info(&text))
+    }
+
+    fn resolved_dep_info(&self, stored: &str) -> String {
+        let text = dep_info_resolved(stored, &self.profile);
+        self.shared.as_ref().map_or(text.clone(), |shared| shared.root.resolve_dep_info(&text))
+    }
+
     /// `dep_info` is the dep-info file's name and the text already read, so it is stored exactly as parsed for the key.
     fn stage_entry(
         &self,
@@ -1509,7 +1639,7 @@ impl Plan {
         commitments: Option<&HashMap<String, cache::payload::Commitment>>,
     ) -> io::Result<EntryMeta> {
         // The staging directory is private until one rename publishes it, so files are cloned straight to final names.
-        let (out_dir, profile) = (&self.output_dir_abs, &self.profile);
+        let out_dir = &self.output_dir_abs;
         let compress =
             self.context.compression_requested && cache::payload::compression_supported(staged);
         let indices: HashMap<&str, usize> = names
@@ -1561,7 +1691,7 @@ impl Plan {
                 } else {
                     fs::read_to_string(&src)?
                 };
-                let body = dep_info_tokenised(&raw, profile);
+                let body = self.tokenised_dep_info(&raw);
                 let bytes = body.len() as u64;
                 fs::write(staged.join(&stored), body)?;
                 (
@@ -1672,7 +1802,7 @@ impl Plan {
             parallel(names, store_metadata)
         }?;
         cache::metadata_slice::validate_groups(&files)?;
-        let stderr_text = String::from_utf8_lossy(captured).replace(&self.profile, PROFILE_TOKEN);
+        let stderr_text = self.norm(&String::from_utf8_lossy(captured));
         fs::write(staged.join("stderr"), stderr_text)?;
         let (source, workspaces) = match self.workspace().zip(self.source()) {
             Some((workspace, source)) => (Some(source.to_owned()), vec![workspace]),
@@ -1683,11 +1813,11 @@ impl Plan {
             version: self.version(),
             compile_ms,
             created_unix: fsx::unix_now(),
-            prekey: Some(self.prekey.clone()),
+            prekey: Some(self.target().prekey.to_string()),
             source,
             workspaces,
             incremental_unit: if self.parsed.incremental() {
-                self.unit.clone()
+                self.target().unit.map(str::to_string)
             } else {
                 None
             },
@@ -1732,11 +1862,12 @@ impl Plan {
 
     /// A store whose outputs were replaced by a newer compile proves the unit's earlier entries that no target name shares are superseded; with no later store to retire them they would stay as store-only copies.
     fn retire_superseded_orphans(&self) {
-        let Some(unit) = &self.unit else { return };
-        let protection = deferred_protection(&self.dirs);
+        let Some(unit) = self.target().unit else { return };
+        // The snapshot locks idle job files while it lives, so it is taken only once an orphan exists.
+        let mut protection = None;
         for key in self.cache.unit_keys(unit) {
             let Some((dir, meta)) = self.cache.load_entry(&key) else { continue };
-            if !cache::orphaned_linked(&dir, &meta) || protection.protects(&dir) {
+            if !cache::orphaned_linked(&dir, &meta) || protection.get_or_insert_with(|| deferred_protection(&self.dirs)).protects(&dir) {
                 continue;
             }
             self.debug(&format!("retired superseded store-only entry {key} of {}", self.parsed.crate_name));
@@ -1745,7 +1876,11 @@ impl Plan {
     }
 
     fn note_unit(&self, key: &str) {
-        let Some(unit) = &self.unit else { return };
+        self.note_unit_as(self.target().unit, key);
+    }
+
+    fn note_unit_as(&self, unit: Option<&str>, key: &str) {
+        let Some(unit) = unit else { return };
         for old in self.cache.note_unit_entry(unit, key, self.context.unit_versions.clamp(1, UNIT_VERSIONS)) {
             self.debug(&format!(
                 "retired superseded entry {old} of {}",
@@ -2021,6 +2156,12 @@ struct StoreJob {
     args: Vec<String>,
     prekey: String,
     unit: Option<String>,
+    /// The checkout root this job's paths are tokenised against; set only for entries filed under a shared key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    /// The checkout-specific key whose lock the producer holds, when `prekey` is a shared key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lock_prekey: Option<String>,
     trust: String,
     compile_ms: u64,
     spawned_ns: String,
@@ -2039,13 +2180,20 @@ struct StoreJob {
     key_lock: Option<PathBuf>,
 }
 
+impl StoreJob {
+    /// Older binaries accept only their own format number, so a job with shared-key fields is unusable to them.
+    fn readable(&self) -> bool {
+        self.format == JOB_FORMAT || (self.format == LEGACY_JOB_FORMAT && self.root.is_none() && self.lock_prekey.is_none())
+    }
+}
+
 pub(crate) struct BrokerJob(StoreJob);
 
 impl BrokerJob {
     pub(crate) fn decode(bytes: &[u8], dirs: &Dirs, key: Option<&File>) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid broker store job");
         let job: StoreJob = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-        if job.format != JOB_FORMAT
+        if !job.readable()
             || job.ownership_version > 1
             || !job.cwd.is_absolute()
             || !job.home.is_absolute()
@@ -2055,6 +2203,8 @@ impl BrokerJob {
                 .unit
                 .as_ref()
                 .is_some_and(|unit| !cache::valid_key(unit))
+            || job.root.as_deref().is_some_and(|root| Path::new(root) != job.cwd || job.unit.is_none())
+            || job.lock_prekey.as_ref().is_some_and(|key| !cache::valid_key(key))
             || !matches!(job.trust.as_str(), "on" | "off" | "audit")
             || job.slot_lock.is_some()
             || job.key_lock.is_some()
@@ -2118,7 +2268,7 @@ impl BrokerJob {
         }
         if let Some(key) = key {
             // The received description must retain the producer's exact compile lock.
-            let expected = sys::lstat(&keylock_path(dirs, &job.prekey))?;
+            let expected = sys::lstat(&keylock_path(dirs, job.lock_prekey.as_ref().unwrap_or(&job.prekey)))?;
             let received = sys::fstat(key)?;
             if !expected.is_file()
                 || !received.is_file()
@@ -2421,13 +2571,13 @@ fn write_leased_job(dir: &Path, job: &StoreJob) -> io::Result<(PathBuf, File)> {
     write_named_job(dir, &name, job)
 }
 
-/// The prekey in the name lets a drain drop superseded jobs without reading them.
+/// The checkout-specific key in the name lets a drain drop superseded jobs of one checkout without reading them; a shared prekey would also name other checkouts' jobs.
 fn write_queued_job(dir: &Path, job: &StoreJob) -> io::Result<(PathBuf, File)> {
     let name = format!(
         "job-{}-{}-q{}.json",
         std::process::id(),
         hashing::now_ns(),
-        job.prekey
+        job.lock_prekey.as_ref().unwrap_or(&job.prekey)
     );
     write_named_job(dir, &name, job)
 }
@@ -2541,7 +2691,7 @@ pub(crate) fn deferred_retirement(path: &Path) -> io::Result<DeferredRetirement>
     }
     let bytes = read_owned_job(path, &file)?;
     let leased = serde_json::from_slice::<StoreJob>(&bytes)
-        .is_ok_and(|job| job.ownership_version == 1 && job.format == JOB_FORMAT);
+        .is_ok_and(|job| job.ownership_version == 1 && job.readable());
     Ok(if leased {
         DeferredRetirement::Dead(file)
     } else {
@@ -2753,7 +2903,7 @@ pub(crate) fn deferred_protection(dirs: &Dirs) -> DeferredProtection {
             }
             let job: StoreJob = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
             if job.ownership_version > 1
-                || job.format != JOB_FORMAT
+                || !job.readable()
                 || !job.cwd.is_absolute()
                 || job.home != dirs.root()
             {
@@ -2836,7 +2986,7 @@ fn spawn_helper(job: &Path, cwd: &Path, keep: &[&File], lease: &File) -> io::Res
 
 /// Takes the locks the wrapper could not hand over; blocking, because the wrapper releases its own as it returns.
 fn relock(job: &StoreJob) -> Vec<File> {
-    if job.format != JOB_FORMAT || !job.cwd.is_absolute() {
+    if !job.readable() || !job.cwd.is_absolute() {
         return Vec::new();
     }
     let dirs = Dirs::at(job.cwd.join(&job.home));
@@ -2881,9 +3031,12 @@ fn deferred_main_in(path: PathBuf, deferred: &Path) -> i32 {
             return 0;
         };
         let _held = relock(&job);
-        compact::at_background_priority(|| run_deferred(&job));
+        compact::at_store_priority(|| run_deferred(&job));
         // The slot is still held, so queued jobs are finished before it is given back.
-        drain_all(deferred);
+        if !drain_all(deferred).is_empty() {
+            // The inherited slot cannot be given back early, so a drainer retries the handed-back jobs once this helper exits.
+            let _ = spawn_drainer(&job.cwd);
+        }
     }
     0
 }
@@ -2897,13 +3050,53 @@ fn drain_main() -> i32 {
     let Ok(dirs) = Dirs::try_discover() else {
         return 0;
     };
-    let deferred = dirs.deferred();
-    // Held until exit; with every slot taken the running helpers drain the queue instead.
-    let Some(_slot) = acquire_slot(&deferred, slot_count()) else {
-        return 0;
-    };
-    drain_all(&deferred);
+    drain_slotted(&dirs.deferred(), Config::from_env().keylock_wait);
     0
+}
+
+/// Drains under a slot; a job whose key lock was busy is retried only after the slot is given back and the key has been seen free, so this never waits on a key while holding a slot.
+fn drain_slotted(deferred: &Path, patience: Duration) {
+    let begun = Instant::now();
+    loop {
+        // Waiting here holds nothing; a helper that handed jobs back may still be exiting.
+        let Some(slot) = wait_for_slot(deferred, patience.saturating_sub(begun.elapsed())) else {
+            return;
+        };
+        let busy = drain_all(deferred);
+        drop(slot);
+        if busy.is_empty()
+            || !busy
+                .iter()
+                .all(|key| key_seen_free(key, patience.saturating_sub(begun.elapsed())))
+        {
+            return;
+        }
+    }
+}
+
+fn wait_for_slot(deferred: &Path, cap: Duration) -> Option<(File, PathBuf)> {
+    let begun = Instant::now();
+    let mut pause = KEY_POLL_START;
+    loop {
+        if let Some(slot) = acquire_slot(deferred, slot_count()) {
+            return Some(slot);
+        }
+        let remaining = cap.saturating_sub(begun.elapsed());
+        if remaining.is_zero() {
+            return None;
+        }
+        thread::sleep(pause.min(remaining));
+        pause = (pause * 2).min(KEY_POLL_MAX);
+    }
+}
+
+/// Takes and at once releases the key lock, holding no slot meanwhile.
+fn key_seen_free(key: &Path, cap: Duration) -> bool {
+    let file = match sys::open_existing_lock_file(key) {
+        Ok(file) => file,
+        Err(err) => return err.kind() == io::ErrorKind::NotFound,
+    };
+    try_key_lock(&file).unwrap_or(false) || wait_key_lock(&file, cap).unwrap_or(false)
 }
 
 /// Starts a drain helper without handing it a slot, which it takes itself.
@@ -2955,18 +3148,60 @@ fn claim_queued(job: &QueuedName) -> Option<JobFile> {
     Some(JobFile(claimed))
 }
 
-/// Claims and runs queued jobs until none remain; only the newest job of a prekey is read, since an older one would fail its frozen check against the newer compile's outputs.
-fn drain_queue(deferred: &Path, mut run: impl FnMut(&JobFile)) {
+/// What running a claimed job came to.
+enum Drained {
+    Done,
+    /// Its key lock was held elsewhere; the path of that lock.
+    KeyBusy(PathBuf),
+}
+
+/// Jobs handed back during one drain, which it neither claims again nor spins on, and the key locks they wait for.
+#[derive(Default)]
+struct HandedBack {
+    jobs: HashSet<PathBuf>,
+    keys: Vec<PathBuf>,
+}
+
+impl HandedBack {
+    fn settle(&mut self, file: &JobFile, outcome: Drained) {
+        let Drained::KeyBusy(key) = outcome else {
+            return;
+        };
+        if let Some(path) = unclaim(file) {
+            self.jobs.insert(path);
+            if !self.keys.contains(&key) {
+                self.keys.push(key);
+            }
+        }
+    }
+}
+
+/// Renames a claimed file back to its unclaimed `job-` name; if that fails the claim's drop deletes it.
+fn unclaim(file: &JobFile) -> Option<PathBuf> {
+    let name = file.0.file_name()?.to_str()?.strip_prefix(CLAIMED_PREFIX)?;
+    let unclaimed = file.0.with_file_name(format!("job-{}", name.split_once('-')?.1));
+    sys::rename(&file.0, &unclaimed).ok()?;
+    Some(unclaimed)
+}
+
+/// Claims and runs queued jobs until none remain; only the newest job of a checkout-specific key is read, since an older one would fail its frozen check against the newer compile's outputs.
+fn drain_queue(deferred: &Path, back: &mut HandedBack, mut run: impl FnMut(&JobFile) -> Drained) {
     loop {
         let mut claimed_any = false;
         let mut seen = HashSet::new();
         for job in queued_jobs(deferred) {
+            // A handed-back job still supersedes older ones of its prekey.
+            if back.jobs.contains(&job.path) {
+                seen.insert(job.prekey);
+                continue;
+            }
             let Some(file) = claim_queued(&job) else {
                 continue;
             };
             claimed_any = true;
             if seen.insert(job.prekey) {
-                run(&file);
+                let outcome = run(&file);
+                back.settle(&file, outcome);
             }
         }
         if !claimed_any {
@@ -2975,20 +3210,25 @@ fn drain_queue(deferred: &Path, mut run: impl FnMut(&JobFile)) {
     }
 }
 
-/// Queued jobs, then job files whose owner died, until neither remains.
-fn drain_all(deferred: &Path) {
+/// Queued jobs, then job files whose owner died, until neither remains; returns the busy key locks of the jobs it handed back.
+fn drain_all(deferred: &Path) -> Vec<PathBuf> {
+    let mut back = HandedBack::default();
     loop {
-        drain_queue(deferred, run_queued);
+        drain_queue(deferred, &mut back, run_queued);
         let mut adopted = false;
         for path in orphaned_jobs(deferred) {
+            if back.jobs.contains(&path) {
+                continue;
+            }
             let Some(file) = adopt_orphan(&path) else {
                 continue;
             };
             adopted = true;
-            run_adopted(&file);
+            let outcome = run_adopted(&file);
+            back.settle(&file, outcome);
         }
         if !adopted {
-            return;
+            return back.keys;
         }
     }
 }
@@ -3035,28 +3275,56 @@ fn adopt_orphan(path: &Path) -> Option<JobFile> {
 }
 
 /// The slot is this helper's own, so the slot lock a dead producer recorded is never taken again.
-fn run_adopted(file: &JobFile) {
-    let Some(mut job) = read_job(&file.0) else {
-        return;
+fn run_adopted(file: &JobFile) -> Drained {
+    let Some(job) = read_job(&file.0) else {
+        return Drained::Done;
     };
-    job.slot_lock = None;
+    let _key = match try_job_key(&job) {
+        Ok(key) => key,
+        Err(busy) => return Drained::KeyBusy(busy),
+    };
     let Ok(_lease) = lease_deferred_job(&file.0) else {
-        return;
+        return Drained::Done;
     };
-    let _held = relock(&job);
-    compact::at_background_priority(|| run_deferred(&job));
+    compact::at_store_priority(|| run_deferred(&job));
+    Drained::Done
 }
 
 /// Queued jobs hold no inherited lease and their key lock, if any, is taken again by path.
-fn run_queued(file: &JobFile) {
+fn run_queued(file: &JobFile) -> Drained {
     let Some(job) = read_job(&file.0).filter(|job| job.ownership_version == 0) else {
-        return;
+        return Drained::Done;
+    };
+    let _key = match try_job_key(&job) {
+        Ok(key) => key,
+        Err(busy) => return Drained::KeyBusy(busy),
     };
     let Ok(_lease) = helper_job_lease(&file.0, 0) else {
-        return;
+        return Drained::Done;
     };
-    let _held = relock(&job);
-    compact::at_background_priority(|| run_deferred(&job));
+    compact::at_store_priority(|| run_deferred(&job));
+    Drained::Done
+}
+
+/// A drain holds a slot, so it only tries the key lock: the holder may be a broker worker or helper waiting for that very slot, or this process itself.
+fn try_job_key(job: &StoreJob) -> Result<Option<File>, PathBuf> {
+    let Some(path) = job
+        .key_lock
+        .as_ref()
+        .filter(|_| job.readable() && job.cwd.is_absolute())
+    else {
+        return Ok(None);
+    };
+    let path = job.cwd.join(path);
+    let dirs = Dirs::at(job.cwd.join(&job.home));
+    let Ok(file) = lock::open_lock_file(&path, lock::shared_mode(&dirs)) else {
+        return Ok(None);
+    };
+    match try_key_lock(&file) {
+        Ok(true) => Ok(Some(file)),
+        Ok(false) => Err(path),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The slot lock, and the key lock of a registry or git unit, were inherited from the wrapper (or taken again by `relock`) and stay held until this process exits.
@@ -3406,6 +3674,79 @@ impl PrekeyStats {
     }
 }
 
+/// The checkout root when this unit may share entries across checkouts; every condition is a fact known before compiling.
+fn share_candidate(hasher: &Hasher, cwd: &Path, profile: (&str, &Path), args: &[OsString], parsed: &RustcArgs) -> Result<Root, String> {
+    let (profile, profile_abs) = profile;
+    let no = |reason: &str| Err(reason.to_string());
+    if !crate::config::share_roots() {
+        return Err(String::new());
+    }
+    let Some(manifest) = env::var_os("CARGO_MANIFEST_DIR").filter(|dir| !dir.is_empty()) else {
+        return no("no CARGO_MANIFEST_DIR");
+    };
+    let manifest = cwd.join(manifest);
+    // Cargo caps lints only for crates that are not local, which includes vendored sources.
+    let capped = args.iter().filter_map(|arg| arg.to_str()).any(|arg| arg == "--cap-lints" || arg.starts_with("--cap-lints="));
+    if capped || hasher.in_immutable_root(&manifest) || !manifest.starts_with(cwd) {
+        return no("not a workspace crate of this checkout");
+    }
+    if !share_roots::flags_eligible(&args[1..], &parsed.crate_name, parsed.test_harness) {
+        return no("crate type or flags do not qualify");
+    }
+    let inside = |path: &Path| {
+        let path = cwd.join(path);
+        !path.components().any(|part| part == Component::ParentDir) && (path.starts_with(cwd) || path.starts_with(profile_abs))
+    };
+    for (_, arg) in &parsed.paths {
+        match arg {
+            PathArg::NativeDir(dir) if !inside(dir) => return no("a native directory outside the checkout"),
+            PathArg::MaybeFiles(files) if !files.iter().all(|file| inside(file)) => return no("a link input outside the checkout"),
+            _ => {}
+        }
+    }
+    let main = args.iter().skip(1).filter_map(|arg| arg.to_str()).find(|arg| !arg.starts_with('-') && arg.ends_with(".rs"));
+    if !main.is_some_and(|main| inside(Path::new(main))) {
+        return no("source file outside the checkout");
+    }
+    let Some(root) = Root::new(cwd) else { return no("root unusable") };
+    match points_into_root(&root, profile, &args[1..], parsed, &keyed_env(env::vars_os())) {
+        Some(what) => Err(format!("{what} points into the checkout")),
+        None => Ok(root),
+    }
+}
+
+/// Cargo-provided variables describe the package and the working directory and are tokenised with them; a read of one is caught after the compile.
+fn cargo_path_variable(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"CARGO_")
+}
+
+/// What names the checkout outside the cwd, manifest directory, source, externs and hashed link inputs; a sysroot, SDK or linker location there could differ in content between checkouts.
+fn points_into_root(root: &Root, profile: &str, rest: &[OsString], parsed: &RustcArgs, env: &[(OsString, OsString)]) -> Option<String> {
+    let mentions = |text: &str| {
+        let text = text.replace(profile, PROFILE_TOKEN);
+        root.forms().iter().any(|form| text.contains(form.as_str()))
+    };
+    let hashed: HashSet<usize> = parsed
+        .paths
+        .iter()
+        .filter(|(_, path)| !matches!(path, PathArg::Tool(_)))
+        .map(|(index, _)| *index)
+        .collect();
+    let source = rest.iter().position(|arg| arg.to_str().is_some_and(|arg| !arg.starts_with('-') && arg.ends_with(".rs")));
+    let arg = rest.iter().enumerate().find(|(index, arg)| {
+        let skipped = source == Some(*index)
+            || hashed.contains(index)
+            || parsed.out_dir_args.contains(index)
+            || parsed.incremental_args.contains(index);
+        !skipped && mentions(&arg.to_string_lossy())
+    });
+    if let Some((index, _)) = arg {
+        return Some(format!("argument {index}"));
+    }
+    let var = env.iter().find(|(name, value)| !cargo_path_variable(name) && mentions(&value.to_string_lossy()));
+    var.map(|(name, _)| format!("variable {}", name.to_string_lossy()))
+}
+
 /// Outputs that dependents take as `--extern` inputs and hash into their own keys.
 fn is_dependency_artifact(name: &str) -> bool {
     [".rlib", ".rmeta", ".so", ".dylib", ".dll"].iter().any(|suffix| name.ends_with(suffix))
@@ -3497,12 +3838,39 @@ fn extern_hash_threads_with(
     }
 }
 
+/// Which key domain a pre-key is computed in; `Plain` is the checkout-specific key every build has always used.
+#[derive(Clone, Copy)]
+enum KeyMode<'r> {
+    Plain,
+    /// The specific key of a unit that is compiled with the root remapped, kept apart from unremapped entries.
+    Remapped,
+    Shared(&'r Root),
+}
+
+impl KeyMode<'_> {
+    /// The mode of the checkout-specific key: remapped exactly when the unit also has a shared key, which is when its compile gets the remap flag.
+    fn specific(shared: Option<&Shared>) -> KeyMode<'static> {
+        if shared.is_some() { KeyMode::Remapped } else { KeyMode::Plain }
+    }
+}
+
 impl KeyContext<'_> {
+    #[cfg(test)]
     fn prekey(
         &self,
         tool: &OsString,
         rest: &[OsString],
         parsed: &RustcArgs,
+    ) -> Result<PreKey, String> {
+        self.prekey_in(tool, rest, parsed, KeyMode::Plain)
+    }
+
+    fn prekey_in(
+        &self,
+        tool: &OsString,
+        rest: &[OsString],
+        parsed: &RustcArgs,
+        mode: KeyMode,
     ) -> Result<PreKey, String> {
         let inputs = parsed
             .paths
@@ -3514,9 +3882,10 @@ impl KeyContext<'_> {
             DETACHED_STORE.load(Ordering::Relaxed),
             || thread::available_parallelism().map_or(1, |n| n.get()),
         );
-        self.prekey_with_threads(tool, rest, parsed, threads)
+        self.prekey_in_threads(tool, rest, parsed, threads, mode)
     }
 
+    #[cfg(test)]
     fn prekey_with_threads(
         &self,
         tool: &OsString,
@@ -3524,12 +3893,37 @@ impl KeyContext<'_> {
         parsed: &RustcArgs,
         threads: usize,
     ) -> Result<PreKey, String> {
+        self.prekey_in_threads(tool, rest, parsed, threads, KeyMode::Plain)
+    }
+
+    fn prekey_in_threads(
+        &self,
+        tool: &OsString,
+        rest: &[OsString],
+        parsed: &RustcArgs,
+        threads: usize,
+        mode: KeyMode,
+    ) -> Result<PreKey, String> {
+        let root = match mode {
+            KeyMode::Shared(root) => Some(root),
+            _ => None,
+        };
+        let tokenised = |text: &str| {
+            let text = text.replace(self.profile, PROFILE_TOKEN);
+            root.map_or(text.clone(), |root| root.tokenise(&text))
+        };
         let mut watched = Vec::new();
         let mut extern_hashes = HashMap::new();
         let mut stats = PrekeyStats::default();
         let mut tools = Vec::new();
         let mut hasher = Both(blake3::Hasher::new(), blake3::Hasher::new());
-        hasher.update(b"frust-prekey-v2\0");
+        hasher.update(match mode {
+            KeyMode::Shared(_) => b"frust-prekey-shared-v1\0".as_slice(),
+            _ => b"frust-prekey-v2\0".as_slice(),
+        });
+        if matches!(mode, KeyMode::Remapped) {
+            hasher.update(b"remapped-root-v1\0");
+        }
         if parsed.unhashed_windows_pdb() {
             hasher.update(b"unhashed-windows-pdb-v1\0");
         }
@@ -3538,7 +3932,10 @@ impl KeyContext<'_> {
                 .ok_or("cannot identify the compiler")?
                 .as_bytes(),
         );
-        hasher.update(self.cwd.to_string_lossy().as_bytes());
+        match root {
+            Some(_) => hasher.update(ROOT_TOKEN.as_bytes()),
+            None => hasher.update(self.cwd.to_string_lossy().as_bytes()),
+        }
 
         let mut externs = if threads > 1 {
             let paths: Vec<_> = rest
@@ -3600,11 +3997,7 @@ impl KeyContext<'_> {
                 .map_err(|e| format!("cannot read --extern {}: {e}", path.display()))?;
                 hasher.update(name.as_bytes());
                 hasher.content(hashed.hash.as_bytes());
-                hasher.unit_only(
-                    path.to_string_lossy()
-                        .replace(self.profile, PROFILE_TOKEN)
-                        .as_bytes(),
-                );
+                hasher.unit_only(tokenised(&path.to_string_lossy()).as_bytes());
                 if path.starts_with(self.profile_abs) {
                     extern_hashes.insert(path.clone(), hashed.hash.clone());
                 }
@@ -3614,7 +4007,7 @@ impl KeyContext<'_> {
             if specials.iter().any(|path| matches!(path, PathArg::Tool(_))) {
                 hasher.update(text.as_bytes());
             } else {
-                hasher.update(text.replace(self.profile, PROFILE_TOKEN).as_bytes());
+                hasher.update(tokenised(text).as_bytes());
             }
             for special in specials {
                 match special {
@@ -3691,7 +4084,7 @@ impl KeyContext<'_> {
             hasher.update(b"\0v");
             hasher.update(name.as_encoded_bytes());
             match value.to_str() {
-                Some(text) => hasher.update(text.replace(self.profile, PROFILE_TOKEN).as_bytes()),
+                Some(text) => hasher.update(tokenised(text).as_bytes()),
                 None => hasher.update(value.as_encoded_bytes()),
             }
         }
@@ -3837,6 +4230,10 @@ mod tests {
     }
 
     fn keyed(cwd: &Path, extra: &[&str]) -> Result<PreKey, String> {
+        keyed_in(cwd, extra, KeyMode::Plain)
+    }
+
+    fn keyed_in(cwd: &Path, extra: &[&str], mode: KeyMode) -> Result<PreKey, String> {
         let out_dir = cwd.join("target").join("debug").join("deps");
         let mut args: Vec<OsString> = ["--crate-name", "k", "--emit=dep-info,link", "--out-dir"]
             .iter()
@@ -3855,7 +4252,27 @@ mod tests {
             profile: &profile,
             profile_abs: Path::new(&profile),
         };
-        ctx.prekey(&OsString::from("rustc"), &args, &parsed)
+        ctx.prekey_in(&OsString::from("rustc"), &args, &parsed, mode)
+    }
+
+    #[test]
+    fn shared_keys_of_equal_checkouts_match_while_the_other_domains_keep_the_root() {
+        let (a, b) = (Scratch::new("share-a"), Scratch::new("share-b"));
+        let flags = ["--crate-type", "lib", "src/lib.rs"];
+        let shared = |cwd: &Path| {
+            let root = Root::new(cwd).unwrap();
+            keyed_in(cwd, &flags, KeyMode::Shared(&root)).unwrap()
+        };
+        let (shared_a, shared_b) = (shared(&a.0), shared(&b.0));
+        assert_eq!(shared_a.key, shared_b.key);
+        assert_eq!(shared_a.unit, shared_b.unit);
+        assert_ne!(key(&a.0, &flags).unwrap(), key(&b.0, &flags).unwrap(), "the plain key hashes the root");
+        let remapped = |cwd: &Path| keyed_in(cwd, &flags, KeyMode::Remapped).unwrap().key;
+        assert_ne!(remapped(&a.0), remapped(&b.0));
+        let domains = [shared_a.key.clone(), key(&a.0, &flags).unwrap(), remapped(&a.0)];
+        assert!(domains[0] != domains[1] && domains[1] != domains[2] && domains[0] != domains[2], "the domains never collide");
+        let other = keyed_in(&a.0, &["--crate-type", "lib", "src/other.rs"], KeyMode::Shared(&Root::new(&a.0).unwrap())).unwrap();
+        assert_ne!(other.key, shared_a.key, "arguments still count in the shared domain");
     }
 
     #[test]
@@ -5068,6 +5485,8 @@ mod tests {
             args,
             prekey: "ab".repeat(20),
             unit: None,
+            root: None,
+            lock_prekey: None,
             trust: "on".to_string(),
             compile_ms: 7,
             // Far enough ahead that the freshly written source is not "too new" for this compile.
@@ -5304,7 +5723,7 @@ mod tests {
             |job: &mut StoreJob| job.key_lock = Some(PathBuf::from("another-key")),
             |job: &mut StoreJob| job.prekey = "../bad-key".to_string(),
             |job: &mut StoreJob| job.trust = "unknown".to_string(),
-            |job: &mut StoreJob| job.format -= 1,
+            |job: &mut StoreJob| job.format = LEGACY_JOB_FORMAT - 1,
         ];
         for mutate in mutations {
             let mut malformed = job.clone();
@@ -5682,7 +6101,7 @@ mod tests {
         encoded.as_object_mut().unwrap().remove("context");
         assert!(serde_json::from_value::<StoreJob>(encoded).is_err());
         let mut old = job.clone();
-        old.format = JOB_FORMAT - 1;
+        old.format = JOB_FORMAT - 2;
         assert!(Plan::from_job(&old, &cfg).is_none());
         let mut relative = job.clone();
         relative.cwd = PathBuf::from("relative");
@@ -6846,6 +7265,94 @@ mod tests {
     }
 
     #[test]
+    fn a_job_filed_under_a_shared_key_tokenises_against_its_checkout_or_is_refused() {
+        let s = Scratch::new("shared-job");
+        let (mut job, _, _) = fixture(&s);
+        let root = s.0.to_str().unwrap().to_string();
+        job.unit = Some("cd".repeat(20));
+        job.root = Some("/x".to_string());
+        assert!(Plan::from_job(&job, &Config::from_env()).is_none(), "a root too short to match safely");
+        job.root = Some(root.clone());
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        assert_eq!(plan.target().root.map(Root::as_str), Some(root.as_str()));
+        assert_eq!(plan.target().prekey, job.prekey);
+        assert_eq!(plan.norm(&format!("{root}/src/lib.rs")), format!("{ROOT_TOKEN}/src/lib.rs"));
+        assert_eq!(plan.resolve(&format!("{ROOT_TOKEN}/src/lib.rs")), s.0.join("src/lib.rs"));
+        job.root = None;
+        let plain = Plan::from_job(&job, &Config::from_env()).unwrap();
+        assert!(plain.target().root.is_none());
+        assert_eq!(plain.norm(&format!("{root}/src/lib.rs")), format!("{root}/src/lib.rs"));
+    }
+
+    #[test]
+    fn queued_jobs_of_two_checkouts_with_one_shared_key_are_named_by_their_own_keys() {
+        let s = Scratch::new("queued-names");
+        let (job, _, _) = fixture(&s);
+        let dir = s.0.join("queue");
+        let (a, b) = ("aa".repeat(20), "bb".repeat(20));
+        let [first, second] = [&a, &b].map(|key| StoreJob { lock_prekey: Some(key.clone()), ..job.clone() });
+        let _leases = [write_queued_job(&dir, &first).unwrap(), write_queued_job(&dir, &second).unwrap()];
+        let mut keys: Vec<String> = queued_jobs(&dir).into_iter().map(|queued| queued.prekey).collect();
+        keys.sort();
+        assert_eq!(keys, [a, b], "a drain keeps the newest job of each checkout instead of one per shared key");
+        let (path, _lease) = write_queued_job(&dir, &job).unwrap();
+        assert!(path.to_string_lossy().ends_with(&format!("-q{}.json", job.prekey)), "an unshared job keeps its own key");
+    }
+
+    #[test]
+    fn only_the_current_and_the_unshared_legacy_job_formats_are_readable() {
+        let s = Scratch::new("job-formats");
+        let (job, _, _) = fixture(&s);
+        assert!(job.readable());
+        let legacy = StoreJob { format: LEGACY_JOB_FORMAT, ..job.clone() };
+        assert!(legacy.readable() && Plan::from_job(&legacy, &Config::from_env()).unwrap().target().root.is_none());
+        let shared_legacy = StoreJob { root: Some(s.0.to_string_lossy().into_owned()), unit: Some("cd".repeat(20)), ..legacy.clone() };
+        assert!(!shared_legacy.readable(), "a legacy job cannot carry shared-key fields");
+        for format in [JOB_FORMAT + 1, LEGACY_JOB_FORMAT - 1, 0] {
+            assert!(!StoreJob { format, ..job.clone() }.readable(), "format {format}");
+        }
+        assert_eq!(JOB_FORMAT, LEGACY_JOB_FORMAT + 1, "older binaries accept only their own number, so the new format is unusable to them");
+    }
+
+    #[test]
+    fn the_remapped_key_domain_is_chosen_only_for_a_unit_with_a_shared_key() {
+        let s = Scratch::new("remapped-mode");
+        let shared = Shared { root: Root::new(&s.0).unwrap(), prekey: "ab".repeat(20), unit: "cd".repeat(20) };
+        assert!(matches!(KeyMode::specific(Some(&shared)), KeyMode::Remapped));
+        assert!(matches!(KeyMode::specific(None), KeyMode::Plain));
+    }
+
+    #[test]
+    fn a_toolchain_location_inside_the_checkout_keeps_the_unit_specific() {
+        let s = Scratch::new("toolchain-in-root");
+        let root = Root::new(&s.0).unwrap();
+        let deps = s.0.join("target").join("debug").join("deps");
+        let profile = deps.parent().unwrap().to_string_lossy().into_owned();
+        let check = |extra: &[String], env: &[(&str, PathBuf)]| {
+            let mut args: Vec<OsString> =
+                ["--crate-name", "k", "--emit=dep-info,link", "--crate-type", "lib", "--out-dir"].iter().map(OsString::from).collect();
+            args.push(deps.clone().into_os_string());
+            args.push("src/lib.rs".into());
+            args.extend(extra.iter().map(OsString::from));
+            let parsed = rustc_args::parse(&args).unwrap();
+            let env: Vec<(OsString, OsString)> = env.iter().map(|(name, value)| ((*name).into(), value.clone().into_os_string())).collect();
+            points_into_root(&root, &profile, &args, &parsed, &env).is_some()
+        };
+        let inside = |tail: &str| s.0.join(tail);
+        for name in ["CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH", "CARGO_RUSTC_CURRENT_DIR"] {
+            assert!(!check(&[], &[(name, inside("crates/k"))]), "cargo's own {name} may name the checkout");
+        }
+        assert!(!check(&["-L".into(), format!("dependency={}", deps.display())], &[]), "the profile directory is tokenised first");
+        assert!(!check(&["-L".into(), format!("native={}", inside("native").display())], &[]), "hashed link directories are fine");
+        assert!(check(&["--cfg".into(), format!("toolchain=\"{}\"", inside("sdk/sysroot").display())], &[]), "an argument with a path that nothing hashes");
+        assert!(check(&["-C".into(), format!("linker={}", inside("tools/ld").display())], &[]));
+        for name in ["SDKROOT", "DEVELOPER_DIR", "COMPILER_PATH", "GCC_EXEC_PREFIX", "RUST_TARGET_PATH"] {
+            assert!(check(&[], &[(name, inside("sdk"))]), "{name}");
+        }
+        assert!(!check(&[], &[("SDKROOT", PathBuf::from("/Applications/Xcode.app/sdk"))]), "a toolchain outside the checkout is the same everywhere");
+    }
+
+    #[test]
     fn other_queued_stores_keep_the_key_lock_until_they_publish() {
         // (unit, primary, incremental): registry, non-primary path, primary non-incremental, non-primary incremental
         let cases = [(None, false, false), (Some("u"), false, false), (Some("u"), true, false), (Some("u"), false, true)];
@@ -6977,9 +7484,10 @@ mod tests {
         }
         fs::write(deferred.join("job-1-50.json"), b"x").unwrap();
         let mut ran = Vec::new();
-        drain_queue(&deferred, |file| {
+        drain_queue(&deferred, &mut HandedBack::default(), |file| {
             let name = file.0.file_name().unwrap().to_str().unwrap();
             ran.push(name.split_once(&format!("{}-", std::process::id())).unwrap().1.to_string());
+            Drained::Done
         });
         assert_eq!(ran, [format!("1-300-q{a}.json"), format!("1-200-q{b}.json")]);
         assert_eq!(file_names(&deferred), ["job-1-50.json"], "a job meant for its own helper is left alone");
@@ -6991,7 +7499,7 @@ mod tests {
         let (job, _, _) = fixture(&s);
         let deferred = s.0.join("deferred");
         let (_, lease) = write_queued_job(&deferred, &job).unwrap();
-        drain_queue(&deferred, run_queued);
+        drain_queue(&deferred, &mut HandedBack::default(), run_queued);
         drop(lease);
         assert_eq!(rows(&job), 1);
         assert!(file_names(&deferred).is_empty());
@@ -7004,7 +7512,7 @@ mod tests {
         let deferred = s.0.join("deferred");
         let (_, lease) = write_queued_job(&deferred, &job).unwrap();
         fs::write(&rlib, b"object rewritten after the freeze").unwrap();
-        drain_queue(&deferred, run_queued);
+        drain_queue(&deferred, &mut HandedBack::default(), run_queued);
         drop(lease);
         assert_eq!(rows(&job), 0);
         assert!(file_names(&deferred).is_empty());
@@ -7029,6 +7537,10 @@ mod tests {
 
     #[test]
     fn a_claimed_job_of_a_dead_process_is_adopted_and_stored() {
+        // A child forked by a concurrent test can briefly share the job's lease and make it look owned.
+        if crate::isolated_test(module_path!(), "a_claimed_job_of_a_dead_process_is_adopted_and_stored") {
+            return;
+        }
         let s = Scratch::new("adopt-dead");
         let (job, _, _) = fixture(&s);
         let deferred = s.0.join("deferred");
@@ -7098,6 +7610,134 @@ mod tests {
         assert!(!path.exists());
         assert!(deferred_protection(&dirs).protects(&output));
         drop((claimed, lease));
+    }
+
+    /// A queued job whose store needs the unit key lock, as a lent registry unit's does.
+    fn keyed_queued_job(s: &Scratch) -> (StoreJob, Dirs, PathBuf) {
+        let (mut job, _, _) = fixture(s);
+        let dirs = Dirs::at(&job.home);
+        let key = keylock_path(&dirs, &job.prekey);
+        job.key_lock = Some(key.clone());
+        let (_, lease) = write_queued_job(&dirs.deferred(), &job).unwrap();
+        drop(lease);
+        (job, dirs, key)
+    }
+
+    /// Runs `drain` on a thread and reports whether it returned within `cap`.
+    fn returns_within(cap: Duration, drain: impl FnOnce() + Send + 'static) -> bool {
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drain();
+            let _ = done.send(());
+        });
+        finished.recv_timeout(cap).is_ok()
+    }
+
+    #[test]
+    fn a_drain_holding_the_only_slot_never_waits_on_a_key_lock_held_by_a_store_waiting_for_that_slot() {
+        // Children forked by concurrent tests briefly share open lock descriptions.
+        if crate::isolated_test(module_path!(), "a_drain_holding_the_only_slot_never_waits_on_a_key_lock_held_by_a_store_waiting_for_that_slot") {
+            return;
+        }
+        let s = Scratch::new("queue-key-abba");
+        let (job, dirs, key) = keyed_queued_job(&s);
+        let deferred = dirs.deferred();
+        let slot = acquire_slot(&deferred, 1).unwrap();
+        // A broker worker holds the lent key lock and waits for a slot.
+        let (held, key_taken) = std::sync::mpsc::channel();
+        let worker = {
+            let (dirs, key, deferred) = (Dirs::at(&job.home), key.clone(), deferred.clone());
+            thread::spawn(move || {
+                let file = open_key_lock(&dirs, &key).unwrap();
+                sys::lock(&file, LockKind::Exclusive).unwrap();
+                held.send(()).unwrap();
+                let begun = Instant::now();
+                while begun.elapsed() < Duration::from_secs(20) {
+                    if let Some(slot) = acquire_slot(&deferred, 1) {
+                        drop((file, slot));
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                false
+            })
+        };
+        key_taken.recv().unwrap();
+        let drained = deferred.clone();
+        assert!(
+            returns_within(Duration::from_secs(5), move || {
+                drain_all(&drained);
+            }),
+            "the drain waited on a key lock while holding the slot"
+        );
+        assert_eq!(rows(&job), 0);
+        assert_eq!(queued_jobs(&deferred).len(), 1, "the job is handed back unclaimed");
+        drop(slot);
+        assert!(worker.join().unwrap(), "the key holder got the slot once the drain let go");
+        let slot = acquire_slot(&deferred, 1).unwrap();
+        drain_all(&deferred);
+        drop(slot);
+        assert_eq!(rows(&job), 1);
+        assert!(queued_jobs(&deferred).is_empty() && orphaned_jobs(&deferred).is_empty());
+    }
+
+    #[test]
+    fn a_drainer_gives_back_its_slot_to_a_key_holder_waiting_for_it_and_then_stores_the_job() {
+        if crate::isolated_test(module_path!(), "a_drainer_gives_back_its_slot_to_a_key_holder_waiting_for_it_and_then_stores_the_job") {
+            return;
+        }
+        let s = Scratch::new("queue-key-drainer");
+        let (job, dirs, key) = keyed_queued_job(&s);
+        let deferred = dirs.deferred();
+        let key_file = open_key_lock(&dirs, &key).unwrap();
+        sys::lock(&key_file, LockKind::Exclusive).unwrap();
+        let drained = deferred.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drain_slotted(&drained, Duration::from_secs(20));
+            let _ = done.send(());
+        });
+        // Time for the drainer to take the slot and find the key busy; it must then give the slot back to this key holder.
+        thread::sleep(Duration::from_millis(200));
+        let begun = Instant::now();
+        let slot = loop {
+            if let Some(slot) = acquire_slot(&deferred, 1) {
+                break slot;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(5), "the drainer kept the slot while the key was busy");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(rows(&job), 0);
+        drop((key_file, slot));
+        finished.recv_timeout(Duration::from_secs(10)).expect("the drainer retried once the key was free");
+        assert_eq!(rows(&job), 1);
+        assert!(queued_jobs(&deferred).is_empty() && orphaned_jobs(&deferred).is_empty());
+    }
+
+    #[test]
+    fn a_helper_draining_a_job_of_the_key_lock_it_still_holds_hands_it_back() {
+        // Children forked by concurrent tests briefly share open lock descriptions.
+        if crate::isolated_test(module_path!(), "a_helper_draining_a_job_of_the_key_lock_it_still_holds_hands_it_back") {
+            return;
+        }
+        let s = Scratch::new("queue-key-self");
+        let (job, dirs, key) = keyed_queued_job(&s);
+        let deferred = dirs.deferred();
+        // The helper of an earlier store of this unit still holds its inherited key lock.
+        let inherited = open_key_lock(&dirs, &key).unwrap();
+        sys::lock(&inherited, LockKind::Exclusive).unwrap();
+        let drained = deferred.clone();
+        assert!(
+            returns_within(Duration::from_secs(5), move || {
+                drain_all(&drained);
+            }),
+            "the drain waited on a key lock its own process holds"
+        );
+        assert_eq!(queued_jobs(&deferred).len(), 1, "the job is handed back unclaimed");
+        drop(inherited);
+        drain_all(&deferred);
+        assert_eq!(rows(&job), 1);
+        assert!(queued_jobs(&deferred).is_empty());
     }
 
     #[test]

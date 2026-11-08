@@ -1499,6 +1499,14 @@ pub fn lower_thread_priority() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
 }
 
+/// Background mode also lowers I/O and memory priority and can starve; a store only yields CPU to builds.
+pub fn lower_store_priority() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    // SAFETY: the pseudo handle of the current thread is always valid; failure only leaves the priority unchanged.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+}
+
 pub fn fs_type_name(path: &Path) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
     const DRIVE_UNKNOWN: u32 = 0;
@@ -1542,6 +1550,7 @@ mod compact_hashing_tests {
     #[test]
     fn lowering_priority_on_a_spawned_thread_returns() {
         std::thread::spawn(lower_thread_priority).join().unwrap();
+        std::thread::spawn(lower_store_priority).join().unwrap();
     }
 
     #[test]

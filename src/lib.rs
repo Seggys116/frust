@@ -15,6 +15,7 @@ pub mod linking;
 pub mod lock;
 pub mod paths;
 pub mod run;
+pub mod share_roots;
 pub mod signals;
 pub mod stats;
 pub(crate) mod store_broker;

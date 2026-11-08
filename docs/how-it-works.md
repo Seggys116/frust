@@ -33,7 +33,50 @@ stays inactive. `frust doctor` says so.
 
 Workspace crates are keyed by their absolute directory, because their outputs embed absolute paths. Each git
 worktree or clone therefore misses once for its own crates, while registry and git crates hit across worktrees.
-Sharing workspace crate entries across roots is not done.
+`FRUST_CACHE_SHARE_ROOTS=on` (off by default) lets a provable subset of workspace crates share entries across
+checkouts; see [sharing across checkouts](#sharing-across-checkouts-opt-in).
+
+### Sharing across checkouts (opt-in)
+
+With the knob on, a unit that qualifies is also keyed in a second, *shared* domain: the checkout root (rustc's
+working directory, which cargo sets to the workspace root) is replaced by a token in the key's directory component,
+in the arguments, in `--extern` paths and in the keyed `CARGO_*` values, so two checkouts with the same layout and
+the same file contents compute the same key. Entries filed under it store their dep-info, diagnostics and input
+paths with the same token, and a restore substitutes the current checkout. The shared domain has its own key prefix,
+so shared and checkout-specific keys never collide. Lookup tries the shared key, then the checkout-specific one.
+
+A unit qualifies when, before compiling, it is a library or binary (not a build script, proc macro, cdylib or
+dylib), is not a test harness, has a source file and manifest inside the checkout, uses no
+`-C rpath` or user `--remap-path-prefix`, has no `-L native=` directory or link input outside the checkout and the
+target directory, and is not a vendored or registry source. A qualifying unit is compiled with
+`--remap-path-prefix=<root>=/frust-root`, added by the wrapper after cargo's arguments, so no fingerprint
+changes. After the compile the entry goes under the shared key only if (a) dep-info records no
+`CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_TARGET_DIR` or other variable whose value mentions the checkout or the
+target directory, and (b) none of the unit's output files contains the checkout or target directory as text. Otherwise
+the entry is stored under the checkout-specific key, so a crate that did `env!("CARGO_MANIFEST_DIR")` or whose
+proc macro embedded a path is never shared. Dependents hash their `--extern` libraries by content, so a unit that
+depends on a crate that is not shared simply misses in the other checkout.
+
+Residual risks: the remap covers paths rustc embeds, not every artifact (a binary may still carry the target
+directory, for example in Mach-O debug-map entries or a Windows PDB path, which then keeps it out of the shared
+domain); debuggers may need `set substitute-path /frust-root <checkout>` for a restored library; restored
+artifacts are not byte-identical to an unremapped build; with a `-C debuginfo` level above 0 the placeholder path
+appears in debug information. Incremental units (the dev-profile default for workspace crates) share too: the
+incremental session directory is not part of any key, and the shared unit identity used for retention is
+root-independent. A hit in another checkout restores the outputs but leaves no incremental session there, as any
+hit does, so the first edit in that checkout compiles the crate fully. Because the remap flag is part of rustc's
+incremental options, turning the knob on or off invalidates a checkout's existing session once. Units are
+retained one version per unit identity, and the shared identity is common to all checkouts, so two checkouts
+editing the same crate evict each other's older entries; that is accepted. Tokenising treats the root as a whole leading path (a sibling
+such as `<root> 2` or `<root>+x` is left alone) and recognises the verbatim (`\\?\`) and forward-slash spellings on
+Windows; a spelling it misses is merely not tokenised, which only costs sharing. The output scan is stricter on
+purpose: on Windows and macOS, whose volumes ignore case, it ignores case and separator style, so an artifact that
+embeds the checkout in any spelling is never shared. Only the working directory, `CARGO_MANIFEST_DIR`, the source
+file, `--extern` paths, `-L dependency=` paths and hashed link inputs may name the checkout; a unit whose other
+arguments or keyed environment variables (a repo-local `SDKROOT`, `DEVELOPER_DIR`, linker or sysroot location)
+point inside it keeps its checkout-specific key, because their contents could differ between checkouts. Queued
+store jobs are named by the checkout-specific key, so checkouts never drop each other's jobs, and job files carry a
+new format number that older binaries refuse.
 
 ## Stamp trust and audits
 
