@@ -12,6 +12,7 @@ const STORE_TOP_MARKDOWN: usize = 10;
 const FILES_PER_QUERY: usize = 63;
 const DEFAULT_EDITS: usize = 20;
 const DEFAULT_REPO_RUNS: usize = 3;
+const DEFAULT_SHARED_RUNS: usize = 1;
 const NOOP_REPEATS: usize = 3;
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
 const REPORT_SCHEMA_VERSION: u32 = 3;
@@ -29,6 +30,9 @@ const GATE_COLD_RATIO: f64 = 1.0;
 const GATE_COLD_SLACK_MS: f64 = 100.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
 const GATE_CLEAN_SLACK_MS: f64 = 100.0;
+const GATE_SHARED_RATIO: f64 = 0.6;
+const GATE_SHARED_SLACK_MS: f64 = 100.0;
+const SHARED_NOTE: &str = "Shared-cache phases build a second (and, with root sharing, third) checkout of the repository against the frust home the main phases filled, with an empty target. They are measured against plain cargo's empty-cache cold median; they run after the disk figures are taken and never enter the disk comparison.";
 
 const CLASSES: [&str; 5] = ["registry-git", "path", "unknown", "build-script", "proc-macro"];
 const EXTENSIONS: [&str; 6] = ["rlib", "rmeta", "dylib", "bin", "d", "other"];
@@ -58,6 +62,7 @@ struct RepoOptions {
     features: Option<String>,
     disk_slack: f64,
     untuned_runs: Option<usize>,
+    shared_runs: usize,
 }
 
 fn positive(name: &str, value: &str) -> Result<usize, String> {
@@ -73,6 +78,7 @@ impl RepoOptions {
         let mut features = None;
         let mut disk_slack = 0.0;
         let mut untuned_runs = None;
+        let mut shared_runs = DEFAULT_SHARED_RUNS;
         let (mut edits, mut runs) = (DEFAULT_EDITS, DEFAULT_REPO_RUNS);
         let (mut json, mut markdown, mut gate) = (false, false, false);
         let mut index = 0;
@@ -86,7 +92,7 @@ impl RepoOptions {
                 "--json" if inline.is_none() => json = true,
                 "--markdown" if inline.is_none() => markdown = true,
                 "--gate" if inline.is_none() => gate = true,
-                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" => {
+                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" | "--shared-runs" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -102,6 +108,9 @@ impl RepoOptions {
                         "--edits" => edits = positive(name, value)?,
                         "--runs" => runs = positive(name, value)?,
                         "--untuned-runs" => untuned_runs = Some(positive(name, value)?),
+                        "--shared-runs" => {
+                            shared_runs = value.trim().parse::<usize>().map_err(|_| format!("{name} needs a non-negative integer, got `{value}`"))?;
+                        }
                         "--package" => package = Some(value.to_string()),
                         "--features" => features = Some(value.to_string()),
                         "--disk-slack" => {
@@ -116,7 +125,7 @@ impl RepoOptions {
             index += 1;
         }
         let repo = repo.ok_or("--repo PATH is required")?;
-        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs })
+        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs, shared_runs })
     }
 
     // The untuned column is a reference, so it may run on fewer of the paired runs than the gated columns.
@@ -904,6 +913,41 @@ struct GateCheck {
     ratio_max: Option<f64>,
 }
 
+// One cold build of a fresh checkout against a home that already holds its dependencies.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SharedRun {
+    ms: f64,
+    units: usize,
+    hit_units: usize,
+    miss_units: usize,
+    miss_crates: usize,
+    restored_files: u64,
+    // Physical bytes of the checkout's central target, and the part of them shared with store entries by link or clone.
+    target_bytes: u64,
+    restored_bytes: u64,
+    // Physical growth of the whole frust home across the build, with the checkout's target still in place.
+    home_growth_bytes: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SharedPhase {
+    name: &'static str,
+    roots: bool,
+    runs: Vec<SharedRun>,
+    median_ms: Option<f64>,
+    // Plain cargo's empty-cache cold median from the main phase, the reference cargo has no shared state to improve on.
+    cargo_cold_ms: Option<f64>,
+    ratio: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SharedReport {
+    requested_runs: usize,
+    note: &'static str,
+    phases: Vec<SharedPhase>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RepoReport {
     schema_version: u32,
@@ -932,6 +976,8 @@ struct RepoReport {
     features: Option<String>,
     gate: Option<Vec<GateCheck>>,
     gate_untuned: Option<Vec<GateCheck>>,
+    shared: Option<SharedReport>,
+    gate_shared: Option<Vec<GateCheck>>,
 }
 
 // The effective tuning each frust column reported through `frust env`; absent when that build does not print it.
@@ -1033,6 +1079,39 @@ fn evaluate_gate_for(cargo: &Samples, frust: &Samples, windows: bool) -> Vec<Gat
     checks
 }
 
+// Summarises one shared-cache build from its wrapper records and the sizes taken around it.
+fn shared_run(ms: f64, summary: &TimingSummary, target_bytes: u64, restored_bytes: u64, home_growth_bytes: i64) -> SharedRun {
+    SharedRun {
+        ms,
+        units: summary.units,
+        hit_units: summary.store_modes.get("hit").copied().unwrap_or(0),
+        miss_units: summary.miss_units,
+        miss_crates: summary.miss_crates,
+        restored_files: summary.restore_paths.values().sum(),
+        target_bytes,
+        restored_bytes,
+        home_growth_bytes,
+    }
+}
+
+fn shared_phase(name: &'static str, roots: bool, runs: Vec<SharedRun>, cargo_cold: &[f64]) -> SharedPhase {
+    let times: Vec<f64> = runs.iter().map(|r| r.ms).collect();
+    let median_ms = median_of(&times);
+    let cargo_cold_ms = median_of(cargo_cold);
+    let ratio = median_ms.zip(cargo_cold_ms).filter(|(_, c)| *c > 0.0).map(|(m, c)| m / c);
+    SharedPhase { name, roots, runs, median_ms, cargo_cold_ms, ratio }
+}
+
+// A warm-cache cold build must clearly beat an empty-cache cargo build; unlike the paired rows it compares medians of different counts.
+fn shared_check(phase: &SharedPhase) -> Option<GateCheck> {
+    let (ratio, base) = phase.ratio.zip(phase.cargo_cold_ms)?;
+    Some(ratio_check(phase.name, ratio, base, GATE_SHARED_RATIO, GATE_SHARED_SLACK_MS))
+}
+
+fn evaluate_shared_gate(shared: &SharedReport) -> Vec<GateCheck> {
+    shared.phases.iter().filter_map(shared_check).collect()
+}
+
 fn disk_verdict(cargo_bytes: u64, frust_bytes: u64, slack_pct: f64) -> Result<(), String> {
     let allowed = if slack_pct > 0.0 { (cargo_bytes as f64 * (1.0 + slack_pct / 100.0)) as u64 } else { cargo_bytes };
     if frust_bytes > allowed {
@@ -1046,10 +1125,14 @@ fn disk_verdict(cargo_bytes: u64, frust_bytes: u64, slack_pct: f64) -> Result<()
     Ok(())
 }
 
+fn shared_error(report: &RepoReport) -> bool {
+    report.shared.as_ref().is_some_and(|s| s.error.is_some())
+}
+
 fn exit_code(report: &RepoReport) -> i32 {
-    if !report.disk_tuned.ok {
+    if !report.disk_tuned.ok || shared_error(report) {
         1
-    } else if report.gate.as_ref().is_some_and(|checks| checks.iter().any(|c| !c.pass)) {
+    } else if report.gate.iter().chain(&report.gate_shared).flatten().any(|c| !c.pass) {
         2
     } else {
         0
@@ -1063,6 +1146,10 @@ fn overall_status(report: &RepoReport) -> String {
     }
     if let Some(checks) = &report.gate {
         failed.extend(checks.iter().filter(|c| !c.pass).map(|c| c.name.as_str()));
+    }
+    failed.extend(report.gate_shared.iter().flatten().filter(|c| !c.pass).map(|c| c.name.as_str()));
+    if shared_error(report) {
+        failed.push("shared");
     }
     if failed.is_empty() { "pass".to_string() } else { format!("fail: {}", failed.join(", ")) }
 }
@@ -1178,8 +1265,42 @@ fn breakdown_lines(b: &DiskBreakdown) -> Vec<String> {
     lines
 }
 
+fn signed_bytes(bytes: i64) -> String {
+    let text = human_bytes(bytes.unsigned_abs());
+    if bytes < 0 { format!("-{text}") } else { text }
+}
+
+const SHARED_HEADER: [&str; 9] = ["phase", "frust-tuned", "cargo cold", "ratio", "units hit / missed", "restored files", "target", "restored by link or clone", "home growth"];
+
+// One row per shared-cache phase: the median time against plain cargo's empty-cache cold median and the last run's cache behaviour.
+fn shared_rows(shared: &SharedReport, gate: Option<&Vec<GateCheck>>) -> Vec<Vec<String>> {
+    let mut header: Vec<String> = SHARED_HEADER.iter().map(|h| h.to_string()).collect();
+    if gate.is_some() {
+        header.push("gate".to_string());
+    }
+    let mut rows = vec![header];
+    for phase in &shared.phases {
+        let mut cells = vec![phase.name.to_string(), fmt_ms(phase.median_ms), fmt_ms(phase.cargo_cold_ms), fmt_ratio(phase.ratio)];
+        match phase.runs.last() {
+            Some(run) => cells.extend([
+                format!("{} / {}", run.hit_units, run.miss_units),
+                run.restored_files.to_string(),
+                human_bytes(run.target_bytes),
+                human_bytes(run.restored_bytes),
+                signed_bytes(run.home_growth_bytes),
+            ]),
+            None => cells.extend(vec!["n/a".to_string(); 5]),
+        }
+        if let Some(checks) = gate {
+            cells.push(checks.iter().find(|c| c.name == phase.name).map_or("n/a", |c| if c.pass { "pass" } else { "fail" }).to_string());
+        }
+        rows.push(cells);
+    }
+    rows
+}
+
 fn gate_failure_lines(report: &RepoReport) -> Vec<String> {
-    report.gate.iter().flatten().filter(|c| !c.pass).map(|c| {
+    report.gate.iter().chain(&report.gate_shared).flatten().filter(|c| !c.pass).map(|c| {
         format!("{}: frust-tuned {:.1} ms against cargo {:.1} ms is {:.2}x, limit {}", c.name, c.frust_ms, c.cargo_ms, c.ratio, c.limit)
     }).collect()
 }
@@ -1232,6 +1353,14 @@ fn repo_markdown(report: &RepoReport) -> String {
         ));
         out.push_str(&markdown_table(&miss_rows(summary, MISS_TOP_MARKDOWN)));
     }
+    if let Some(shared) = &report.shared {
+        out.push_str(&format!("\n#### Second checkout with a warm shared cache ({} run{})\n\n{}\n\n", shared.requested_runs, if shared.requested_runs == 1 { "" } else { "s" }, shared.note));
+        if let Some(error) = &shared.error {
+            out.push_str(&format!("Shared-cache phases failed: {error}\n"));
+        } else {
+            out.push_str(&markdown_table(&shared_rows(shared, report.gate_shared.as_ref())));
+        }
+    }
     if let Some(message) = &report.disk_tuned.message {
         out.push_str(&format!("\n{message}\n"));
     }
@@ -1279,6 +1408,17 @@ fn print_repo(report: &RepoReport) {
     }
     for line in sharing_lines(&report.frust_timings) {
         println!("{line}");
+    }
+    if let Some(shared) = &report.shared {
+        match &shared.error {
+            Some(error) => println!("Shared-cache phases failed: {error}"),
+            None => {
+                println!("Second checkout with a warm shared cache:");
+                for line in aligned(&shared_rows(shared, report.gate_shared.as_ref())) {
+                    println!("  {line}");
+                }
+            }
+        }
     }
     if let Some(message) = &report.disk_tuned.message {
         println!("{message}");
@@ -1549,6 +1689,11 @@ impl Rig<'_> {
 
     // `row` names the table row; frust builds also record per-wrapper timings under it.
     fn build(&self, tool: Tool, row: &str) -> Result<f64, String> {
+        self.build_in(tool, row, self.repo, false)
+    }
+
+    // `share_roots` turns on the opt-in worktree sharing for this one build, so checkouts other than the rig's own can hit workspace crates.
+    fn build_in(&self, tool: Tool, row: &str, repo: &Path, share_roots: bool) -> Result<f64, String> {
         let column = self.column(tool);
         if let Some(column) = column {
             self.quiesce(column);
@@ -1563,8 +1708,11 @@ impl Rig<'_> {
             Tool::CargoTuned => Some(self.cargo_tuned_target.as_path()),
             _ => None,
         };
-        let mut cmd = build_command(ctx, tool.is_frust(), self.repo, target, &args, "off");
+        let mut cmd = build_command(ctx, tool.is_frust(), repo, target, &args, "off");
         cmd.env("CARGO_NET_OFFLINE", "false");
+        if share_roots {
+            cmd.env("FRUST_CACHE_SHARE_ROOTS", "on");
+        }
         if let Some(column) = column {
             apply_tuning(&mut cmd, column.tuned);
         }
@@ -1626,6 +1774,83 @@ impl Rig<'_> {
         apply_tuning(&mut cmd, column.tuned);
         let output = cmd.output().ok().filter(|o| o.status.success())?;
         parse_tuning(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+// Copies a working tree for use as another checkout, leaving the top-level target directory behind; the lockfile and sources are identical.
+fn copy_checkout(src: &Path, dst: &Path) -> Result<(), String> {
+    fn copy(src: &Path, dst: &Path, top: bool) -> std::io::Result<()> {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if top && name == "target" {
+                continue;
+            }
+            let (from, to) = (entry.path(), dst.join(&name));
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                copy(&from, &to, false)?;
+            } else if kind.is_symlink() {
+                sys::copy_symlink(&from, &to)?;
+            } else {
+                fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+    copy(src, dst, true).map_err(|e| format!("copying {} to {}: {e}", src.display(), dst.display()))
+}
+
+impl Rig<'_> {
+    // One cold build of a fresh checkout, the central target for that checkout removed afterwards; the frust home keeps what it learned.
+    fn shared_build(&self, checkout: &Path, row: &str, share_roots: bool) -> Result<SharedRun, String> {
+        let column = &self.tuned;
+        self.quiesce(column);
+        let home = column.ctx.home.as_path();
+        let store = column.dirs.store();
+        let central = workspace::central_target(&column.dirs, Some(&canonical(checkout)), &column.ctx.probe_id);
+        let before = compact::physical_size(&[home]);
+        let ms = self.build_in(Tool::FrustTuned, row, checkout, share_roots)?;
+        let target_bytes = compact::physical_size(&[central.as_path()]);
+        let store_bytes = compact::physical_size(&[store.as_path()]);
+        let union = compact::physical_size(&[central.as_path(), store.as_path()]);
+        let restored_bytes = (target_bytes + store_bytes).saturating_sub(union);
+        let growth = compact::physical_size(&[home]) as i64 - before as i64;
+        clear(&central)?;
+        let summary = column.timings.borrow_mut().remove(row).unwrap_or_default();
+        Ok(shared_run(ms, &summary, target_bytes, restored_bytes, growth))
+    }
+
+    // Checkout B builds with the default keys; with root sharing, B is first rebuilt once untimed to store root-token entries and a fresh checkout C is measured.
+    fn shared_phases(&self, runs: usize, cargo_cold: &[f64]) -> Result<Vec<SharedPhase>, String> {
+        let (mut plain, mut roots) = (Vec::new(), Vec::new());
+        let name = self.repo.file_name().unwrap_or_default();
+        for run in 0..runs {
+            eprintln!("frust bench: shared-cache run {} of {runs}", run + 1);
+            let b = self.scratch.join(format!("checkout-b-{run}")).join(name);
+            let c = self.scratch.join(format!("checkout-c-{run}")).join(name);
+            let result = self.shared_pair(&b, &c, &mut plain, &mut roots);
+            for checkout in [&b, &c] {
+                if let Some(parent) = checkout.parent() {
+                    clear(parent)?;
+                }
+            }
+            result?;
+        }
+        Ok(vec![
+            shared_phase("cold-shared", false, plain, cargo_cold),
+            shared_phase("cold-shared-roots", true, roots, cargo_cold),
+        ])
+    }
+
+    fn shared_pair(&self, b: &Path, c: &Path, plain: &mut Vec<SharedRun>, roots: &mut Vec<SharedRun>) -> Result<(), String> {
+        copy_checkout(self.repo, b)?;
+        plain.push(self.shared_build(b, "cold_shared", false)?);
+        self.shared_build(b, "cold_shared_seed", true)?;
+        copy_checkout(self.repo, c)?;
+        roots.push(self.shared_build(c, "cold_shared_roots", true)?);
+        Ok(())
     }
 }
 
@@ -1785,6 +2010,7 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
     let untuned_verdict = disk_verdict(untuned_disk.cargo_bytes, untuned_disk.frust_bytes, opts.disk_slack);
     let tuned_verdict = disk_verdict(tuned_disk.cargo_bytes, tuned_disk.frust_bytes, opts.disk_slack);
     let store_only = scan_store(&rig.tuned.dirs, &rig.tuned.restores.borrow());
+    let frust_timings = rig.tuned.timings.take();
     let disk_breakdown = measure_disk_breakdown(&rig.tuned.dirs, &rig.cargo_tuned_target, tuned_disk.cargo_bytes)
         .inspect_err(|error| eprintln!("frust bench: warning: disk breakdown unavailable: {error}")).ok()
         .map(|breakdown| DiskBreakdown { frust_physical_bytes_before_maintenance: Some(tuned_disk.frust_before_maintenance), ..breakdown });
@@ -1803,6 +2029,15 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
     let frust_report = report_of(Tool::Frust, untuned_disk.frust_bytes);
     let frust_tuned_report = report_of(Tool::FrustTuned, tuned_disk.frust_bytes);
     let reference = tuned_reference(&cargo_tuned_report, &frust_tuned_report);
+    // After every disk figure is taken: these builds add entries and targets that must not count against the main comparison.
+    let shared = (opts.shared_runs > 0).then(|| {
+        let (phases, error) = match rig.shared_phases(opts.shared_runs, &samples[Tool::Cargo.index()].cold) {
+            Ok(phases) => (phases, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        SharedReport { requested_runs: opts.shared_runs, note: SHARED_NOTE, phases, error }
+    });
+    let gate_shared = if opts.gate { shared.as_ref().map(evaluate_shared_gate) } else { None };
     let display = |path: &PathBuf| path.strip_prefix(&repo).unwrap_or(path.as_path()).display().to_string();
     Ok(RepoReport {
         schema_version: REPORT_SCHEMA_VERSION,
@@ -1826,11 +2061,13 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         disk_tuned: disk_report(&tuned_disk, &tuned_verdict),
         disk_breakdown,
         store_only,
-        frust_timings: rig.tuned.timings.take(),
+        frust_timings,
         frust_untuned_timings: rig.untuned.timings.take(),
         features: opts.features.clone(),
         gate: opts.gate.then(|| evaluate_gate(&samples[Tool::Cargo.index()], &samples[Tool::FrustTuned.index()])),
         gate_untuned: opts.gate.then(|| evaluate_gate(&samples[Tool::Cargo.index()], &samples[Tool::Frust.index()])),
+        shared,
+        gate_shared,
     })
 }
 
@@ -1936,6 +2173,24 @@ mod tests {
             features: None,
             gate: gate.then(|| evaluate_gate_for(cargo, tuned, false)),
             gate_untuned: gate.then(|| evaluate_gate_for(cargo, untuned, false)),
+            shared: None,
+            gate_shared: None,
+        }
+    }
+
+    fn shared_sample(ms: f64) -> SharedRun {
+        SharedRun { ms, units: 100, hit_units: 90, miss_units: 10, miss_crates: 3, restored_files: 180, target_bytes: 4096, restored_bytes: 3072, home_growth_bytes: -512 }
+    }
+
+    fn shared_report(plain_ms: f64, roots_ms: f64, cargo_cold: f64) -> SharedReport {
+        SharedReport {
+            requested_runs: 1,
+            note: SHARED_NOTE,
+            phases: vec![
+                shared_phase("cold-shared", false, vec![shared_sample(plain_ms)], &[cargo_cold; 3]),
+                shared_phase("cold-shared-roots", true, vec![shared_sample(roots_ms)], &[cargo_cold; 3]),
+            ],
+            error: None,
         }
     }
 
@@ -1949,22 +2204,144 @@ mod tests {
         assert_eq!(parsed, RepoOptions {
             repo: PathBuf::from("/work/rg"), edits: 20, runs: 3, package: None,
             json: false, markdown: false, out: None, gate: false, features: None, disk_slack: 0.0,
-            untuned_runs: None,
+            untuned_runs: None, shared_runs: 1,
         });
         assert_eq!(parsed.untuned_runs(), 3);
         let full = RepoOptions::parse(&flags(&[
             "--repo=/work/tokio", "--edits", "5", "--runs=2", "--package", "tokio",
             "--json", "--markdown", "--out", "r.json", "--gate", "--features", "full", "--disk-slack=2.5",
-            "--untuned-runs", "9",
+            "--untuned-runs", "9", "--shared-runs", "4",
         ])).unwrap();
         assert_eq!(full, RepoOptions {
             repo: PathBuf::from("/work/tokio"), edits: 5, runs: 2, package: Some("tokio".into()),
             json: true, markdown: true, out: Some(PathBuf::from("r.json")), gate: true,
-            features: Some("full".into()), disk_slack: 2.5, untuned_runs: Some(9),
+            features: Some("full".into()), disk_slack: 2.5, untuned_runs: Some(9), shared_runs: 4,
         });
         assert_eq!(full.untuned_runs(), 2);
         let fewer = RepoOptions::parse(&flags(&["--repo", "x", "--runs", "5", "--untuned-runs=3"])).unwrap();
         assert_eq!(fewer.untuned_runs(), 3);
+    }
+
+    #[test]
+    fn shared_runs_default_to_one_and_zero_turns_the_phases_off() {
+        assert_eq!(RepoOptions::parse(&flags(&["--repo", "x"])).unwrap().shared_runs, 1);
+        assert_eq!(RepoOptions::parse(&flags(&["--repo", "x", "--shared-runs=0"])).unwrap().shared_runs, 0);
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--shared-runs", "-1"])).unwrap_err().contains("--shared-runs"));
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--shared-runs"])).unwrap_err().contains("--shared-runs"));
+    }
+
+    #[test]
+    fn the_shared_gate_allows_six_tenths_of_cargo_cold_plus_a_hundred_milliseconds() {
+        let at_limit = shared_report(1000.0 * 0.6 + 100.0, 100.0, 1000.0);
+        let checks = evaluate_shared_gate(&at_limit);
+        assert_eq!(checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["cold-shared", "cold-shared-roots"]);
+        assert!(checks.iter().all(|c| c.pass), "{checks:?}");
+        assert_eq!(checks[0].limit, "<= 0.60x + 100 ms");
+        let over = evaluate_shared_gate(&shared_report(701.0, 100.0, 1000.0));
+        assert_eq!(failing(&over), ["cold-shared"]);
+        // A short cargo build is judged on the allowance alone.
+        assert!(evaluate_shared_gate(&shared_report(150.0, 150.0, 100.0)).iter().all(|c| c.pass));
+        assert_eq!(failing(&evaluate_shared_gate(&shared_report(200.0, 200.0, 100.0))), ["cold-shared", "cold-shared-roots"]);
+    }
+
+    #[test]
+    fn a_shared_phase_uses_the_median_run_against_the_cargo_cold_median() {
+        let runs = vec![shared_sample(900.0), shared_sample(300.0), shared_sample(500.0)];
+        let phase = shared_phase("cold-shared", false, runs, &[1000.0, 2000.0, 4000.0]);
+        assert_eq!(phase.median_ms, Some(500.0));
+        assert_eq!(phase.cargo_cold_ms, Some(2000.0));
+        assert_eq!(phase.ratio, Some(0.25));
+        let empty = shared_phase("cold-shared", false, Vec::new(), &[1000.0]);
+        assert_eq!((empty.median_ms, empty.ratio), (None, None));
+        assert!(shared_check(&empty).is_none());
+        assert!(shared_check(&shared_phase("cold-shared", false, vec![shared_sample(1.0)], &[])).is_none());
+    }
+
+    #[test]
+    fn a_shared_run_counts_hits_misses_and_restored_files_from_the_wrapper_records() {
+        let record = |mode: &str, files: u64| TimingLine {
+            krate: "dep".into(), store_mode: mode.into(), restore_paths: BTreeMap::from([("link".to_string(), files)]), ..TimingLine::default()
+        };
+        let mut summary = TimingSummary::default();
+        summary.add_build(&[record("hit", 2), record("hit", 3), record("inline", 0)], 0);
+        let run = shared_run(12.5, &summary, 100, 60, -7);
+        assert_eq!((run.units, run.hit_units, run.miss_units, run.miss_crates), (3, 2, 1, 1));
+        assert_eq!((run.restored_files, run.target_bytes, run.restored_bytes, run.home_growth_bytes), (5, 100, 60, -7));
+    }
+
+    #[test]
+    fn the_report_carries_the_shared_section_as_additive_schema_three_fields() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
+        let without = serde_json::to_value(&report).unwrap();
+        assert!(without["shared"].is_null() && without["gate_shared"].is_null());
+        report.gate_shared = Some(evaluate_shared_gate(&shared_report(400.0, 300.0, 1000.0)));
+        report.shared = Some(shared_report(400.0, 300.0, 1000.0));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        let phases = json["shared"]["phases"].as_array().unwrap();
+        assert_eq!(phases[0]["name"], "cold-shared");
+        assert_eq!(phases[0]["roots"], false);
+        assert_eq!(phases[1]["roots"], true);
+        assert_eq!(phases[0]["runs"][0]["hit_units"], 90);
+        assert_eq!(phases[0]["runs"][0]["home_growth_bytes"], -512);
+        assert_eq!(phases[0]["ratio"], 0.4);
+        assert_eq!(json["gate_shared"][1]["name"], "cold-shared-roots");
+        assert_eq!(exit_code(&report), 0);
+    }
+
+    #[test]
+    fn a_failing_shared_check_or_a_shared_error_changes_the_exit_code() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
+        report.shared = Some(shared_report(900.0, 300.0, 1000.0));
+        report.gate_shared = report.shared.as_ref().map(evaluate_shared_gate);
+        assert_eq!(exit_code(&report), 2);
+        assert_eq!(overall_status(&report), "fail: cold-shared");
+        assert!(gate_failure_lines(&report).iter().any(|l| l.starts_with("cold-shared:")));
+        let mut errored = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
+        errored.shared = Some(SharedReport { requested_runs: 1, note: SHARED_NOTE, phases: Vec::new(), error: Some("copy failed".into()) });
+        assert_eq!(exit_code(&errored), 1);
+        assert_eq!(overall_status(&errored), "fail: shared");
+    }
+
+    #[test]
+    fn markdown_and_text_list_the_shared_phases_with_their_gate_status() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
+        report.shared = Some(shared_report(400.0, 800.0, 1000.0));
+        report.gate_shared = report.shared.as_ref().map(evaluate_shared_gate);
+        let markdown = repo_markdown(&report);
+        assert!(markdown.contains("#### Second checkout with a warm shared cache"), "{markdown}");
+        let line = |prefix: &str| markdown.lines().find(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix}\n{markdown}")).to_string();
+        let plain = line("| cold-shared |");
+        for cell in ["400 ms", "1.00 s", "0.40x", "90 / 10", "180", "3.0 KiB", "-512"] {
+            assert!(plain.contains(cell), "{cell} in {plain}");
+        }
+        assert!(plain.ends_with("| pass |"), "{plain}");
+        assert!(line("| cold-shared-roots |").ends_with("| fail |"));
+        assert!(line("| phase |").ends_with("| gate |"));
+        let rows = shared_rows(report.shared.as_ref().unwrap(), None);
+        assert_eq!(rows[0].len(), SHARED_HEADER.len());
+        assert!(!rows[0].contains(&"gate".to_string()));
+    }
+
+    #[test]
+    fn checkouts_copy_everything_but_the_top_level_target() {
+        let dir = std::env::temp_dir().join(format!("frust-bench-checkout-test-{}", std::process::id()));
+        let (src, dst) = (dir.join("src"), dir.join("dst"));
+        fs::create_dir_all(src.join("crates/a/target")).unwrap();
+        fs::create_dir_all(src.join("target/debug")).unwrap();
+        fs::write(src.join("Cargo.lock"), "lock").unwrap();
+        fs::write(src.join("crates/a/lib.rs"), "a").unwrap();
+        fs::write(src.join("crates/a/target/keep"), "nested").unwrap();
+        fs::write(src.join("target/debug/big"), "built").unwrap();
+        copy_checkout(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("Cargo.lock")).unwrap(), "lock");
+        assert_eq!(fs::read_to_string(dst.join("crates/a/lib.rs")).unwrap(), "a");
+        assert!(dst.join("crates/a/target/keep").is_file());
+        assert!(!dst.join("target").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
