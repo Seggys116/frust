@@ -894,18 +894,46 @@ impl Session {
         let joined = guard.as_ref().and_then(|g| g.joined().cloned());
 
         // Plain output is observed through cargo's JSON only when it is logged anyway; stderr is identical in both formats.
-        let mut recorder = (noop.wants_capture() && (style.is_some() || guard.is_some())).then(crate::noop::Recorder::default);
-        let mut cmd = Command::new(&self.cargo);
-        cmd.args(&command);
-        if style.is_some() || recorder.is_some() {
-            cmd.arg("--message-format=json-render-diagnostics");
+        let observed = noop.wants_capture() || (noop.observable() && crate::exec::enabled());
+        let mut recorder = (observed && (style.is_some() || guard.is_some())).then(crate::noop::Recorder::default);
+        let mut exec_gate = crate::exec::Gate::new(crate::exec::Invocation {
+            dirs: &self.dirs,
+            record: noop.record_path(),
+            fingerprint: &fingerprint,
+            cwd: &self.cwd,
+            root: self.root.as_deref(),
+            target: &self.lock_target,
+            eligible: recorder.is_some() && guard.is_some() && !noop.auditing(),
+            env_vars: &self.env_vars,
+            configs: self.noop_configs(),
+            args: &phase_args,
+            debug: self.cfg.debug,
+        });
+        // Decided under the lock: the executor stands in for cargo and speaks its output format.
+        let replay = exec_gate.check();
+        let executing = replay.is_some();
+        let mut cmd = match replay {
+            Some(cmd) => cmd,
+            None => {
+                let mut cmd = Command::new(&self.cargo);
+                cmd.args(&command);
+                if style.is_some() || recorder.is_some() {
+                    cmd.arg("--message-format=json-render-diagnostics");
+                }
+                cmd.args(rest);
+                exec_gate.journal(&mut cmd);
+                cmd
+            }
+        };
+        if executing {
+            trace(&self.cfg, started, "executor replays the plan");
         }
-        cmd.args(rest);
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
         }
         cmd.env_remove(crate::wrapper::SLOT_SUPERVISOR_ENV);
-        if self.env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER")
+        if !executing
+            && self.env_vars.iter().any(|(key, _)| key == "RUSTC_WRAPPER")
             && (1, 89, 0) <= self.probe.cargo_version
             && self.probe.cargo_version < (1, 100, 0)
         {
@@ -948,9 +976,18 @@ impl Session {
                 eprintln!("frust: auto-compact {report:?}");
             }
         }
+        trace(&self.cfg, started, "maintenance done");
         let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
+        let exec_failure = exec_gate.finish(code, interrupted, recorder.as_ref());
+        noop.set_exec(exec_gate.trace());
+        trace(&self.cfg, started, "executor plan settled");
         // Recorded after compaction and before the lock passes on, so no other build changes the target in between.
         let audit_failure = noop.finish(code, interrupted, launched_ns, recorder.as_ref());
+        trace(&self.cfg, started, "no-op record settled");
+        let audit_failure = match (exec_failure, audit_failure) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.or(b),
+        };
         let code = if audit_failure.is_some() && code == 0 { 1 } else { code };
         // A signalled build is not a result to share.
         if let Some(guard) = guard.take() {
@@ -1151,7 +1188,8 @@ impl Session {
         let child_started = Instant::now();
         signals::supervise(child.id());
         let sub = self.parsed.subcommand.as_deref().unwrap_or("");
-        let mut planning_gate = PlanningGate { pending: crate::unit_graph::supported(sub) };
+        let executor = planning_args.first().is_some_and(|a| a == crate::exec::CHILD_ARG);
+        let mut planning_gate = PlanningGate { pending: crate::unit_graph::supported(sub) && !executor };
         let mut planning = None;
         if let Some(lock) = lock.as_deref_mut() {
             lock.log_start(true, true);

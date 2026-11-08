@@ -476,6 +476,11 @@ impl Recorder {
         }
     }
 
+    /// Everything cargo printed, unless recording was refused.
+    pub fn lines(&self) -> Option<&[(Stream, String)]> {
+        self.refused.is_none().then_some(self.lines.as_slice())
+    }
+
     pub fn refuse(&mut self, why: &'static str) {
         self.refused.get_or_insert(why);
         self.lines.clear();
@@ -519,6 +524,7 @@ pub struct Invocation<'a> {
 pub struct Gate {
     mode: Mode,
     ineligible: Option<&'static str>,
+    observable: bool,
     dirs: Dirs,
     key: String,
     display: String,
@@ -531,10 +537,12 @@ pub struct Gate {
     env_vars: Vec<(OsString, OsString)>,
     configs: Vec<PathBuf>,
     predicted: Option<Record>,
+    owed: Vec<(String, String)>,
     debug: bool,
     decision: String,
     detail: String,
     recorded: String,
+    exec: Option<(String, String)>,
 }
 
 impl Gate {
@@ -543,9 +551,11 @@ impl Gate {
         let stderr_tty = io::stderr().is_terminal();
         let display = display_key(inv.style == Some("ansi") && inv.colour);
         let ineligible = ineligibility(&inv, mode, stderr_tty);
+        let capturable = inv.style.is_some() || (inv.locking && !stderr_tty);
         Gate {
             mode,
             ineligible,
+            observable: ineligibility(&inv, Mode::On, stderr_tty).is_none() && capturable,
             dirs: inv.dirs.clone(),
             key: inv.fingerprint.to_string(),
             path: records_dir(inv.dirs).join(record_name(inv.fingerprint, &display)),
@@ -558,16 +568,37 @@ impl Gate {
             env_vars: inv.env_vars.to_vec(),
             configs: inv.configs,
             predicted: None,
+            owed: Vec::new(),
             debug: inv.debug,
             decision: String::new(),
             detail: String::new(),
             recorded: String::new(),
+            exec: None,
         }
+    }
+
+    pub fn record_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A pending audit needs cargo itself to run.
+    pub fn auditing(&self) -> bool {
+        self.predicted.is_some()
+    }
+
+    /// The executor's decision and plan outcome, reported in the same trace line.
+    pub fn set_exec(&mut self, trace: (String, String)) {
+        self.exec = Some(trace);
     }
 
     /// Whether the cargo run should be observed for recording or audit.
     pub fn wants_capture(&self) -> bool {
         self.ineligible.is_none() && self.capturable
+    }
+
+    /// The command could be recorded whether or not this fast path is switched on; the executor relies on the same observation.
+    pub fn observable(&self) -> bool {
+        self.observable
     }
 
     /// The replay when nothing changed and the fast path may answer; in audit mode the verdict is kept for [`Gate::finish`].
@@ -583,6 +614,7 @@ impl Gate {
         match self.verify() {
             Ok(record) if self.mode == Mode::Audit => {
                 self.decision = "audit:pending".into();
+                self.owed = crate::exec::owed(&self.dirs, &self.path);
                 self.predicted = Some(record);
                 None
             }
@@ -648,7 +680,7 @@ impl Gate {
     pub fn finish(&mut self, code: i32, interrupted: bool, launched_ns: i128, recorder: Option<&Recorder>) -> Option<String> {
         let mut failure = None;
         if let Some(predicted) = self.predicted.take() {
-            failure = audit(&predicted, code, recorder);
+            failure = audit(&predicted, code, recorder, &self.owed);
             self.decision = if failure.is_some() { "audit:failed".into() } else { "audit:ok".into() };
             if let Some(text) = &failure {
                 self.log_audit(text);
@@ -798,7 +830,11 @@ impl Gate {
         let Some(path) = env::var_os("FRUST_NOOP_TRACE").filter(|p| !p.is_empty()) else { return };
         let decision = if self.decision.is_empty() { "unchecked" } else { &self.decision };
         let recorded = if self.recorded.is_empty() { "none" } else { &self.recorded };
-        let line = serde_json::json!({ "t": crate::events::now_ms(), "noop": decision, "record": recorded, "detail": self.detail });
+        let mut line = serde_json::json!({ "t": crate::events::now_ms(), "noop": decision, "record": recorded, "detail": self.detail });
+        if let Some((exec, plan)) = &self.exec {
+            line["exec"] = serde_json::Value::from(exec.as_str());
+            line["plan"] = serde_json::Value::from(plan.as_str());
+        }
         append_line(Path::new(&path), &line.to_string());
     }
 }
@@ -827,7 +863,8 @@ fn per_run(name: &str) -> bool {
     PER_RUN_VARS.contains(&name) || name == crate::store_broker::CAPABILITY_ENV || name == crate::wrapper::SLOT_SUPERVISOR_ENV
 }
 
-fn audit(predicted: &Record, code: i32, recorder: Option<&Recorder>) -> Option<String> {
+/// `owed` lists units the executor rebuilt after removing their fingerprints: cargo recompiles them through the cache without any input having changed.
+fn audit(predicted: &Record, code: i32, recorder: Option<&Recorder>, owed: &[(String, String)]) -> Option<String> {
     if code != 0 {
         return Some(format!("no-op audit failed: cargo exited with {code} where the fast path predicted an unchanged build"));
     }
@@ -840,14 +877,21 @@ fn audit(predicted: &Record, code: i32, recorder: Option<&Recorder>) -> Option<S
             continue;
         }
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact") && msg.get("fresh").and_then(|f| f.as_bool()) != Some(true) {
+        if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact")
+            && msg.get("fresh").and_then(|f| f.as_bool()) != Some(true)
+            && !owed.iter().any(|(key, _)| *key == crate::exec::unit_key(&msg))
+        {
             rebuilt.push(msg.pointer("/target/name").and_then(|n| n.as_str()).unwrap_or("?").to_string());
         }
     }
     if !rebuilt.is_empty() {
         return Some(format!("no-op audit failed: cargo rebuilt {} while the fast path would have skipped the build", rebuilt.join(", ")));
     }
-    let replayable = |(s, l): &&(Stream, String)| *s == Stream::Err && !status_word(l).is_some_and(|w| TRANSIENT_STATUS.contains(&w.as_str()));
+    let owed_status = |l: &str| {
+        let plain = term::strip_ansi(l);
+        plain.trim_start().strip_prefix("Compiling ").is_some_and(|rest| owed.iter().any(|(_, package)| package == rest))
+    };
+    let replayable = |(s, l): &&(Stream, String)| *s == Stream::Err && !status_word(l).is_some_and(|w| TRANSIENT_STATUS.contains(&w.as_str())) && !owed_status(l);
     let lines = |list: &mut dyn Iterator<Item = &(Stream, String)>| list.filter(replayable).map(|(_, l)| normalised(l)).collect::<Vec<_>>();
     let expected = lines(&mut predicted.replay.iter());
     let actual = lines(&mut recorder.lines.iter());
@@ -966,7 +1010,7 @@ fn split_suffix(name: &str) -> (&str, &str) {
 }
 
 /// Handles the old id form (`serde 1.0.0 (registry+...)`) and the new one (`registry+https://...#serde@1.0.0`).
-fn package_name(id: &str) -> String {
+pub(crate) fn package_name(id: &str) -> String {
     if let Some((head, fragment)) = id.split_once('#') {
         return match fragment.split_once('@') {
             Some((name, _)) => name.to_string(),
@@ -976,7 +1020,7 @@ fn package_name(id: &str) -> String {
     id.split_whitespace().next().unwrap_or("").to_string()
 }
 
-fn fingerprint_file(msg: &serde_json::Value) -> Option<String> {
+pub(crate) fn fingerprint_file(msg: &serde_json::Value) -> Option<String> {
     let kind = msg.pointer("/target/kind")?.as_array()?.first()?.as_str()?;
     let kind = match kind {
         "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro" => "lib",
@@ -997,6 +1041,19 @@ struct Unit {
     fingerprints: Vec<PathBuf>,
     depinfos: Vec<PathBuf>,
     extra_outputs: Vec<PathBuf>,
+}
+
+/// The fingerprint files of the unit an artifact message names (a superset when ambiguous); empty when none is found.
+pub(crate) fn fingerprint_files(msg: &serde_json::Value) -> Vec<PathBuf> {
+    let mut outputs: Vec<PathBuf> = msg.get("filenames").and_then(|f| f.as_array()).into_iter().flatten()
+        .filter_map(|f| f.as_str().map(PathBuf::from)).collect();
+    if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
+        outputs.push(PathBuf::from(exe));
+    }
+    outputs.sort();
+    outputs.dedup();
+    let Some(file) = fingerprint_file(msg) else { return Vec::new() };
+    locate_unit(msg, &outputs).map(|unit| unit.fingerprints.iter().map(|dir| dir.join(&file)).collect()).unwrap_or_default()
 }
 
 fn locate_unit(msg: &serde_json::Value, outputs: &[PathBuf]) -> Result<Unit, &'static str> {
@@ -1110,7 +1167,7 @@ fn candidates(msg: &serde_json::Value, profile: &Path, package: &str, crate_name
     Ok(unit)
 }
 
-fn build_directives(text: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn build_directives(text: &str) -> (Vec<String>, Vec<String>) {
     let (mut files, mut vars) = (Vec::new(), Vec::new());
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) else { continue };
@@ -1647,13 +1704,13 @@ mod tests {
         let predicted = Record { replay: vec![(Stream::Err, "    Finished `dev` profile in 0.01s".into())], ..sample() };
         let mut fresh = Recorder::default();
         fresh.take(&[br#"{"reason":"compiler-artifact","fresh":true,"target":{"name":"a"}}"#.to_vec()], &[b"    Finished `dev` profile in 0.31s".to_vec()]);
-        assert_eq!(audit(&predicted, 0, Some(&fresh)), None);
-        assert!(audit(&predicted, 101, Some(&fresh)).is_some());
+        assert_eq!(audit(&predicted, 0, Some(&fresh), &[]), None);
+        assert!(audit(&predicted, 101, Some(&fresh), &[]).is_some());
         let mut rebuilt = Recorder::default();
         rebuilt.take(&[br#"{"reason":"compiler-artifact","fresh":false,"target":{"name":"a"}}"#.to_vec()], &[b"    Finished `dev` profile in 0.31s".to_vec()]);
-        assert!(audit(&predicted, 0, Some(&rebuilt)).unwrap().contains("rebuilt a"));
+        assert!(audit(&predicted, 0, Some(&rebuilt), &[]).unwrap().contains("rebuilt a"));
         let mut noisy = Recorder::default();
         noisy.take(&[], &[b"warning: x".to_vec(), b"    Finished `dev` profile in 0.31s".to_vec()]);
-        assert!(audit(&predicted, 0, Some(&noisy)).unwrap().contains("differs"));
+        assert!(audit(&predicted, 0, Some(&noisy), &[]).unwrap().contains("differs"));
     }
 }

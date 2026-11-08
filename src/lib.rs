@@ -8,6 +8,7 @@ pub mod compact;
 pub mod config;
 pub mod doctor;
 pub mod events;
+pub mod exec;
 pub mod fsx;
 pub mod gc;
 pub mod history;
@@ -48,6 +49,9 @@ pub fn main_for(persona: Persona) -> i32 {
     let mut argv = std::env::args_os();
     let argv0 = argv.next().unwrap_or_default();
     let args: Vec<OsString> = argv.collect();
+    if matches!(persona, Persona::Frust | Persona::Cargo) && args.first().is_some_and(|a| a == exec::CHILD_ARG) {
+        return exec::child::main(&args);
+    }
     match persona {
         Persona::Frust => dispatch_by_name(&argv0, args),
         Persona::Cargo => run::cargo_main(args),

@@ -494,6 +494,53 @@ Residual risks: an edit that preserves a file's inode, size and both timestamps 
 change time cannot be set by ordinary tools); a crate whose compile observed a variable frust passes only to cargo is
 handled as cargo-provided; a registry or git source edited in place is ignored, as cargo ignores it.
 
+## Executor
+
+When the no-op check finds a change, the graph is unchanged and only sources of path packages changed, `fcargo`
+replays the rustc calls cargo would make instead of starting cargo, which saves cargo's startup, resolution,
+fingerprint walk and job queue. `FRUST_EXEC=off` disables it; every doubt runs cargo.
+
+**Recording.** While cargo runs a `build` or `check` that the no-op path would record, `FRUST_EXEC_JOURNAL` names a
+file in `exec/` and the wrapper appends one line per rustc call: arguments, environment (minus jobserver and per-run
+variables), working directory, start time, duration and exit code. After a successful run the plan is built from
+cargo's JSON messages and the journal (units cargo reported fresh keep their call from the previous plan). A fresh
+unit no journal covers, as in a target built before the executor, means no plan; its fingerprint file is removed so the
+next cargo run recompiles it through the cache under a journal, a one-time cost. Per unit the plan keeps the call, the environment cargo set or removed relative to frust's own, the
+outputs rustc writes, the uplifted copies with cargo's `<name>.d` files, edges from `--extern` paths (to `.rmeta` when
+the dependent may start on metadata), its rustc dep-info inputs and `env-dep` values, cargo's cached diagnostics for
+the unit, and its fingerprint file. Build scripts contribute their `rerun-if-changed` paths (not those inside a
+registry or git package, whose sources never change in place), `rerun-if-env-changed` values and, without
+`rerun-if-changed`, their package tree. Manifests, `Cargo.lock`, config and toolchain files are stamped, and
+the target-discovery layout of each package (`build.rs`, `src/lib.rs`, `src/main.rs`, `src/bin`, `examples`,
+`tests`, `benches`) and the member directories are kept by name, so an editor that saves by rename does not decline.
+The plan lives next to the no-op record of the same command and display, as `exec/<name>.plan`.
+
+**The check.** Under the build lock: the key, every graph stamp, the layout and every build script trigger must match;
+units whose inputs or `env-dep` values changed are dirty, with every unit that depends on them (cargo rebuilds a
+dependent whenever a dependency's output changed; dependents are never skipped). Clean units' outputs must be exactly
+as recorded. It declines when a dirty unit is a build script, a registry or git unit, or one whose `<name>.d` files
+frust could not reproduce byte for byte when recording, when a Windows executable to replace is in use, and for
+argument files, `-o`, or packed debug info on macOS.
+
+**The replay.** A child process (`fcargo --frust-exec-child`) stands in for cargo, so the display, the build log for
+joining builds, cache events and recording work unchanged. It removes the fingerprint file of every dirty unit first
+(cargo then rebuilds those units through the cache on its next run; cargo's own files are never written and
+`invoked.timestamp` is untouched), prints fresh units' artifacts and cached warnings, then runs dirty units through
+`RUSTC_WRAPPER` with the recorded arguments, in dependency order, starting a dependent once the `.rmeta` it needs is
+announced, bounded by `-j` (else `CARGO_BUILD_JOBS`, else the available parallelism) through its own jobserver. Output
+follows cargo: `Compiling` once per package, rendered diagnostics deduplicated, the warning summary with the `cargo fix`
+hint, `could not compile ... due to N previous errors` with exit 101, and the recorded `Finished` line with this run's
+time. Each finished unit is uplifted atomically (a clone on macOS, a hard link elsewhere) and its `<name>.d` files are
+rewritten when their contents change. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
+next run rebuilds the same units. On success the plan is updated with the new inputs and outputs, and the no-op record
+is written from the child's output as from cargo's.
+
+**Audit.** `FRUST_EXEC=audit` runs cargo where the executor would have answered and fails the build with
+`frust: exec audit failed: ...` (also in `exec/audit.jsonl`) unless every unit cargo rebuilt was predicted dirty or
+owed a rebuild after an earlier replay, each was compiled with the recorded arguments and environment, and a replay of
+the predicted units without the cache then reproduces cargo's `.rmeta` files (and, for units without incremental
+compilation, `.rlib` files and executables) byte for byte and prints the same diagnostics.
+
 ## Platforms
 
 Everything that differs between operating systems lives in `src/sys/`, with a Unix backend and a Windows backend

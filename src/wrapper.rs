@@ -124,6 +124,7 @@ pub fn run(args: Vec<OsString>) -> i32 {
     // SAFETY: startup has opened no files; pipe validation rejects stale descriptor numbers.
     JOBSERVER.get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() });
     let started = Instant::now();
+    let journal = crate::exec::journal::begin(&args);
     let cfg = Config::from_env();
     let args = crate::linking::prepare(&args, cfg.debug).unwrap_or(args);
     if cfg.cache
@@ -135,7 +136,13 @@ pub fn run(args: Vec<OsString>) -> i32 {
             plan.parsed.crate_name,
             started.elapsed().as_millis()
         ));
+        if let Some(journal) = journal {
+            journal.finish(Some(code));
+        }
         return code;
+    }
+    if let Some(journal) = journal {
+        journal.finish(None);
     }
     timings::passthrough(started);
     passthrough(&args)
