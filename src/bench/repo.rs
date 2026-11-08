@@ -1809,7 +1809,7 @@ impl Rig<'_> {
         self.quiesce(column);
         let home = column.ctx.home.as_path();
         let store = column.dirs.store();
-        let central = workspace::central_target(&column.dirs, Some(checkout), &column.ctx.probe_id);
+        let central = workspace::central_target(&column.dirs, Some(&canonical(checkout)), &column.ctx.probe_id);
         let before = compact::physical_size(&[home]);
         let ms = self.build_in(Tool::FrustTuned, row, checkout, share_roots)?;
         let target_bytes = compact::physical_size(&[central.as_path()]);
