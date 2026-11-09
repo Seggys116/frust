@@ -593,7 +593,8 @@ the target-discovery layout of each package (`build.rs`, `src/lib.rs`, `src/main
 The plan lives next to the no-op record of the same command and display, as `exec/<name>.plan`.
 
 **The check.** Under the build lock: the key, every graph stamp, the layout and every build script trigger must match;
-units whose inputs or `env-dep` values changed are dirty, with every unit that depends on them (cargo rebuilds a
+units whose inputs (path packages only: like cargo, registry and git sources are not checked) or `env-dep` values
+changed are dirty, with every unit that depends on them (cargo rebuilds a
 dependent whenever a dependency's output changed; dependents are never skipped). Clean units' outputs must be exactly
 as recorded. It declines when a dirty unit is a build script, a registry or git unit, or one whose `<name>.d` files
 frust could not reproduce byte for byte when recording, when a Windows executable to replace is in use, and for
@@ -610,7 +611,8 @@ hint, `could not compile ... due to N previous errors` with exit 101, and the re
 time. Each finished unit is uplifted atomically (a clone on macOS, a hard link elsewhere) and its `<name>.d` files are
 rewritten when their contents change. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
 next run rebuilds the same units. On success the plan is updated with the new inputs and outputs, and the no-op record
-is written from the child's output as from cargo's.
+is written from the child's output as from cargo's. When compaction later replaces a listed output with identical
+bytes, the plan is restamped under the same rule as no-op records; any other change makes the next check decline.
 
 **Audit.** `FRUST_EXEC=audit` runs cargo where the executor would have answered and fails the build with
 `frust: exec audit failed: ...` (also in `exec/audit.jsonl`) unless every unit cargo rebuilt was predicted dirty or

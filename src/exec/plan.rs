@@ -20,6 +20,7 @@ const MAX_TREE: usize = 20_000;
 
 pub type Packed = [i64; 5];
 pub type EnvDeps = Vec<(String, Option<String>)>;
+pub type Layout = Vec<(String, bool, Vec<String>)>;
 
 /// Never equal to a real stamp: the input changed while it was being read, so its unit stays dirty.
 const POISON: Packed = [-1; 5];
@@ -128,7 +129,7 @@ pub struct Plan {
     pub target: String,
     pub finished: String,
     pub graph: Vec<Entry>,
-    pub layout: Vec<(String, bool, Vec<String>)>,
+    pub layout: Layout,
     pub scripts: Vec<Script>,
     pub units: Vec<Unit>,
     /// Cargo's JSON messages in order; artifacts name their unit.
@@ -316,10 +317,13 @@ pub struct Recorded<'a> {
     pub messages: Vec<serde_json::Value>,
     pub finished: String,
     pub journal: Vec<Record>,
-    pub previous: Option<Plan>,
+    /// Earlier plans whose units may stand in for fresh ones: this command's first, then others of the same target.
+    pub previous: Vec<Plan>,
     pub base_env: &'a HashMap<String, String>,
     pub configs: &'a [PathBuf],
     pub launched_ns: i128,
+    /// Graph stamps and layout the check just found unchanged under the same lock; cargo never changes them.
+    pub verified: Option<(Vec<Entry>, Layout)>,
 }
 
 fn delta(env: &[(String, String)], base: &HashMap<String, String>) -> (Vec<(String, String)>, Vec<String>) {
@@ -452,7 +456,7 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
         candidates.push(Candidate { argv: record.argv.clone(), cwd: record.cwd.clone(), env_set, env_unset, t: record.t, ms: record.ms, parsed, manifest, previous: None });
     }
     let fresh_from = candidates.len();
-    if let Some(previous) = &rec.previous {
+    for previous in &rec.previous {
         for unit in &previous.units {
             let Some(parsed) = unit.argv() else { continue };
             let env_set = previous.env_of(unit);
@@ -535,10 +539,14 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
             return Err("unrecognised fingerprint layout".into());
         }
         let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
-        let (inputs, env_deps) = match &c.previous {
+        let (mut inputs, env_deps) = match &c.previous {
             Some(prev) => (prev.inputs.clone(), prev.env_deps.clone()),
             None => read_inputs(a, Path::new(&c.cwd), rec.target, i128::from(c.t))?,
         };
+        // Cargo never checks registry or git sources for changes either; their units still follow their dependencies.
+        if !local {
+            inputs.clear();
+        }
         let diagnostics = match fs::read_to_string(fp_dir.join(format!("output-{fp_name}"))) {
             Ok(text) => text.lines().map(str::to_string).collect(),
             Err(_) => Vec::new(),
@@ -773,6 +781,11 @@ pub fn layout_facts(dir: &Path, package: bool) -> Vec<String> {
 }
 
 fn graph_inputs(plan: &mut Plan, rec: &Recorded<'_>) -> Result<(), &'static str> {
+    if let Some((graph, layout)) = &rec.verified {
+        plan.graph = graph.clone();
+        plan.layout = layout.clone();
+        return Ok(());
+    }
     let mut seen = HashSet::new();
     let mut push = |plan: &mut Plan, path: PathBuf, absent_ok: bool| {
         if seen.insert(path.clone()) {

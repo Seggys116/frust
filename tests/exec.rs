@@ -431,6 +431,20 @@ fn a_target_built_without_the_executor_is_adopted_through_the_cache() {
 }
 
 #[test]
+fn another_display_of_the_same_command_borrows_the_recorded_calls() {
+    let mut fx = Fixture::new("exec-display", &lib_and_bin());
+    assert_success(&fx.run("on").0);
+    fx.env.push(("CARGO_TERM_HYPERLINKS".into(), "false".into()));
+    fx.edit("app/src/main.rs", &format!("{MAIN}// other display\n"));
+    let (out, trace) = fx.run("on");
+    assert_success(&out);
+    assert_eq!(trace["plan"], "written", "the fresh library's call comes from the other display's plan, nothing is adopted: {trace}");
+    fx.edit("applib/src/lib.rs", "pub fn value() -> u32 {\n    7\n}\n");
+    fx.replayed(2);
+    assert_eq!(fx.output("app"), "7");
+}
+
+#[test]
 fn concurrent_builds_join_and_both_succeed() {
     let fx = Fixture::new("exec-concurrent", &lib_and_bin());
     assert_success(&fx.run("on").0);

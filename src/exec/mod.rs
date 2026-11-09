@@ -109,6 +109,7 @@ pub struct Gate {
     predicted: Option<(Plan, Vec<usize>)>,
     owed: HashSet<String>,
     loaded: Option<Plan>,
+    graph_verified: bool,
     launched_ns: i128,
     decision: String,
     planned: String,
@@ -186,6 +187,7 @@ impl Gate {
             predicted: None,
             owed: HashSet::new(),
             loaded: None,
+            graph_verified: false,
             launched_ns: 0,
             decision: String::new(),
             planned: String::new(),
@@ -217,6 +219,7 @@ impl Gate {
             (Some(plan), Ok(dirty)) => (plan, dirty),
             (plan, verdict) => {
                 let why = verdict.err().unwrap_or("none");
+                self.graph_verified = plan.is_some() && !matches!(why, "key" | "manifest or config changed" | "targets changed");
                 // Cargo runs under the same lock, so the plan read here is still the previous one when the new one is built.
                 self.loaded = plan;
                 self.decision = format!("decline:{why}");
@@ -231,6 +234,7 @@ impl Gate {
             // An earlier replay removed these fingerprints, so cargo rebuilds them and everything above them through the cache.
             let owed = owed_units(&plan);
             self.owed = plan.units.iter().zip(owed).filter(|(_, o)| *o).map(|(u, _)| u.id.clone()).collect();
+            self.graph_verified = true;
             self.predicted = Some((plan, dirty));
             return None;
         }
@@ -354,27 +358,39 @@ impl Gate {
         }
         let lines = lines.unwrap_or_default();
         let previous = self.loaded.take().or_else(|| plan::load(&self.plan_path));
+        let previous_ok = previous.as_ref().filter(|_| self.graph_verified).map(|p| (p.graph.clone(), p.layout.clone()));
         let messages: Vec<serde_json::Value> = lines.iter()
             .filter(|(s, _)| *s == Stream::Out)
             .filter_map(|(_, l)| serde_json::from_str(l).ok())
             .collect();
         let finished = lines.iter().rev().find(|(s, l)| *s == Stream::Err && term::strip_ansi(l).trim_start().starts_with("Finished ")).map(|(_, l)| l.clone());
         let root = self.root.clone().unwrap_or_default();
-        let built = finished.ok_or(plan::Refused::from("no Finished line")).and_then(|finished| {
-            plan::build(plan::Recorded {
-                key: &self.key,
-                cwd: &self.cwd,
-                target: &self.target,
-                root: &root,
-                messages,
-                finished,
-                journal: records.clone(),
-                previous,
-                base_env: &self.base,
-                configs: &self.configs,
-                launched_ns: self.launched_ns,
+        let attempt = |previous: Vec<Plan>| {
+            finished.clone().ok_or(plan::Refused::from("no Finished line")).and_then(|finished| {
+                plan::build(plan::Recorded {
+                    key: &self.key,
+                    cwd: &self.cwd,
+                    target: &self.target,
+                    root: &root,
+                    messages: messages.clone(),
+                    finished,
+                    journal: records.clone(),
+                    previous,
+                    base_env: &self.base,
+                    configs: &self.configs,
+                    launched_ns: self.launched_ns,
+                    verified: previous_ok.clone(),
+                })
             })
-        });
+        };
+        let mut built = attempt(previous.clone().into_iter().collect());
+        // The same command recorded under another display may already cover the fresh units.
+        if built.as_ref().is_err_and(|r| !r.adopt.is_empty()) {
+            let siblings = sibling_plans(&self.dirs, &self.plan_path, &self.key, &self.target);
+            if !siblings.is_empty() {
+                built = attempt(previous.into_iter().chain(siblings).collect());
+            }
+        }
         let failure = match built {
             Ok(new_plan) => {
                 let failure = self.predicted.take().and_then(|(old, dirty)| self.audit(&old, &dirty, &new_plan, &records, lines));
@@ -574,6 +590,17 @@ pub fn restamp(dirs: &Dirs, rewrites: &[crate::noop::Rewrite], gated: bool) -> u
         }
     }
     updated
+}
+
+/// Plans of the same command and target recorded under another display, whose calls are identical.
+fn sibling_plans(dirs: &Dirs, own: &Path, key: &str, target: &Path) -> Vec<Plan> {
+    let Ok(entries) = fs::read_dir(dir(dirs)) else { return Vec::new() };
+    entries.flatten()
+        .map(|e| e.path())
+        .filter(|p| p != own && p.to_string_lossy().ends_with(PLAN_SUFFIX))
+        .filter_map(|p| plan::load(&p))
+        .filter(|p| p.key == key && Path::new(&p.target) == target)
+        .collect()
 }
 
 /// Cargo's rule: a unit rebuilds when any dependency did.
