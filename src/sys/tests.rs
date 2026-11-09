@@ -545,3 +545,63 @@ fn pipe_reads_never_block_and_report_end_of_stream() {
     );
     assert_eq!(pipe.read(&mut buf).unwrap(), 0);
 }
+
+#[test]
+fn directory_scans_report_what_stat_reports_across_batches_links_and_filters() {
+    let dir = scratch("scan-dir");
+    for i in 0..2500 {
+        fs::write(dir.join(format!("unit-abc.{i:05}.rcgu.o")), vec![b'x'; i % 97]).unwrap();
+    }
+    fs::write(dir.join("other-file"), b"skip").unwrap();
+    fs::create_dir(dir.join("unit-abc.dir")).unwrap();
+    fs::hard_link(dir.join("unit-abc.00007.rcgu.o"), dir.join("unit-abc.hard")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("unit-abc.00011.rcgu.o"), dir.join("unit-abc.link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("unit-abc.dangling")).unwrap();
+    }
+    let unstamped = OsStr::new("unit-abc.00003.rcgu.o");
+    let bulk_chosen = AtomicBool::new(false);
+    let found = scan_dir(&dir, |name| name.to_string_lossy().starts_with("unit-abc"), |name| name != unstamped, &bulk_chosen).unwrap();
+    // Nearly every entry needs a stat, so macOS reads the directory in bulk and remembers it.
+    assert_eq!(bulk_chosen.load(std::sync::atomic::Ordering::Relaxed), cfg!(target_os = "macos"));
+    let names: std::collections::BTreeSet<_> = found.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(names.len(), found.len());
+    let expected = fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("unit-abc")).count();
+    assert_eq!(found.len(), expected);
+    assert!(!names.contains(OsStr::new("other-file")));
+    for (name, stat) in &found {
+        let want = if name == unstamped { None } else { super::stat(&dir.join(name)).ok().map(|meta| EntryStat::of(&meta)) };
+        assert_eq!(*stat, want, "{}", name.to_string_lossy());
+    }
+    let stat_of = |wanted: &str| found.iter().find(|(name, _)| name == wanted).and_then(|(_, stat)| *stat).unwrap();
+    let (hard, original) = (stat_of("unit-abc.hard"), stat_of("unit-abc.00007.rcgu.o"));
+    assert_eq!((hard.dev, hard.ino), (original.dev, original.ino));
+    #[cfg(unix)]
+    assert_eq!(found.iter().find(|(name, _)| name == "unit-abc.dangling").unwrap().1, None);
+    // A few wanted names among many take the per-entry path, which must agree too.
+    let few_wanted = |name: &OsStr| name == "unit-abc.00042.rcgu.o" || name == "unit-abc.link";
+    let per_entry = AtomicBool::new(false);
+    let few = scan_dir(&dir, few_wanted, |_| true, &per_entry).unwrap();
+    assert!(!per_entry.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(few.len(), if cfg!(unix) { 2 } else { 1 });
+    for (name, stat) in &few {
+        assert_eq!(*stat, super::stat(&dir.join(name)).ok().map(|meta| EntryStat::of(&meta)));
+    }
+    // A remembered bulk choice gives the same answer for any filter.
+    let mut hinted = scan_dir(&dir, few_wanted, |_| true, &bulk_chosen).unwrap();
+    hinted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut plain = few.clone();
+    plain.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(hinted, plain);
+    // The fallback would hide a failing bulk read, so the bulk path must succeed on its own.
+    #[cfg(target_os = "macos")]
+    {
+        let mut bulk = imp::scan_dir_bulk(&dir, &|name: &OsStr| name.to_string_lossy().starts_with("unit-abc"), &|name: &OsStr| name != unstamped).unwrap();
+        let mut each = scan_dir_each(&dir, &|name: &OsStr| name.to_string_lossy().starts_with("unit-abc"), &|name: &OsStr| name != unstamped).unwrap();
+        bulk.sort_by(|a, b| a.0.cmp(&b.0));
+        each.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(bulk, each);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
