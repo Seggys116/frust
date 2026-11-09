@@ -872,6 +872,86 @@ fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A file compaction replaced with identical bytes in a new inode: its stamp just before and just after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    pub path: PathBuf,
+    pub before: Stamp,
+    pub after: Stamp,
+}
+
+/// Caller holds the profile locks of every rewritten file. A record is rewritten only when each entry either still
+/// matches or is a listed rewrite whose recorded stamp is its stamp before and whose current stamp is its stamp after;
+/// any other mismatch leaves the record alone. `gated` means the caller already holds frust's target gate.
+pub fn restamp(dirs: &Dirs, rewrites: &[Rewrite], gated: bool) -> usize {
+    let by_path: HashMap<&str, &Rewrite> = rewrites.iter().filter_map(|r| Some((r.path.to_str()?, r))).collect();
+    if by_path.is_empty() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(records_dir(dirs)) else { return 0 };
+    let mut updated = 0;
+    for file in entries.flatten() {
+        let path = file.path();
+        if !file.file_name().to_string_lossy().ends_with(RECORD_SUFFIX) {
+            continue;
+        }
+        let Ok(bytes) = read_capped(&path) else { continue };
+        let Some((_, target)) = peek_paths(&bytes) else { continue };
+        if !by_path.keys().any(|p| within(p, &target, cfg!(windows))) {
+            continue;
+        }
+        let Some(mut record) = decode(&bytes) else { continue };
+        let mut touched = false;
+        let mut valid = true;
+        for entry in &mut record.entries {
+            let current = match sys::stat(Path::new(&entry.path)) {
+                Ok(meta) => Some(Stamp::of(&meta)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            };
+            if current == entry.stamp {
+                continue;
+            }
+            match (by_path.get(entry.path.as_str()), entry.stamp, current) {
+                (Some(r), Some(old), Some(now)) if old == r.before && now == r.after => {
+                    entry.stamp = Some(now);
+                    touched = true;
+                }
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid || !touched {
+            continue;
+        }
+        // Without the gate a build that just released Cargo's locks could be writing this record.
+        let _gate = if gated {
+            None
+        } else {
+            match lock::target_activity(dirs, Path::new(&target)) {
+                Ok(None) => None,
+                Ok(Some(_)) => match lock::try_target_maintenance(dirs, Path::new(&target)) {
+                    Ok(Some(guard)) => Some(guard),
+                    _ => continue,
+                },
+                Err(_) => continue,
+            }
+        };
+        if read_capped(&path).ok().as_deref() != Some(bytes.as_slice()) {
+            continue;
+        }
+        if fsx::write_atomic(&path, &encode(&record)).is_ok() {
+            updated += 1;
+        }
+    }
+    updated
+}
+
 /// Waiting tickets or a held build lock mean another build may be changing the target.
 fn build_in_flight(dirs: &Dirs, target: &Path, scope: &Scope) -> bool {
     let dir = lock::dir_for(dirs, target);
@@ -1554,6 +1634,42 @@ mod tests {
         assert_eq!(decode(&read_capped(&live).unwrap()).map(|r| r.units), Some(3));
         assert_eq!(collect(&dirs), 1);
         assert!(live.exists() && !gone.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restamping_covers_only_listed_identical_rewrites_of_an_otherwise_valid_record() {
+        let root = fsx::temp_sibling(&env::temp_dir().join("frust-noop-restamp"));
+        let dirs = Dirs::at(&root);
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let (out, other) = (target.join("out.rlib"), target.join("other.rlib"));
+        fs::write(&out, b"same bytes").unwrap();
+        fs::write(&other, b"other").unwrap();
+        let mut record = sample();
+        record.target = target.to_str().unwrap().into();
+        record.entries = [&out, &other].iter().map(|p| Entry { path: p.to_str().unwrap().into(), stamp: Some(Stamp::read(p).unwrap()) }).collect();
+        let path = records_dir(&dirs).join(format!("r{RECORD_SUFFIX}"));
+        fsx::write_atomic(&path, &encode(&record)).unwrap();
+        let before = Stamp::read(&out).unwrap();
+        let replacement = target.join("tmp");
+        fs::write(&replacement, b"same bytes").unwrap();
+        sys::rename(&replacement, &out).unwrap();
+        let after = Stamp::read(&out).unwrap();
+        let read = || decode(&read_capped(&path).unwrap()).unwrap();
+
+        let stale = Rewrite { path: out.clone(), before: Stamp { ino: before.ino + 1, ..before }, after };
+        assert_eq!(restamp(&dirs, &[stale], true), 0, "a rewrite of a different file than the record saw is not trusted");
+        assert_eq!(restamp(&dirs, &[Rewrite { path: other.clone(), before, after }], true), 0, "an unlisted change is never covered");
+        fs::write(&other, b"changed").unwrap();
+        assert_eq!(restamp(&dirs, &[Rewrite { path: out.clone(), before, after }], true), 0, "a record that already mismatched stays as it is");
+        assert_eq!(read(), record);
+        fs::write(&other, b"other").unwrap();
+        record.entries[1].stamp = Some(Stamp::read(&other).unwrap());
+        fsx::write_atomic(&path, &encode(&record)).unwrap();
+        assert_eq!(restamp(&dirs, &[Rewrite { path: out.clone(), before, after }], true), 1);
+        assert_eq!(read().entries[0].stamp, Some(after));
+        assert_eq!(read().entries[1], record.entries[1]);
         fs::remove_dir_all(root).unwrap();
     }
 

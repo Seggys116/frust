@@ -38,6 +38,8 @@ pub(super) struct Slices<'a> {
     began: Instant,
     activity: Option<SystemTime>,
     polled: Instant,
+    /// Files rewritten with identical bytes this slice; no-op records are restamped for them before the locks go.
+    pending: Vec<crate::noop::Rewrite>,
     pub slices: u32,
     pub longest: Duration,
     pub aborted: Option<&'static str>,
@@ -98,6 +100,7 @@ impl<'a> Slices<'a> {
             began: Instant::now(),
             activity: None,
             polled: Instant::now(),
+            pending: Vec::new(),
             slices: 1,
             longest: Duration::ZERO,
             aborted: None,
@@ -234,10 +237,17 @@ impl<'a> Slices<'a> {
         Yield::Abort
     }
 
+    pub fn note(&mut self, rewrites: Vec<crate::noop::Rewrite>) {
+        self.pending.extend(rewrites);
+    }
+
     /// Ends the current slice and drops every lock.
     pub fn finish(&mut self) {
         if self.locks.is_empty() && self.gate.is_none() {
             return;
+        }
+        if !self.pending.is_empty() {
+            crate::noop::restamp(self.dirs, &std::mem::take(&mut self.pending), self.gate.is_some());
         }
         self.longest = self.longest.max(self.began.elapsed());
         self.locks.clear();

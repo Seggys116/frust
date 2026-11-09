@@ -346,8 +346,11 @@ entries use their own key domain, so older versions treat them as misses.
   removed, compressed files stay compressed and the memo keeps file hashes), so the next due pass continues where it
   stopped. A completed pass is throttled for 10 minutes per target; an incomplete pass retries after 30 seconds.
   The marker records the last pass's slice count, longest lock hold and CPU time. Cargo profile locks are taken
-  without waiting, so another active build is skipped. A pass that rewrites outputs can make the next no-op check
-  run Cargo once. Between hourly reassessments, a completed pass can be skipped when
+  without waiting, so another active build is skipped. Before it releases the locks, a pass (and `frust compact`)
+  restamps the no-op records for the files it replaced with identical bytes (compressed or cloned): an entry is
+  updated only when its recorded stamp is the file's stamp just before the rewrite and every other entry of the
+  record still matches, so a record that was already stale is never revived and the next unchanged build is still
+  answered by the fast path. Between hourly reassessments, a completed pass can be skipped when
   a change signature (modification times and entry names of a few directories per profile, plus the number of cache
   entries) matches the last complete pass, or when the target grew by less than 64 MiB since then. Once an hour has
   elapsed since the last completed full pass,

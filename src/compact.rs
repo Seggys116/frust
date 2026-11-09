@@ -1590,7 +1590,9 @@ pub fn compact_with(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions, pro
             collect(&store, true, stats::STORE_SCOPE, &mut candidates);
         }
         retain_unprotected_candidates(&mut candidates, &protection, &mut report);
-        shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report, progress, &|path| scope_of(dirs, path));
+        let mut ctx = ShrinkCtx::plain();
+        shrink(candidates, opts, &mut ctx, &mut report, progress, &|path| scope_of(dirs, path));
+        crate::noop::restamp(dirs, &ctx.rewrites, false);
     }
 
     drop(locks);
@@ -1650,6 +1652,8 @@ struct ShrinkCtx<'a> {
     stopped: bool,
     dir_times: DirTimes,
     pause: Option<&'a mut dyn Pause>,
+    /// Recorded outputs keep serving the no-op fast path only if their records are restamped for these.
+    rewrites: Vec<crate::noop::Rewrite>,
 }
 
 /// How a shrink pass gives way inside a sliced automatic pass.
@@ -1658,6 +1662,8 @@ trait Pause {
     fn checkpoint(&mut self) -> Yield;
     /// Runs `work` with the locks released.
     fn outside(&mut self, work: &mut dyn FnMut()) -> Yield;
+    /// Hands over rewrites to restamp before the locks are next released.
+    fn note(&mut self, rewrites: Vec<crate::noop::Rewrite>);
 }
 
 struct SlicePause<'s, 'a> {
@@ -1673,6 +1679,10 @@ impl Pause for SlicePause<'_, '_> {
     fn outside(&mut self, work: &mut dyn FnMut()) -> Yield {
         credit_pause(self.slices.release_while(work).1, self.store)
     }
+
+    fn note(&mut self, rewrites: Vec<crate::noop::Rewrite>) {
+        self.slices.note(rewrites);
+    }
 }
 
 /// Reading and encoding a file this large takes tens of milliseconds, so a sliced pass does it without the locks.
@@ -1681,7 +1691,7 @@ const UNLOCKED_ENCODE_BYTES: u64 = 4 * 1024 * 1024;
 impl<'a> ShrinkCtx<'a> {
     /// No budget, no memo and no sampling: the explicit `frust compact` behaviour.
     fn plain() -> ShrinkCtx<'a> {
-        ShrinkCtx { budget: None, memo: None, memo_path: None, sample: false, stopped: false, dir_times: DirTimes::default(), pause: None }
+        ShrinkCtx { budget: None, memo: None, memo_path: None, sample: false, stopped: false, dir_times: DirTimes::default(), pause: None, rewrites: Vec::new() }
     }
 
     fn for_auto(dirs: &Dirs, target: &Path, opts: &AutoOptions, pause: &'a mut dyn Pause) -> ShrinkCtx<'a> {
@@ -1694,6 +1704,14 @@ impl<'a> ShrinkCtx<'a> {
             stopped: false,
             dir_times: DirTimes::default(),
             pause: Some(pause),
+            rewrites: Vec::new(),
+        }
+    }
+
+    /// Called under the locks right after `path` was replaced by identical bytes.
+    fn rewritten(&mut self, path: &Path, before: &sys::Meta) {
+        if let Ok(after) = crate::cache::hashing::Stamp::read(path) {
+            self.rewrites.push(crate::noop::Rewrite { path: path.to_path_buf(), before: crate::cache::hashing::Stamp::of(before), after });
         }
     }
 
@@ -1719,6 +1737,7 @@ impl<'a> ShrinkCtx<'a> {
     /// None when the pass must stop; an unsliced pass runs `work` in place.
     fn unlocked<R>(&mut self, mut work: impl FnMut() -> R) -> Option<R> {
         let Some(pause) = self.pause.as_mut() else { return Some(work()) };
+        pause.note(std::mem::take(&mut self.rewrites));
         let mut done = None;
         let step = pause.outside(&mut || done = Some(work()));
         if self.resumed(step) { done } else { None }
@@ -1726,6 +1745,7 @@ impl<'a> ShrinkCtx<'a> {
 
     fn exhausted(&mut self) -> bool {
         if let Some(pause) = self.pause.as_mut() {
+            pause.note(std::mem::take(&mut self.rewrites));
             let step = pause.checkpoint();
             if !self.resumed(step) {
                 return true;
@@ -2054,6 +2074,7 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
                         Ok(()) => {
                             report.deduped_files += 1;
                             report.dedupe_saved += saved;
+                            ctx.rewritten(&m.path, &m.meta);
                             saved
                         }
                         Err(err) => {
@@ -2315,6 +2336,7 @@ fn compress_one(c: &Candidate, dry_run: bool, ctx: &mut ShrinkCtx<'_>, report: &
             report.compressed_files += 1;
             report.compress_before += before;
             report.compress_after += after;
+            ctx.rewritten(&c.path, &c.meta);
         }
         Err(err) => {
             report.errors.push((c.path.clone(), err.to_string()));
@@ -3005,7 +3027,9 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
             retain_unprotected_candidates(&mut candidates, &protection, &mut report);
             shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report, &mut Silent, &|_| String::new());
             let stopped = ctx.stopped;
+            let rewrites = std::mem::take(&mut ctx.rewrites);
             ctx.finish();
+            slices.note(rewrites);
             report.budget_stopped = stopped && slices.aborted.is_none();
             if slices.aborted.is_some() {
                 break 'work;
