@@ -2031,7 +2031,7 @@ pub fn run_auto_child(dirs: &Dirs, cfg: &Config) -> i32 {
 }
 
 /// The `frust` binary next to this executable, or one level up when running from cargo's `deps` directory.
-fn collector_binary() -> Option<PathBuf> {
+pub(crate) fn collector_binary() -> Option<PathBuf> {
     let name = format!("frust{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().ok()?;
     let exe = exe.canonicalize().unwrap_or(exe);

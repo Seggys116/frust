@@ -331,10 +331,23 @@ entries use their own key domain, so older versions treat them as misses.
   the number of remembered files. A missing or damaged payload, mismatch or exhausted budget leaves coverage
   unproven, so the existing age rules decide what can be removed. Current outputs and fresh incremental sessions
   keep their existing protection.
-* Automatic compaction is synchronous but cheap when there is nothing to do. It runs after Cargo exits and before
-  the build lock is handed to a waiter, at background CPU and I/O priority. A completed pass is throttled for
-  10 minutes per target; an incomplete pass retries after 30 seconds. Cargo profile locks are taken without
-  waiting, so another active build is skipped. Between hourly reassessments, a completed pass can be skipped when
+* Automatic compaction never runs inside a build. Once a successful build has released its lock, it checks the
+  marker's age (one `stat`) and, when a pass is due, starts `frust compact --auto-background` as a detached process
+  at utility CPU and I/O priority (background priority could starve it while it holds a lock a build waits for); a
+  pass already running for the target holds the marker, so a second one exits at once. The pass works in slices of
+  `FRUST_COMPACT_SLICE_MS` (100 ms by default): it holds frust's target gate and Cargo's profile locks for one slice,
+  finishes the file or directory in progress, releases everything for at least 15 ms and takes the locks again only
+  if no frust build is queued or running and the modification times of the target's profile, `deps`,
+  `.fingerprint`, `build`, `examples` and incremental directories are unchanged. Read-only work (fingerprint
+  analysis, session and stale-object listings, collecting files) and reading and encoding a file of 4 MiB or more run
+  with the locks released, under the same check. A frust build that queues mid-slice is noticed within 10 ms and
+  makes the pass stop after the step in progress; a busy profile lock (a plain Cargo build) makes it back off exponentially and stop after 30 seconds. An
+  interrupted pass, stopped or killed, leaves the marker incomplete; every step is idempotent (removed state stays
+  removed, compressed files stay compressed and the memo keeps file hashes), so the next due pass continues where it
+  stopped. A completed pass is throttled for 10 minutes per target; an incomplete pass retries after 30 seconds.
+  The marker records the last pass's slice count, longest lock hold and CPU time. Cargo profile locks are taken
+  without waiting, so another active build is skipped. A pass that rewrites outputs can make the next no-op check
+  run Cargo once. Between hourly reassessments, a completed pass can be skipped when
   a change signature (modification times and entry names of a few directories per profile, plus the number of cache
   entries) matches the last complete pass, or when the target grew by less than 64 MiB since then. Once an hour has
   elapsed since the last completed full pass,
@@ -343,7 +356,8 @@ entries use their own key domain, so older versions treat them as misses.
   time. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files that did not
   compress; compressibility is judged from a sample of two 64 KiB blocks, and a file that would save
   less than 5 percent is left alone. The dedupe and compression stage stops after 2 seconds or 512 MiB of work per
-  pass, and the next due pass continues. Explicit `frust compact` has no budget.
+  pass (time spent yielded to builds is not counted), and the next due pass continues. Explicit `frust compact` has
+  no budget, holds the profile locks for its whole run and reports progress.
 * Dead incremental directories (those of a configuration nobody builds any more) are recognised by the codegen
   units they hold. Besides rlib members and object files, frust reads the DWARF string tables of ELF binaries
   (Linux) for rustc's `<source>/@/<codegen unit>` names, so binaries whose objects are gone are still matched.
@@ -541,7 +555,7 @@ not stamped, since every cargo run copies them again and only cargo runs them.
 versioned binary format with a checksum, so a torn or foreign file is ignored and replaced. At most 256 records are
 kept, each at most 16 MiB; records written more than 30 days ago, stale temporary files and, once a day, records whose
 workspace or target directory vanished are removed when a record is written. A run that the fast path answers still
-runs the daily automatic gc at startup, runs automatic compaction when due as after a cargo no-op, records its run in
+runs the daily automatic gc at startup, starts automatic compaction in the background when due as after a cargo no-op, records its run in
 the event log when the display is on, and may print the update notice.
 
 **Audit.** `FRUST_NOOP=audit` runs cargo anyway whenever the fast path would have answered, and fails the build with

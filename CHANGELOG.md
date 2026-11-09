@@ -33,6 +33,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Changed
 
+* Automatic compaction no longer runs inside a build. A due pass starts as a detached `frust compact --auto-background` process after the build has released its lock, and holds Cargo's profile locks only for slices of `FRUST_COMPACT_SLICE_MS` (100 ms by default), stopping as soon as a frust build queues; an interrupted pass is continued by the next. Previously a due pass ran under the build lock after Cargo exited and added seconds to some builds. `FRUST_COMPACT_SYNC=on` runs the pass in the invoking command instead, after its lock is released.
 * `frust compact` lists target directories without measuring them first and measures each root once, and `frust gc` no longer walks every target after collecting just to decide whether to suggest `frust compact`, so neither spends minutes in silent extra walks on a large home.
 * A linked store reads each output once: it links first and hashes through the new name, and the same read attests a library again under the stamp the link left, instead of hashing before the link and reading the library a second time after it.
 * A file under a build script's `build/<unit>/out` is remembered in the hash memo as soon as cargo's `output` file beside it has a later change time, instead of after the 2 second settle margin, so static archives rewritten during a clean rebuild are no longer read again on the first edit.

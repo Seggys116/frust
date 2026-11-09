@@ -1143,20 +1143,16 @@ impl Session {
         }
         trace(&self.cfg, started, "cargo finished");
 
-        // A queued build cannot take the profile before due maintenance has had its nonblocking cleanup opportunity.
-        if code == 0 && self.lock_target.starts_with(self.dirs.targets()) {
-            let report = crate::compact::auto_compact(&self.dirs, &self.lock_target, &self.cfg);
-            if self.cfg.debug {
-                eprintln!("frust: auto-compact {report:?}");
-            }
-        }
         let interrupted = signals::received().is_some() || !(0..=128).contains(&code);
-        // Recorded after compaction and before the lock passes on, so no other build changes the target in between.
+        // Recorded before the lock passes on, so no other build changes the target in between.
         let audit_failure = noop.finish(code, interrupted, launched_ns, recorder.as_ref());
         let code = if audit_failure.is_some() && code == 0 { 1 } else { code };
         // A signalled build is not a result to share.
         if let Some(guard) = guard.take() {
             guard.finish(BuildResult { code, units: progress.done, interrupted });
+        }
+        if code == 0 {
+            self.start_compaction();
         }
         let stats = ui.as_mut().map(|ui| ui.finish(Outcome { success: code == 0, exit_code: code }, Instant::now()));
         if let Some(failure) = &audit_failure {
@@ -1259,15 +1255,21 @@ impl Session {
             }
         }
         // The compaction schedule is kept as after a cargo no-op; a pass that changes the target only makes the next check decline.
-        if self.lock_target.starts_with(self.dirs.targets()) {
-            let report = crate::compact::auto_compact(&self.dirs, &self.lock_target, &self.cfg);
-            if self.cfg.debug {
-                eprintln!("frust: auto-compact {report:?}");
-            }
-        }
+        self.start_compaction();
         noop.trace();
         crate::update::notice(&self.dirs);
         0
+    }
+
+    /// Due compaction runs detached once this build no longer holds the target, so it never delays this build or the next.
+    fn start_compaction(&self) {
+        if !self.lock_target.starts_with(self.dirs.targets()) {
+            return;
+        }
+        let outcome = crate::compact::start_auto(&self.dirs, &self.lock_target, &self.cfg);
+        if self.cfg.debug {
+            eprintln!("frust: auto-compact {outcome}");
+        }
     }
 
     fn acquire_lock(&self, sub: &str, fingerprint: &str, scope: &Scope, mut ui: Option<&mut Ui>, joining: &mut Joining) -> Result<Option<Acquired>, LockError> {

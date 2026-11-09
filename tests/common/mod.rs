@@ -135,6 +135,8 @@ impl Sandbox {
             .env("FRUST_STORE_SYNC", "1")
             // A detached collector would run its own compaction while a test runs one, so the spawned commands collect inline.
             .env("FRUST_GC_SYNC", "1")
+            // Likewise a detached compaction pass would race the test's own checks, so due passes run before the command exits.
+            .env("FRUST_COMPACT_SYNC", "1")
             // Backed entries die with a deleted target, so only tests written for them (tests/backed.rs) switch them on.
             .env("FRUST_CACHE_BACKED", "off")
             // Tests written before the default dropped to one version per unit keep the old bound; tests of the default set it themselves.

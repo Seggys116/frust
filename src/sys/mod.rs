@@ -704,6 +704,11 @@ pub fn thread_cpu_ns() -> Option<u64> {
     imp::thread_cpu_ns()
 }
 
+/// CPU time every thread of this process has used, in nanoseconds.
+pub fn process_cpu_ns() -> Option<u64> {
+    imp::process_cpu_ns()
+}
+
 pub fn fs_type_name(path: &Path) -> Option<String> {
     imp::fs_type_name(path)
 }

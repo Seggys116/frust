@@ -1224,6 +1224,17 @@ pub fn lower_thread_priority() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn lower_store_priority() {}
 
+pub fn process_cpu_ns() -> Option<u64> {
+    // SAFETY: rusage is plain data and getrusage only writes the out pointer.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_SELF is always valid and `usage` is a valid out pointer.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let ns = |t: libc::timeval| Some(u64::try_from(t.tv_sec).ok()? * 1_000_000_000 + u64::try_from(t.tv_usec).ok()? * 1000);
+    Some(ns(usage.ru_utime)? + ns(usage.ru_stime)?)
+}
+
 pub fn thread_cpu_ns() -> Option<u64> {
     // SAFETY: timespec is plain data and clock_gettime only writes the out pointer.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };

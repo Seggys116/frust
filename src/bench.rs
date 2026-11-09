@@ -457,6 +457,7 @@ fn benchmark_auto_options(full_maintenance_pass: bool) -> AutoOptions {
         hot_categories: compact::HOT_CATEGORIES.to_vec(), cache_enabled: true, compress: true,
         pass_budget: Duration::from_secs(if full_maintenance_pass { 3600 } else { 2 }),
         pass_bytes: if full_maintenance_pass { u64::MAX } else { 512 * 1024 * 1024 },
+        slice: Duration::ZERO,
     }
 }
 

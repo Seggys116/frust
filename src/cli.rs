@@ -380,6 +380,9 @@ fn resolve_workspace(dirs: &Dirs, wanted: &str) -> Result<String, String> {
 }
 
 fn compact_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
+    if let Some(target) = flag_value(flags, compact::AUTO_CHILD_FLAG) {
+        return compact::run_auto_child(dirs, cfg, std::path::Path::new(&target));
+    }
     let s = Styler::detect();
     let has = |f: &str| flags.iter().any(|x| x == f);
     let mut opts = CompactOptions::full();
