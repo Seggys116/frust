@@ -158,11 +158,20 @@ impl Plan {
 }
 
 pub fn load(path: &Path) -> Option<Plan> {
+    load_if(path, |_| true)
+}
+
+/// Loads only a plan whose raw bytes pass `wanted`, so a cheap byte test spares parsing plans that cannot match.
+pub fn load_if(path: &Path, wanted: impl FnOnce(&[u8]) -> bool) -> Option<Plan> {
     let meta = fs::metadata(path).ok()?;
     if meta.len() > MAX_PLAN_BYTES {
         return None;
     }
-    let plan: Plan = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let bytes = fs::read(path).ok()?;
+    if !wanted(&bytes) {
+        return None;
+    }
+    let plan: Plan = serde_json::from_slice(&bytes).ok()?;
     let sound = plan.format == FORMAT
         && plan.units.iter().all(|u| u.deps.iter().all(|(d, _)| *d < plan.units.len()) && u.run.is_none_or(|r| r < plan.scripts.len()))
         && plan.messages.iter().all(|(u, _)| u.is_none_or(|u| u < plan.units.len()));

@@ -1183,7 +1183,13 @@ fn locate_unit(msg: &serde_json::Value, outputs: &[PathBuf]) -> Result<Unit, &'s
         let Ok(meta) = sys::stat(out) else { continue };
         let want = Stamp::of(&meta);
         let (stem, suffix) = split_suffix(&name);
+        let stem_as_named = stem;
         let stem = stem.replace('-', "_");
+        if let [(hash, original)] = fingerprinted_originals(profile_dir, dir, &package, [stem.as_str(), stem_as_named], suffix, &want).as_slice()
+            && let Some(unit) = unit_at(profile_dir, original.parent().unwrap_or(dir), hash, vec![original.clone()])
+        {
+            return Ok(unit);
+        }
         let mut found = Vec::new();
         for search in [profile_dir.join("deps"), dir.to_path_buf()] {
             let Ok(entries) = fs::read_dir(&search) else { continue };
@@ -1215,6 +1221,26 @@ fn locate_unit(msg: &serde_json::Value, outputs: &[PathBuf]) -> Result<Unit, &'s
     let mut unit = candidates(msg, &profile, &package, &crate_name)?;
     unit.extra_outputs.extend(unhashed);
     Ok(unit)
+}
+
+/// Hashed originals of an uplifted output named after the package's fingerprint hashes, found by stat alone because `deps` piles up stale objects.
+fn fingerprinted_originals(profile: &Path, dir: &Path, package: &str, stems: [&str; 2], suffix: &str, want: &Stamp) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(profile.join(".fingerprint")) else { return Vec::new() };
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        let Some((_, hash)) = name.rsplit_once('-').filter(|(p, h)| *p == package && is_hash(h)) else { continue };
+        for search in [profile.join("deps"), dir.to_path_buf()] {
+            for stem in stems {
+                let path = search.join(format!("{stem}-{hash}{suffix}"));
+                let same = sys::stat(&path).map(|m| Stamp::of(&m)).is_ok_and(|s| s.size == want.size && s.mtime_ns == want.mtime_ns);
+                if same && !found.iter().any(|(h, _)| h == hash) {
+                    found.push((hash.to_string(), path));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Every fingerprint directory of the package holding this unit's fingerprint file; a superset only adds stamps.
@@ -1318,6 +1344,8 @@ impl<'a> Collector<'a> {
                 self.input(&dir.join(name), true)?;
             }
         }
+        // Rebuilt units go first: their sources are the likeliest to refuse the record, and a later check meets them first.
+        units.sort_by_key(|(msg, ..)| msg.get("fresh").and_then(|f| f.as_bool()) == Some(true));
         for (msg, id, manifest, outputs, unit) in &units {
             // Every cargo run re-copies a build script's uplifted executable, which only cargo itself ever runs; its hashed original is stamped instead.
             let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
@@ -1829,5 +1857,33 @@ mod tests {
         let mut noisy = Recorder::default();
         noisy.take(&[], &[b"warning: x".to_vec(), b"    Finished `dev` profile in 0.31s".to_vec()]);
         assert!(audit(&predicted, 0, Some(&noisy), &[]).unwrap().contains("differs"));
+    }
+
+    #[test]
+    fn an_uplifted_binary_is_traced_to_the_original_its_fingerprint_names() {
+        let root = fsx::temp_sibling(&env::temp_dir().join("frust-noop-uplift"));
+        let profile = root.join("debug");
+        let (named, decoy) = ("0123456789abcdef", "fedcba9876543210");
+        fs::create_dir_all(profile.join(".fingerprint").join(format!("my-tool-{named}"))).unwrap();
+        fs::write(profile.join(".fingerprint").join(format!("my-tool-{named}")).join("bin-my-tool"), b"").unwrap();
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        let original = profile.join("deps").join(format!("my_tool-{named}"));
+        fs::write(&original, b"binary").unwrap();
+        let uplifted = profile.join("my-tool");
+        fs::hard_link(&original, &uplifted).unwrap();
+        // A deduplicated alias without a fingerprint of this package must not make the original ambiguous.
+        fs::hard_link(&original, profile.join("deps").join(format!("my_tool-{decoy}"))).unwrap();
+        let msg = serde_json::json!({
+            "package_id": "path+file:///w#my-tool@0.1.0",
+            "target": { "name": "my-tool", "kind": ["bin"] },
+            "profile": { "test": false },
+            "filenames": [uplifted.to_str().unwrap()],
+            "executable": uplifted.to_str().unwrap(),
+        });
+        let unit = locate_unit(&msg, std::slice::from_ref(&uplifted)).unwrap();
+        assert_eq!(unit.fingerprints, vec![profile.join(".fingerprint").join(format!("my-tool-{named}"))]);
+        assert_eq!(unit.extra_outputs, vec![original.clone()]);
+        assert_eq!(unit.depinfos, vec![profile.join("deps").join(format!("my_tool-{named}.d"))]);
+        fs::remove_dir_all(root).unwrap();
     }
 }

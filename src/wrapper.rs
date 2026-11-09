@@ -216,6 +216,8 @@ struct Plan {
     bulk_scan: AtomicBool,
     /// The incremental session this compile finalized, which the store shares into the entry.
     session: OnceLock<cache::session::Produced>,
+    /// An input outside the profile that changed too close to the compile, found by the freeze; no store of this compile can pass its check.
+    too_new_input: OnceLock<PathBuf>,
 }
 
 struct Shared {
@@ -383,6 +385,7 @@ impl Plan {
             uplift_links: sys::CARGO_UPLIFT_LINKS && matches!(env::var(CARGO_COMMAND_ENV).as_deref(), Ok("build" | "b")),
             bulk_scan: AtomicBool::new(false),
             session: OnceLock::new(),
+            too_new_input: OnceLock::new(),
         })
     }
 
@@ -470,6 +473,7 @@ impl Plan {
             uplift_links: false,
             bulk_scan: AtomicBool::new(false),
             session: job.session.clone().map(OnceLock::from).unwrap_or_default(),
+            too_new_input: OnceLock::new(),
         })
     }
 
@@ -1033,7 +1037,12 @@ impl Plan {
                 for entry in &retired {
                     cache::delete_retired(&self.dirs, entry);
                 }
-                if let Err(err) = self.store(&captured, compile_ms, spawned_ns, &preexisting) {
+                // An input the freeze found too new fails the store's own check, so it is not hashed only to be refused.
+                let stored = match self.too_new_input.get() {
+                    Some(path) => self.skip_store(&format!("{} was modified during the compile", path.display()), compile_ms),
+                    None => self.store(&captured, compile_ms, spawned_ns, &preexisting),
+                };
+                if let Err(err) = stored {
                     self.debug(&format!(
                         "store failed for {}: {err}",
                         self.parsed.crate_name
@@ -1348,6 +1357,11 @@ impl Plan {
         if !self.trust.volume_trusted(profile.dev, &self.profile_abs) {
             return None;
         }
+        // The announced dep-info settles the "file too new" check before the output scan, which reads the whole directory.
+        if let Some(path) = self.announced_dep_info(captured).and_then(|dep| self.too_new_dep_input(&dep, spawned_ns)) {
+            let _ = self.too_new_input.set(path);
+            return None;
+        }
         let (names, scanned) = self.output_files_scanned(captured, preexisting, true);
         let dep_name = names.iter().find(|n| n.ends_with(".d"))?.clone();
         let dep_text = fs::read_to_string(self.output_dir_abs.join(&dep_name)).ok()?;
@@ -1361,6 +1375,7 @@ impl Plan {
             let stamp = Stamp::of(&meta);
             // Reject inputs that cannot settle for this compile before reading output commitments.
             if !path.starts_with(&self.profile_abs) && stamp.too_new_for(spawned_ns) {
+                let _ = self.too_new_input.set(path);
                 return None;
             }
             inputs.insert(path, stamp);
@@ -1414,6 +1429,25 @@ impl Plan {
             commitments,
         };
         (!frozen.has_coarse_stamp()).then_some(frozen)
+    }
+
+    /// The dep-info file rustc announced in this output directory, if any.
+    fn announced_dep_info(&self, captured: &[u8]) -> Option<PathBuf> {
+        String::from_utf8_lossy(captured).lines().filter(|line| line.contains("\"artifact\"")).find_map(|line| {
+            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            let path = Path::new(value.get("artifact")?.as_str()?);
+            let local = path.parent() == Some(self.parsed.out_dir.as_path()) || path.parent().is_none();
+            let name = path.file_name()?;
+            (local && name.to_string_lossy().ends_with(".d")).then(|| self.output_dir_abs.join(name))
+        })
+    }
+
+    /// An input of the dep-info outside the profile that changed too close to `spawned_ns` for any store to accept.
+    fn too_new_dep_input(&self, dep: &Path, spawned_ns: i128) -> Option<PathBuf> {
+        let text = fs::read_to_string(dep).ok()?;
+        cache::depinfo::parse(&text).files.iter().map(|file| self.resolve(&self.norm(file))).find(|path| {
+            !path.starts_with(&self.profile_abs) && sys::stat(path).is_ok_and(|meta| !meta.is_dir() && Stamp::of(&meta).too_new_for(spawned_ns))
+        })
     }
 
     /// Cargo's uplift link would void an attestation of this library at once; predicted from the uplifted name still sharing the inode this compile replaced.
@@ -7701,6 +7735,7 @@ mod tests {
         if !hashing::fs_trusted(&s.0) || !fine {
             return;
         }
+        assert_eq!(plan.too_new_input.get(), Some(&src), "the store is skipped instead of hashing inputs only to refuse them");
         let compress = cache_compression_requested()
             && cache::payload::compression_supported(&plan.dirs.tmp());
         let mut captures = Vec::new();
