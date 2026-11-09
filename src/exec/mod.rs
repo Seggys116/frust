@@ -110,6 +110,8 @@ pub struct Gate {
     owed: HashSet<String>,
     loaded: Option<Plan>,
     graph_verified: bool,
+    bound: bool,
+    lock_created: bool,
     launched_ns: i128,
     decision: String,
     planned: String,
@@ -188,6 +190,8 @@ impl Gate {
             owed: HashSet::new(),
             loaded: None,
             graph_verified: false,
+            bound: false,
+            lock_created: false,
             launched_ns: 0,
             decision: String::new(),
             planned: String::new(),
@@ -211,6 +215,11 @@ impl Gate {
     pub fn check(&mut self) -> Option<Command> {
         if let Err(why) = self.active() {
             self.decision = why.to_string();
+            return None;
+        }
+        if self.mode == Mode::On && rerun_bound(&self.plan_path, &self.key) {
+            self.decision = "decline:build script reruns on any change".into();
+            self.bound = true;
             return None;
         }
         let loaded = plan::load(&self.plan_path);
@@ -299,13 +308,16 @@ impl Gate {
             u.inputs.iter().any(|e| !e.current()) || u.env_deps.iter().any(|(k, v)| self.unit_env(plan, u, k) != *v)
         }).collect());
         for (u, unit) in plan.units.iter().enumerate() {
-            if !dirty[u] {
-                if let Some(moved) = unit.stamps.iter().find(|e| !e.current_output()) {
-                    if self.debug {
-                        eprintln!("frust: executor: {} was {:?}, now {:?}", moved.path, moved.stamp, plan::stamp(Path::new(&moved.path)));
-                    }
-                    return Err("outputs changed");
+            // Outputs another build rewrote since the plan was written, dirty or not, mean only cargo knows what is current.
+            // A failed replay of a dirty unit may have rewritten its rustc dep-info, which is no sign of another build.
+            let own_depinfo = |e: &&plan::Entry| dirty[u] && e.path.ends_with(".d") && unit.outputs.contains(&e.path);
+            if let Some(moved) = unit.stamps.iter().filter(|e| !own_depinfo(e)).find(|e| !e.current_output()) {
+                if self.debug {
+                    eprintln!("frust: executor: {} was {:?}, now {:?}", moved.path, moved.stamp, plan::stamp(Path::new(&moved.path)));
                 }
+                return Err("outputs changed");
+            }
+            if !dirty[u] {
                 continue;
             }
             if unit.script {
@@ -327,7 +339,7 @@ impl Gate {
     /// Asks the wrapper to journal this cargo run's rustc calls, so a later build may replay them.
     pub fn journal(&mut self, cmd: &mut Command) {
         cmd.env_remove(journal::ENV);
-        if self.active().is_err() || self.served {
+        if self.active().is_err() || self.served || self.bound {
             return;
         }
         let _ = fs::create_dir_all(dir(&self.dirs));
@@ -336,6 +348,7 @@ impl Gate {
             cmd.env(journal::ENV, &path);
             self.journal = Some(path);
             self.launched_ns = crate::cache::hashing::now_ns();
+            self.lock_created = self.root.as_ref().is_some_and(|r| !r.join("Cargo.lock").exists());
         }
     }
 
@@ -382,13 +395,14 @@ impl Gate {
                     base_env: &self.base,
                     configs: &self.configs,
                     launched_ns: self.launched_ns,
+                    lock_created: self.lock_created,
                     verified: previous_ok.clone(),
                 })
             })
         };
         let mut built = attempt(previous.clone().into_iter().collect());
         // The same command recorded under another display may already cover the fresh units.
-        if built.as_ref().is_err_and(|r| !r.adopt.is_empty()) {
+        if built.as_ref().is_err_and(|r| r.why == "uncovered unit") {
             let siblings = sibling_plans(&self.dirs, &self.plan_path, &self.key, &self.target);
             if !siblings.is_empty() {
                 built = attempt(previous.into_iter().chain(siblings).collect());
@@ -402,13 +416,16 @@ impl Gate {
                     Err(_) => self.planned = "skip:unwritable".into(),
                 }
                 prune(&dir(&self.dirs), &self.plan_path);
+                record_rerun_bound(&self.plan_path, &new_plan);
                 failure.or_else(|| self.replay_audit(&new_plan, lines))
             }
             Err(plan::Refused { why, adopt }) => {
                 self.planned = format!("skip:{why}");
                 let _ = fs::remove_file(&self.plan_path);
-                // Units built before frust journaled them: cargo recompiles them through the cache once, under a journal.
-                let adopted = adopt.iter().filter(|f| fs::remove_file(f).is_ok()).count();
+                // A target built before the executor existed: cargo recompiles its units through the cache once, under a
+                // journal. A target that already has plans is never adopted, so other commands keep cargo's state intact.
+                let first_contact = !adopt.is_empty() && !target_has_plans(&self.dirs, &self.plan_path, &self.target);
+                let adopted = if first_contact { adopt.iter().filter(|f| fs::remove_file(f).is_ok()).count() } else { 0 };
                 if adopted > 0 {
                     self.planned = format!("skip:{why}, adopting {adopted}");
                 }
@@ -604,6 +621,58 @@ fn sibling_plans(dirs: &Dirs, own: &Path, key: &str, target: &Path) -> Vec<Plan>
         .filter_map(|p| plan::load(&p))
         .filter(|p| p.key == key && Path::new(&p.target) == target)
         .collect()
+}
+
+/// Stamps that keep a command known to be bound to cargo: every local unit sits in a package whose build script has no
+/// `rerun-if-changed`, so any source edit reruns a script and a replay could never answer.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RerunBound {
+    key: String,
+    entries: Vec<plan::Entry>,
+}
+
+fn bound_path(plan_path: &Path) -> PathBuf {
+    plan_path.with_extension("bound")
+}
+
+/// Stat-only: while no manifest, lockfile, config or build script changed, the answer stays cargo's.
+fn rerun_bound(plan_path: &Path, key: &str) -> bool {
+    let path = bound_path(plan_path);
+    let Ok(bytes) = fs::read(&path) else { return false };
+    match serde_json::from_slice::<RerunBound>(&bytes) {
+        Ok(bound) if bound.key == key && bound.entries.iter().all(plan::Entry::current) => true,
+        _ => {
+            let _ = fs::remove_file(path);
+            false
+        }
+    }
+}
+
+fn record_rerun_bound(plan_path: &Path, plan: &Plan) {
+    let path = bound_path(plan_path);
+    let mut local = plan.units.iter().filter(|u| u.local && !u.script).peekable();
+    let bound = local.peek().is_some() && local.all(|u| u.run.is_some_and(|r| plan.scripts[r].rerun.is_empty()));
+    if !bound {
+        let _ = fs::remove_file(path);
+        return;
+    }
+    // The manifests and lockfile are among the graph stamps; a build script's own sources may add a directive.
+    let mut entries = plan.graph.clone();
+    for unit in plan.units.iter().filter(|u| u.local && u.script) {
+        entries.extend(unit.inputs.iter().cloned());
+    }
+    let record = RerunBound { key: plan.key.clone(), entries };
+    if let Ok(bytes) = serde_json::to_vec(&record) {
+        let _ = crate::fsx::write_atomic(&path, &bytes);
+    }
+}
+
+fn target_has_plans(dirs: &Dirs, own: &Path, target: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir(dirs)) else { return false };
+    entries.flatten()
+        .map(|e| e.path())
+        .filter(|p| p != own && p.to_string_lossy().ends_with(PLAN_SUFFIX))
+        .any(|p| plan::load(&p).is_some_and(|plan| Path::new(&plan.target) == target))
 }
 
 /// Cargo's rule: a unit rebuilds when any dependency did.

@@ -145,6 +145,20 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+/// What cargo itself compiles now: `--message-format=json` keeps both fast paths out of the way.
+fn cargo_rebuilds(fx: &Fixture) -> Vec<String> {
+    let mut cmd = fx.command("on");
+    cmd.arg("--message-format=json");
+    let out = cmd.output().unwrap();
+    assert_success(&out);
+    stdout(&out)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|msg| msg["reason"] == "compiler-artifact" && msg["fresh"] != true)
+        .map(|msg| msg["target"]["name"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
 /// Everything but the status lines cargo and the executor time differently.
 fn diagnostics(out: &Output) -> Vec<String> {
     stderr(out)
@@ -188,6 +202,7 @@ fn an_edited_library_is_replayed_without_cargo_and_the_binary_sees_it() {
     fx.edit("applib/src/lib.rs", "pub fn value() -> u32 {\n    4\n}\n");
     fx.replayed(2);
     assert_eq!(fx.output("app"), "4");
+    assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "cargo itself finds the replayed units fresh");
 
     fx.edit("app/src/bin/extra.rs", "fn main() {}\n");
     fx.declined("targets changed");
@@ -214,9 +229,16 @@ fn replayed_outputs_are_byte_identical_to_plain_cargo() {
     };
     let replayed = snapshot(&deps);
     assert_eq!(replayed.len(), 3, "rlib, rmeta and executable: {:?}", replayed.iter().map(|f| &f.0).collect::<Vec<_>>());
+    // The replay left cargo nothing to do, so cargo's record of the two units is removed to make it compile them.
+    for entry in fs::read_dir(fx.target().join("debug").join(".fingerprint")).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("applib-") || name.starts_with("app-") {
+            fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
     let out = fx.plain(&fx.target());
     assert_success(&out);
-    assert!(stderr(&out).contains("Compiling applib") && stderr(&out).contains("Compiling app "), "cargo recompiles what the replay invalidated: {}", stderr(&out));
+    assert!(stderr(&out).contains("Compiling applib") && stderr(&out).contains("Compiling app "), "cargo recompiles both units: {}", stderr(&out));
     let plain = snapshot(&deps);
     for ((name, mine), (_, theirs)) in replayed.iter().zip(&plain) {
         assert!(mine == theirs, "{name} differs from plain cargo's");
@@ -442,6 +464,34 @@ fn another_display_of_the_same_command_borrows_the_recorded_calls() {
     fx.edit("applib/src/lib.rs", "pub fn value() -> u32 {\n    7\n}\n");
     fx.replayed(2);
     assert_eq!(fx.output("app"), "7");
+}
+
+#[test]
+fn a_package_whose_build_script_watches_everything_declines_from_stats_alone() {
+    let files = vec![
+        ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string()),
+        ("build.rs", "fn main() {}\n".to_string()),
+        ("src/main.rs", "fn main() {\n    println!(\"1\");\n}\n".to_string()),
+    ];
+    let fx = Fixture::new("exec-bound", &files);
+    let (out, trace) = fx.run("on");
+    assert_success(&out);
+    assert_eq!(trace["plan"], "written", "trace {trace}");
+    for value in ["2", "3"] {
+        fx.edit("src/main.rs", &format!("fn main() {{\n    println!(\"{value}\");\n}}\n"));
+        let (out, trace) = fx.run("on");
+        assert_success(&out);
+        assert_eq!(Fixture::exec(&trace), "decline:build script reruns on any change", "no plan is read or built: {trace}");
+        assert_eq!(trace["plan"], "none", "nothing is journaled: {trace}");
+        assert_eq!(fx.output("app"), value);
+    }
+    fx.edit("build.rs", "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n");
+    let (out, trace) = fx.run("on");
+    assert_success(&out);
+    assert_eq!(trace["plan"], "written", "a changed build script is looked at again: {trace}");
+    fx.edit("src/main.rs", "fn main() {\n    println!(\"4\");\n}\n");
+    fx.replayed(1);
+    assert_eq!(fx.output("app"), "4");
 }
 
 #[test]

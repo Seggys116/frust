@@ -581,8 +581,9 @@ fingerprint walk and job queue. `FRUST_EXEC=off` disables it; every doubt runs c
 file in `exec/` and the wrapper appends one line per rustc call: arguments, environment (minus jobserver and per-run
 variables), working directory, start time, duration and exit code. After a successful run the plan is built from
 cargo's JSON messages and the journal (units cargo reported fresh keep their call from the previous plan). A fresh
-unit no journal covers, as in a target built before the executor, means no plan; its fingerprint file is removed so the
-next cargo run recompiles it through the cache under a journal, a one-time cost. Per unit the plan keeps the call, the environment cargo set or removed relative to frust's own, the
+unit no journal covers, as in a target built before the executor, means no plan; when the run compiled something and no plan of any
+command exists for the target yet, its fingerprint file is removed so the next cargo run recompiles it through the
+cache under a journal, a one-time cost. A `Cargo.lock` that cargo itself created during the run is recorded as written. Per unit the plan keeps the call, the environment cargo set or removed relative to frust's own, the
 outputs rustc writes, the uplifted copies with cargo's `<name>.d` files, edges from `--extern` paths (to `.rmeta` when
 the dependent may start on metadata), its rustc dep-info inputs and `env-dep` values, cargo's cached diagnostics for
 the unit, and its fingerprint file. Build scripts contribute their `rerun-if-changed` paths (not those inside a
@@ -595,21 +596,27 @@ The plan lives next to the no-op record of the same command and display, as `exe
 **The check.** Under the build lock: the key, every graph stamp, the layout and every build script trigger must match;
 units whose inputs (path packages only: like cargo, registry and git sources are not checked) or `env-dep` values
 changed are dirty, with every unit that depends on them (cargo rebuilds a
-dependent whenever a dependency's output changed; dependents are never skipped). Clean units' outputs must be exactly
-as recorded. It declines when a dirty unit is a build script, a registry or git unit, or one whose `<name>.d` files
+dependent whenever a dependency's output changed; dependents are never skipped). Every unit's outputs must still be the files recorded (a
+failed replay's own rustc dep-info aside): another build that rewrote them leaves the answer to cargo. It declines when a dirty unit is a build script, a registry or git unit, or one whose `<name>.d` files
 frust could not reproduce byte for byte when recording, when a Windows executable to replace is in use, and for
 argument files, `-o`, or packed debug info on macOS.
 
 **The replay.** A child process (`fcargo --frust-exec-child`) stands in for cargo, so the display, the build log for
-joining builds, cache events and recording work unchanged. It removes the fingerprint file of every dirty unit first
-(cargo then rebuilds those units through the cache on its next run; cargo's own files are never written and
-`invoked.timestamp` is untouched), prints fresh units' artifacts and cached warnings, then runs dirty units through
+joining builds, cache events and recording work unchanged. It prints fresh units' artifacts and cached warnings, then runs dirty units through
 `RUSTC_WRAPPER` with the recorded arguments, in dependency order, starting a dependent once the `.rmeta` it needs is
 announced, bounded by `-j` (else `CARGO_BUILD_JOBS`, else the available parallelism) through its own jobserver. Output
 follows cargo: `Compiling` once per package, rendered diagnostics deduplicated, the warning summary with the `cargo fix`
 hint, `could not compile ... due to N previous errors` with exit 101, and the recorded `Finished` line with this run's
 time. Each finished unit is uplifted atomically (a clone on macOS, a hard link elsewhere) and its `<name>.d` files are
-rewritten when their contents change. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
+rewritten when their contents change. Cargo's state is then left as if cargo had compiled the unit: when the compile
+read the same files and `env-dep` values and printed the same diagnostics cargo cached, the modification time of cargo's
+dep-info file in `.fingerprint` moves to the compile's start, as cargo itself sets it, so a later cargo run finds the
+unit fresh; otherwise its fingerprint file is removed and cargo recompiles it through the cache. No cargo file is ever
+written and `invoked.timestamp` is untouched. Until then an edited source is newer than cargo's dep-info and a rebuilt
+dependency newer than its dependents' outputs, so an interrupted replay leaves cargo seeing every unit it must rebuild.
+A package whose build script has no `rerun-if-changed` reruns it on any change, so when every workspace unit sits in
+such a package the command is marked bound to cargo: until a manifest, lockfile, config or build script source changes,
+later builds decline from a few stats without reading, journaling or rebuilding a plan. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
 next run rebuilds the same units. On success the plan is updated with the new inputs and outputs, and the no-op record
 is written from the child's output as from cargo's. When compaction later replaces a listed output with identical
 bytes, the plan is restamped under the same rule as no-op records; any other change makes the next check decline.

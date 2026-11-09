@@ -322,6 +322,8 @@ pub struct Recorded<'a> {
     pub base_env: &'a HashMap<String, String>,
     pub configs: &'a [PathBuf],
     pub launched_ns: i128,
+    /// `Cargo.lock` did not exist when cargo was launched.
+    pub lock_created: bool,
     /// Graph stamps and layout the check just found unchanged under the same lock; cargo never changes them.
     pub verified: Option<(Vec<Entry>, Layout)>,
 }
@@ -587,7 +589,9 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
         });
     }
     if gaps > 0 {
-        return Err(Refused { why: "uncovered unit", adopt: uncovered });
+        // Only an edit loop pays the one-time recompile; a run that compiled nothing adopts nothing.
+        let compiled = rec.messages.iter().any(|m| m.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact") && m.get("fresh").and_then(|f| f.as_bool()) != Some(true));
+        return Err(Refused { why: "uncovered unit", adopt: if compiled { uncovered } else { Vec::new() } });
     }
     if units.is_empty() {
         return Err("no units".into());
@@ -786,14 +790,18 @@ fn graph_inputs(plan: &mut Plan, rec: &Recorded<'_>) -> Result<(), &'static str>
         plan.layout = layout.clone();
         return Ok(());
     }
+    let lock = rec.root.join("Cargo.lock");
     let mut seen = HashSet::new();
     let mut push = |plan: &mut Plan, path: PathBuf, absent_ok: bool| {
-        if seen.insert(path.clone()) {
-            plan.graph.push(Entry::input(&path, rec.launched_ns, absent_ok));
+        if !seen.insert(path.clone()) {
+            return;
         }
+        // A lockfile cargo itself created during this run is the run's own outcome, not an edit racing it.
+        let entry = if rec.lock_created && path == lock { Entry::now(&path) } else { Entry::input(&path, rec.launched_ns, absent_ok) };
+        plan.graph.push(entry);
     };
     push(plan, rec.root.join("Cargo.toml"), false);
-    push(plan, rec.root.join("Cargo.lock"), true);
+    push(plan, lock.clone(), true);
     for config in rec.configs {
         push(plan, config.clone(), true);
     }

@@ -1,6 +1,6 @@
 //! The executor process: replays dirty units through the wrapper and prints what cargo would.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -11,7 +11,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -277,18 +277,6 @@ impl Executor {
     fn run(&mut self, request: &Request) -> i32 {
         self.replay_fresh();
         let total = self.plan.units.len();
-        for u in 0..total {
-            if self.dirty[u] {
-                match fs::remove_file(&self.plan.units[u].fingerprint) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        self.printer.error(&format!("cannot invalidate {}: {e}", self.plan.units[u].fingerprint));
-                        return 101;
-                    }
-                }
-            }
-        }
         let mut dependents = vec![Vec::new(); total];
         for (u, unit) in self.plan.units.iter().enumerate() {
             for (dep, _) in &unit.deps {
@@ -446,6 +434,7 @@ impl Executor {
         let argv = self.plan.units[u].argv().ok_or("unreplayable arguments")?;
         let cwd = PathBuf::from(&self.plan.units[u].cwd);
         let (inputs, env_deps) = plan::read_inputs(&argv, &cwd, Path::new(&self.plan.target), run.spawned_ns).map_err(str::to_string)?;
+        settle_fingerprint(&self.plan.units[u], &inputs, &env_deps, &run.diagnostics, run.spawned_ns).map_err(|e| format!("cannot settle cargo's fingerprint: {e}"))?;
         {
             let unit = &mut self.plan.units[u];
             unit.inputs = inputs;
@@ -564,4 +553,26 @@ fn uplift(src: &Path, dst: &Path) -> io::Result<()> {
     let renamed = sys::rename(&tmp, dst);
     let _ = fs::remove_file(&tmp);
     renamed
+}
+
+/// Leaves cargo's state as if cargo had compiled the unit: when the compile read the same files and environment and
+/// printed the same diagnostics cargo recorded, cargo's dep-info timestamp moves to the compile's start, as cargo sets
+/// it; otherwise the fingerprint file goes and cargo recompiles the unit through the cache. Contents are never written.
+fn settle_fingerprint(unit: &plan::Unit, inputs: &[plan::Entry], env_deps: &plan::EnvDeps, diagnostics: &[String], spawned_ns: i128) -> io::Result<()> {
+    let hash = Path::new(&unit.fingerprint);
+    let (Some(dir), Some(name)) = (hash.parent(), hash.file_name().and_then(|n| n.to_str())) else { return Ok(()) };
+    let dep = dir.join(format!("dep-{name}"));
+    let cached: Vec<String> = fs::read_to_string(dir.join(format!("output-{name}"))).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default();
+    let paths = |list: &[plan::Entry]| list.iter().map(|e| e.path.clone()).collect::<BTreeSet<_>>();
+    let same = hash.is_file() && dep.is_file() && paths(&unit.inputs) == paths(inputs) && unit.env_deps == *env_deps && cached == diagnostics;
+    if same {
+        let when = UNIX_EPOCH + Duration::from_nanos(u64::try_from(spawned_ns).unwrap_or(0));
+        if fs::File::options().write(true).open(&dep).and_then(|f| f.set_modified(when)).is_ok() {
+            return Ok(());
+        }
+    }
+    match fs::remove_file(hash) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
