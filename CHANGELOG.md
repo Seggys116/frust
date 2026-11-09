@@ -6,6 +6,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Added
 
+* `FRUST_TUNE` compiles incremental, unoptimised crates of the dev and test profiles with 64 codegen units instead of rustc's incremental default of 256 when no codegen-units value is set, which cuts the per-object file work rustc and the linker do on every edit; release, custom profiles, dependencies and explicit settings are unchanged, and `FRUST_TUNE=off` restores rustc's default.
 * An incremental unit's rustc session is stored with its cache entry and restored on a hit, so the first edit after a clean rebuild is incremental instead of a from-scratch compile (`FRUST_CACHE_SESSIONS=off` disables).
 * Edit-loop executor: repeated edits replay only the affected rustc calls itself and fall back to cargo whenever it cannot prove the result identical (`FRUST_EXEC=off|on|audit`).
 * `frust gc` and `frust compact` report progress on stderr: a live status line on a terminal (phase, items done of the total, bytes, workspace or profile, elapsed time and ETA) and a line per phase plus at most one every 5 seconds in logs. `--quiet` silences it and `--progress` forces it (including with `FRUST_RENDER=off`). The gc plan and the compaction report now break the whole home down by workspace, with the store and other state listed separately, and `frust compact --workspace NAME|PATH` limits a run to one workspace. Library callers get the same events through `gc::plan_with`, `gc::execute_with` and `compact::compact_with` with a `Progress` implementation.

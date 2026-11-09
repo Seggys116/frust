@@ -1,4 +1,4 @@
-//! Dependency debuginfo tuning is on by default, applies to dev-like profiles, and yields to user debug settings and `FRUST_TUNE=off`.
+//! Dev tuning (dependency debuginfo, incremental codegen units) is on by default, applies to dev-like profiles, and yields to user settings and `FRUST_TUNE=off`.
 
 mod common;
 
@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use common::{Sandbox, assert_success, stderr};
+use common::{Sandbox, assert_success, stderr, stdout};
 
 fn project(sb: &Sandbox, manifest_extra: &str) -> PathBuf {
     let dep = sb.root.join("outdep");
@@ -132,6 +132,56 @@ fn tuned_and_untuned_builds_share_one_cache_without_mixing_entries() {
     let again = fcargo(&sb, &ws, &["build", "-v"], Some("on"));
     assert_success(&again);
     assert!(!stderr(&again).lines().any(|l| l.contains("Running") && l.contains("--crate-name outdep ") && l.contains("debuginfo=2")));
+}
+
+/// Objects in the newest incremental session of `krate`: one per codegen unit rustc emitted.
+fn session_objects(sb: &Sandbox, ws: &Path, krate: &str) -> usize {
+    let incremental = sb.central_target(ws).join("debug").join("incremental");
+    let crate_dir = fs::read_dir(&incremental).unwrap().flatten().map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("{krate}-"))).unwrap();
+    let session = fs::read_dir(&crate_dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).max_by_key(|p| fs::metadata(p).unwrap().modified().unwrap()).unwrap();
+    fs::read_dir(session).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "o" || x == "obj")).count()
+}
+
+/// A workspace binary of 80 modules, which rustc's default of 256 incremental units keeps as about 80 objects.
+fn many_modules(sb: &Sandbox) -> PathBuf {
+    let ws = project(sb, "");
+    let mut main = String::new();
+    for i in 0..80 {
+        main.push_str(&format!("mod m{i} {{ pub fn f() -> u32 {{ {i} }} }}\n"));
+    }
+    main.push_str("fn main() {\n    let mut sum = outdep::f();\n");
+    for i in 0..80 {
+        main.push_str(&format!("    sum += m{i}::f();\n"));
+    }
+    main.push_str("    println!(\"{sum}\");\n}\n");
+    fs::write(ws.join("src/main.rs"), main).unwrap();
+    ws
+}
+
+#[test]
+fn incremental_dev_compiles_use_64_codegen_units() {
+    let sb = Sandbox::new("tuning-units");
+    let ws = many_modules(&sb);
+    let out = fcargo(&sb, &ws, &["build"], None);
+    assert_success(&out);
+    let objects = session_objects(&sb, &ws, "wsmain");
+    assert!((1..=64).contains(&objects), "{objects} objects");
+    let run = common::run_binary(&sb.central_target(&ws), "debug", "wsmain");
+    assert_eq!(stdout(&run).trim(), "3161");
+}
+
+#[test]
+fn tune_off_and_explicit_units_keep_rustc_default_units() {
+    let sb = Sandbox::new("tuning-units-off");
+    let ws = many_modules(&sb);
+    let out = fcargo(&sb, &ws, &["build"], Some("off"));
+    assert_success(&out);
+    assert!(session_objects(&sb, &ws, "wsmain") > 64);
+    let sb = Sandbox::new("tuning-units-explicit");
+    let ws = many_modules(&sb);
+    let out = fcargo(&sb, &ws, &["build", "--config", "profile.dev.codegen-units=128"], None);
+    assert_success(&out);
+    assert!(session_objects(&sb, &ws, "wsmain") > 64);
 }
 
 #[test]
