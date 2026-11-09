@@ -284,6 +284,7 @@ impl Executor {
             }
         }
         let weight: Vec<usize> = (0..total).map(|u| reach(&dependents, u)).collect();
+        let waits = plan::waits(&self.plan.units);
         let jobs = request.jobs.max(1);
         let client = match jobserver::Client::new(jobs.saturating_sub(1).max(1)) {
             Ok(client) => client,
@@ -323,11 +324,11 @@ impl Executor {
             }
             let mut ready: Vec<usize> = Vec::new();
             if !failed {
-                for (u, unit) in self.plan.units.iter().enumerate() {
+                for (u, wait) in waits.iter().enumerate() {
                     if !self.dirty[u] || started_units[u] {
                         continue;
                     }
-                    let satisfied = unit.deps.iter().all(|&(d, meta_only)| !self.dirty[d] || done[d] || (meta_only && rmeta[d]));
+                    let satisfied = wait.iter().all(|&(d, meta_only)| !self.dirty[d] || done[d] || (meta_only && rmeta[d]));
                     if satisfied {
                         ready.push(u);
                     }

@@ -273,6 +273,33 @@ fn a_three_crate_chain_rebuilds_the_middle_and_its_dependents() {
 }
 
 #[test]
+fn a_binary_links_only_after_every_transitive_library_is_complete() {
+    // The binary names only `thin`; `heavy` reaches its link through `-L dependency=`, as grep-cli reaches rg through grep.
+    let mut heavy = String::from("pub fn value() -> u32 {\n    1\n}\n");
+    for i in 0..8000 {
+        heavy.push_str(&format!("pub fn f{i}(x: u64) -> u64 {{ x.wrapping_mul({i}).rotate_left(3) ^ {i} }}\n"));
+    }
+    let files = vec![
+        ("Cargo.toml", "[workspace]\nmembers = [\"heavy\", \"thin\", \"app\"]\nresolver = \"2\"\n".to_string()),
+        ("heavy/Cargo.toml", "[package]\nname = \"heavy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string()),
+        ("heavy/src/lib.rs", heavy.clone()),
+        ("thin/Cargo.toml", "[package]\nname = \"thin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nheavy = { path = \"../heavy\" }\n".to_string()),
+        ("thin/src/lib.rs", "pub use heavy::value;\n".to_string()),
+        ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nthin = { path = \"../thin\" }\n".to_string()),
+        ("app/src/main.rs", "fn main() {\n    println!(\"{}\", thin::value());\n}\n".to_string()),
+    ];
+    let mut fx = Fixture::new("exec-transitive", &files);
+    fx.env.push(("CARGO_INCREMENTAL".into(), "0".into()));
+    assert_success(&fx.run("on").0);
+    for n in 2..5 {
+        fx.edit("heavy/src/lib.rs", &heavy.replacen("    1\n", &format!("    {n}\n"), 1));
+        let out = fx.replayed(3);
+        assert!(!stderr(&out).contains("rlib format"), "{}", stderr(&out));
+        assert_eq!(fx.output("app"), n.to_string());
+    }
+}
+
+#[test]
 fn new_module_files_and_proc_macros_are_followed() {
     let files = vec![
         ("Cargo.toml", "[workspace]\nmembers = [\"macros\", \"applib\", \"app\"]\nresolver = \"2\"\n".to_string()),
