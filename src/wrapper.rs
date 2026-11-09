@@ -205,6 +205,8 @@ struct Plan {
     began: (Instant, Option<u64>),
     /// Cargo runs `build` on a platform where uplifting a root library hard-links it.
     uplift_links: bool,
+    /// Set once a scan of the output directory chose the bulk read, so the scan after the compile skips the listing that decides it.
+    bulk_scan: AtomicBool,
 }
 
 struct Shared {
@@ -370,6 +372,7 @@ impl Plan {
             store_sink: timings::configured().map(Path::to_path_buf),
             began: (begun, sys::thread_cpu_ns()),
             uplift_links: sys::CARGO_UPLIFT_LINKS && matches!(env::var(CARGO_COMMAND_ENV).as_deref(), Ok("build" | "b")),
+            bulk_scan: AtomicBool::new(false),
         })
     }
 
@@ -455,6 +458,7 @@ impl Plan {
             store_sink: job.timings.clone().filter(|path| path.is_absolute()),
             began: (Instant::now(), sys::thread_cpu_ns()),
             uplift_links: false,
+            bulk_scan: AtomicBool::new(false),
         })
     }
 
@@ -939,16 +943,19 @@ impl Plan {
         let started = Instant::now();
         // Taken after any wait and before rustc starts: an input changed after this may have been read in its old state.
         let spawned_ns = hashing::now_ns();
-        let preexisting: HashMap<String, Stamp> = self
-            .prefixed_outputs(|_| true)
-            .into_iter()
-            .filter_map(|(name, stamp)| Some((name, stamp?)))
-            .collect();
-        self.debug(&format!(
-            "{} earlier outputs scanned in {}ms",
-            preexisting.len(),
-            started.elapsed().as_millis()
-        ));
+        let scan_earlier = |compiling: bool| -> HashMap<String, Stamp> {
+            let scanned = self
+                .prefixed_outputs(|_| true)
+                .into_iter()
+                .filter_map(|(name, stamp)| Some((name, stamp?)))
+                // A name rustc already wrote during the scan has changed since `spawned_ns`, so it stays out and counts as this compile's output.
+                .filter(|(_, stamp)| !compiling || !stamp.changed_since(spawned_ns, 0))
+                .collect::<HashMap<_, _>>();
+            self.debug(&format!("{} earlier outputs scanned in {}ms", scanned.len(), started.elapsed().as_millis()));
+            scanned
+        };
+        // Where stat cannot disturb a writer, the scan overlaps rustc's start instead of delaying it.
+        let early = (!sys::STAT_BESIDE_WRITERS).then(|| scan_earlier(false));
         let rustc_started = Instant::now();
         let mut compiler = compiler_command(&self.args[0]);
         compiler.args(&self.args[1..]);
@@ -969,6 +976,7 @@ impl Plan {
         };
         let pipe = child.stderr.take().expect("stderr was piped");
         let forwarder = thread::spawn(move || forward(pipe));
+        let preexisting = early.unwrap_or_else(|| scan_earlier(true));
         let status = child.wait();
         let captured = forwarder.join().unwrap_or_default();
         self.probe.set(|r| r.rustc_ms = timings::ms(rustc_started));
@@ -984,9 +992,7 @@ impl Plan {
             let compile_ms = started.elapsed().as_millis() as u64;
             let store_started = Instant::now();
             self.settle(&captured, &preexisting);
-            if !self.skips_store() {
-                self.supersede_unit_versions();
-            }
+            let retired = if self.skips_store() { Vec::new() } else { self.supersede_unit_versions() };
             if self.skips_store() {
                 self.probe.mode(|| "skip:test".to_string());
                 let _ = self.skip_store("test executables are not stored", compile_ms);
@@ -996,12 +1002,16 @@ impl Plan {
                 spawned_ns,
                 &preexisting,
                 &mut key_lock,
+                &retired,
             ) {
                 self.debug(&format!(
                     "compiled {} in {compile_ms}ms, store deferred",
                     self.parsed.crate_name
                 ));
             } else {
+                for entry in &retired {
+                    cache::delete_retired(&self.dirs, entry);
+                }
                 if let Err(err) = self.store(&captured, compile_ms, spawned_ns, &preexisting) {
                     self.debug(&format!(
                         "store failed for {}: {err}",
@@ -1085,6 +1095,7 @@ impl Plan {
         spawned_ns: i128,
         preexisting: &HashMap<String, Stamp>,
         key_lock: &mut Option<File>,
+        retired: &[cache::Retired],
     ) -> bool {
         // Capability probes reuse or delete these exact output names immediately after the wrapper returns.
         if !self.can_defer_store() {
@@ -1094,7 +1105,7 @@ impl Plan {
             });
             return false;
         }
-        match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock) {
+        match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock, retired) {
             Ok(handed_over) => handed_over,
             Err(err) => {
                 self.probe.mode(|| "inline:error".to_string());
@@ -1129,6 +1140,7 @@ impl Plan {
         spawned_ns: i128,
         preexisting: &HashMap<String, Stamp>,
         key_lock: &mut Option<File>,
+        retired: &[cache::Retired],
     ) -> io::Result<bool> {
         let deferred = self.dirs.deferred();
         // The front end drains after-build jobs once cargo exits, so they wait as files and hold no slot or key lock meanwhile.
@@ -1222,6 +1234,7 @@ impl Plan {
             key_lock: lent
                 .filter(|_| helper_relocks || queue_only)
                 .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
+            retired: retired.iter().map(|entry| cache::Retired { path: self.cwd.join(&entry.path), ..entry.clone() }).collect(),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
@@ -1313,7 +1326,7 @@ impl Plan {
         if !self.trust.volume_trusted(profile.dev, &self.profile_abs) {
             return None;
         }
-        let names = self.output_files(captured, preexisting);
+        let (names, scanned) = self.output_files_scanned(captured, preexisting, true);
         let dep_name = names.iter().find(|n| n.ends_with(".d"))?.clone();
         let dep_text = fs::read_to_string(self.output_dir_abs.join(&dep_name)).ok()?;
         let mut inputs = HashMap::new();
@@ -1337,30 +1350,38 @@ impl Plan {
         let linked = self.linked_storage();
         for name in &names {
             let path = self.output_dir_abs.join(name);
-            // A bundle's inner files can change without its own stamp moving.
-            let mut meta = sys::stat(&path).ok()?;
-            if meta.is_dir() {
-                return None;
-            }
-            // Without a commitment the store hashes outputs later; libraries that dependents may use are read once below to attest their hash.
-            if !linked && compress && !name.ends_with(".d") && meta.is_file() && meta.len() >= cache::payload::MIN_BYTES {
-                let (committed_meta, commitment) = capture(&path).ok()?;
-                if Stamp::of(&meta) != Stamp::of(&committed_meta)
-                    || meta.mode() != committed_meta.mode()
-                {
-                    return None;
+            let wants_commitment = !linked && compress && !name.ends_with(".d");
+            // The scan already stat'd regular files after rustc exited; anything else is stat'd here.
+            let (stamp, is_file) = match scanned.get(name) {
+                Some(stat) if stat.is_file && !(wants_commitment && stat.size >= cache::payload::MIN_BYTES) => (Stamp::of_entry(stat), true),
+                _ => {
+                    // A bundle's inner files can change without its own stamp moving.
+                    let mut meta = sys::stat(&path).ok()?;
+                    if meta.is_dir() {
+                        return None;
+                    }
+                    // Without a commitment the store hashes outputs later; libraries that dependents may use are read once below to attest their hash.
+                    if wants_commitment && meta.is_file() && meta.len() >= cache::payload::MIN_BYTES {
+                        let (committed_meta, commitment) = capture(&path).ok()?;
+                        if Stamp::of(&meta) != Stamp::of(&committed_meta)
+                            || meta.mode() != committed_meta.mode()
+                        {
+                            return None;
+                        }
+                        meta = committed_meta;
+                        commitments.insert(name.clone(), commitment);
+                    }
+                    (Stamp::of(&meta), meta.is_file())
                 }
-                meta = committed_meta;
-                commitments.insert(name.clone(), commitment);
-            }
+            };
             if is_dependency_artifact(name)
-                && meta.is_file()
+                && is_file
                 && self.may_have_dependents()
                 && !self.uplift_relinks(name, preexisting)
             {
-                self.attest_output(&path, &meta, commitments.get(name));
+                self.attest_output(&path, &stamp, commitments.get(name));
             }
-            outputs.push((name.clone(), Stamp::of(&meta)));
+            outputs.push((name.clone(), stamp));
         }
         let frozen = Frozen {
             names,
@@ -1398,13 +1419,12 @@ impl Plan {
     }
 
     /// Dependents of a freshly produced library look its hash up by stamp; the commitment already holds it when the store needed one.
-    fn attest_output(&self, path: &Path, meta: &sys::Meta, commitment: Option<&cache::payload::Commitment>) {
-        let stamp = Stamp::of(meta);
+    fn attest_output(&self, path: &Path, stamp: &Stamp, commitment: Option<&cache::payload::Commitment>) {
         match commitment {
             Some(commitment) => {
-                self.hasher.attest(path, commitment.hash(), &stamp);
+                self.hasher.attest(path, commitment.hash(), stamp);
             }
-            None => self.attest_by_reading(path, &stamp),
+            None => self.attest_by_reading(path, stamp),
         }
     }
 
@@ -1436,6 +1456,10 @@ impl Plan {
 
     /// Catches outputs rustc writes without an artifact notification, such as split debuginfo objects; only names accepted by `wants_stamp` are stat'd.
     fn prefixed_outputs(&self, wants_stamp: impl Fn(&str) -> bool) -> Vec<(String, Option<Stamp>)> {
+        self.prefixed_entries(wants_stamp).into_iter().map(|(name, stat)| (name, stat.as_ref().map(Stamp::of_entry))).collect()
+    }
+
+    fn prefixed_entries(&self, wants_stamp: impl Fn(&str) -> bool) -> Vec<(String, Option<sys::EntryStat>)> {
         let mut found = Vec::new();
         let extra = &self.parsed.extra_filename;
         // Cargo's flat hash suffix gives metadata compiles two exact output names.
@@ -1451,8 +1475,8 @@ impl Plan {
                 if let Ok(meta) = sys::lstat(&path)
                     && meta.is_file()
                 {
-                    let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
-                    found.push((name, stamp));
+                    let stat = wants_stamp(&name).then(|| sys::EntryStat::of(&meta));
+                    found.push((name, stat));
                 }
             }
             return found;
@@ -1463,8 +1487,8 @@ impl Plan {
                 if let Ok(meta) = sys::lstat(&self.output_dir_abs.join(&name))
                     && meta.is_file()
                 {
-                    let stamp = wants_stamp(&name).then(|| Stamp::of(&meta));
-                    found.push((name, stamp));
+                    let stat = wants_stamp(&name).then(|| sys::EntryStat::of(&meta));
+                    found.push((name, stat));
                 }
             }
             return found;
@@ -1477,18 +1501,11 @@ impl Plan {
                 self.parsed.crate_name, self.parsed.extra_filename
             ),
         ];
-        if let Ok(entries) = fs::read_dir(&self.output_dir_abs) {
-            for entry in entries.flatten() {
-                let filename = entry.file_name();
-                let name = filename.to_string_lossy();
-                if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
-                    let stamp = if wants_stamp(&name) {
-                        Stamp::read(&entry.path()).ok()
-                    } else {
-                        None
-                    };
-                    found.push((name.into_owned(), stamp));
-                }
+        // Stale objects of earlier incremental sessions pile up beside these, so the directory is read in bulk rather than one stat per name.
+        let prefixed = |name: &OsStr| prefixes.iter().any(|p| name.to_string_lossy().starts_with(p.as_str()));
+        if let Ok(entries) = sys::scan_dir(&self.output_dir_abs, prefixed, |name| wants_stamp(&name.to_string_lossy()), &self.bulk_scan) {
+            for (name, stat) in entries {
+                found.push((name.to_string_lossy().into_owned(), stat));
             }
         }
         found
@@ -1496,18 +1513,27 @@ impl Plan {
 
     /// Incremental rustc never removes earlier per-compile names, so files unchanged since before rustc started are left out of the entry.
     fn output_files(&self, captured: &[u8], preexisting: &HashMap<String, Stamp>) -> Vec<String> {
+        self.output_files_scanned(captured, preexisting, false).0
+    }
+
+    /// With `stamp_all`, the scan's stat of every discovered output comes back too, so freezing need not stat them again.
+    fn output_files_scanned(&self, captured: &[u8], preexisting: &HashMap<String, Stamp>, stamp_all: bool) -> (Vec<String>, HashMap<String, sys::EntryStat>) {
         let mut names = BTreeSet::new();
+        let mut scanned = HashMap::new();
         let pdb = self.parsed.unhashed_windows_pdb().then(|| format!("{}.pdb", self.parsed.crate_name));
         let mut changed_pdb = false;
         let mut linked_output = false;
         // A file that did not exist before the compile cannot be a leftover, so only earlier names need a stamp.
-        for (name, stamp) in self.prefixed_outputs(|name| preexisting.contains_key(name)) {
-            let leftover = stamp.as_ref().is_some_and(|now| {
+        for (name, stat) in self.prefixed_entries(|name| stamp_all || preexisting.contains_key(name)) {
+            let leftover = stat.as_ref().is_some_and(|now| {
                 preexisting
                     .get(&name)
-                    .is_some_and(|before| same_file(before, now))
+                    .is_some_and(|before| same_file(before, &Stamp::of_entry(now)))
             });
             if !leftover {
+                if let Some(stat) = stat.filter(|_| stamp_all) {
+                    scanned.insert(name.clone(), stat);
+                }
                 if pdb.as_ref() == Some(&name) { changed_pdb = true; }
                 else { names.insert(name); }
             }
@@ -1546,9 +1572,9 @@ impl Plan {
             .iter()
             .all(|name| names.contains(name))
         {
-            return Vec::new();
+            return (Vec::new(), HashMap::new());
         }
-        names.into_iter().collect()
+        (names.into_iter().collect(), scanned)
     }
 
     fn store(
@@ -2091,11 +2117,17 @@ impl Plan {
     }
 
     /// The compile just replaced the unit's outputs, so its earlier entries no longer match the target; retiring them now does not depend on the store publishing, being skipped, failing or being dropped.
-    fn supersede_unit_versions(&self) {
-        let Some(unit) = self.target().unit else { return self.supersede_lineage() };
-        for old in self.cache.supersede_unit_entries(unit, self.context.unit_versions.clamp(1, UNIT_VERSIONS)) {
+    /// Returns the retired directories still to delete, which a deferred store takes off the compile's critical path.
+    fn supersede_unit_versions(&self) -> Vec<cache::Retired> {
+        let Some(unit) = self.target().unit else {
+            self.supersede_lineage();
+            return Vec::new();
+        };
+        let (keys, queued) = self.cache.supersede_unit_entries_queued(unit, self.context.unit_versions.clamp(1, UNIT_VERSIONS));
+        for old in keys {
             self.debug(&format!("retired entry {old} of {} superseded by a new compile", self.parsed.crate_name));
         }
+        queued
     }
 
     /// Cargo's output names of a registry or git unit; its entries are recorded under this so a recompile (a build script that writes a differently stamped static library, say) finds the states it replaced.
@@ -2427,6 +2459,9 @@ struct StoreJob {
     /// Lock files the helper takes again itself when handles cannot be inherited.
     slot_lock: Option<PathBuf>,
     key_lock: Option<PathBuf>,
+    /// Superseded entries the producer queued for deletion; older readers ignore them and maintenance sweeps them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired: Vec<cache::Retired>,
 }
 
 impl StoreJob {
@@ -2457,6 +2492,7 @@ impl BrokerJob {
             || !matches!(job.trust.as_str(), "on" | "off" | "audit")
             || job.slot_lock.is_some()
             || job.key_lock.is_some()
+            || job.retired.iter().any(|entry| !entry.path.is_absolute())
             || job.spawned_ns.parse::<i128>().is_err()
             || job.args.len() < 2
             || job
@@ -3605,6 +3641,12 @@ fn run_deferred(job: &StoreJob) {
 }
 
 fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
+    if !job.retired.is_empty() && job.cwd.is_absolute() {
+        let dirs = Dirs::at(job.cwd.join(&job.home));
+        for entry in &job.retired {
+            cache::delete_retired(&dirs, entry);
+        }
+    }
     let (Some(plan), Some(frozen), Ok(spawned_ns)) = (
         Plan::from_job(job, worker_config),
         Frozen::from_job(job),
@@ -5807,6 +5849,7 @@ mod tests {
             timings: None,
             slot_lock: None,
             key_lock: None,
+            retired: Vec::new(),
         };
         (job, src, rlib)
     }
@@ -5815,6 +5858,29 @@ mod tests {
         Cache::new(&Dirs::at(job.cwd.join(&job.home)))
             .candidates(&job.prekey)
             .len()
+    }
+
+    #[test]
+    fn a_deferred_store_deletes_the_entries_its_compile_superseded() {
+        let s = Scratch::new("deferred-retired");
+        let (mut job, _, _) = fixture(&s);
+        let dirs = Dirs::at(job.cwd.join(&job.home));
+        let cache = Cache::new(&dirs);
+        let unit = "cd".repeat(20);
+        let old = "ef".repeat(20);
+        let staged = cache.stage().unwrap();
+        fs::write(staged.join("meta.json"), b"{}").unwrap();
+        cache.publish(&staged, &old).unwrap();
+        cache.note_unit_entry(&unit, &old, 2);
+        let (keys, retired) = cache.supersede_unit_entries_queued(&unit, 1);
+        assert_eq!(keys, vec![old.clone()]);
+        assert!(retired.len() == 1 && retired[0].path.is_dir(), "retiring leaves the directory for the helper");
+        job.retired = retired.clone();
+        let job: StoreJob = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        assert_eq!(job.retired, retired);
+        run_deferred(&job);
+        assert_eq!(rows(&job), 1);
+        assert!(!retired[0].path.exists());
     }
 
     #[test]
@@ -6359,7 +6425,7 @@ mod tests {
         job.outputs = job.names.iter().map(|name| (name.clone(), wire(&rlib.with_file_name(name)))).collect();
         let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         // As the wrapper does at freeze, before the store adds a name to the output.
-        plan.attest_output(&rlib, &sys::stat(&rlib).unwrap(), None);
+        plan.attest_output(&rlib, &Stamp::read(&rlib).unwrap(), None);
         run_deferred(&job);
         let key = plan.cache.candidates(&job.prekey)[0].key.clone();
         let (entry, meta) = plan.cache.load_entry(&key).unwrap();
@@ -7613,7 +7679,7 @@ mod tests {
         let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
         assert!(
             !plan
-                .spawn_deferred(&[], 0, 0, &HashMap::new(), &mut None)
+                .spawn_deferred(&[], 0, 0, &HashMap::new(), &mut None, &[])
                 .unwrap()
         );
         let dir = plan.dirs.deferred();

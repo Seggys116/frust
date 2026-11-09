@@ -47,18 +47,21 @@ pub struct Stamp {
 
 impl Stamp {
     pub fn of(meta: &sys::Meta) -> Stamp {
-        let ((mtime_s, mtime_n), (ctime_s, ctime_n)) = (meta.mtime(), meta.ctime());
-        Stamp {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.len(),
-            mtime_ns: mtime_s as i128 * 1_000_000_000 + mtime_n as i128,
-            ctime_ns: ctime_s as i128 * 1_000_000_000 + ctime_n as i128,
-        }
+        Stamp::of_entry(&sys::EntryStat::of(meta))
     }
 
     pub fn read(path: &Path) -> io::Result<Stamp> {
         sys::stat(path).map(|m| Stamp::of(&m))
+    }
+
+    pub fn of_entry(entry: &sys::EntryStat) -> Stamp {
+        Stamp {
+            dev: entry.dev,
+            ino: entry.ino,
+            size: entry.size,
+            mtime_ns: entry.mtime.0 as i128 * 1_000_000_000 + entry.mtime.1 as i128,
+            ctime_ns: entry.ctime.0 as i128 * 1_000_000_000 + entry.ctime.1 as i128,
+        }
     }
 
     /// The birth time is `None` where the platform or filesystem does not report one.

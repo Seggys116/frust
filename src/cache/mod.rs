@@ -469,6 +469,17 @@ impl Cache {
         self.record_unit_versions(unit, None, keep.saturating_sub(1), || {}, |_| {}, fsx::remove_any)
     }
 
+    /// As `supersede_unit_entries`, but the retired directories stay queued for [`delete_retired`], so a compile need not wait for their deletion.
+    pub fn supersede_unit_entries_queued(&self, unit: &str, keep: usize) -> (Vec<String>, Vec<Retired>) {
+        let mut queued = Vec::new();
+        let keys = self.record_unit_versions(unit, None, keep.saturating_sub(1), || {}, |_| {}, |path| {
+            let (dev, ino) = real_directory(path).ok_or_else(|| io::Error::other("retired entry vanished"))?;
+            queued.push(Retired { path: path.to_path_buf(), dev, ino });
+            Ok(())
+        });
+        (keys, queued)
+    }
+
     fn note_unit_entry_with(
         &self, unit: &str, key: &str, keep: usize,
         after_lock: impl FnOnce(), before_commit: impl FnOnce(&Path), delete: impl FnMut(&Path) -> io::Result<()>,
@@ -835,6 +846,21 @@ impl Drop for UnitRecordsGuard {
 struct RetiredEntry {
     path: PathBuf,
     proof: RetiredChildProof,
+}
+
+/// A retired entry directory waiting in the eviction queue, named with the identity it had when it was queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retired {
+    pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Deletes a queued entry only while it is still the same directory in the same queue; anything else stays for maintenance.
+pub fn delete_retired(dirs: &Dirs, retired: &Retired) -> bool {
+    let Some(queue) = QueueProof::capture(dirs) else { return false };
+    let Some(proof) = queue.child(dirs, &retired.path) else { return false };
+    proof.identity == (retired.dev, retired.ino) && proof.valid(dirs, &retired.path) && fsx::remove_any(&retired.path).is_ok()
 }
 
 pub fn evicted_dir(dirs: &Dirs) -> PathBuf {
@@ -1322,6 +1348,35 @@ mod tests {
         }, fsx::remove_any).is_empty());
         for entry in 1..=3 { assert!(cache.has_entry(&key(entry))); }
         assert_eq!(fs::read_dir(evicted_dir(&Dirs::at(&dir))).map(|e| e.count()).unwrap_or(0), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queued_supersession_retires_now_and_deletes_only_the_same_queued_directory_later() {
+        let (dir, cache) = scratch("supersede-queued");
+        let dirs = Dirs::at(&dir);
+        let unit = key(0xaa);
+        for n in 1..=3 {
+            publish_entry(&cache, n);
+            cache.note_unit_entry(&unit, &key(n), 3);
+        }
+        let (keys, queued) = cache.supersede_unit_entries_queued(&unit, 2);
+        assert_eq!(keys, vec![key(2), key(1)]);
+        assert_eq!(cache.unit_keys(&unit), vec![key(3)]);
+        assert!(!cache.has_entry(&key(1)) && !cache.has_entry(&key(2)));
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|entry| entry.path.is_dir() && entry.path.parent() == Some(evicted_dir(&dirs).as_path())));
+        // A directory that replaced the queued one, or a path outside the queue, is never deleted.
+        let swapped = Retired { ino: queued[0].ino.wrapping_add(1), ..queued[0].clone() };
+        assert!(!delete_retired(&dirs, &swapped));
+        let outside = Retired { path: dir.join("tmp"), ..queued[0].clone() };
+        assert!(!delete_retired(&dirs, &outside));
+        assert!(queued[0].path.is_dir());
+        for entry in &queued {
+            assert!(delete_retired(&dirs, entry));
+            assert!(!entry.path.exists());
+        }
+        assert!(!delete_retired(&dirs, &queued[0]));
         fs::remove_dir_all(dir).unwrap();
     }
 

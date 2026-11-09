@@ -270,6 +270,15 @@ pub fn stat(path: &Path) -> io::Result<(Metadata, Ext)> {
     query_meta(&open_handle(path, FILE_READ_ATTRIBUTES, true)?)
 }
 
+pub fn scan_dir(
+    dir: &Path,
+    wanted: &dyn Fn(&std::ffi::OsStr) -> bool,
+    stamped: &dyn Fn(&std::ffi::OsStr) -> bool,
+    _bulk: &std::sync::atomic::AtomicBool,
+) -> io::Result<Vec<(std::ffi::OsString, Option<super::EntryStat>)>> {
+    super::scan_dir_each(dir, wanted, stamped)
+}
+
 pub fn lstat(path: &Path) -> io::Result<(Metadata, Ext)> {
     query_meta(&open_handle(path, FILE_READ_ATTRIBUTES, false)?)
 }
