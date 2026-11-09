@@ -86,7 +86,7 @@ pub struct Script {
     pub env: Vec<(String, Option<String>)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Unit {
     pub id: String,
     pub package_id: String,
@@ -124,6 +124,35 @@ impl Unit {
     pub fn checks(&self) -> bool {
         self.argv().is_some_and(|a| !a.emit.iter().any(|e| e == "link"))
     }
+
+    /// Whether rustc links this unit, so every upstream library must be complete and not just announce its metadata.
+    pub fn links(&self) -> bool {
+        self.argv().is_none_or(|a| a.emit.iter().any(|e| e == "link") && (a.test || a.types.is_empty() || a.types.iter().any(|t| t != "lib" && t != "rlib")))
+    }
+}
+
+/// Each unit's start conditions: its own edges, and for a linking unit every transitive dependency in full, as cargo waits.
+pub fn waits(units: &[Unit]) -> Vec<Vec<(usize, bool)>> {
+    units
+        .iter()
+        .map(|unit| {
+            if !unit.links() {
+                return unit.deps.clone();
+            }
+            let mut seen = vec![false; units.len()];
+            let mut stack: Vec<usize> = unit.deps.iter().map(|&(d, _)| d).collect();
+            let mut all = Vec::new();
+            while let Some(d) = stack.pop() {
+                if std::mem::replace(&mut seen[d], true) {
+                    continue;
+                }
+                all.push((d, false));
+                stack.extend(units[d].deps.iter().map(|&(e, _)| e));
+            }
+            all.sort_unstable();
+            all
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -971,6 +1000,30 @@ mod tests {
         let bin = parse_argv(&args(&["rustc", "--crate-name", "app", "--crate-type", "bin", "--emit=dep-info,link", "--out-dir", "d", "-Cextra-filename=-9"]), Path::new("/w")).unwrap();
         assert_eq!(bin.out_dir, PathBuf::from("/w/d"));
         assert_eq!(outputs(&bin)[1], PathBuf::from(format!("/w/d/app-9{}", std::env::consts::EXE_SUFFIX)));
+    }
+
+    #[test]
+    fn linking_units_wait_for_every_transitive_library_in_full() {
+        let unit = |kind: &str, emit: &str, extra: &[&str], deps: Vec<(usize, bool)>| {
+            let mut argv = args(&["rustc", "--crate-name", "x", "--crate-type", kind, emit, "--out-dir", "/t/deps"]);
+            argv.extend(args(extra));
+            Unit { argv, cwd: "/w".into(), deps, ..Unit::default() }
+        };
+        // heavy <- thin (metadata only) <- app; the binary names only thin, as rg names only grep.
+        let units = vec![
+            unit("lib", "--emit=dep-info,metadata,link", &[], vec![]),
+            unit("lib", "--emit=dep-info,metadata,link", &[], vec![(0, true)]),
+            unit("bin", "--emit=dep-info,link", &[], vec![(1, false)]),
+            unit("lib", "--emit=dep-info,link", &["--test"], vec![(1, true)]),
+            unit("bin", "--emit=dep-info,metadata", &[], vec![(1, true)]),
+            unit("proc-macro", "--emit=dep-info,link", &[], vec![(1, true)]),
+        ];
+        let waits = waits(&units);
+        assert_eq!(waits[1], vec![(0, true)], "a library keeps pipelining on metadata");
+        assert_eq!(waits[2], vec![(0, false), (1, false)]);
+        assert_eq!(waits[3], vec![(0, false), (1, false)], "test harnesses link");
+        assert_eq!(waits[4], vec![(1, true)], "a check build never links");
+        assert_eq!(waits[5], vec![(0, false), (1, false)], "proc macros link");
     }
 
     #[test]

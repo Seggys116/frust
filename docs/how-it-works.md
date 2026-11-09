@@ -618,7 +618,8 @@ argument files, `-o`, or packed debug info on macOS.
 **The replay.** A child process (`fcargo --frust-exec-child`) stands in for cargo, so the display, the build log for
 joining builds, cache events and recording work unchanged. It prints fresh units' artifacts and cached warnings, then runs dirty units through
 `RUSTC_WRAPPER` with the recorded arguments, in dependency order, starting a dependent once the `.rmeta` it needs is
-announced, bounded by `-j` (else `CARGO_BUILD_JOBS`, else the available parallelism) through its own jobserver. Output
+announced (a unit that links, such as a binary, test or proc macro, waits like cargo until every library it reaches,
+directly or not, has finished), bounded by `-j` (else `CARGO_BUILD_JOBS`, else the available parallelism) through its own jobserver. Output
 follows cargo: `Compiling` once per package, rendered diagnostics deduplicated, the warning summary with the `cargo fix`
 hint, `could not compile ... due to N previous errors` with exit 101, and the recorded `Finished` line with this run's
 time. Each finished unit is uplifted atomically (a clone on macOS, a hard link elsewhere) and its `<name>.d` files are
