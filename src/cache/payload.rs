@@ -885,8 +885,10 @@ fn cargo_aliases(dst: &Path) -> Vec<PathBuf> {
     let Some((base, _)) = stem.rsplit_once('-').filter(|(_, hash)| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())) else {
         return Vec::new();
     };
+    // A build script's debug info keeps the crate name's underscores (`build_script_build.pdb`); its executable takes the target name.
     if base == "build_script_build" {
-        return vec![dir.join(format!("build-script-build{suffix}"))];
+        let alias = if suffix.eq_ignore_ascii_case(".pdb") { "build_script_build" } else { "build-script-build" };
+        return vec![dir.join(format!("{alias}{suffix}"))];
     }
     let uplifted = format!("{base}{suffix}");
     let mut names = vec![dir.join(&uplifted)];
@@ -1206,6 +1208,23 @@ mod tests {
         assert!(!unshared_by_targets(&staged, &dst));
         assert_eq!(cargo_aliases(&deps.join("bat-0123456789abcdef")), [deps.join("bat"), scratch.0.join("bat")]);
         assert!(cargo_aliases(&deps.join("plain")).is_empty());
+    }
+
+    #[test]
+    fn a_build_scripts_debug_info_held_by_cargos_underscored_alias_is_linked_not_copied() {
+        let scratch = Scratch::new();
+        let bytes = pattern(300_000);
+        let (staged, file) = exclusive(&scratch.0, &bytes);
+        let dir = scratch.0.join("build").join("tokio-0123456789abcdef");
+        fs::create_dir_all(&dir).unwrap();
+        // Cargo names a build script's debug info after the crate name, with underscores, unlike the executable's alias.
+        let alias = dir.join("build_script_build.pdb");
+        fs::hard_link(&staged, &alias).unwrap();
+        let dst = dir.join("build_script_build-0123456789abcdef.pdb");
+        assert!(unshared_by_targets(&staged, &dst));
+        assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Linked);
+        assert_eq!(sys::lstat(&dst).unwrap().ino(), sys::lstat(&staged).unwrap().ino());
+        assert_eq!(cargo_aliases(&dir.join("build_script_build-0123456789abcdef.exe")), [dir.join("build-script-build.exe")]);
     }
 
     fn busy() -> io::Error {
