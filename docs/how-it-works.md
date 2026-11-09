@@ -620,7 +620,10 @@ written and `invoked.timestamp` is untouched. Until then an edited source is new
 dependency newer than its dependents' outputs, so an interrupted replay leaves cargo seeing every unit it must rebuild.
 A package whose build script has no `rerun-if-changed` reruns it on any change, so when every workspace unit sits in
 such a package the command is marked bound to cargo: until a manifest, lockfile, config or build script source changes,
-later builds decline from a few stats without reading, journaling or rebuilding a plan. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
+later builds decline from a few stats without reading, journaling or rebuilding a plan. Rerunning such a script
+exactly would not be enough: cargo hashes the package's newest file (`<mtime> (<path>)`) into the script run's
+fingerprint and that hash into every dependent's, so leaving cargo's state consistent would mean recomputing cargo's
+internal fingerprint hashes and its package file listing. A ctrl-c kills every unit's process group and leaves the plan as it was, so the
 next run rebuilds the same units. On success the plan is updated with the new inputs and outputs, and the no-op record
 is written from the child's output as from cargo's. When compaction later replaces a listed output with identical
 bytes, the plan is restamped under the same rule as no-op records; any other change makes the next check decline.
