@@ -509,3 +509,20 @@ fn concurrent_builds_join_and_both_succeed() {
     assert!(rebuilt <= 1, "only one build compiles: {traces:?}");
     assert_eq!(fx.output("app"), "6");
 }
+
+/// A manifest written as cargo starts poisons the recorded graph, but the plan keeps cargo's calls, so the next edit's
+/// cargo run finds its fresh units covered and the target is never mistaken for one built before the executor.
+#[test]
+fn a_manifest_written_as_the_build_starts_leaves_cargo_fingerprints_alone() {
+    let fx = Fixture::new("exec-young-manifest", &lib_and_bin());
+    let manifest = fx.dir.join("Cargo.toml");
+    let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+    fs::File::options().write(true).open(&manifest).unwrap().set_modified(soon).unwrap();
+    assert_success(&fx.run("on").0);
+    settle(&manifest);
+    fx.edit("app/src/main.rs", &format!("{MAIN}// edited\n"));
+    let (out, trace) = fx.run("on");
+    assert_success(&out);
+    assert_eq!(trace["plan"], "written", "the edit's cargo run is planned: {trace}");
+    assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "no run removed a fingerprint of a unit cargo built under a journal");
+}

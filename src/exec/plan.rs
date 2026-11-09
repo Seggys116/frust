@@ -908,9 +908,8 @@ fn graph_inputs(plan: &mut Plan, rec: &Recorded<'_>) -> Result<(), &'static str>
         let facts = layout_facts(&dir, false);
         plan.layout.push((dir.to_string_lossy().into_owned(), false, facts));
     }
-    if plan.graph.iter().any(|e| e.stamp == Some(POISON)) {
-        return Err("manifest changed during the build");
-    }
+    // A manifest written during the build stays poisoned, so the next check declines while this plan still covers cargo's
+    // fresh units and keeps the target from looking like one built before the executor.
     Ok(())
 }
 
