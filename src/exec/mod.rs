@@ -618,7 +618,8 @@ fn sibling_plans(dirs: &Dirs, own: &Path, key: &str, target: &Path) -> Vec<Plan>
     entries.flatten()
         .map(|e| e.path())
         .filter(|p| p != own && p.to_string_lossy().ends_with(PLAN_SUFFIX))
-        .filter_map(|p| plan::load(&p))
+        // A plan of the same command stores its key verbatim; any other is skipped without parsing it.
+        .filter_map(|p| plan::load_if(&p, |bytes| std::str::from_utf8(bytes).is_ok_and(|text| text.contains(key))))
         .filter(|p| p.key == key && Path::new(&p.target) == target)
         .collect()
 }

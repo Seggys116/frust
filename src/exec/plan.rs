@@ -158,11 +158,20 @@ impl Plan {
 }
 
 pub fn load(path: &Path) -> Option<Plan> {
+    load_if(path, |_| true)
+}
+
+/// Loads only a plan whose raw bytes pass `wanted`, so a cheap byte test spares parsing plans that cannot match.
+pub fn load_if(path: &Path, wanted: impl FnOnce(&[u8]) -> bool) -> Option<Plan> {
     let meta = fs::metadata(path).ok()?;
     if meta.len() > MAX_PLAN_BYTES {
         return None;
     }
-    let plan: Plan = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let bytes = fs::read(path).ok()?;
+    if !wanted(&bytes) {
+        return None;
+    }
+    let plan: Plan = serde_json::from_slice(&bytes).ok()?;
     let sound = plan.format == FORMAT
         && plan.units.iter().all(|u| u.deps.iter().all(|(d, _)| *d < plan.units.len()) && u.run.is_none_or(|r| r < plan.scripts.len()))
         && plan.messages.iter().all(|(u, _)| u.is_none_or(|u| u < plan.units.len()));
@@ -482,111 +491,30 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
     let mut unit_msgs: Vec<serde_json::Value> = Vec::new();
     let mut uncovered: Vec<PathBuf> = Vec::new();
     let mut gaps = 0usize;
-    for msg in &rec.messages {
-        match msg.get("reason").and_then(|r| r.as_str()) {
-            Some("compiler-artifact") => {}
-            Some("build-script-executed") => {
+    // Each message's checks only read the target, so they run spread over threads and are applied in message order.
+    let steps = par_map(&rec.messages, |msg| assess(msg, &candidates, fresh_from, rec.target));
+    for (msg, step) in rec.messages.iter().zip(steps) {
+        match step? {
+            Step::Skip => {}
+            Step::Script => {
                 scripts_msgs.push(msg.clone());
                 messages.push((None, msg.to_string()));
-                continue;
             }
-            _ => continue,
-        }
-        let fresh = msg.get("fresh").and_then(|f| f.as_bool()) == Some(true);
-        if strings(msg.get("filenames")).iter().any(|f| f.ends_with(".dSYM")) {
-            return Err("packed debug info".into());
-        }
-        let range = if fresh { 0..candidates.len() } else { 0..fresh_from };
-        let identity = Identity::of(msg);
-        let mut found = None;
-        for ci in range {
-            let c = &candidates[ci];
-            if !identity.matches(&c.parsed, c.manifest.as_deref()) {
-                continue;
+            Step::Uncovered(files) => {
+                uncovered.extend(files);
+                gaps += 1;
             }
-            let outs = outputs(&c.parsed);
-            if let Some(pairs) = uplifts_for(msg, &c.parsed, &outs) {
-                found = Some((ci, outs, pairs));
-                break;
+            Step::Unit(drafted) => {
+                let (unit, outs) = *drafted;
+                let index = units.len();
+                for out in outs {
+                    produced.insert(out, index);
+                }
+                messages.push((Some(index), msg.to_string()));
+                unit_msgs.push(msg.clone());
+                units.push(unit);
             }
         }
-        let Some((ci, outs, uplifts)) = found else {
-            if !fresh {
-                return Err("unrecorded compile".into());
-            }
-            uncovered.extend(crate::noop::fingerprint_files(msg));
-            gaps += 1;
-            continue;
-        };
-        if outs.iter().any(|o| !o.exists()) {
-            return Err("unpredicted outputs".into());
-        }
-        let c = &candidates[ci];
-        let a = &c.parsed;
-        if a.packed && a.types.iter().any(|t| t != "lib" && t != "rlib") {
-            return Err("packed debug info".into());
-        }
-        let package_id = msg.get("package_id").and_then(|p| p.as_str()).ok_or("unit without package")?.to_string();
-        let local = package_id.starts_with("path+");
-        let pkg_name = crate::noop::package_name(&package_id);
-        let version = c.env_set.iter().find(|(k, _)| k == "CARGO_PKG_VERSION").map(|(_, v)| v.clone()).unwrap_or_default();
-        let dir = manifest_dir(msg).unwrap_or_default();
-        let package = if local { format!("{pkg_name} v{version} ({dir})") } else { format!("{pkg_name} v{version}") };
-        let (desc, fix) = describe(msg, local);
-        let profile = profile_root(&a.out_dir);
-        let hash = a.extra.trim_start_matches('-');
-        let fp_dir = profile.join(".fingerprint").join(format!("{pkg_name}-{hash}"));
-        let fp_name = fingerprint_file(msg).ok_or("unknown unit kind")?;
-        if hash.is_empty() || !fp_dir.is_dir() {
-            return Err("unrecognised fingerprint layout".into());
-        }
-        let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
-        let (mut inputs, env_deps) = match &c.previous {
-            Some(prev) => (prev.inputs.clone(), prev.env_deps.clone()),
-            None => read_inputs(a, Path::new(&c.cwd), rec.target, i128::from(c.t))?,
-        };
-        // Cargo never checks registry or git sources for changes either; their units still follow their dependencies.
-        if !local {
-            inputs.clear();
-        }
-        let diagnostics = match fs::read_to_string(fp_dir.join(format!("output-{fp_name}"))) {
-            Ok(text) => text.lines().map(str::to_string).collect(),
-            Err(_) => Vec::new(),
-        };
-        let index = units.len();
-        for out in &outs {
-            produced.insert(out.clone(), index);
-        }
-        messages.push((Some(index), msg.to_string()));
-        unit_msgs.push(msg.clone());
-        units.push(Unit {
-            id: unit_id(a),
-            package_id,
-            package,
-            pkg_name,
-            desc,
-            fix,
-            local,
-            script,
-            argv: c.argv.clone(),
-            cwd: c.cwd.clone(),
-            env_set: c.env_set.clone(),
-            env_unset: c.env_unset.clone(),
-            outputs: outs.iter().map(|o| o.to_string_lossy().into_owned()).collect(),
-            inputs,
-            env_deps,
-            stamps: Vec::new(),
-            deps: Vec::new(),
-            uplifts,
-            depfiles: Vec::new(),
-            depfiles_ok: true,
-            fingerprint: fp_dir.join(fp_name).to_string_lossy().into_owned(),
-            diagnostics,
-            run: None,
-            script_unit: None,
-            incremental: a.incremental,
-            ms: c.ms,
-        });
     }
     if gaps > 0 {
         // Only an edit loop pays the one-time recompile; a run that compiled nothing adopts nothing.
@@ -605,10 +533,9 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
             }
         }
     }
-    let mut scripts = Vec::new();
-    for msg in &scripts_msgs {
-        scripts.push(script_of(msg, &units, &unit_msgs, rec.base_env, rec.launched_ns, rec.target)?);
-    }
+    let scripts = par_map(&scripts_msgs, |msg| script_of(msg, &units, &unit_msgs, rec.base_env, rec.launched_ns, rec.target))
+        .into_iter()
+        .collect::<Result<Vec<Script>, _>>()?;
     let profiles: Vec<String> = units.iter().map(|u| profile_root(&u.argv().map(|a| a.out_dir).unwrap_or_default()).to_string_lossy().into_owned()).collect();
     let script_units: Vec<usize> = (0..units.len()).filter(|&i| units[i].script).collect();
     for i in 0..units.len() {
@@ -648,6 +575,123 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
     graph_inputs(&mut plan, &rec)?;
     plan.intern_env();
     Ok(plan)
+}
+
+/// What one cargo message contributes to a plan, decided without touching the plan itself.
+enum Step {
+    Skip,
+    Script,
+    Uncovered(Vec<PathBuf>),
+    Unit(Box<(Unit, Vec<PathBuf>)>),
+}
+
+fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, target: &Path) -> Result<Step, Refused> {
+    match msg.get("reason").and_then(|r| r.as_str()) {
+        Some("compiler-artifact") => {}
+        Some("build-script-executed") => return Ok(Step::Script),
+        _ => return Ok(Step::Skip),
+    }
+    let fresh = msg.get("fresh").and_then(|f| f.as_bool()) == Some(true);
+    if strings(msg.get("filenames")).iter().any(|f| f.ends_with(".dSYM")) {
+        return Err("packed debug info".into());
+    }
+    let range = if fresh { 0..candidates.len() } else { 0..fresh_from };
+    let identity = Identity::of(msg);
+    let mut found = None;
+    for ci in range {
+        let c = &candidates[ci];
+        if !identity.matches(&c.parsed, c.manifest.as_deref()) {
+            continue;
+        }
+        let outs = outputs(&c.parsed);
+        if let Some(pairs) = uplifts_for(msg, &c.parsed, &outs) {
+            found = Some((ci, outs, pairs));
+            break;
+        }
+    }
+    let Some((ci, outs, uplifts)) = found else {
+        if !fresh {
+            return Err("unrecorded compile".into());
+        }
+        return Ok(Step::Uncovered(crate::noop::fingerprint_files(msg)));
+    };
+    if outs.iter().any(|o| !o.exists()) {
+        return Err("unpredicted outputs".into());
+    }
+    let c = &candidates[ci];
+    let a = &c.parsed;
+    if a.packed && a.types.iter().any(|t| t != "lib" && t != "rlib") {
+        return Err("packed debug info".into());
+    }
+    let package_id = msg.get("package_id").and_then(|p| p.as_str()).ok_or("unit without package")?.to_string();
+    let local = package_id.starts_with("path+");
+    let pkg_name = crate::noop::package_name(&package_id);
+    let version = c.env_set.iter().find(|(k, _)| k == "CARGO_PKG_VERSION").map(|(_, v)| v.clone()).unwrap_or_default();
+    let dir = manifest_dir(msg).unwrap_or_default();
+    let package = if local { format!("{pkg_name} v{version} ({dir})") } else { format!("{pkg_name} v{version}") };
+    let (desc, fix) = describe(msg, local);
+    let profile = profile_root(&a.out_dir);
+    let hash = a.extra.trim_start_matches('-');
+    let fp_dir = profile.join(".fingerprint").join(format!("{pkg_name}-{hash}"));
+    let fp_name = fingerprint_file(msg).ok_or("unknown unit kind")?;
+    if hash.is_empty() || !fp_dir.is_dir() {
+        return Err("unrecognised fingerprint layout".into());
+    }
+    let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
+    let (mut inputs, env_deps) = match &c.previous {
+        Some(prev) => (prev.inputs.clone(), prev.env_deps.clone()),
+        None => read_inputs(a, Path::new(&c.cwd), target, i128::from(c.t))?,
+    };
+    // Cargo never checks registry or git sources for changes either; their units still follow their dependencies.
+    if !local {
+        inputs.clear();
+    }
+    let diagnostics = match fs::read_to_string(fp_dir.join(format!("output-{fp_name}"))) {
+        Ok(text) => text.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    };
+    let unit = Unit {
+        id: unit_id(a),
+        package_id,
+        package,
+        pkg_name,
+        desc,
+        fix,
+        local,
+        script,
+        argv: c.argv.clone(),
+        cwd: c.cwd.clone(),
+        env_set: c.env_set.clone(),
+        env_unset: c.env_unset.clone(),
+        outputs: outs.iter().map(|o| o.to_string_lossy().into_owned()).collect(),
+        inputs,
+        env_deps,
+        stamps: Vec::new(),
+        deps: Vec::new(),
+        uplifts,
+        depfiles: Vec::new(),
+        depfiles_ok: true,
+        fingerprint: fp_dir.join(fp_name).to_string_lossy().into_owned(),
+        diagnostics,
+        run: None,
+        script_unit: None,
+        incremental: a.incremental,
+        ms: c.ms,
+    };
+    Ok(Step::Unit(Box::new((unit, outs))))
+}
+
+/// An order-preserving map over a few scoped threads; plan recording is bound by stat and read calls.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len().div_ceil(16)).max(1);
+    if workers == 1 {
+        return items.iter().map(&f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items.chunks(items.len().div_ceil(workers)).map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    })
 }
 
 /// Stamps of everything the unit leaves in the target, checked before a replay trusts it.
@@ -722,34 +766,57 @@ fn script_of(
 
 /// Every entry below `top`, symlinked directories followed once; a package walk skips `target`, `.git` and nested packages.
 fn tree(top: &Path, package: bool, target: &Path, since_ns: i128, out: &mut Vec<Entry>) -> Result<(), &'static str> {
-    let mut stack = vec![(top.to_path_buf(), 0usize)];
     let mut walked = HashSet::new();
-    while let Some((dir, depth)) = stack.pop() {
-        out.push(Entry::input(&dir, since_ns, false));
-        let meta = sys::stat(&dir).map_err(|_| "unreadable directory")?;
-        if !walked.insert((meta.dev(), meta.ino())) {
-            continue;
+    let mut level = vec![(top.to_path_buf(), 0usize)];
+    // A directory is stamped before it is listed; one depth is listed at a time across threads and files are stamped once the walk is done.
+    let mut walk: Vec<Result<Entry, PathBuf>> = Vec::new();
+    let before = out.len();
+    while !level.is_empty() {
+        let mut listing = Vec::new();
+        for (dir, depth) in level.drain(..) {
+            walk.push(Ok(Entry::input(&dir, since_ns, false)));
+            let meta = sys::stat(&dir).map_err(|_| "unreadable directory")?;
+            if walked.insert((meta.dev(), meta.ino())) {
+                listing.push((dir, depth));
+            }
         }
-        let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir).map_err(|_| "unreadable directory")?.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            if out.len() > MAX_TREE {
+        for listed in par_map(&listing, |(dir, depth)| list_tree_dir(dir, *depth, package, target)) {
+            let (files, dirs, seen) = listed?;
+            if before + walk.len() + level.len() + seen > MAX_TREE {
                 return Err("tree too large");
             }
-            let path = entry.path();
-            let kind = entry.file_type().map_err(|_| "unreadable directory")?;
-            if !(kind.is_dir() || kind.is_symlink() && path.is_dir()) {
-                out.push(Entry::input(&path, since_ns, true));
-                continue;
-            }
-            let name = entry.file_name();
-            let skip = name == ".git" || path.starts_with(target) || (package && depth == 0 && name == "target") || (package && path.join("Cargo.toml").exists());
-            if !skip {
-                stack.push((path, depth + 1));
-            }
+            walk.extend(files.into_iter().map(Err));
+            level.extend(dirs);
         }
     }
+    out.extend(par_map(&walk, |item| match item {
+        Ok(entry) => entry.clone(),
+        Err(file) => Entry::input(file, since_ns, true),
+    }));
     Ok(())
+}
+
+/// One directory of a tree walk: its files, the subdirectories to descend into with their depth, and how many entries it holds.
+type Listed = (Vec<PathBuf>, Vec<(PathBuf, usize)>, usize);
+
+fn list_tree_dir(dir: &Path, depth: usize, package: bool, target: &Path) -> Result<Listed, &'static str> {
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir).map_err(|_| "unreadable directory")?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    for entry in &entries {
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|_| "unreadable directory")?;
+        if !(kind.is_dir() || kind.is_symlink() && path.is_dir()) {
+            files.push(path);
+            continue;
+        }
+        let name = entry.file_name();
+        let skip = name == ".git" || path.starts_with(target) || (package && depth == 0 && name == "target") || (package && path.join("Cargo.toml").exists());
+        if !skip {
+            dirs.push((path, depth + 1));
+        }
+    }
+    Ok((files, dirs, entries.len()))
 }
 
 /// What decides which targets and members cargo finds, compared by name so a save that rewrites a directory is not a change.
@@ -820,13 +887,9 @@ fn graph_inputs(plan: &mut Plan, rec: &Recorded<'_>) -> Result<(), &'static str>
             return Err("unit without manifest directory");
         };
         push(plan, dir.join("Cargo.toml"), false);
-        if dir.starts_with(rec.root) {
-            for ancestor in dir.ancestors().skip(1) {
-                members.insert(ancestor.to_path_buf());
-                if ancestor == rec.root {
-                    break;
-                }
-            }
+        // Only directories inside the workspace hold members; the root package itself has none above it to record.
+        for ancestor in dir.ancestors().skip(1).take_while(|a| a.starts_with(rec.root)) {
+            members.insert(ancestor.to_path_buf());
         }
         dirs.insert(dir);
     }
@@ -919,5 +982,37 @@ mod tests {
         let (set, unset) = delta(&env, &base);
         assert_eq!(set, vec![("CARGO_PKG_NAME".to_string(), "a".to_string())]);
         assert_eq!(unset, vec!["GONE".to_string()]);
+    }
+
+    #[test]
+    fn member_directories_stop_at_the_workspace_root() {
+        let root = crate::fsx::temp_sibling(&std::env::temp_dir().join("frust-plan-layout"));
+        let member = root.join("crates").join("m");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        fs::write(member.join("Cargo.toml"), b"[package]\n").unwrap();
+        let unit = |dir: &Path| Unit {
+            id: String::new(), package_id: String::new(), package: String::new(), pkg_name: String::new(), desc: String::new(), fix: None,
+            local: true, script: false, argv: Vec::new(), cwd: String::new(),
+            env_set: vec![("CARGO_MANIFEST_DIR".to_string(), dir.to_string_lossy().into_owned())], env_unset: Vec::new(),
+            outputs: Vec::new(), inputs: Vec::new(), env_deps: Vec::new(), stamps: Vec::new(), deps: Vec::new(), uplifts: Vec::new(),
+            depfiles: Vec::new(), depfiles_ok: true, fingerprint: String::new(), diagnostics: Vec::new(), run: None, script_unit: None,
+            incremental: false, ms: 0,
+        };
+        let mut plan = Plan {
+            format: FORMAT, key: String::new(), cwd: String::new(), target: String::new(), finished: String::new(), graph: Vec::new(),
+            layout: Vec::new(), scripts: Vec::new(), units: vec![unit(&root), unit(&member)], messages: Vec::new(), env_common: Vec::new(),
+        };
+        let base = HashMap::new();
+        let rec = Recorded {
+            key: "", cwd: &root, target: &root.join("target"), root: &root, messages: Vec::new(), finished: String::new(), journal: Vec::new(),
+            previous: Vec::new(), base_env: &base, configs: &[], launched_ns: crate::cache::hashing::now_ns() + 60_000_000_000, lock_created: false, verified: None,
+        };
+        graph_inputs(&mut plan, &rec).unwrap();
+        let holders: Vec<&str> = plan.layout.iter().filter(|(_, package, _)| !package).map(|(dir, _, _)| dir.as_str()).collect();
+        let expected = [root.to_string_lossy().into_owned(), root.join("crates").to_string_lossy().into_owned()];
+        assert_eq!(holders, expected.iter().map(String::as_str).collect::<Vec<_>>(), "nothing above the workspace root is listed");
+        fs::remove_dir_all(root).unwrap();
     }
 }
