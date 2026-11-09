@@ -484,8 +484,27 @@ pub(super) fn try_lock_session_with(
     mode: super::SessionRecordMode,
     record: &mut impl FnMut(&File, super::SessionRecordMode, libc::c_short) -> io::Result<()>,
 ) -> Result<(), super::SessionLockError> {
-    file.try_lock().map_err(io::Error::from)?;
-    if let Err(error) = record(file, mode, libc::F_WRLCK as _) {
+    lock_session_as(file, mode, false, record)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn try_lock_session_shared(
+    file: &File,
+    mode: super::SessionRecordMode,
+) -> Result<(), super::SessionLockError> {
+    lock_session_as(file, mode, true, &mut session_record_lock)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lock_session_as(
+    file: &File,
+    mode: super::SessionRecordMode,
+    shared: bool,
+    record: &mut impl FnMut(&File, super::SessionRecordMode, libc::c_short) -> io::Result<()>,
+) -> Result<(), super::SessionLockError> {
+    if shared { file.try_lock_shared() } else { file.try_lock() }.map_err(io::Error::from)?;
+    let kind = if shared { libc::F_RDLCK } else { libc::F_WRLCK };
+    if let Err(error) = record(file, mode, kind as _) {
         let _ = file.unlock();
         #[cfg(target_os = "linux")]
         if mode == super::SessionRecordMode::Ofd
@@ -510,6 +529,11 @@ pub(super) fn try_lock_session_with(
 #[cfg(target_os = "macos")]
 pub fn try_lock_session(file: &File) -> io::Result<()> {
     file.try_lock().map_err(io::Error::from)
+}
+
+#[cfg(target_os = "macos")]
+pub fn try_lock_session_shared(file: &File) -> io::Result<()> {
+    file.try_lock_shared().map_err(io::Error::from)
 }
 
 #[cfg(not(target_os = "macos"))]

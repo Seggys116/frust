@@ -374,6 +374,10 @@ pub fn try_lock_session(file: &File) -> io::Result<()> {
     file.try_lock().map_err(io::Error::from)
 }
 
+pub fn try_lock_session_shared(file: &File) -> io::Result<()> {
+    file.try_lock_shared().map_err(io::Error::from)
+}
+
 pub fn unlock_session(file: &File) {
     let _ = file.unlock();
 }

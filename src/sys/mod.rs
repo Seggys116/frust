@@ -457,6 +457,20 @@ pub fn try_session_lock(path: &Path) -> io::Result<SessionLock> {
     Ok(SessionLock { inner: try_session_locks(&[path.to_path_buf()])?, path: path.to_path_buf() })
 }
 
+/// The kind rustc takes to copy from a finished session, which keeps its garbage collection from deleting it meanwhile.
+pub fn try_session_lock_shared(path: &Path) -> io::Result<SessionLock> {
+    let paths = [path.to_path_buf()];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let inner = try_session_locks_with(&paths, &mut imp::open_session_lock, &mut imp::try_lock_session_shared)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let inner = {
+        let guard = SessionLocks { files: Vec::new(), locked: 0, record_mode: SessionRecordMode::Handle };
+        session_lock_attempt(&paths, guard, &mut imp::open_session_lock, &mut |file, _| imp::try_lock_session_shared(file).map_err(Into::into))
+            .map_err(SessionLockError::into_io)?
+    };
+    Ok(SessionLock { inner, path: path.to_path_buf() })
+}
+
 /// Notifications are scheduling hints; callers must recheck their state.
 pub struct DirectoryWatcher {
     inner: Option<imp::DirectoryWatcher>,
