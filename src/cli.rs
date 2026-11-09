@@ -361,7 +361,8 @@ fn resolve_workspace(dirs: &Dirs, wanted: &str) -> Result<String, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let canonical = std::fs::canonicalize(wanted).ok().map(|p| p.display().to_string());
+    // The recorded root is in `sys::canonicalize` form, which drops Windows' verbatim prefix.
+    let canonical = crate::sys::canonicalize(std::path::Path::new(wanted)).ok().map(|p| p.display().to_string());
     let exact: Vec<&String> = names
         .iter()
         .filter(|(name, root)| name == wanted || root.as_deref().is_some_and(|r| r == wanted || Some(r) == canonical.as_deref()))

@@ -222,6 +222,10 @@ fn gc_and_compact_cover_every_workspace_and_report_progress_on_stderr() {
     assert_success(&scoped);
     let out = stdout(&scoped);
     assert!(out.contains(&wa) && !out.contains(&wb) && !out.contains("cache store"), "{out}");
+    // Another spelling of the same directory, as a Windows short name or a symlinked temp dir gives, names it too.
+    let respelled = sb.bin("frust").args(["compact", "--dry-run", "--workspace", &a.join(".").join("..").join("alpha").display().to_string()]).output().unwrap();
+    assert_success(&respelled);
+    assert!(stdout(&respelled).contains(&wa) && !stdout(&respelled).contains(&wb), "{}", stdout(&respelled));
     let unknown = sb.bin("frust").args(["compact", "--dry-run", "--workspace", "no-such-workspace"]).output().unwrap();
     assert_eq!(unknown.status.code(), Some(2), "{}", stderr(&unknown));
 }
