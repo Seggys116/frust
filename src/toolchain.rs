@@ -177,7 +177,7 @@ impl Probe {
         Probe::cached_then(dirs, toolchain, cwd, || {})
     }
 
-    /// As [`Probe::cached`]; a probe that has to run calls `on_cold` once `cargo -V` has returned, so other cargo queries can start beside the rest.
+    /// As [`Probe::cached`]; a probe that has to run calls `on_cold` once no proxy can still be installing the toolchain, so other cargo queries can start beside the rest.
     pub fn cached_then(dirs: &Dirs, toolchain: Option<&OsStr>, cwd: &Path, on_cold: impl FnOnce()) -> Option<(Probe, CacheOutcome)> {
         let rustc = probe_rustc()?;
         let cargo = resolve_tool("cargo")?;
@@ -222,21 +222,34 @@ impl Probe {
 /// An empty sysroot list means the result cannot be validated and must not be memoised.
 fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, want_sysroot: bool, after_cargo: impl FnOnce()) -> Option<(Probe, Vec<PathBuf>)> {
     let tc: Option<OsString> = toolchain.map(|t| t.to_os_string());
-    let spawn = |tool: PathBuf, args: &'static [&'static str]| {
-        let (tc, cwd) = (tc.clone(), cwd.to_path_buf());
+    let installed = installed_selection(toolchain, cwd);
+    let spawn = |tool: &Path, name: &str, args: &'static [&'static str]| {
+        let (tool, tc) = match installed.as_deref().and_then(|dir| proxied_binary(dir, tool, name)) {
+            Some(exe) => (exe, None),
+            None => (tool.to_path_buf(), tc.clone()),
+        };
+        let cwd = cwd.to_path_buf();
         thread::spawn(move || query(&tool, tc.as_deref(), args, &cwd))
     };
-    // Run one query alone first: parallel proxies would each start rustup's auto-install of a missing toolchain and corrupt it.
-    let cargo_out = query(cargo, tc.as_deref(), &["-V"], cwd);
+    // Run one query alone first unless the toolchain is installed: parallel proxies would each start rustup's auto-install of a missing toolchain and corrupt it.
+    let cargo_handle = installed.is_some().then(|| spawn(cargo, "cargo", &["-V"]));
+    let cargo_out = match cargo_handle {
+        Some(_) => None,
+        None => query(cargo, tc.as_deref(), &["-V"], cwd),
+    };
     after_cargo();
-    let rustc_handle = spawn(rustc.to_path_buf(), &["-vV"]);
-    let own_handle = spawn(rustc.to_path_buf(), &["--print", "sysroot"]);
+    let rustc_handle = spawn(rustc, "rustc", &["-vV"]);
+    let own_handle = spawn(rustc, "rustc", &["--print", "sysroot"]);
     let mut sysroot_handles = Vec::new();
     // `RUSTC` may name a compiler other than the proxied one `cargo` belongs to.
     if want_sysroot && let Some(proxy) = resolve_tool("rustc").filter(|p| p != rustc) {
-        sysroot_handles.push(spawn(proxy, &["--print", "sysroot"]));
+        sysroot_handles.push(spawn(&proxy, "rustc", &["--print", "sysroot"]));
     }
     let rustc_out = rustc_handle.join().ok().flatten();
+    let cargo_out = match cargo_handle {
+        Some(handle) => handle.join().ok().flatten(),
+        None => cargo_out,
+    };
     let own_sysroot = own_handle.join().ok().flatten().map(|s| PathBuf::from(s.trim())).filter(|s| s.is_absolute());
     let mut sysroots = Vec::new();
     let mut complete = true;
@@ -363,6 +376,52 @@ fn probe_key(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path) 
     }
     d.file(&rustup_home()?.join("settings.toml"))?;
     Some(d.finish())
+}
+
+/// The directory of the toolchain rustup would pick, only when it is installed so no proxy can start an install; anything unclear answers `None`.
+fn selected_toolchain(rustup: &Path, toolchain: Option<&OsStr>, env_toolchain: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
+    let toolchains = rustup.join("toolchains");
+    let installed = |name: &str| {
+        let dir = toolchains.join(name);
+        (!name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." && dir.is_dir()).then_some(dir)
+    };
+    if let Some(chosen) = toolchain.or(env_toolchain) {
+        let chosen = chosen.to_str()?;
+        return installed(chosen.strip_prefix('+').unwrap_or(chosen));
+    }
+    let pinned = memo::ancestor_chains(cwd)
+        .iter()
+        .any(|dir| ["rust-toolchain.toml", "rust-toolchain"].iter().any(|name| fs::symlink_metadata(dir.join(name)).is_ok()));
+    let settings = fs::read_to_string(rustup.join("settings.toml")).ok()?;
+    let (mut section, mut default) = (String::new(), None);
+    for line in settings.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        if line.starts_with('[') {
+            section = line.to_string();
+        } else if section.contains("overrides") {
+            return None;
+        } else if section.is_empty()
+            && let Some(value) = line.strip_prefix("default_toolchain").map(str::trim_start).and_then(|rest| rest.strip_prefix('='))
+        {
+            default = value.trim().strip_prefix('"').and_then(|v| v.strip_suffix('"')).map(str::to_string);
+        }
+    }
+    installed(&default.filter(|_| !pinned)?)
+}
+
+fn installed_selection(toolchain: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
+    selected_toolchain(&rustup_home()?, toolchain, env::var_os("RUSTUP_TOOLCHAIN").as_deref(), cwd)
+}
+
+/// A rustup proxy of an installed toolchain only runs that toolchain's binary, so the binary can be run directly; a hard-linked proxy is not recognised.
+fn proxied_binary(toolchain_dir: &Path, tool: &Path, name: &str) -> Option<PathBuf> {
+    let proxy = sys::canonicalize(tool).is_ok_and(|real| real.file_stem().is_some_and(|stem| stem == "rustup"));
+    let exe = toolchain_dir.join("bin").join(format!("{name}{}", env::consts::EXE_SUFFIX));
+    (proxy && exe.is_file()).then_some(exe)
+}
+
+/// The binary the rustup proxy `tool` would run for `cwd`, which then takes no `+toolchain` argument; `None` keeps the proxy.
+pub fn direct_binary(tool: &Path, name: &str, toolchain: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
+    proxied_binary(&installed_selection(toolchain, cwd)?, tool, name)
 }
 
 fn rustup_home() -> Option<PathBuf> {
@@ -656,6 +715,50 @@ mod tests {
         assert_eq!(resolve_linker("frust-test-missing", sysroot), None);
         assert_eq!(resolve_linker("", sysroot), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn queries_run_together_only_when_the_selected_toolchain_is_installed() {
+        let root = env::temp_dir().join(format!("frust-selection-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (rustup, project) = (root.join("rustup"), root.join("work").join("project"));
+        fs::create_dir_all(rustup.join("toolchains").join("stable-x")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let settings = |text: &str| fs::write(rustup.join("settings.toml"), text).unwrap();
+        let selected = |tc: Option<&str>, env_tc: Option<&str>| selected_toolchain(&rustup, tc.map(OsStr::new), env_tc.map(OsStr::new), &project);
+        let installed = |tc: Option<&str>, env_tc: Option<&str>| selected(tc, env_tc).is_some();
+        assert!(!installed(None, None), "no settings file");
+        settings("version = \"12\"\ndefault_toolchain = \"stable-x\"\nprofile = \"default\"\n\n[overrides]\n");
+        assert_eq!(selected(None, None), Some(rustup.join("toolchains").join("stable-x")));
+        assert!(installed(Some("+stable-x"), None) && installed(None, Some("stable-x")));
+        assert!(!installed(Some("+beta-x"), None) && !installed(None, Some("beta-x")) && !installed(Some("+stable"), None));
+        assert!(!installed(None, Some("../toolchains/stable-x")) && !installed(None, Some("")));
+        settings("default_toolchain = \"beta-x\"\n");
+        assert!(!installed(None, None), "default not installed");
+        settings("default_toolchain = \"stable-x\"\n[overrides]\n\"/elsewhere\" = \"beta-x\"\n");
+        assert!(!installed(None, None), "any directory override");
+        settings("default_toolchain = \"stable-x\"\n");
+        for name in ["rust-toolchain", "rust-toolchain.toml"] {
+            fs::write(root.join("work").join(name), "stable-x").unwrap();
+            assert!(!installed(None, None), "{name} in an ancestor");
+            assert!(installed(None, Some("stable-x")), "the variable outranks {name}");
+            fs::remove_file(root.join("work").join(name)).unwrap();
+        }
+        assert!(installed(None, None));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_probe_answers_what_the_proxies_answer() {
+        let (Some(rustc), Some(cargo)) = (probe_rustc(), resolve_tool("cargo")) else { return };
+        let cwd = env::current_dir().unwrap();
+        let Some((probe, sysroots)) = probe_now(&rustc, &cargo, None, &cwd, true, || {}) else { return };
+        assert_eq!(Some(probe.rustc_verbose.clone()), query(&rustc, None, &["-vV"], &cwd));
+        let sysroot = query(&rustc, None, &["--print", "sysroot"], &cwd).unwrap();
+        assert_eq!(probe.sysroot, sysroot.trim());
+        assert_eq!(sysroots.first().map(|dir| dir.to_string_lossy().into_owned()), Some(sysroot.trim().to_string()));
+        let version = query(&cargo, None, &["-V"], &cwd).unwrap();
+        assert_eq!(probe.cargo_version, parse_version(version.split_whitespace().nth(1).unwrap()));
     }
 
     #[test]
