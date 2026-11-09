@@ -126,7 +126,9 @@ fn final_link_reads_no_file_of_a_build_script_link_directory() {
     .unwrap();
     let a = sb.project("a", &[("nat", "1.0.0")], "fn main() { println!(\"{}\", nat::value()); }\n");
     let timings = sb.root.join("timings.jsonl");
-    assert_success(&sb.bin("fcargo").arg("build").env("FRUST_TIMINGS", &timings).current_dir(&a).output().unwrap());
+    // A stamp audit proves every attested record by reading the file, so the memo is only served with stamps trusted.
+    let build = sb.bin("fcargo").arg("build").env("FRUST_TIMINGS", &timings).env("FRUST_CACHE_TRUST_STAMPS", "on").current_dir(&a).output().unwrap();
+    assert_success(&build);
     assert_eq!(stdout(&run_binary(&sb.central_target(&a), "debug", "app")).trim(), "3");
     let records: Vec<serde_json::Value> = fs::read_to_string(&timings).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let app = records.iter().find(|r| r["crate"] == "app").expect("the binary was compiled through the wrapper");

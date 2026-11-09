@@ -28,11 +28,12 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
-    WaitForSingleObject,
+    CreateProcessW, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_TERMINATE, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use super::{LockKind, StdStream};
@@ -892,6 +893,115 @@ impl Job {
 
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
+// The console's Ctrl+C then reaches only frust, which alone decides when an owned tree stops.
+pub fn own_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Kills an owned child and every live descendant together; the caller's unwaited `Child` handle pins the pid.
+pub fn cancel_owned_process_group(pid: u32) -> Result<(), String> {
+    const ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE;
+    let root = open_process(pid, ACCESS)
+        .map_err(|error| format!("cannot open owned process {pid}: {error}; ownership unproven, group not signalled"))?;
+    // SAFETY: creating an unnamed job object with default security.
+    let raw = unsafe { CreateJobObjectW(null(), null()) };
+    if raw.is_null() {
+        return Err(format!("cannot create a job for group {pid}: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: `raw` is a fresh handle that we own.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut members = vec![(pid, creation_ticks(&root), root)];
+    let mut loose = Vec::new();
+    // A process inside the job bears its children inside it, so sweeping until a fresh snapshot adds nobody leaves no live descendant outside.
+    let mut fresh = 0;
+    while fresh < members.len() {
+        for (_, _, process) in &members[fresh..] {
+            // SAFETY: both handles are valid; a process that already exited or sits in a job barring nesting stays loose.
+            if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
+                loose.push(process.as_raw_handle());
+            }
+        }
+        fresh = members.len();
+        let parents = process_parents().map_err(|error| format!("cannot list the processes of group {pid}: {error}"))?;
+        loop {
+            let before = members.len();
+            for &(child, parent) in &parents {
+                if members.iter().any(|(member, _, _)| *member == child) {
+                    continue;
+                }
+                let Some(&(_, born, _)) = members.iter().find(|(member, _, _)| *member == parent) else { continue };
+                let Ok(process) = open_process(child, ACCESS) else { continue };
+                // A child older than its recorded parent belongs to an earlier holder of a recycled pid.
+                if creation_ticks(&process) >= born {
+                    members.push((child, creation_ticks(&process), process));
+                }
+            }
+            if members.len() == before {
+                break;
+            }
+        }
+    }
+    // SAFETY: `job` is a valid job handle; termination of every assigned process is asynchronous but final.
+    let terminated = unsafe { TerminateJobObject(job.as_raw_handle(), 1) } != 0;
+    let job_error = (!terminated).then(io::Error::last_os_error);
+    for process in loose {
+        // SAFETY: `process` belongs to a handle in `members`, still open; failure means it already exited.
+        unsafe { TerminateProcess(process, 1) };
+    }
+    match job_error {
+        Some(error) => Err(format!("foreground group cancellation failed: {error}")),
+        None => Ok(()),
+    }
+}
+
+fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: OpenProcess has no memory preconditions.
+    let raw = unsafe { OpenProcess(access, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh process handle that we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+fn creation_ticks(process: &OwnedHandle) -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    let zero = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero(), zero(), zero(), zero());
+    // SAFETY: the handle carries query rights and all four out pointers are valid.
+    if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return 0;
+    }
+    (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+}
+
+/// Every process of the system as (pid, parent pid).
+fn process_parents() -> io::Result<Vec<(u32, u32)>> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a process snapshot has no memory preconditions.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh snapshot handle that we own.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut parents = Vec::new();
+    // SAFETY: the snapshot handle is valid and `entry` has its size set as the API requires.
+    let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while more {
+        parents.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    Ok(parents)
+}
+
 pub fn load_average() -> Option<f64> {
     None
 }
@@ -1321,6 +1431,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn owned_cmd(script: &str) -> (std::process::Child, std::sync::mpsc::Receiver<()>) {
+        let mut command = Command::new("cmd");
+        command.args(["/c", script]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+        own_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (closed, eof) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = stdout.read_to_end(&mut Vec::new());
+            let _ = closed.send(());
+        });
+        (child, eof)
+    }
+
+    #[test]
+    fn owned_group_cancellation_kills_a_running_leader_and_its_child() {
+        let (mut child, eof) = owned_cmd("ping -n 60 127.0.0.1");
+        assert!(eof.recv_timeout(Duration::from_millis(300)).is_err(), "the tree must still hold its pipe");
+        cancel_owned_process_group(child.id()).unwrap();
+        assert!(eof.recv_timeout(Duration::from_secs(10)).is_ok(), "every member must release the inherited pipe");
+        assert_eq!(child.wait().unwrap().code(), Some(1));
+    }
+
+    #[test]
+    fn owned_group_cancellation_kills_live_descendant_after_leader_exit() {
+        let (mut child, eof) = owned_cmd("start /b ping -n 60 127.0.0.1 & exit 9");
+        assert_eq!(child.wait().unwrap().code(), Some(9));
+        assert!(eof.recv_timeout(Duration::from_millis(300)).is_err(), "the descendant must still hold the pipe");
+        cancel_owned_process_group(child.id()).unwrap();
+        assert!(eof.recv_timeout(Duration::from_secs(10)).is_ok(), "descendant must release its inherited pipe");
     }
 
     #[test]

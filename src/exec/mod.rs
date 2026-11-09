@@ -115,6 +115,7 @@ pub struct Gate {
     launched_ns: i128,
     decision: String,
     planned: String,
+    profile_locks: Vec<crate::compact::ProfileLock>,
 }
 
 /// What the child would see: this process's environment under frust's own settings.
@@ -195,6 +196,7 @@ impl Gate {
             launched_ns: 0,
             decision: String::new(),
             planned: String::new(),
+            profile_locks: Vec::new(),
         }
     }
 
@@ -247,6 +249,15 @@ impl Gate {
             self.predicted = Some((plan, dirty));
             return None;
         }
+        // Cargo's own locks keep another cargo out of the profiles the replay writes; a held one means cargo must wait for it.
+        let profiles: std::collections::BTreeSet<PathBuf> = plan.units.iter().filter_map(|u| u.argv()).map(|a| crate::cache::rustc_args::profile_root(&a.out_dir)).collect();
+        let Some(locks) = profiles.iter().map(|p| crate::compact::ProfileLock::try_acquire(p)).collect::<Option<Vec<_>>>() else {
+            self.graph_verified = true;
+            self.loaded = Some(plan);
+            self.decision = "decline:busy".into();
+            return None;
+        };
+        self.profile_locks = locks;
         let total = plan.units.len();
         let cmd = self.child_command(&plan, dirty.clone(), false)?;
         self.decision = format!("replay:{}/{total}", dirty.len());
@@ -303,6 +314,10 @@ impl Gate {
                 return Err("build script would rerun");
             }
         }
+        // Cargo may still find such a unit fresh, and every doubt runs cargo.
+        if plan.units.iter().any(|u| u.inputs.iter().any(plan::Entry::poisoned)) {
+            return Err("input written as it was compiled");
+        }
         let total = plan.units.len();
         let dirty = with_dependents(plan, plan.units.iter().map(|u| {
             u.inputs.iter().any(|e| !e.current()) || u.env_deps.iter().any(|(k, v)| self.unit_env(plan, u, k) != *v)
@@ -354,6 +369,7 @@ impl Gate {
 
     /// Records the plan after a successful cargo run and settles an audit; returns an audit failure.
     pub fn finish(&mut self, code: i32, interrupted: bool, recorder: Option<&Recorder>) -> Option<String> {
+        self.profile_locks.clear();
         if let Some(request) = self.request.take() {
             let _ = fs::remove_file(request);
         }
