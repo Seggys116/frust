@@ -29,6 +29,10 @@ pub const DIR_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 const READ_BUF: usize = 256 * 1024;
 
+/// A file in the memo directory rewritten to read the filesystem clock; a few millisecond waits outlast the coarsest kernel tick.
+const CLOCK_PROBE: &str = "clock";
+const CLOCK_PROBE_TRIES: u32 = 25;
+
 #[cfg_attr(not(unix), allow(dead_code))]
 const MMAP_MIN_BYTES: u64 = 1024 * 1024;
 
@@ -439,6 +443,8 @@ pub struct Hasher {
     audit_attested: bool,
     read_bytes: AtomicU64,
     memo_bytes: AtomicU64,
+    /// The last probed change time of the clock probe and its device.
+    clock: Mutex<Option<(u64, i128)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +466,7 @@ impl Hasher {
             audit_attested: false,
             read_bytes: AtomicU64::new(0),
             memo_bytes: AtomicU64::new(0),
+            clock: Mutex::new(None),
         }
     }
 
@@ -570,19 +577,53 @@ impl Hasher {
         // Stat'd before the read: the proof needs the witness's change time set before any byte is read.
         let young = persist && current.changed_since(now_ns(), SETTLE_MARGIN_NS);
         let witness = young.then(|| build_output_witness(path)).flatten();
+        // A coarse kernel clock can stamp the witness in the tick of the file itself; a fresh probe then shows the tick has passed.
+        let passed = witness.filter(|w| w.dev == current.dev && !w.coarse()).and_then(|w| match w.ctime_ns.cmp(&current.ctime_ns) {
+            std::cmp::Ordering::Greater => Some(w.ctime_ns),
+            std::cmp::Ordering::Equal => self.clock_past(current.dev, current.ctime_ns),
+            std::cmp::Ordering::Less => None,
+        });
         let hashed = self.read(path, immutable)?;
         if persist && hashed.reusable() {
             self.remember(path, &hashed);
         } else if persist
             && hashed.stable
             && hashed.stamp.ctime_ns > 0
-            && witness.is_some_and(|w| w.dev == hashed.stamp.dev && !w.coarse() && w.ctime_ns > hashed.stamp.ctime_ns)
+            && hashed.stamp.dev == current.dev
+            && passed.is_some_and(|tick| tick > hashed.stamp.ctime_ns)
         {
             // The timestamp clock had passed the file's change time before the read, so any later write moves the stamp; audit mode proves it as attested.
             self.write_record(path, &hashed.stamp, &hashed.hash, true);
         }
         self.memo().insert(path.to_path_buf(), hashed.clone());
         Ok(hashed)
+    }
+
+    /// A change time of `dev` later than `ctime_ns`, from a probe written now or earlier in this process, so any later write moves a stamp past it.
+    fn clock_past(&self, dev: u64, ctime_ns: i128) -> Option<i128> {
+        let mut last = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((probed_dev, tick)) = *last
+            && probed_dev == dev
+            && tick > ctime_ns
+        {
+            return Some(tick);
+        }
+        let dir = self.persist_dir.as_ref()?;
+        let _ = fs::create_dir_all(dir);
+        let probe = File::options().create(true).write(true).truncate(false).open(dir.join(CLOCK_PROBE)).ok()?;
+        for _ in 0..CLOCK_PROBE_TRIES {
+            sys::write_all_at(&probe, &[0], 0).ok()?;
+            let stamp = Stamp::of(&sys::fstat(&probe).ok()?);
+            if stamp.dev != dev || stamp.coarse() {
+                return None;
+            }
+            *last = Some((dev, stamp.ctime_ns));
+            if stamp.ctime_ns > ctime_ns {
+                return Some(stamp.ctime_ns);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        None
     }
 
     fn log_path(&self) -> Option<PathBuf> {
@@ -1747,6 +1788,22 @@ mod tests {
         let next = dependent(&memo);
         next.hash(&archive, true).unwrap();
         assert_eq!(next.tally().0, bytes.len() as u64, "an archive the script may still be writing is read again");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_script_archive_stamped_in_the_tick_of_its_output_file_is_remembered_once_the_clock_passes() {
+        let dir = scratch("witness-tie");
+        let script = dir.join("build").join("foo-0123abcd");
+        fs::create_dir_all(script.join("out")).unwrap();
+        let Some((archive, bytes, _)) = fresh_output(&script.join("out"), "libfoo.a") else { return };
+        // One inode for both ties the change times, as a coarse kernel clock ties writes within one tick.
+        fs::hard_link(&archive, script.join("output")).unwrap();
+        let memo = dir.join("memo");
+        let hashed = dependent(&memo).hash(&archive, true).unwrap();
+        let next = dependent(&memo);
+        assert_eq!(next.hash(&archive, true).unwrap().hash, hashed.hash);
+        assert_eq!(next.tally(), (0, bytes.len() as u64), "the probe shows the tick passed before the read, so the next unit takes the memo");
         let _ = fs::remove_dir_all(&dir);
     }
 
