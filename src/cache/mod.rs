@@ -6,6 +6,7 @@ pub mod hashing;
 pub mod metadata_slice;
 pub mod payload;
 pub mod rustc_args;
+pub mod session;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -103,6 +104,9 @@ pub struct EntryMeta {
     /// Central-target workspace ids that stored or restored this entry, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<String>,
+    /// The incremental session the compile left, in the entry's `session` directory while no newer state of the unit holds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<session::StoredSession>,
     pub files: Vec<StoredFile>,
     /// Name of the diagnostics file; empty when the diagnostics are `stderr_inline`, which entries stored before the inline layout never use.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1199,7 +1203,7 @@ mod tests {
         };
         let object = "k-0123456789abcdef.0a1b2c3d4e5f.1x2y3z.rcgu.o";
         let meta = EntryMeta {
-            crate_name: "k".into(), version: "0.1.0".into(), compile_ms: 1, created_unix: 0, incremental_unit: None, prekey: None,
+            crate_name: "k".into(), version: "0.1.0".into(), compile_ms: 1, created_unix: 0, incremental_unit: None, prekey: None, session: None,
             source: None, workspaces: Vec::new(), files: vec![linked("libk.rlib", "f0"), linked(object, "f1")], stderr: "stderr".into(), stderr_inline: String::new(),
         };
         for (stored, name) in [("f0", "libk.rlib"), ("f1", object)] {

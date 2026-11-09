@@ -207,6 +207,8 @@ struct Plan {
     uplift_links: bool,
     /// Set once a scan of the output directory chose the bulk read, so the scan after the compile skips the listing that decides it.
     bulk_scan: AtomicBool,
+    /// The incremental session this compile finalized, which the store shares into the entry.
+    session: OnceLock<cache::session::Produced>,
 }
 
 struct Shared {
@@ -373,6 +375,7 @@ impl Plan {
             began: (begun, sys::thread_cpu_ns()),
             uplift_links: sys::CARGO_UPLIFT_LINKS && matches!(env::var(CARGO_COMMAND_ENV).as_deref(), Ok("build" | "b")),
             bulk_scan: AtomicBool::new(false),
+            session: OnceLock::new(),
         })
     }
 
@@ -459,6 +462,7 @@ impl Plan {
             began: (Instant::now(), sys::thread_cpu_ns()),
             uplift_links: false,
             bulk_scan: AtomicBool::new(false),
+            session: job.session.clone().map(OnceLock::from).unwrap_or_default(),
         })
     }
 
@@ -874,6 +878,7 @@ impl Plan {
             Ok(file.bytes)
         })?;
         let bytes = restored.iter().sum();
+        self.restore_session(entry, meta);
         let stderr = self.detokenise(&meta.read_stderr(entry)?);
         let mut out = io::stderr().lock();
         out.write_all(stderr.as_bytes())?;
@@ -956,6 +961,11 @@ impl Plan {
         };
         // Where stat cannot disturb a writer, the scan overlaps rustc's start instead of delaying it.
         let early = (!sys::STAT_BESIDE_WRITERS).then(|| scan_earlier(false));
+        let sessions_before = self.session_root().map(|root| {
+            let before = cache::session::snapshot(&root, &self.parsed.crate_name);
+            let before = self.seed_session(&root, before);
+            (root, before)
+        });
         let rustc_started = Instant::now();
         let mut compiler = compiler_command(&self.args[0]);
         compiler.args(&self.args[1..]);
@@ -993,6 +1003,10 @@ impl Plan {
             let store_started = Instant::now();
             self.settle(&captured, &preexisting);
             let retired = if self.skips_store() { Vec::new() } else { self.supersede_unit_versions() };
+            // Named before the wrapper returns, while this compile's session is the only new one; the store shares it in later.
+            if let Some(produced) = sessions_before.filter(|_| !self.declines_session(&captured)).and_then(|(root, before)| self.produced_session(&root, &before)) {
+                let _ = self.session.set(produced);
+            }
             if self.skips_store() {
                 self.probe.mode(|| "skip:test".to_string());
                 let _ = self.skip_store("test executables are not stored", compile_ms);
@@ -1235,6 +1249,7 @@ impl Plan {
                 .filter(|_| helper_relocks || queue_only)
                 .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
             retired: retired.iter().map(|entry| cache::Retired { path: self.cwd.join(&entry.path), ..entry.clone() }).collect(),
+            session: self.session.get().cloned(),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
@@ -1445,6 +1460,72 @@ impl Plan {
             && hashed.stamp == *stamp
         {
             self.hasher.attest(path, &hashed.hash, stamp);
+        }
+    }
+
+    /// The incremental directory of a path unit whose entry keeps its session; `None` where nothing would store or restore one.
+    fn session_root(&self) -> Option<PathBuf> {
+        let dir = self.parsed.incremental_dir.as_ref().filter(|_| self.unit.is_some() && !self.skips_store() && sessions_enabled())?;
+        Some(self.cwd.join(dir))
+    }
+
+    fn produced_session(&self, root: &Path, before: &cache::session::Snapshot) -> Option<cache::session::Produced> {
+        let produced = cache::session::produced(root, &self.parsed.crate_name, before);
+        if produced.is_none() {
+            self.debug(&format!("no session of {} to keep: none or more than one finalized", self.parsed.crate_name));
+        }
+        produced
+    }
+
+    /// A miss whose crate has no session (cleanup retired it, or the target was replaced) starts rustc from the unit's stored one, which rustc checks against the sources like any earlier session.
+    fn seed_session(&self, root: &Path, before: cache::session::Snapshot) -> cache::session::Snapshot {
+        if !before.is_empty() && before.values().all(|sessions| !sessions.is_empty()) {
+            return before;
+        }
+        let units = self.shared.as_ref().map(|shared| shared.unit.as_str()).into_iter().chain(self.unit.as_deref());
+        for key in units.flat_map(|unit| self.cache.unit_keys(unit)) {
+            let Some((entry, meta)) = self.cache.load_entry(&key) else { continue };
+            let Some(stored) = meta.session.as_ref().filter(|_| cache::session::present(&entry)) else { continue };
+            if before.get(&stored.crate_dir).is_some_and(|sessions| !sessions.is_empty()) {
+                return before;
+            }
+            return match cache::session::restore(&entry.join(cache::session::DIR), root, stored) {
+                Ok(_) => {
+                    self.note_restore("session-seed", None);
+                    cache::session::snapshot(root, &self.parsed.crate_name)
+                }
+                Err(err) => {
+                    self.debug(&format!("session of {} not seeded: {err}", self.parsed.crate_name));
+                    before
+                }
+            };
+        }
+        before
+    }
+
+    /// One session per unit: the entry just published holds the newest, so the unit's other entries give theirs up.
+    fn strip_older_sessions(&self, key: &str) {
+        let Some(unit) = self.target().unit else { return };
+        for other in self.cache.unit_keys(unit).into_iter().filter(|other| other != key) {
+            if cache::session::strip(&self.cache.entry_dir(&other), &self.dirs.tmp()) {
+                self.debug(&format!("entry {other} of {} gave its session up", self.parsed.crate_name));
+            }
+        }
+    }
+
+    /// Leaves rustc the session the restored outputs came from, so the next edit compiles incrementally; failing leaves the target's sessions as they were.
+    fn restore_session(&self, entry: &Path, meta: &EntryMeta) {
+        let (Some(stored), Some(root)) = (&meta.session, self.session_root()) else { return };
+        if !cache::session::present(entry) {
+            return;
+        }
+        match cache::session::restore(&entry.join(cache::session::DIR), &root, stored) {
+            Ok(cache::session::Placed::Restored) => self.note_restore("session", None),
+            Ok(cache::session::Placed::Present) => self.note_restore("session-kept", None),
+            Err(err) => {
+                self.debug(&format!("session of {} not restored: {err}", self.parsed.crate_name));
+                self.note_restore("session-skip", Some(&format!("session:{:?}", err.kind())));
+            }
         }
     }
 
@@ -1725,6 +1806,9 @@ impl Plan {
                     if let Err(err) = self.cache.publish(&staged, &key) {
                         let _ = fsx::remove_any(&staged);
                         return Err(err);
+                    }
+                    if meta.session.is_some() {
+                        self.strip_older_sessions(&key);
                     }
                     self.record_miss(
                         &meta.version,
@@ -2061,6 +2145,12 @@ impl Plan {
             } else {
                 None
             },
+            // A session that cannot be shared in leaves an entry of artifacts only, as before sessions were kept.
+            session: self.session.get().zip(self.session_root()).and_then(|(produced, root)| {
+                cache::session::keep(&root, produced, staged)
+                    .inspect_err(|err| self.debug(&format!("session of {} not kept: {err}", self.parsed.crate_name)))
+                    .ok()
+            }),
             files,
             stderr: stderr_file,
             stderr_inline,
@@ -2462,6 +2552,9 @@ struct StoreJob {
     /// Superseded entries the producer queued for deletion; older readers ignore them and maintenance sweeps them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired: Vec<cache::Retired>,
+    /// The incremental session the compile finalized, shared into the entry by the store; older readers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<cache::session::Produced>,
 }
 
 impl StoreJob {
@@ -2493,6 +2586,7 @@ impl BrokerJob {
             || job.slot_lock.is_some()
             || job.key_lock.is_some()
             || job.retired.iter().any(|entry| !entry.path.is_absolute())
+            || job.session.as_ref().is_some_and(|session| !session.valid())
             || job.spawned_ns.parse::<i128>().is_err()
             || job.args.len() < 2
             || job
@@ -3944,6 +4038,11 @@ fn primary_incremental_enabled() -> bool {
         env::var("FRUST_CACHE_PRIMARY_INCREMENTAL").as_deref(),
         Ok("0" | "off" | "false" | "no")
     )
+}
+
+/// `FRUST_CACHE_SESSIONS=off` (or `0`, `false`, `no`) stores and restores incremental units as artifacts only.
+fn sessions_enabled() -> bool {
+    !matches!(env::var("FRUST_CACHE_SESSIONS").as_deref(), Ok("0" | "off" | "false" | "no"))
 }
 
 /// The pre-key hasher and the unit identity hasher, fed together.
@@ -5850,6 +5949,7 @@ mod tests {
             slot_lock: None,
             key_lock: None,
             retired: Vec::new(),
+            session: None,
         };
         (job, src, rlib)
     }

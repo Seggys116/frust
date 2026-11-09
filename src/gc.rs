@@ -385,7 +385,8 @@ fn scan_entries_with(dirs: &Dirs, progress: &mut dyn Progress) -> Vec<ScannedEnt
         };
         let unit = meta.as_ref().and_then(unit_identity);
         let link = meta.as_ref().map(|meta| link_state(&path, meta)).unwrap_or_default();
-        let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| bytes.saturating_sub(link.shared_estimate));
+        let session = meta.as_ref().and_then(|meta| meta.session.as_ref()).filter(|_| cache::session::present(&path)).map_or(0, |session| session.bytes.div_ceil(4096) * 4096);
+        let estimate = meta.as_ref().and_then(estimate_entry_bytes).map(|bytes| (bytes + session).saturating_sub(link.shared_estimate));
         let group = meta
             .as_ref()
             .and_then(|meta| meta.incremental_unit.clone().filter(|unit| cache::valid_key(unit)))
@@ -2844,6 +2845,26 @@ mod tests {
         let orphaned = scan_entries(&dirs);
         assert_eq!(orphaned[0].estimate, Some(ENTRY_OVERHEAD_BYTES + 65_536));
         assert!(orphaned[0].link.orphaned);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_kept_session_counts_toward_its_entry_until_given_up() {
+        let home = home("session-sizes");
+        let dirs = Dirs::at(&home);
+        let dir = home.join("store").join(format!("aa{}", "1".repeat(38)));
+        fs::create_dir_all(dir.join(cache::session::DIR)).unwrap();
+        fs::write(dir.join("f0"), vec![1u8; 4096]).unwrap();
+        fs::write(dir.join(cache::session::DIR).join("dep-graph.bin"), vec![2u8; 5000]).unwrap();
+        let meta = serde_json::json!({
+            "crate_name": "c", "version": "1", "compile_ms": 1, "created_unix": 1, "stderr": "",
+            "session": {"crate_dir": "c-0abc", "name": "s-1-2-3", "bytes": 5000},
+            "files": [{"name": "libc.rlib", "stored": "f0", "text": false, "bytes": 4096}],
+        });
+        fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(scan_entries(&dirs)[0].estimate, Some(ENTRY_OVERHEAD_BYTES + 4096 + 8192));
+        assert!(cache::session::strip(&dir, &dirs.tmp()));
+        assert_eq!(scan_entries(&dirs)[0].estimate, Some(ENTRY_OVERHEAD_BYTES + 4096), "a session given up frees its bytes");
         let _ = fs::remove_dir_all(&home);
     }
 

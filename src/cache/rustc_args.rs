@@ -20,6 +20,8 @@ pub struct RustcArgs {
     pub out_dir_args: Vec<usize>,
     /// The directory holds rustc's private session state, never an input to the outputs.
     pub incremental_args: Vec<usize>,
+    /// The last `-C incremental` value: where rustc keeps the session directories of every crate.
+    pub incremental_dir: Option<PathBuf>,
     /// The last `-C opt-level` value, `-O` counting as `2`. `None` means the default (0).
     pub opt_level: Option<String>,
 }
@@ -270,6 +272,7 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
         libs,
         out_dir_args,
         incremental_args: codegen_state.incremental_args,
+        incremental_dir: codegen_state.incremental_dir,
         opt_level: codegen_state.opt_level,
     })
 }
@@ -333,6 +336,7 @@ fn push_option_paths(index: usize, value: &str, paths: &mut Vec<(usize, PathArg)
 #[derive(Default)]
 struct Codegen {
     incremental_args: Vec<usize>,
+    incremental_dir: Option<PathBuf>,
     opt_level: Option<String>,
 }
 
@@ -340,7 +344,10 @@ impl Codegen {
     fn option(&mut self, indices: &[usize], value: &str, extra_filename: &mut String) {
         let (key, val) = value.split_once('=').unwrap_or((value, ""));
         match key {
-            "incremental" => self.incremental_args.extend_from_slice(indices),
+            "incremental" => {
+                self.incremental_args.extend_from_slice(indices);
+                self.incremental_dir = Some(PathBuf::from(val));
+            }
             "opt-level" => self.opt_level = Some(val.to_string()),
             "extra-filename" => *extra_filename = val.to_string(),
             _ => {}
@@ -593,6 +600,7 @@ mod tests {
     fn incremental_and_opt_level_are_reported() {
         let parsed = with(&["-C", "incremental=/t/debug/incremental", "-Cdebuginfo=2"]).unwrap();
         assert_eq!(parsed.incremental_args, vec![5, 6]);
+        assert_eq!(parsed.incremental_dir.as_deref(), Some(Path::new("/t/debug/incremental")));
         assert!(parsed.incremental() && parsed.unoptimised());
         assert!(parsed.paths.is_empty(), "the session directory is not an input");
         let joined = with(&["-Cincremental=/i", "--codegen=opt-level=0"]).unwrap();
