@@ -29,8 +29,46 @@ pub fn locate_cached(
     manifest_path: Option<&OsStr>,
     toolchain_id: &str,
 ) -> (Option<PathBuf>, CacheOutcome) {
+    locate_cached_early(dirs, cwd, toolchain, manifest_path, toolchain_id, None)
+}
+
+/// A `cargo locate-project` started before the toolchain id was known, with the key its inputs had when it started.
+pub struct EarlyLocate {
+    before: Option<String>,
+    handle: std::thread::JoinHandle<Option<PathBuf>>,
+}
+
+impl EarlyLocate {
+    pub fn start(cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsStr>) -> EarlyLocate {
+        let before = locate_key(cwd, toolchain, manifest_path, "").map(|(key, _)| key);
+        let (cwd, toolchain, manifest_path) = (cwd.to_path_buf(), toolchain.map(OsStr::to_os_string), manifest_path.map(OsStr::to_os_string));
+        let handle = std::thread::spawn(move || locate(&cwd, toolchain.as_deref(), manifest_path.as_deref()));
+        EarlyLocate { before, handle }
+    }
+
+    /// The answer, and whether the inputs stayed as they were from before it started until now.
+    fn finish(self, cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsStr>) -> (Option<PathBuf>, bool) {
+        let root = self.handle.join().ok().flatten();
+        let settled = self.before.is_some() && locate_key(cwd, toolchain, manifest_path, "").map(|(key, _)| key) == self.before;
+        (root, settled)
+    }
+}
+
+/// As [`locate_cached`]; a miss takes `early`'s answer instead of asking cargo again.
+pub fn locate_cached_early(
+    dirs: &Dirs,
+    cwd: &Path,
+    toolchain: Option<&OsStr>,
+    manifest_path: Option<&OsStr>,
+    toolchain_id: &str,
+    early: Option<EarlyLocate>,
+) -> (Option<PathBuf>, CacheOutcome) {
+    let run = |early: Option<EarlyLocate>| match early {
+        Some(early) => early.finish(cwd, toolchain, manifest_path),
+        None => (locate(cwd, toolchain, manifest_path), true),
+    };
     let Some((key, chain)) = locate_key(cwd, toolchain, manifest_path, toolchain_id) else {
-        return (locate(cwd, toolchain, manifest_path), CacheOutcome::Bypass);
+        return (run(early).0, CacheOutcome::Bypass);
     };
     let slot = locate_slot(dirs, cwd, toolchain, manifest_path);
     if let Some(entry) = memo::load::<LocateEntry>(&slot)
@@ -42,7 +80,7 @@ pub fn locate_cached(
     }
     let _guard = memo::cold_miss(dirs, &slot);
     let Some((key, chain)) = locate_key(cwd, toolchain, manifest_path, toolchain_id) else {
-        return (locate(cwd, toolchain, manifest_path), CacheOutcome::Bypass);
+        return (run(early).0, CacheOutcome::Bypass);
     };
     if let Some(entry) = memo::load::<LocateEntry>(&slot)
         && entry.format == LOCATE_FORMAT
@@ -51,10 +89,10 @@ pub fn locate_cached(
     {
         return (Some(entry.root), CacheOutcome::Hit);
     }
-    let root = locate(cwd, toolchain, manifest_path);
+    let (root, settled) = run(early);
     if let Some(root) = root.as_ref().filter(|r| chain.contains(r)) {
         // Inputs edited while cargo ran: use the answer, but do not memoise it.
-        let unchanged = locate_key(cwd, toolchain, manifest_path, toolchain_id).is_some_and(|(again, _)| again == key);
+        let unchanged = settled && locate_key(cwd, toolchain, manifest_path, toolchain_id).is_some_and(|(again, _)| again == key);
         if unchanged {
             memo::store(dirs, &slot, &LocateEntry { format: LOCATE_FORMAT.to_string(), key, root: root.clone() });
         }

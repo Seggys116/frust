@@ -56,12 +56,16 @@ pub fn cargo_main(args: Vec<OsString>) -> i32 {
 
     let cwd = working_dir(&parsed);
     // Both answers are memoised and revalidated each run, so a warm build spawns neither the probe nor `locate-project`.
-    let Some((probe, probed)) = Probe::cached(&dirs, parsed.toolchain.as_deref(), &cwd) else {
+    let manifest = parsed.value_of("--manifest-path");
+    // A probe that has to run starts `locate-project` beside its rustc queries, since a new toolchain id rarely meets a memoised location.
+    let mut early = None;
+    let Some((probe, probed)) = Probe::cached_then(&dirs, parsed.toolchain.as_deref(), &cwd, || {
+        early = Some(workspace::EarlyLocate::start(&cwd, parsed.toolchain.as_deref(), manifest.as_deref()));
+    }) else {
         return exec(&cargo, &parsed.original(), &[]);
     };
     trace(&cfg, started, &format!("toolchain probed (probe cache {})", probed.label()));
-    let manifest = parsed.value_of("--manifest-path");
-    let (root, located) = workspace::locate_cached(&dirs, &cwd, parsed.toolchain.as_deref(), manifest.as_deref(), &probe.id);
+    let (root, located) = workspace::locate_cached_early(&dirs, &cwd, parsed.toolchain.as_deref(), manifest.as_deref(), &probe.id, early);
     trace(&cfg, started, &format!("workspace located (locate cache {})", located.label()));
 
     let configs = ConfigInputs::new(root.as_deref(), &cwd);

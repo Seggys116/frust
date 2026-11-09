@@ -169,26 +169,35 @@ impl Probe {
     pub fn run(toolchain: Option<&OsStr>, cwd: &Path) -> Option<Probe> {
         let rustc = probe_rustc()?;
         let cargo = resolve_tool("cargo")?;
-        probe_now(&rustc, &cargo, toolchain, cwd, false).map(|(probe, _)| probe)
+        probe_now(&rustc, &cargo, toolchain, cwd, false, || {}).map(|(probe, _)| probe)
     }
 
     /// The key covers toolchain selection; sysroot file stats validate the toolchain bytes, since `rustup update` leaves the proxy unchanged.
     pub fn cached(dirs: &Dirs, toolchain: Option<&OsStr>, cwd: &Path) -> Option<(Probe, CacheOutcome)> {
+        Probe::cached_then(dirs, toolchain, cwd, || {})
+    }
+
+    /// As [`Probe::cached`]; a probe that has to run calls `on_cold` once `cargo -V` has returned, so other cargo queries can start beside the rest.
+    pub fn cached_then(dirs: &Dirs, toolchain: Option<&OsStr>, cwd: &Path, on_cold: impl FnOnce()) -> Option<(Probe, CacheOutcome)> {
         let rustc = probe_rustc()?;
         let cargo = resolve_tool("cargo")?;
         let Some(key) = probe_key(&rustc, &cargo, toolchain, cwd) else {
-            return probe_now(&rustc, &cargo, toolchain, cwd, false).map(|(p, _)| (p, CacheOutcome::Bypass));
+            return probe_now(&rustc, &cargo, toolchain, cwd, false, on_cold).map(|(p, _)| (p, CacheOutcome::Bypass));
         };
         let slot = probe_slot(dirs, &rustc, &cargo, toolchain, cwd);
-        if let Some(entry) = memo::load::<ProbeEntry>(&slot)
+        let earlier = memo::load::<ProbeEntry>(&slot);
+        if let Some(entry) = &earlier
             && entry.valid(&key)
         {
-            return Some((entry.probe, CacheOutcome::Hit));
+            return earlier.map(|entry| (entry.probe, CacheOutcome::Hit));
         }
+        // Only an unseen toolchain selection is likely to change the id that keys the other memos; an expired entry keeps it.
+        let unseen = earlier.is_none_or(|entry| entry.key != key);
+        let on_cold = move || if unseen { on_cold() };
 
         let _guard = memo::cold_miss(dirs, &slot);
         let Some(key) = probe_key(&rustc, &cargo, toolchain, cwd) else {
-            return probe_now(&rustc, &cargo, toolchain, cwd, false)
+            return probe_now(&rustc, &cargo, toolchain, cwd, false, on_cold)
                 .map(|(p, _)| (p, CacheOutcome::Bypass));
         };
         if let Some(entry) = memo::load::<ProbeEntry>(&slot)
@@ -198,7 +207,7 @@ impl Probe {
         }
 
         let started = SystemTime::now();
-        let (probe, sysroots) = probe_now(&rustc, &cargo, toolchain, cwd, true)?;
+        let (probe, sysroots) = probe_now(&rustc, &cargo, toolchain, cwd, true, on_cold)?;
         let validate = validation_set(&sysroots);
         let racy = validate.iter().any(|(_, sig)| sig.as_ref().is_some_and(|s| s.changed_after(started, RACY_SLACK)));
         let stable = probe_key(&rustc, &cargo, toolchain, cwd).as_deref() == Some(key.as_str());
@@ -211,7 +220,7 @@ impl Probe {
 }
 
 /// An empty sysroot list means the result cannot be validated and must not be memoised.
-fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, want_sysroot: bool) -> Option<(Probe, Vec<PathBuf>)> {
+fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, want_sysroot: bool, after_cargo: impl FnOnce()) -> Option<(Probe, Vec<PathBuf>)> {
     let tc: Option<OsString> = toolchain.map(|t| t.to_os_string());
     let spawn = |tool: PathBuf, args: &'static [&'static str]| {
         let (tc, cwd) = (tc.clone(), cwd.to_path_buf());
@@ -219,6 +228,7 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
     };
     // Run one query alone first: parallel proxies would each start rustup's auto-install of a missing toolchain and corrupt it.
     let cargo_out = query(cargo, tc.as_deref(), &["-V"], cwd);
+    after_cargo();
     let rustc_handle = spawn(rustc.to_path_buf(), &["-vV"]);
     let own_handle = spawn(rustc.to_path_buf(), &["--print", "sysroot"]);
     let mut sysroot_handles = Vec::new();
