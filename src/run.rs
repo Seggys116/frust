@@ -1075,6 +1075,10 @@ impl Session {
             trace(&self.cfg, started, "no-op fast path");
             return self.serve_noop(&noop, &replay, ui.as_mut(), started, sub, workspace_name, &history_keys);
         }
+        let chosen_linker = os(&target_linker_var(&self.probe.host));
+        if let Some((_, linker)) = self.env_vars.iter().find(|(key, _)| *key == chosen_linker) {
+            crate::wrapper::warm_tool_hash(&self.dirs, Path::new(linker), self.cfg.debug);
+        }
 
         let mut joining = Joining::new(style);
         let mut guard = match self.acquire_lock(sub, &fingerprint, &scope, ui.as_mut(), &mut joining) {

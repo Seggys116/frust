@@ -4077,6 +4077,24 @@ fn stamp_policy(gate: &Arc<TrustGate>) -> StampTrust {
     Box::new(move |dev, path| gate.volume_trusted(dev, path))
 }
 
+/// Records the hash of a linker frust chose in the shared memo, keyed and trusted exactly as a wrapper's prekey reads it.
+fn warm_tool(dirs: &Dirs, tool: &Path, debug: bool) -> io::Result<hashing::Hashed> {
+    let trust = Arc::new(TrustGate::new(TrustMode::from_env(), dirs, debug));
+    let hasher = Hasher::new(Some(dirs.hashmemo()), Vec::new())
+        .with_stamp_trust(stamp_policy(&trust))
+        .audit_attested(trust.mode == TrustMode::Audit)
+        .with_violation_sink(violation_sink(&trust, dirs, "linker"));
+    hasher.hash(tool, true)
+}
+
+/// With an empty memo every unit cargo starts at once would read the linker itself; one read here, while cargo starts, serves them all.
+pub fn warm_tool_hash(dirs: &Dirs, tool: &Path, debug: bool) {
+    let (dirs, tool) = (dirs.clone(), tool.to_path_buf());
+    thread::spawn(move || {
+        let _ = warm_tool(&dirs, &tool, debug);
+    });
+}
+
 /// Files the hasher finds lying about their stamp are reported and quarantined exactly like a lying input stamp.
 fn violation_sink(gate: &Arc<TrustGate>, dirs: &Dirs, krate: &str) -> hashing::ViolationSink {
     let (gate, dirs, krate) = (Arc::clone(gate), dirs.clone(), krate.to_string());
@@ -5004,6 +5022,25 @@ mod tests {
             key(&s.0, &["-Clinker=./tools"]).is_err(),
             "directories cannot stand in for executable content"
         );
+    }
+
+    #[test]
+    fn a_linker_warmed_by_the_driver_is_served_to_wrappers_from_the_memo() {
+        let s = Scratch::new("warm-linker");
+        let linker = crate::toolchain::find_on_path("rustc").expect("the test toolchain is on PATH");
+        let wrapper_hasher = |home: &Path| {
+            let dirs = Dirs::at(home);
+            let trust = Arc::new(TrustGate::new(TrustMode::On, &dirs, false));
+            Hasher::new(Some(dirs.hashmemo()), Vec::new()).with_stamp_trust(stamp_policy(&trust))
+        };
+        let cold = wrapper_hasher(&s.0.join("cold"));
+        let read = cold.hash(&linker, true).unwrap();
+        assert_eq!(cold.tally(), (read.stamp.size, 0), "an empty memo makes a wrapper read the linker");
+        let warmed = warm_tool(&Dirs::at(s.0.join("warm")), &linker, false).unwrap();
+        let served_by = wrapper_hasher(&s.0.join("warm"));
+        let served = served_by.hash(&linker, true).unwrap();
+        assert_eq!((served.hash.as_str(), served.hash.as_str()), (warmed.hash.as_str(), read.hash.as_str()));
+        assert_eq!(served_by.tally(), (0, warmed.stamp.size), "the warmed record answers without reading the linker");
     }
 
     #[test]
