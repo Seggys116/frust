@@ -310,6 +310,16 @@ entries use their own key domain, so older versions treat them as misses.
   proc macros already compile without it. `line-tables-only` was measured to be both slower and larger, so it is
   not used. Skipped when your project or cargo config defines any profile, or with `FRUST_TUNE=off`. The debuginfo
   level reaches rustc as an argument, so tuned and untuned builds key the compile cache separately.
+* `FRUST_TUNE` also compiles incremental, unoptimised crates of the `debug` profile directory (dev and test builds,
+  their build scripts) with `-C codegen-units=64` when nothing sets a count, instead of rustc's incremental default
+  of 256. Each edit still recompiles only the changed units, but rustc hard-links, copies, checks and deletes, and
+  the linker opens, a quarter as many object files. On macOS, edits of ripgrep 14.1.1 and bat 0.24.0 used about
+  0.6x and 0.7x the CPU time of the untuned build, from-scratch compiles of the crate were no slower, and the debug
+  binaries produced identical output at the same or better speed. Dependencies,
+  release, bench and custom profiles, optimised or non-incremental compiles, and any explicit `codegen-units`
+  (profile, `--config` or `RUSTFLAGS`) are left alone. The frust wrapper appends the flag, so it keys the cache
+  and the incremental session but not cargo's fingerprint: switching `FRUST_TUNE` rebuilds an edited crate from
+  scratch once, and a crate cargo considers fresh keeps its existing, equivalent binary.
 * On Windows (MSVC) hosts frust sets `CARGO_TARGET_<HOST>_LINKER` to the toolchain's `rust-lld.exe` for build
   commands, unless you configured a linker anywhere or set `FRUST_LINKER=system`; it falls back to `link.exe` when
   the sysroot has no `rust-lld.exe`.

@@ -26,6 +26,8 @@ pub struct RustcArgs {
     pub incremental_dir: Option<PathBuf>,
     /// The last `-C opt-level` value, `-O` counting as `2`. `None` means the default (0).
     pub opt_level: Option<String>,
+    /// The last `-C codegen-units` value; `None` leaves rustc's default.
+    pub codegen_units: Option<String>,
 }
 
 impl RustcArgs {
@@ -277,6 +279,7 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
         incremental_args: codegen_state.incremental_args,
         incremental_dir: codegen_state.incremental_dir,
         opt_level: codegen_state.opt_level,
+        codegen_units: codegen_state.codegen_units,
     })
 }
 
@@ -341,17 +344,20 @@ struct Codegen {
     incremental_args: Vec<usize>,
     incremental_dir: Option<PathBuf>,
     opt_level: Option<String>,
+    codegen_units: Option<String>,
 }
 
 impl Codegen {
     fn option(&mut self, indices: &[usize], value: &str, extra_filename: &mut String) {
         let (key, val) = value.split_once('=').unwrap_or((value, ""));
-        match key {
+        // rustc accepts `_` for `-` in option names.
+        match key.replace('_', "-").as_str() {
             "incremental" => {
                 self.incremental_args.extend_from_slice(indices);
                 self.incremental_dir = Some(PathBuf::from(val));
             }
             "opt-level" => self.opt_level = Some(val.to_string()),
+            "codegen-units" => self.codegen_units = Some(val.to_string()),
             "extra-filename" => *extra_filename = val.to_string(),
             _ => {}
         }
@@ -613,6 +619,15 @@ mod tests {
         assert!(!with(&["-O"]).unwrap().unoptimised());
         assert!(!with(&["-Copt-level=s"]).unwrap().unoptimised());
         assert!(!with(&[]).unwrap().incremental());
+    }
+
+    #[test]
+    fn codegen_units_are_reported_in_every_spelling() {
+        assert_eq!(with(&[]).unwrap().codegen_units, None);
+        for args in [&["-C", "codegen-units=4"][..], &["-Ccodegen-units=4"], &["--codegen=codegen-units=4"], &["--codegen", "codegen_units=4"]] {
+            assert_eq!(with(args).unwrap().codegen_units.as_deref(), Some("4"), "{args:?}");
+        }
+        assert!(!with(&["-Copt_level=3"]).unwrap().unoptimised());
     }
 
     #[test]

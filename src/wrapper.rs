@@ -127,6 +127,7 @@ pub fn run(args: Vec<OsString>) -> i32 {
     let journal = crate::exec::journal::begin(&args);
     let cfg = Config::from_env();
     let args = crate::linking::prepare(&args, cfg.debug).unwrap_or(args);
+    let args = dev_codegen_units(&args, cfg.tune).unwrap_or(args);
     if cfg.cache
         && let Some(plan) = Plan::build(&cfg, &args)
     {
@@ -146,6 +147,24 @@ pub fn run(args: Vec<OsString>) -> i32 {
     }
     timings::passthrough(started);
     passthrough(&args)
+}
+
+/// Codegen units for incremental dev compiles; rustc's default of 256 costs more in per-object file work than it saves in recompiled code.
+const DEV_CODEGEN_UNITS: &str = "-Ccodegen-units=64";
+
+/// Appends `DEV_CODEGEN_UNITS` to an unoptimised incremental compile of the `debug` profile that sets no unit count.
+fn dev_codegen_units(args: &[OsString], tune: bool) -> Option<Vec<OsString>> {
+    if !tune {
+        return None;
+    }
+    let parsed = rustc_args::parse(args.get(1..)?).ok()?;
+    let debug_profile = rustc_args::profile_root(&parsed.out_dir).file_name() == Some(OsStr::new("debug"));
+    if !debug_profile || !parsed.emits_link || !parsed.incremental() || !parsed.unoptimised() || parsed.codegen_units.is_some() {
+        return None;
+    }
+    let mut tuned = args.to_vec();
+    tuned.push(OsString::from(DEV_CODEGEN_UNITS));
+    Some(tuned)
 }
 
 /// The last component of a path, which is all a timing record needs to name a file.
@@ -4815,6 +4834,46 @@ mod tests {
 
     fn key(cwd: &Path, extra: &[&str]) -> Result<String, String> {
         keyed(cwd, extra).map(|p| p.key)
+    }
+
+    fn unit_compile(out_dir: &str, emit: &str, incremental: bool, extra: &[&str]) -> Vec<OsString> {
+        let mut args = vec!["rustc", "--crate-name", "app", "--edition=2021", "src/main.rs", "--crate-type", "bin", emit, "-C", "debuginfo=2", "--out-dir", out_dir];
+        if incremental {
+            args.extend(["-C", "incremental=/t/debug/incremental"]);
+        }
+        args.extend(extra);
+        args.into_iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn incremental_debug_profile_compiles_get_dev_codegen_units() {
+        for (out_dir, extra) in [("/t/debug/deps", &[][..]), ("/t/debug/deps", &["--test"]), ("/t/debug/build/app-1", &[]), ("/t/aarch64-apple-darwin/debug/deps", &["--target", "aarch64-apple-darwin"])] {
+            let args = unit_compile(out_dir, "--emit=dep-info,link", true, extra);
+            let tuned = dev_codegen_units(&args, true).unwrap_or_else(|| panic!("{args:?}"));
+            assert_eq!(tuned[..args.len()], args[..]);
+            assert_eq!(tuned[args.len()..], [OsString::from("-Ccodegen-units=64")]);
+        }
+    }
+
+    #[test]
+    fn dev_codegen_units_leave_other_compiles_unchanged() {
+        assert!(dev_codegen_units(&unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &[]), false).is_none(), "FRUST_TUNE=off");
+        let declined = [
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", false, &[]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,metadata", true, &[]),
+            unit_compile("/t/release/deps", "--emit=dep-info,link", true, &[]),
+            unit_compile("/t/profiling/deps", "--emit=dep-info,link", true, &[]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &["-C", "opt-level=1"]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &["-O"]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &["-C", "codegen-units=256"]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &["-Ccodegen_units=1"]),
+            unit_compile("/t/debug/deps", "--emit=dep-info,link", true, &["--codegen=codegen-units=16"]),
+            ["rustc", "-vV"].into_iter().map(OsString::from).collect(),
+            ["rustc", "-", "--crate-name", "___", "--print=file-names"].into_iter().map(OsString::from).collect(),
+        ];
+        for args in declined {
+            assert!(dev_codegen_units(&args, true).is_none(), "{args:?}");
+        }
     }
 
     fn keyed(cwd: &Path, extra: &[&str]) -> Result<PreKey, String> {
