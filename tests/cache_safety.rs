@@ -104,6 +104,35 @@ fn native_library_outside_the_target_is_keyed_by_content() {
     assert_eq!(sb.count_cache("hit", "nat"), 0);
 }
 
+/// The final link keys every file of a build script's link directory; the package's own compile records them, so the link at the end of the build reads none.
+#[cfg(unix)]
+#[test]
+fn final_link_reads_no_file_of_a_build_script_link_directory() {
+    if !have_c_toolchain() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let sb = Sandbox::new("native-warm");
+    let libdir = sb.root.join("external-lib");
+    build_static_lib(&libdir, 3);
+    sb.vendor_crate("nat", "1.0.0", "unsafe extern \"C\" { fn foo_value() -> i32; }\npub fn value() -> i32 { unsafe { foo_value() } }\n");
+    fs::write(
+        sb.vendor().join("nat-1.0.0").join("build.rs"),
+        format!(
+            "use std::{{env, fs, path::PathBuf}};\nfn main() {{\n    let lib = PathBuf::from(env::var(\"OUT_DIR\").unwrap()).join(\"lib\");\n    fs::create_dir_all(lib.join(\"obj\")).unwrap();\n    fs::copy(\"{}\", lib.join(\"libfoo.a\")).unwrap();\n    for i in 0..8u8 {{ fs::write(lib.join(\"obj\").join(format!(\"part{{i}}.o\")), vec![i; 700]).unwrap(); }}\n    println!(\"cargo:rustc-link-search=native={{}}\", lib.display());\n    println!(\"cargo:rustc-link-lib=static=foo\");\n}}\n",
+            libdir.join("libfoo.a").display()
+        ),
+    )
+    .unwrap();
+    let a = sb.project("a", &[("nat", "1.0.0")], "fn main() { println!(\"{}\", nat::value()); }\n");
+    let timings = sb.root.join("timings.jsonl");
+    assert_success(&sb.bin("fcargo").arg("build").env("FRUST_TIMINGS", &timings).current_dir(&a).output().unwrap());
+    assert_eq!(stdout(&run_binary(&sb.central_target(&a), "debug", "app")).trim(), "3");
+    let records: Vec<serde_json::Value> = fs::read_to_string(&timings).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let app = records.iter().find(|r| r["crate"] == "app").expect("the binary was compiled through the wrapper");
+    assert_eq!(app["native_dir_bytes_hashed"], 0, "the final link found every file of the link directory in the memo: {app}");
+}
+
 #[cfg(target_os = "macos")]
 fn minos(binary: &Path) -> String {
     let out = Command::new("otool").arg("-l").arg(binary).output().unwrap();

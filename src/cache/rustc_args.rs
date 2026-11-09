@@ -15,6 +15,8 @@ pub struct RustcArgs {
     pub test_harness: bool,
     /// Runs the system linker; a library-only compile reads just the bundled static libraries it names.
     pub links: bool,
+    /// Writes an rlib or other linkable output, which a check build never does.
+    pub emits_link: bool,
     pub paths: Vec<(usize, PathArg)>,
     pub libs: Vec<NativeLib>,
     pub out_dir_args: Vec<usize>,
@@ -267,6 +269,7 @@ pub fn parse(args: &[OsString]) -> Result<RustcArgs, Skip> {
                 matches!(target, "i586-pc-windows-msvc" | "i686-pc-windows-msvc" | "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" | "arm64ec-pc-windows-msvc" | "thumbv7a-pc-windows-msvc")
             }),
         links: test_flag || cfg_test || !crate_types.iter().all(|kind| matches!(kind.as_str(), "lib" | "rlib")) || crate_types.is_empty(),
+        emits_link,
         test_harness: emits_link && (test_flag || cfg_test && crate_types.iter().any(|kind| kind == "bin")),
         paths,
         libs,

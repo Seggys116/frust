@@ -993,8 +993,19 @@ impl Plan {
         };
         let pipe = child.stderr.take().expect("stderr was piped");
         let forwarder = thread::spawn(move || forward(pipe));
-        let preexisting = early.unwrap_or_else(|| scan_earlier(true));
-        let status = child.wait();
+        let warm = self.link_dirs_to_warm();
+        let budget = (!warm.is_empty()).then(|| worker_budget(2));
+        let concurrent = budget.as_ref().is_some_and(|b| b.threads > 1);
+        let (preexisting, status) = thread::scope(|scope| {
+            let warming = concurrent.then(|| scope.spawn(|| self.warm_link_dirs(&warm)));
+            let preexisting = early.unwrap_or_else(|| scan_earlier(true));
+            let status = child.wait();
+            if let Some(warming) = warming {
+                let _ = warming.join();
+            }
+            (preexisting, status)
+        });
+        drop(budget);
         let captured = forwarder.join().unwrap_or_default();
         self.probe.set(|r| r.rustc_ms = timings::ms(rustc_started));
         let Ok(status) = status else {
@@ -1007,6 +1018,9 @@ impl Plan {
         }
         if status.success() {
             let compile_ms = started.elapsed().as_millis() as u64;
+            if !concurrent {
+                self.warm_link_dirs(&warm);
+            }
             let store_started = Instant::now();
             self.settle(&captured, &preexisting);
             let retired = if self.skips_store() { Vec::new() } else { self.supersede_unit_versions() };
@@ -1423,6 +1437,32 @@ impl Plan {
             return false;
         };
         Stamp::read(&self.profile_abs.join(format!("{stem}.rlib"))).is_ok_and(|now| now.dev == replaced.dev && now.ino == replaced.ino)
+    }
+
+    /// Link directories this package's build script filled, which only the final links hash in full; a check build has none.
+    fn link_dirs_to_warm(&self) -> Vec<PathBuf> {
+        let Some(out_dir) = env::var_os("OUT_DIR").filter(|_| self.parsed.emits_link && !self.parsed.links).map(|dir| self.cwd.join(dir)) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = self
+            .parsed
+            .paths
+            .iter()
+            .filter_map(|(_, arg)| match arg {
+                PathArg::NativeDir(dir) => Some(self.cwd.join(dir)),
+                _ => None,
+            })
+            .filter(|dir| dir.starts_with(&out_dir) && dir.starts_with(&self.profile_abs))
+            .collect();
+        dirs.dedup();
+        dirs
+    }
+
+    /// Records every file of them in the memo, so the final link's pre-key at the end of the build reads none.
+    fn warm_link_dirs(&self, dirs: &[PathBuf]) {
+        for dir in dirs {
+            let _ = self.hasher.hash_dir(dir, true, None, &mut Vec::new());
+        }
     }
 
     /// Test harnesses and binary-only crates are leaves of the build graph, so reading their outputs to attest them would be wasted.

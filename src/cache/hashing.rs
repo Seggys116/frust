@@ -526,10 +526,11 @@ impl Hasher {
             self.memo().insert(path.to_path_buf(), hashed.clone());
             return Ok(hashed);
         }
-        self.hash_observed(path, persist, Stamp::read(path)?)
+        self.hash_observed(path, persist, Stamp::read(path)?, PERSIST_MIN_BYTES)
     }
 
-    fn hash_observed(&self, path: &Path, persist: bool, current: Stamp) -> io::Result<Hashed> {
+    /// Files below `persist_min` are never recorded; a caller that already stat'd the file may record small ones too.
+    fn hash_observed(&self, path: &Path, persist: bool, current: Stamp, persist_min: u64) -> io::Result<Hashed> {
         let immutable = self.in_immutable_root(path);
         if !self.believes(path, &current) {
             return self.read(path, immutable);
@@ -541,7 +542,7 @@ impl Hasher {
             self.served(current.size);
             return Ok(known.clone());
         }
-        let persist = persist && self.persist_dir.is_some() && current.size >= PERSIST_MIN_BYTES;
+        let persist = persist && self.persist_dir.is_some() && current.size >= persist_min;
         if persist && let Some((hash, attested)) = self.persisted(path, &current) {
             if attested && self.audit_attested {
                 let fresh = self.read(path, immutable)?;
@@ -706,8 +707,8 @@ impl DirWalk<'_> {
         if self.files > DIR_MAX_FILES || self.bytes > DIR_MAX_BYTES {
             return Err(format!("{} is too large to hash", path.display()));
         }
-        // Link directories are shared by every dependent, so the persistent memo avoids rehashing large libraries per process.
-        let hashed = self.hasher.hash_observed(&path, true, Stamp::of(meta)).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Shared by every dependent and already stat'd, so even a small file is cheaper to look up than to read.
+        let hashed = self.hasher.hash_observed(&path, true, Stamp::of(meta), 0).map_err(|e| format!("{}: {e}", path.display()))?;
         self.watch.push((path, hashed.stamp));
         self.entries.push((rel, hashed.hash));
         Ok(())
@@ -1153,7 +1154,7 @@ mod tests {
         fs::write(&file, b"before").unwrap();
         let observed = Stamp::read(&file).unwrap();
         fs::write(&file, b"after, with different contents").unwrap();
-        let hashed = Hasher::ephemeral().hash_observed(&file, false, observed).unwrap();
+        let hashed = Hasher::ephemeral().hash_observed(&file, false, observed, PERSIST_MIN_BYTES).unwrap();
         assert!(hashed.stable);
         assert_ne!(hashed.stamp, observed);
         assert_eq!(hashed.stamp, Stamp::read(&file).unwrap());
@@ -1711,6 +1712,29 @@ mod tests {
         let audit = dependent(&memo).audit_attested(true);
         assert_eq!(audit.hash(&archive, true).unwrap().hash, hashed.hash);
         assert_eq!(audit.tally().0, bytes.len() as u64, "audit mode proves the record by content");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_objects_in_a_build_script_link_directory_are_read_once() {
+        let dir = scratch("witness-small");
+        let Some((archive, _)) = build_script_archive(&dir, false) else { return };
+        let out = archive.parent().unwrap().to_path_buf();
+        let nested = out.join("obj");
+        fs::create_dir_all(&nested).unwrap();
+        for (i, name) in ["a.o", "b.o", "c.o"].iter().enumerate() {
+            fs::write(nested.join(name), vec![i as u8; 900]).unwrap();
+        }
+        // Rewritten after the objects, as cargo does once the script exits.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs::write(out.parent().unwrap().join("output"), "cargo:rustc-link-search=native=out\n").unwrap();
+        let memo = dir.join("memo");
+        let first = dependent(&memo);
+        let hash = first.hash_dir(&out, true, None, &mut Vec::new());
+        assert!(first.tally().0 > 0);
+        let link = dependent(&memo);
+        assert_eq!(link.hash_dir(&out, true, None, &mut Vec::new()), hash);
+        assert_eq!(link.tally().0, 0, "a linking dependent takes every file of the directory from the memo");
         let _ = fs::remove_dir_all(&dir);
     }
 

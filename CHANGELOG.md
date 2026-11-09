@@ -52,6 +52,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Detached helpers on Windows are created without inheriting handles.
 * `cargo clean` of a central target now runs as a child of frust under the whole-target build lock, so no build can start between releasing cache entries and deleting the target. Its arguments, output and exit code are unchanged, and the empty workspace directory is removed afterwards.
 * Cache payloads are LZ4-compressed on Windows volumes without block cloning (such as NTFS), so the store no longer keeps a raw copy of each large artifact next to the target's copy.
+* A `-sys` package's compile records every file of the link directories its build script filled, small object files included, so the final link at the end of a cold build looks them up instead of reading them (bat's binary pre-key: about 20 ms to 5 ms).
 
 ### Fixed
 
