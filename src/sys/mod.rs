@@ -789,12 +789,12 @@ pub(crate) fn observe_child_unreaped(pid: u32, blocking: bool) -> Result<Option<
     imp::observe_child_unreaped(pid, blocking)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) fn cancel_owned_process_group(pid: u32) -> Result<(), String> {
     imp::cancel_owned_process_group(pid)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) fn own_process_group(command: &mut Command) {
     imp::own_process_group(command);
 }
