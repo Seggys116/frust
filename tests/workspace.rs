@@ -221,7 +221,7 @@ fn check_all_targets_and_doc_use_the_central_dir() {
     let ws = workspace(&sb, "ws");
     let central = sb.central_target(&ws);
     assert_success(&fcargo(&sb, &ws, &["check", "--workspace", "--all-targets"]));
-    assert!(central.join("debug/.fingerprint").is_dir(), "check wrote its fingerprints centrally");
+    assert!(sb.check_target(&ws).join("debug/.fingerprint").is_dir(), "check wrote its fingerprints to its own central directory");
     assert_success(&fcargo(&sb, &ws, &["build", "--workspace", "--all-targets"]));
     let demo = central.join("debug/examples").join(common::exe("demo"));
     assert!(demo.is_file(), "--all-targets built the example");
@@ -238,7 +238,7 @@ fn fclippy_lints_the_workspace_and_reports_clippy_findings() {
     let ws = workspace(&sb, "ws");
     let clean = sb.bin("fclippy").args(["--workspace", "--all-targets", "--", "-D", "warnings"]).current_dir(&ws).output().unwrap();
     assert_success(&clean);
-    assert!(sb.central_target(&ws).join("debug").is_dir());
+    assert!(sb.check_target(&ws).join("debug").is_dir());
     // `x == x` is clippy's deny-by-default `eq_op`; rustc itself accepts it.
     write(&ws.join("crates/ws-core/src/lib.rs"), &format!("{CORE_LIB}\npub fn same(x: u32) -> bool {{\n    x == x\n}}\n"));
     let linted = sb.bin("fclippy").args(["-p", "ws-core"]).current_dir(&ws).output().unwrap();

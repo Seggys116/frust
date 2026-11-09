@@ -339,19 +339,6 @@ impl Gate {
         }
         if self.served {
             self.planned = if code == 0 { "updated".into() } else { "kept".into() };
-            // Compaction ran after the child wrote the plan and may have replaced outputs by clones; the lock is still held.
-            if code == 0 && !interrupted
-                && let Some(mut plan) = plan::load(&self.plan_path)
-            {
-                let mut moved = false;
-                for unit in plan.units.iter_mut().filter(|u| u.stamps.iter().any(|e| !e.current_output())) {
-                    plan::restamp(unit);
-                    moved = true;
-                }
-                if moved && plan::save(&self.plan_path, &plan).is_err() {
-                    self.planned = "skip:unwritable".into();
-                }
-            }
         }
         let journal_path = self.journal.take()?;
         let records = journal::read(&journal_path).unwrap_or_default();
@@ -520,6 +507,75 @@ impl Gate {
     }
 }
 
+/// The plans' counterpart of `noop::restamp`: a plan is rewritten only when every stamp that moved is a listed
+/// identical-bytes rewrite from its recorded stamp to its current one; any other difference leaves it alone.
+pub fn restamp(dirs: &Dirs, rewrites: &[crate::noop::Rewrite], gated: bool) -> usize {
+    let pack = |s: &crate::cache::hashing::Stamp| -> plan::Packed { [s.dev as i64, s.ino as i64, s.size as i64, s.mtime_ns as i64, s.ctime_ns as i64] };
+    let by_path: HashMap<&Path, (plan::Packed, plan::Packed)> = rewrites.iter().map(|r| (r.path.as_path(), (pack(&r.before), pack(&r.after)))).collect();
+    if by_path.is_empty() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(dir(dirs)) else { return 0 };
+    let mut updated = 0;
+    for file in entries.flatten() {
+        let path = file.path();
+        if !file.file_name().to_string_lossy().ends_with(PLAN_SUFFIX) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Some(mut plan) = plan::load(&path) else { continue };
+        let target = PathBuf::from(&plan.target);
+        if !by_path.keys().any(|p| p.starts_with(&target)) {
+            continue;
+        }
+        let (mut touched, mut valid) = (false, true);
+        let entries = plan.units.iter_mut().flat_map(|u| u.stamps.iter_mut().map(|e| (e, true)).chain(u.inputs.iter_mut().map(|e| (e, false))));
+        for (entry, output) in entries {
+            if if output { entry.current_output() } else { entry.current() } {
+                continue;
+            }
+            let now = plan::stamp(Path::new(&entry.path));
+            match (by_path.get(Path::new(&entry.path)), entry.stamp, now) {
+                (Some((before, after)), Some(old), Some(now)) if old == *before && now == *after => {
+                    entry.stamp = Some(now);
+                    touched = true;
+                }
+                (Some((before, after)), Some(old), Some(now)) if output && old[..4] == before[..4] && now[..4] == after[..4] => {
+                    entry.stamp = Some(now);
+                    touched = true;
+                }
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid || !touched {
+            continue;
+        }
+        // Without the gate a build that just released cargo's locks could be writing this plan.
+        let _gate = if gated {
+            None
+        } else {
+            match crate::lock::target_activity(dirs, &target) {
+                Ok(None) => None,
+                Ok(Some(_)) => match crate::lock::try_target_maintenance(dirs, &target) {
+                    Ok(Some(guard)) => Some(guard),
+                    _ => continue,
+                },
+                Err(_) => continue,
+            }
+        };
+        if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+            continue;
+        }
+        if plan::save(&path, &plan).is_ok() {
+            updated += 1;
+        }
+    }
+    updated
+}
+
 /// Cargo's rule: a unit rebuilds when any dependency did.
 fn with_dependents(plan: &Plan, mut marked: Vec<bool>) -> Vec<bool> {
     let mut dependents = vec![Vec::new(); plan.units.len()];
@@ -595,6 +651,44 @@ mod tests {
         assert_eq!(Mode::parse(Some("off")), Mode::Off);
         assert_eq!(Mode::parse(Some("audit")), Mode::Audit);
         assert_eq!(Mode::parse(None), Mode::On);
+    }
+
+    #[test]
+    fn plans_follow_only_listed_identical_rewrites() {
+        use crate::cache::hashing::Stamp;
+        let root = crate::fsx::temp_sibling(&env::temp_dir().join("frust-exec-restamp"));
+        let dirs = Dirs::at(&root);
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let (out, other) = (target.join("libk.rlib"), target.join("libo.rlib"));
+        fs::write(&out, b"same bytes").unwrap();
+        fs::write(&other, b"other").unwrap();
+        let unit = plan::Unit {
+            id: "k".into(), package_id: "path+file:///w#k@0.1.0".into(), package: "k v0.1.0 (/w)".into(), pkg_name: "k".into(),
+            desc: "lib".into(), fix: None, local: true, script: false, argv: vec![], cwd: "/w".into(), env_set: vec![], env_unset: vec![],
+            outputs: vec![], inputs: vec![], env_deps: vec![], stamps: vec![plan::Entry::now(&out), plan::Entry::now(&other)], deps: vec![],
+            uplifts: vec![], depfiles: vec![], depfiles_ok: true, fingerprint: String::new(), diagnostics: vec![], run: None,
+            script_unit: None, incremental: false, ms: 0,
+        };
+        let recorded = Plan {
+            format: plan::FORMAT, key: "k".into(), cwd: "/w".into(), target: target.to_string_lossy().into_owned(), finished: String::new(),
+            graph: vec![], layout: vec![], scripts: vec![], units: vec![unit], messages: vec![], env_common: vec![],
+        };
+        let path = dir(&dirs).join(format!("p{PLAN_SUFFIX}"));
+        plan::save(&path, &recorded).unwrap();
+        let before = Stamp::read(&out).unwrap();
+        let replacement = target.join("tmp");
+        fs::write(&replacement, b"same bytes").unwrap();
+        crate::sys::rename(&replacement, &out).unwrap();
+        let after = Stamp::read(&out).unwrap();
+        let rewrite = |before: Stamp| crate::noop::Rewrite { path: out.clone(), before, after };
+        assert_eq!(restamp(&dirs, &[rewrite(Stamp { ino: before.ino + 1, ..before })], true), 0, "a stale before-stamp is not covered");
+        assert!(plan::load(&path).unwrap().units[0].stamps.iter().any(|e| !e.current_output()));
+        assert_eq!(restamp(&dirs, &[rewrite(before)], true), 1);
+        assert!(plan::load(&path).unwrap().units[0].stamps.iter().all(plan::Entry::current_output), "the rewritten output verifies again");
+        fs::write(&other, b"changed").unwrap();
+        assert_eq!(restamp(&dirs, &[rewrite(after)], true), 0, "an unlisted change is never covered");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

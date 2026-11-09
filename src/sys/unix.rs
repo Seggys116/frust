@@ -211,6 +211,204 @@ pub fn stat(path: &Path) -> io::Result<(Metadata, Ext)> {
     fs::metadata(path).map(|meta| (meta, Ext))
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn scan_dir(
+    dir: &Path,
+    wanted: &dyn Fn(&OsStr) -> bool,
+    stamped: &dyn Fn(&OsStr) -> bool,
+    _bulk: &std::sync::atomic::AtomicBool,
+) -> io::Result<Vec<(std::ffi::OsString, Option<super::EntryStat>)>> {
+    super::scan_dir_each(dir, wanted, stamped)
+}
+
+/// Measured on APFS, a bulk read costs a tenth of a `stat` or less per entry, so it is used once one entry in this many needs a stat.
+#[cfg(target_os = "macos")]
+const BULK_ENTRIES_PER_STAT: usize = 10;
+
+/// Names come from a plain listing first; a directory the bulk call cannot read is scanned entry by entry instead.
+#[cfg(target_os = "macos")]
+pub fn scan_dir(
+    dir: &Path,
+    wanted: &dyn Fn(&OsStr) -> bool,
+    stamped: &dyn Fn(&OsStr) -> bool,
+    bulk: &std::sync::atomic::AtomicBool,
+) -> io::Result<Vec<(std::ffi::OsString, Option<super::EntryStat>)>> {
+    use std::sync::atomic::Ordering;
+    if bulk.load(Ordering::Relaxed)
+        && let Ok(found) = scan_dir_bulk(dir, wanted, stamped)
+    {
+        return Ok(found);
+    }
+    let mut total = 0usize;
+    let mut chosen = Vec::new();
+    for entry in fs::read_dir(dir)?.flatten() {
+        total += 1;
+        let name = entry.file_name();
+        if wanted(&name) {
+            chosen.push(name);
+        }
+    }
+    let stats = chosen.iter().filter(|name| stamped(name)).count();
+    if stats > 0
+        && stats * BULK_ENTRIES_PER_STAT >= total
+        && let Ok(found) = scan_dir_bulk(dir, wanted, stamped)
+    {
+        bulk.store(true, Ordering::Relaxed);
+        return Ok(found);
+    }
+    Ok(chosen
+        .into_iter()
+        .map(|name| {
+            let stat = stamped(&name).then(|| super::stat(&dir.join(&name)).ok().map(|meta| super::EntryStat::of(&meta))).flatten();
+            (name, stat)
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+const ATTR_CMN_ERROR: libc::attrgroup_t = 0x2000_0000;
+
+/// One `getattrlistbulk` call returns many entries; only regular files with every field present skip the per-entry `stat`.
+#[cfg(target_os = "macos")]
+pub(super) fn scan_dir_bulk(
+    dir: &Path,
+    wanted: &dyn Fn(&OsStr) -> bool,
+    stamped: &dyn Fn(&OsStr) -> bool,
+) -> io::Result<Vec<(std::ffi::OsString, Option<super::EntryStat>)>> {
+    const VREG: u32 = 1;
+    let common = libc::ATTR_CMN_RETURNED_ATTRS
+        | libc::ATTR_CMN_NAME
+        | libc::ATTR_CMN_DEVID
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_CHGTIME
+        | libc::ATTR_CMN_FILEID
+        | ATTR_CMN_ERROR;
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: common,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: libc::ATTR_FILE_DATALENGTH,
+        forkattr: 0,
+    };
+    let handle = File::open(dir)?;
+    let mut words = vec![0u64; 16 * 1024];
+    let mut found = Vec::new();
+    loop {
+        let capacity = words.len() * 8;
+        // SAFETY: the request and the buffer outlive the call and the buffer holds `capacity` writable bytes.
+        let count = unsafe {
+            libc::getattrlistbulk(
+                handle.as_raw_fd(),
+                (&mut request as *mut libc::attrlist).cast(),
+                words.as_mut_ptr().cast(),
+                capacity,
+                0,
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if count == 0 {
+            return Ok(found);
+        }
+        // SAFETY: u64 storage of `capacity` bytes viewed as initialised bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), capacity) };
+        let mut offset = 0usize;
+        for _ in 0..count {
+            let entry = bytes.get(offset..).ok_or_else(bulk_invalid)?;
+            let length = read_u32(entry, 0)? as usize;
+            let entry = entry.get(..length).filter(|_| length >= 24).ok_or_else(bulk_invalid)?;
+            offset += length;
+            let parsed = parse_bulk_entry(entry)?;
+            if !wanted(&parsed.name) {
+                continue;
+            }
+            let stat = if !stamped(&parsed.name) {
+                None
+            } else if parsed.objtype == Some(VREG) && parsed.stat.is_some() {
+                parsed.stat
+            } else {
+                super::stat(&dir.join(&parsed.name)).ok().map(|meta| super::EntryStat::of(&meta))
+            };
+            found.push((parsed.name, stat));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct BulkEntry {
+    name: std::ffi::OsString,
+    objtype: Option<u32>,
+    stat: Option<super::EntryStat>,
+}
+
+#[cfg(target_os = "macos")]
+fn bulk_invalid() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed getattrlistbulk entry")
+}
+
+#[cfg(target_os = "macos")]
+fn read_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
+    let raw = bytes.get(at..at + 4).ok_or_else(bulk_invalid)?;
+    Ok(u32::from_ne_bytes(raw.try_into().map_err(|_| bulk_invalid())?))
+}
+
+#[cfg(target_os = "macos")]
+fn read_i64(bytes: &[u8], at: usize) -> io::Result<i64> {
+    let raw = bytes.get(at..at + 8).ok_or_else(bulk_invalid)?;
+    Ok(i64::from_ne_bytes(raw.try_into().map_err(|_| bulk_invalid())?))
+}
+
+/// Attributes follow the returned-attribute set in ascending bit order, each four-byte aligned; the name's reference is relative to itself.
+#[cfg(target_os = "macos")]
+fn parse_bulk_entry(entry: &[u8]) -> io::Result<BulkEntry> {
+    let common = read_u32(entry, 4)?;
+    let file = read_u32(entry, 16)?;
+    let mut at: usize = 24;
+    if common & libc::ATTR_CMN_NAME == 0 {
+        return Err(bulk_invalid());
+    }
+    let name_at = at.checked_add_signed(read_u32(entry, at)? as i32 as isize).ok_or_else(bulk_invalid)?;
+    let name_len = read_u32(entry, at + 4)? as usize;
+    let raw = entry.get(name_at..name_at + name_len).ok_or_else(bulk_invalid)?;
+    let raw = raw.split(|b| *b == 0).next().unwrap_or_default();
+    if raw.is_empty() {
+        return Err(bulk_invalid());
+    }
+    let name = OsStr::from_bytes(raw).to_os_string();
+    at += 8;
+    let mut take = |flag: libc::attrgroup_t, size: usize| -> Option<usize> {
+        (common & flag != 0).then(|| {
+            at += size;
+            at - size
+        })
+    };
+    let dev = take(libc::ATTR_CMN_DEVID, 4);
+    let objtype = take(libc::ATTR_CMN_OBJTYPE, 4);
+    let mtime = take(libc::ATTR_CMN_MODTIME, 16);
+    let ctime = take(libc::ATTR_CMN_CHGTIME, 16);
+    let ino = take(libc::ATTR_CMN_FILEID, 8);
+    let error = take(ATTR_CMN_ERROR, 4);
+    let size = (file & libc::ATTR_FILE_DATALENGTH != 0).then_some(at);
+    let objtype = objtype.map(|at| read_u32(entry, at)).transpose()?;
+    let failed = error.map(|at| read_u32(entry, at)).transpose()?.is_some_and(|code| code != 0);
+    let stat = match (dev, mtime, ctime, ino, size) {
+        (Some(dev), Some(mtime), Some(ctime), Some(ino), Some(size)) if !failed => Some(super::EntryStat {
+            dev: read_u32(entry, dev)? as i32 as u64,
+            ino: read_i64(entry, ino)? as u64,
+            size: u64::try_from(read_i64(entry, size)?).map_err(|_| bulk_invalid())?,
+            mtime: (read_i64(entry, mtime)?, read_i64(entry, mtime + 8)?),
+            ctime: (read_i64(entry, ctime)?, read_i64(entry, ctime + 8)?),
+            is_file: true,
+        }),
+        _ => None,
+    };
+    Ok(BulkEntry { name, objtype, stat })
+}
+
 pub fn lstat(path: &Path) -> io::Result<(Metadata, Ext)> {
     fs::symlink_metadata(path).map(|meta| (meta, Ext))
 }
@@ -1223,6 +1421,27 @@ pub fn lower_thread_priority() {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn lower_store_priority() {}
+
+pub fn process_cpu_ns() -> Option<u64> {
+    // SAFETY: rusage is plain data and getrusage only writes the out pointer.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_SELF is always valid and `usage` is a valid out pointer.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let ns = |t: libc::timeval| Some(u64::try_from(t.tv_sec).ok()? * 1_000_000_000 + u64::try_from(t.tv_usec).ok()? * 1000);
+    Some(ns(usage.ru_utime)? + ns(usage.ru_stime)?)
+}
+
+pub fn thread_cpu_ns() -> Option<u64> {
+    // SAFETY: timespec is plain data and clock_gettime only writes the out pointer.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: CLOCK_THREAD_CPUTIME_ID is supported on Linux and macOS and `ts` is a valid out pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(u64::try_from(ts.tv_sec).ok()? * 1_000_000_000 + u64::try_from(ts.tv_nsec).ok()?)
+}
 
 /// A detached helper keeps the lock handles it inherited, but none of its own children may receive them.
 pub fn seal_inherited_descriptors() {

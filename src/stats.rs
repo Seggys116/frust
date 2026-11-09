@@ -166,29 +166,46 @@ pub struct TargetInfo {
 }
 
 pub fn targets(dirs: &Dirs) -> Vec<TargetInfo> {
-    let mut out = Vec::new();
-    let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return out };
+    targets_with(dirs, &mut crate::progress::Silent)
+}
+
+/// Lists every workspace first, so the measuring phase announces its total.
+pub fn targets_with(dirs: &Dirs, progress: &mut dyn crate::progress::Progress) -> Vec<TargetInfo> {
+    let mut found = Vec::new();
+    let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return Vec::new() };
     for ws in workspaces.flatten() {
         let marker = fs::read_to_string(ws.path().join("workspace")).ok();
         let root_exists = marker.as_deref().map(|p| std::path::Path::new(p.trim()).exists()).unwrap_or(true);
         let Ok(toolchains) = fs::read_dir(ws.path()) else { continue };
         for tc in toolchains.flatten() {
-            if !tc.path().is_dir() {
-                continue;
+            if tc.path().is_dir() {
+                found.push((ws.file_name().to_string_lossy().into_owned(), tc, root_exists));
             }
-            out.push(TargetInfo {
-                workspace: ws.file_name().to_string_lossy().into_owned(),
-                toolchain: tc.file_name().to_string_lossy().into_owned(),
-                allocated_bytes: fsx::allocated_size(&tc.path()),
-                idle: idle_time(&tc.path()),
-                path: tc.path(),
-                root_exists,
-            });
         }
     }
+    progress.phase("measure targets", Some(found.len() as u64), "measured");
+    let mut out: Vec<TargetInfo> = found
+        .into_iter()
+        .map(|(workspace, tc, root_exists)| {
+            let allocated_bytes = fsx::allocated_size(&tc.path());
+            progress.item(&workspace, allocated_bytes);
+            TargetInfo { workspace, toolchain: tc.file_name().to_string_lossy().into_owned(), allocated_bytes, idle: idle_time(&tc.path()), path: tc.path(), root_exists }
+        })
+        .collect();
     out.sort_by_key(|t| std::cmp::Reverse(t.allocated_bytes));
     out
 }
+
+/// The workspace directory name of a path inside the central targets, `store` for the cache store, otherwise `None`.
+pub fn workspace_of(dirs: &Dirs, path: &std::path::Path) -> Option<String> {
+    if path.starts_with(dirs.store()) {
+        return Some(STORE_SCOPE.to_string());
+    }
+    let rest = path.strip_prefix(dirs.targets()).ok()?;
+    rest.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned())
+}
+
+pub const STORE_SCOPE: &str = "cache store";
 
 /// Time since anything at the top two levels of a target directory changed.
 fn idle_time(dir: &std::path::Path) -> Duration {

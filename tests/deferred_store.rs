@@ -291,6 +291,33 @@ fn exhausted_admission_and_execution_pools_queue_the_stores() {
     assert_eq!(leaf_rlib(&sb, &a), compiled, "the drained store restores exact bytes");
 }
 
+/// With `FRUST_STORE_START=after-build` no store competes with the compiles: each waits as a job file, and the front end starts the drains once cargo exits.
+#[test]
+fn after_build_stores_wait_for_cargo_to_exit_and_then_drain() {
+    let sb = Sandbox::new("ds-after-build");
+    sb.vendor_crate("leaf", "1.0.0", LEAF);
+    let a = sb.project("a", &[("leaf", "1.0.0")], MAIN);
+    let build = || {
+        let out = sb.bin("fcargo").arg("build").current_dir(&a)
+            .env("FRUST_CACHE", "1").env("FRUST_STORE_START", "after-build")
+            .env("FRUST_TIMINGS", sb.root.join("timings.jsonl"))
+            .env_remove("FRUST_STORE_SYNC").output().unwrap();
+        assert_success(&out);
+    };
+    build();
+    let modes = store_modes(&sb);
+    assert_eq!(modes, ["queued:after-build", "queued:after-build"], "every store waited for cargo");
+    wait_for_stores(&sb, 2);
+    assert!(broker_directories(&sb).is_empty(), "no broker runs beside the build");
+    let compiled = leaf_rlib(&sb, &a);
+    clean(&sb, &a);
+    build();
+    wait_for_stores(&sb, 2);
+    assert_eq!(sb.count_cache("hit", "leaf"), 1, "{:#?}", sb.cache_events());
+    assert_eq!(leaf_rlib(&sb, &a), compiled, "an after-build store restores exact bytes");
+    assert_eq!(app_output(&sb, &a), "41");
+}
+
 /// Where the frozen state cannot be captured the store still runs inline, whatever the slots.
 #[test]
 fn a_store_that_cannot_freeze_stays_inline() {

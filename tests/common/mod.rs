@@ -135,6 +135,8 @@ impl Sandbox {
             .env("FRUST_STORE_SYNC", "1")
             // A detached collector would run its own compaction while a test runs one, so the spawned commands collect inline.
             .env("FRUST_GC_SYNC", "1")
+            // Likewise a detached compaction pass would race the test's own checks, so due passes run before the command exits.
+            .env("FRUST_COMPACT_SYNC", "1")
             // Backed entries die with a deleted target, so only tests written for them (tests/backed.rs) switch them on.
             .env("FRUST_CACHE_BACKED", "off")
             // Tests written before the default dropped to one version per unit keep the old bound; tests of the default set it themselves.
@@ -177,12 +179,14 @@ impl Sandbox {
             .count()
     }
 
-    /// Deletes the project's central target without the cache release a whole-target `fcargo clean` performs.
+    /// Deletes the project's central targets (build and check) without the cache release a whole-target `fcargo clean` performs.
     pub fn lose_target(&self, project: &Path) {
-        match fs::remove_dir_all(self.central_target(project)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => panic!("cannot remove the central target: {error}"),
+        for target in [self.central_target(project), self.check_target(project)] {
+            match fs::remove_dir_all(target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot remove the central target: {error}"),
+            }
         }
     }
 
@@ -196,6 +200,22 @@ impl Sandbox {
         assert!(
             out.status.success(),
             "frust where failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    }
+
+    /// The sibling directory `check` and `clippy` build in.
+    pub fn check_target(&self, project: &Path) -> PathBuf {
+        let out = self
+            .bin("frust")
+            .args(["where", "check"])
+            .current_dir(project)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "frust where check failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())

@@ -398,6 +398,78 @@ fn release_and_debug_builds_run_side_by_side() {
 }
 
 #[test]
+fn check_and_build_run_side_by_side_without_blocking() {
+    let scene = Scene::new("join-check-build", MAIN);
+    let mut build = scene.build("off");
+    scene.wait_started();
+
+    let check = scene.run(&["check"], "off", false).finish();
+    assert_ok(&check);
+    assert!(build.running(), "the check finished while the build was still running");
+    for text in [&check.stderr, &build.stderr()] {
+        assert!(!text.contains("Blocking") && !text.contains("waiting for build lock"), "{text}");
+    }
+    scene.open_gate();
+    let build = build.finish();
+    assert_ok(&build);
+    assert!(!build.stderr.contains("Blocking"), "{}", build.stderr);
+    assert_eq!(scene.app_output("debug"), "3");
+    scene.assert_clean();
+}
+
+#[test]
+fn identical_checks_still_join() {
+    let scene = Scene::new("join-checks", MAIN);
+    let holder = scene.run(&["check"], "plain", true);
+    let holder_pid = holder.pid();
+    scene.wait_started();
+    let joiner = scene.run(&["check"], "plain", true);
+    let joined = format!("joined    running build of {} pid {holder_pid} (identical command)", user());
+    joiner.wait_stderr("the second check to follow the first", |e| e.contains(&joined));
+    scene.open_gate();
+    let done = finish_all(vec![holder, joiner]);
+    done.iter().for_each(assert_ok);
+}
+
+#[test]
+fn a_shared_check_directory_queues_check_behind_build() {
+    let scene = Scene::new("join-check-off", MAIN);
+    let build = scene.build("off");
+    let holder_pid = build.pid();
+    scene.wait_started();
+    let mut cmd = scene.sb.bin("fcargo");
+    cmd.arg("check").current_dir(&scene.project).env("FRUST_RENDER", "off").env("FRUST_CHECK_DIR", "off").stdout(Stdio::null()).stderr(Stdio::piped());
+    common::own_group(&mut cmd);
+    let check = Running::spawn(cmd);
+    let held = format!("waiting for build lock held by {} pid {holder_pid}", user());
+    check.wait_stderr("check to queue behind the build", |e| e.contains(&held));
+    scene.open_gate();
+    let done = finish_all(vec![build, check]);
+    done.iter().for_each(assert_ok);
+}
+
+#[test]
+fn doc_waits_for_its_own_profile_only() {
+    let scene = Scene::new("join-doc", MAIN);
+    let mut doc = scene.run(&["doc", "--no-deps"], "off", true);
+    scene.wait_started();
+
+    let release = scene.run(&["build", "--release"], "off", false).finish();
+    assert_ok(&release);
+    assert!(doc.running(), "the release build finished while doc was still running");
+    assert!(!release.stderr.contains("Blocking") && !release.stderr.contains("waiting for build lock"), "{}", release.stderr);
+
+    let holder_pid = doc.pid();
+    let debug = scene.run(&["build"], "off", false);
+    let held = format!("waiting for build lock held by {} pid {holder_pid}", user());
+    debug.wait_stderr("a debug build to wait for doc", |e| e.contains(&held));
+    scene.open_gate();
+    let done = finish_all(vec![doc, debug]);
+    done.iter().for_each(assert_ok);
+    assert_eq!(scene.app_output("debug"), "3");
+}
+
+#[test]
 fn different_commands_queue_in_order_behind_a_holder_they_cannot_join() {
     let scene = Scene::new("join-fifo", MAIN);
     let holder = scene.build("off");
@@ -406,8 +478,8 @@ fn different_commands_queue_in_order_behind_a_holder_they_cannot_join() {
     let first = scene.run(&["build", "-j", "2"], "off", true);
     let held = format!("waiting for build lock held by {} pid {holder_pid}", user());
     first.wait_stderr("the first waiter", |e| e.contains(&held));
-    // `check` shares the debug profile directory, so cargo would serialise it anyway.
-    let second = scene.run(&["check"], "off", true);
+    // Another debug build shares the profile directory, so cargo would serialise it anyway.
+    let second = scene.run(&["build", "-j", "3"], "off", true);
     second.wait_stderr("the second waiter", |e| e.contains(&held) && e.contains("1 ahead in queue"));
     assert_eq!(scene.tickets().len(), 2);
 

@@ -515,7 +515,7 @@ fn spawn(unit: &plan::Unit, common: &[(String, String)], request: &Request, clie
         cmd.env(name, value);
     }
     for (name, _) in env::vars_os() {
-        if name.to_str().is_some_and(|n| super::journal::per_run(n) && !n.starts_with("CARGO_TERM_") && n != "FRUST_EVENTS" && n != crate::store_broker::CAPABILITY_ENV) {
+        if name.to_str().is_some_and(|n| super::journal::per_run(n) && !n.starts_with("CARGO_TERM_") && !n.starts_with("FRUST_INTERNAL_") && n != "FRUST_EVENTS" && n != crate::store_broker::CAPABILITY_ENV) {
             cmd.env_remove(&name);
         }
     }

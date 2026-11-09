@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use crate::bench;
 use crate::compact::{self, Category, CompactOptions};
-use crate::config::Config;
+use crate::config::{Config, RenderMode};
 use crate::doctor::{self, Status};
 use crate::fsx::human_bytes;
 use crate::gc::{self, Class, GcOptions};
 use crate::lock;
 use crate::paths::Dirs;
+use crate::progress;
 use crate::run;
 use crate::stats;
 use crate::style::{Styler, duration_ms, row};
@@ -56,7 +57,7 @@ fn meta(cmd: &str, rest: Vec<OsString>) -> i32 {
         }
         "stats" => stats_cmd(&dirs, &flags),
         "gc" => gc_cmd(&cfg, &dirs, &flags),
-        "compact" => compact_cmd(&dirs, &flags),
+        "compact" => compact_cmd(&cfg, &dirs, &flags),
         "doctor" => doctor_cmd(&cfg, &dirs),
         "locks" => locks_cmd(&dirs),
         "env" => env_cmd(&dirs),
@@ -87,12 +88,12 @@ fn print_help() {
     println!("{}", s.bold("Commands"));
     for (name, text) in [
         ("stats", "cache hit rate, time saved, disk use, target directories"),
-        ("gc", "prune the cache and target directories  [--dry-run] [--yes] [--max-age-days N] [--max-gib N] [--max-idle-days N]"),
-        ("compact", "shrink target directories: drop superseded variants, compress, dedupe  [--dry-run] [--yes] [--no-compress] [--no-dedupe] [--keep-variants]"),
+        ("gc", "prune the cache and every workspace's target directories  [--dry-run] [--yes] [--max-age-days N] [--max-gib N] [--max-idle-days N] [--quiet] [--progress]"),
+        ("compact", "shrink every workspace's target directories: drop superseded variants, compress, dedupe  [--dry-run] [--yes] [--no-compress] [--no-dedupe] [--keep-variants] [--workspace NAME|PATH] [--quiet] [--progress]"),
         ("doctor", "check the environment frust depends on"),
         ("locks", "show running and queued builds"),
         ("env", "print shell exports so other tools (IDEs, rust-analyzer) use the cache"),
-        ("where", "print the target directory for this workspace  [cache|root] [--fresh]"),
+        ("where", "print the target directory for this workspace  [cache|root|check] [--fresh]"),
         ("bench", "measure speedups and disk savings on generated projects  [--json] [--quick] [--runs N] [--profiles] [--concurrent [--concurrent-profile=dev|release|thin|fat] [--concurrent-incremental=on|off]] [--store=sync|deferred] [--growth [--settle-edits]] [--keep-scratch] [--linking] [--repo PATH [--edits N] [--package P] [--markdown] [--out FILE] [--gate]]"),
         ("ui-demo", "render a scripted build to check the display  [--plain] [--width N]"),
         ("link", "create f<tool> shims for any toolchain tool  [--dir D] <tool>..."),
@@ -257,7 +258,9 @@ fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
     if let Some(days) = flag_value(flags, "--max-idle-days").and_then(|v| v.parse::<u64>().ok()) {
         opts.target_max_idle = Duration::from_secs(days * 86_400);
     }
-    let plan = gc::plan(dirs, &opts);
+    let mut status = progress::Status::new(progress_mode(cfg, flags), std::io::stderr(), "gc");
+    let plan = gc::plan_with(dirs, &opts, &mut status);
+    status.finish();
     println!("{}", s.bold("Garbage collection plan"));
     for class in Class::ALL.into_iter().filter(|c| *c != Class::Ledger) {
         let (count, bytes) = plan.by_class(class);
@@ -275,6 +278,7 @@ fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
             println!("  {}", s.dim(&format!("        {:>10}  {}", human_bytes(bytes), cat.label())));
         }
     }
+    print_gc_workspaces(&s, dirs, &plan);
     if plan.removals.is_empty() && !plan.trim_ledger {
         println!("  {}", s.dim("nothing to remove"));
         return 0;
@@ -300,9 +304,10 @@ fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
             return 1;
         }
     }
-    let (freed, failures) = gc::execute(dirs, &plan);
+    let (freed, failures) = gc::execute_with(dirs, &plan, &mut status);
+    status.finish();
     println!("freed {}", s.green(&human_bytes(freed)));
-    if compact::physical_size(&[&dirs.targets()]) > 0 && cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && std::fs::read_dir(dirs.targets()).is_ok_and(|mut entries| entries.next().is_some()) {
         println!("{}", s.dim("`frust compact` can also compress what remains in target directories"));
     }
     for (path, err) in &failures {
@@ -311,21 +316,101 @@ fn gc_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
     i32::from(!failures.is_empty())
 }
 
-fn compact_cmd(dirs: &Dirs, flags: &[String]) -> i32 {
+/// Progress goes to stderr, so the report on stdout stays parseable.
+fn progress_mode(cfg: &Config, flags: &[String]) -> progress::Mode {
+    let has = |f: &str| flags.iter().any(|x| x == f);
+    progress::Mode::choose(
+        has("--quiet") || has("-q"),
+        has("--progress"),
+        cfg.render == RenderMode::Off,
+        crate::sys::ansi_terminal(crate::sys::StdStream::Stderr),
+    )
+}
+
+fn print_gc_workspaces(s: &Styler, dirs: &Dirs, plan: &gc::Plan) {
+    let (store_items, store_freed) = plan.store_removals(dirs);
+    let (other_items, other_freed) = plan.outside_targets(dirs);
+    if plan.workspaces.is_empty() && plan.store_bytes == 0 && other_items == 0 {
+        return;
+    }
+    println!("  {}", s.dim("by workspace (size, then what would be freed):"));
+    let line = |size: String, freed: u64, items: usize, name: &str, root: Option<&str>| {
+        let root = root.map(|r| format!("  {}", s.dim(r))).unwrap_or_default();
+        println!("  {size:>10}  {:>10} in {items:>5} items  {name}{root}", human_bytes(freed));
+    };
+    for w in &plan.workspaces {
+        line(human_bytes(w.bytes), w.freed, w.items, &w.name, w.root.as_deref());
+    }
+    line(human_bytes(plan.store_bytes), store_freed, store_items, stats::STORE_SCOPE, None);
+    if other_items > 0 {
+        line("-".to_string(), other_freed, other_items, "other state (scratch, manifests, locks, history, memos)", None);
+    }
+    let total: u64 = plan.workspaces.iter().map(|w| w.bytes).sum::<u64>().saturating_add(plan.store_bytes);
+    let count = plan.workspaces.len();
+    println!("  {}", s.dim(&format!("{:>10}  across {count} workspace{} and the cache store", human_bytes(total), if count == 1 { "" } else { "s" })));
+}
+
+/// A workspace directory name under `targets/`, its unique display-name prefix, or the project root it records.
+fn resolve_workspace(dirs: &Dirs, wanted: &str) -> Result<String, String> {
+    let names: Vec<(String, Option<String>)> = std::fs::read_dir(dirs.targets())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read_to_string(e.path().join("workspace")).ok().map(|r| r.trim().to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let canonical = std::fs::canonicalize(wanted).ok().map(|p| p.display().to_string());
+    let exact: Vec<&String> = names
+        .iter()
+        .filter(|(name, root)| name == wanted || root.as_deref().is_some_and(|r| r == wanted || Some(r) == canonical.as_deref()))
+        .map(|(name, _)| name)
+        .collect();
+    let found = if exact.is_empty() {
+        names.iter().filter(|(name, _)| name.rsplit_once('-').is_some_and(|(stem, _)| stem == wanted)).map(|(name, _)| name).collect()
+    } else {
+        exact
+    };
+    match found.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(format!("no workspace named {wanted} under {}", dirs.targets().display())),
+        many => Err(format!("{wanted} matches several workspaces: {}", many.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "))),
+    }
+}
+
+fn compact_cmd(cfg: &Config, dirs: &Dirs, flags: &[String]) -> i32 {
+    if let Some(target) = flag_value(flags, compact::AUTO_CHILD_FLAG) {
+        return compact::run_auto_child(dirs, cfg, std::path::Path::new(&target));
+    }
     let s = Styler::detect();
     let has = |f: &str| flags.iter().any(|x| x == f);
     let mut opts = CompactOptions::full();
     opts.compress = !has("--no-compress");
     opts.dedupe = !has("--no-dedupe");
     opts.remove_superseded = !has("--keep-variants");
-    let targets = compact::central_targets(dirs);
-    if targets.is_empty() && !dirs.store().is_dir() {
+    let mut targets = compact::central_targets(dirs);
+    if let Some(wanted) = flag_value(flags, "--workspace") {
+        let name = match resolve_workspace(dirs, &wanted) {
+            Ok(name) => name,
+            Err(error) => {
+                eprintln!("frust: {error}");
+                return 2;
+            }
+        };
+        targets.retain(|target| stats::workspace_of(dirs, target).as_deref() == Some(name.as_str()));
+        // The store is shared by every workspace, so a run scoped to one leaves it alone.
+        opts.include_store = false;
+    }
+    if targets.is_empty() && (!opts.include_store || !dirs.store().is_dir()) {
         println!("{}", s.dim("no target directories yet"));
         return 0;
     }
+    let mut status = progress::Status::new(progress_mode(cfg, flags), std::io::stderr(), "compact");
     if has("--dry-run") {
         opts.dry_run = true;
-        let report = compact::compact(dirs, &targets, &opts);
+        let report = compact::compact_with(dirs, &targets, &opts, &mut status);
+        status.finish();
         println!("{}", s.bold("Compaction plan (estimate; nothing changed)"));
         print_compact_report(&s, &report, true);
         for (path, _) in report.removed.iter().take(40) {
@@ -335,7 +420,8 @@ fn compact_cmd(dirs: &Dirs, flags: &[String]) -> i32 {
     }
     // Deleting superseded variants follows gc's confirmation rule; compression and dedupe change no contents.
     if opts.remove_superseded && !has("--yes") && !has("-y") {
-        let plan = compact::compact(dirs, &targets, &CompactOptions { compress: false, dedupe: false, dry_run: true, ..opts.clone() });
+        let plan = compact::compact_with(dirs, &targets, &CompactOptions { compress: false, dedupe: false, dry_run: true, ..opts.clone() }, &mut status);
+        status.finish();
         if !plan.removed.is_empty() {
             println!(
                 "{} {} units, {} incremental sessions, {} dead incremental directories and {} object aliases, {}",
@@ -360,7 +446,8 @@ fn compact_cmd(dirs: &Dirs, flags: &[String]) -> i32 {
             }
         }
     }
-    let report = compact::compact(dirs, &targets, &opts);
+    let report = compact::compact_with(dirs, &targets, &opts, &mut status);
+    status.finish();
     println!("{}", s.bold("Compaction"));
     print_compact_report(&s, &report, false);
     for (path, err) in &report.errors {
@@ -425,6 +512,18 @@ fn print_compact_report(s: &Styler, r: &compact::Report, estimate: bool) {
             )
         )
     );
+    if !r.workspaces.is_empty() {
+        println!("  {}", s.dim(&format!("by workspace (size before, then what {verb}go):")));
+        for (name, w) in &r.workspaces {
+            let busy = if w.busy > 0 { format!(", {} busy", w.busy) } else { String::new() };
+            let profiles = if name == stats::STORE_SCOPE { String::new() } else { format!("  {} profiles{busy}", w.profiles) };
+            println!(
+                "  {:>10}  {name}{profiles}  {}",
+                human_bytes(w.before),
+                s.dim(&format!("removed {}, compressed {}, deduplicated {}", human_bytes(w.removed), human_bytes(w.compressed), human_bytes(w.deduped)))
+            );
+        }
+    }
     for busy in &r.busy {
         println!("  {}", s.yellow(&format!("skipped (a build holds it): {}", busy.display())));
     }
@@ -522,13 +621,15 @@ fn where_cmd(dirs: &Dirs, flags: &[String]) -> i32 {
             };
             println!("{}", root.unwrap_or(cwd.clone()).display());
         }
-        _ => {
+        kind => {
             let Some(probe) = probe() else {
                 eprintln!("frust: could not query the toolchain");
                 return 1;
             };
             let root = locate(&probe.id);
-            println!("{}", workspace::central_target(dirs, root.as_deref(), &probe.id).display());
+            let build = workspace::central_target(dirs, root.as_deref(), &probe.id);
+            let dir = if kind == Some("check") { workspace::check_target(&build) } else { build };
+            println!("{}", dir.display());
         }
     }
     0

@@ -125,7 +125,17 @@ tick. A record is written only if the file still has the stamp it had while it w
 trust mode: `off` neither writes nor uses them, `audit` re-reads the file on every use of an attested record, so it
 proves them, and discards a record that does not match; a mismatch under an unchanged stamp is reported and
 quarantines the volume like any other stamp violation. `on` uses them like any other settled record. Test harnesses
-and binary-only crates are not attested, since nothing depends on them.
+and binary-only crates are not attested, since nothing depends on them. On Linux and Windows cargo uplifts a root
+library of `cargo build` into the profile directory by hard link right after rustc exits, which moves the change time
+and voids an attestation at once; the wrapper skips that read when `fcargo build` runs and cargo's plain name
+(`lib<crate>.rlib`) still shares the inode this compile replaced, so a library uplifted last time is not read for
+nothing. A wrong guess only costs a dependent one read. macOS cargo copies instead, so attestation there is unchanged.
+
+A file under a build script's `build/<unit>/out` is remembered while still inside the settle margin when cargo's
+`output` file beside it, stat'd before the read, has a later change time on the same volume. Cargo writes that file only
+after the script exited, and the timestamp clock had passed the file's change time by then, so any later write gives the
+file a newer change time and a different stamp. These records are marked attested, so `audit` proves them by content.
+Static archives a build script just wrote are then read once per build instead of again on the first edit.
 
 Related lookup behaviour:
 
@@ -188,6 +198,13 @@ dependency), only one should compile it.
   waits for the previous store. The wrapper
   records the miss once. Broker workers and helpers share execution slots: half the CPU count, between 1 and 4 (2 and
   8 on Windows, where the store is bound by file I/O rather than cores); `FRUST_STORE_SLOTS` sets the count.
+* `FRUST_STORE_START=after-build` (default `eager`) keeps every store off the build: the wrapper writes the job as
+  `job-<pid>-<ns>-q<prekey>.json` without a broker hand-off, slot or key lock, starts no drain, and the front end
+  starts up to one drain per slot after cargo exits. Measured on bat (macOS, 16 cores): the stores of a cold build
+  take 0.44 s of CPU (1.05 s with linked storage) against about 97 s for the build, and the wrapper saves the 3 to 5 ms
+  broker hand-off per unit, while the stores finish about 0.5 s later. It stays opt-in because no store holds a
+  dependency's key lock, so concurrent builds sharing that dependency each compile it instead of one waiting for the
+  other's entry, and without a supervising front end (no build lock and no display) stores start eagerly.
 * Capacity is reserved before preparing a deferred job, so a saturated queue does not prepare the same outputs twice.
 * With no free slot the store never runs on the compile's path. The wrapper freezes the outputs as usual and writes
   the job as `job-<pid>-<ns>-q<prekey>.json`, without a slot, then returns. A helper that finishes its job drains
@@ -217,8 +234,11 @@ touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans descri
 for `-L` directories), `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
 `spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
 `hit`, `deferred` (helper), `queued` (broker), `queued:slots` (job file waiting for a helper),
+`queued:after-build` (job file the front end drains once cargo exits),
 `inline:<reason>` or `skip:<reason>`; `skip:linker` marks a unit that ran uncached because its explicit linker could
 not be resolved, and `skip:test` a test or bench executable that was compiled but not stored. Stages a run did not reach are 0.
+Store outcomes go to `<file>.events` when that file exists, with `kind` `store`, the outcome in `store_mode`, the
+store's wall time in `total_ms` and the CPU time of the thread that stored in `cpu_ms`.
 
 ## Cache payload storage
 
@@ -272,8 +292,11 @@ The cost and sizing: deleting or replacing the target name leaves the store file
 survive `cargo clean`. `frust gc` counts a linked file that still has another name as zero bytes and an orphaned one
 in full, and drops every orphaned linked entry older than the newest of its unit (grouped by the unit records, not by
 prekey) at once, so frust never holds more than cargo does. A stale incremental object name left in a target does not
-keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path, with its
-identity checked around the hash and again before the link. Compaction treats a linked store file as covering a target file only while it hashes to the
+keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path: the
+store makes the link first and hashes through the new name, and the output must keep its inode, size, modification time
+and mode from before the link to the end of the read. That one read also attests a library again, since the new name
+moved its change time: only when the full stamp, change time included, held for the whole read and the link count grew,
+under the stamp the file carries after the link; otherwise the library is read once more to attest it. Compaction treats a linked store file as covering a target file only while it hashes to the
 recorded content, so it cannot delete the only copy. Manifests that list a linked entry use format 6 and linked
 entries use their own key domain, so older versions treat them as misses.
 
@@ -308,10 +331,26 @@ entries use their own key domain, so older versions treat them as misses.
   the number of remembered files. A missing or damaged payload, mismatch or exhausted budget leaves coverage
   unproven, so the existing age rules decide what can be removed. Current outputs and fresh incremental sessions
   keep their existing protection.
-* Automatic compaction is synchronous but cheap when there is nothing to do. It runs after Cargo exits and before
-  the build lock is handed to a waiter, at background CPU and I/O priority. A completed pass is throttled for
-  10 minutes per target; an incomplete pass retries after 30 seconds. Cargo profile locks are taken without
-  waiting, so another active build is skipped. Between hourly reassessments, a completed pass can be skipped when
+* Automatic compaction never runs inside a build. Once a successful build has released its lock, it checks the
+  marker's age (one `stat`) and, when a pass is due, starts `frust compact --auto-background` as a detached process
+  at utility CPU and I/O priority (background priority could starve it while it holds a lock a build waits for); a
+  pass already running for the target holds the marker, so a second one exits at once. The pass works in slices of
+  `FRUST_COMPACT_SLICE_MS` (100 ms by default): it holds frust's target gate and Cargo's profile locks for one slice,
+  finishes the file or directory in progress, releases everything for at least 15 ms and takes the locks again only
+  if no frust build is queued or running and the modification times of the target's profile, `deps`,
+  `.fingerprint`, `build`, `examples` and incremental directories are unchanged. Read-only work (fingerprint
+  analysis, session and stale-object listings, collecting files) and reading and encoding a file of 4 MiB or more run
+  with the locks released, under the same check. A frust build that queues mid-slice is noticed within 10 ms and
+  makes the pass stop after the step in progress; a busy profile lock (a plain Cargo build) makes it back off exponentially and stop after 30 seconds. An
+  interrupted pass, stopped or killed, leaves the marker incomplete; every step is idempotent (removed state stays
+  removed, compressed files stay compressed and the memo keeps file hashes), so the next due pass continues where it
+  stopped. A completed pass is throttled for 10 minutes per target; an incomplete pass retries after 30 seconds.
+  The marker records the last pass's slice count, longest lock hold and CPU time. Cargo profile locks are taken
+  without waiting, so another active build is skipped. Before it releases the locks, a pass (and `frust compact`)
+  restamps the no-op records for the files it replaced with identical bytes (compressed or cloned): an entry is
+  updated only when its recorded stamp is the file's stamp just before the rewrite and every other entry of the
+  record still matches, so a record that was already stale is never revived and the next unchanged build is still
+  answered by the fast path. Between hourly reassessments, a completed pass can be skipped when
   a change signature (modification times and entry names of a few directories per profile, plus the number of cache
   entries) matches the last complete pass, or when the target grew by less than 64 MiB since then. Once an hour has
   elapsed since the last completed full pass,
@@ -320,7 +359,8 @@ entries use their own key domain, so older versions treat them as misses.
   time. A persistent memo under `compact-memo/` in `FRUST_HOME` remembers file hashes and files that did not
   compress; compressibility is judged from a sample of two 64 KiB blocks, and a file that would save
   less than 5 percent is left alone. The dedupe and compression stage stops after 2 seconds or 512 MiB of work per
-  pass, and the next due pass continues. Explicit `frust compact` has no budget.
+  pass (time spent yielded to builds is not counted), and the next due pass continues. Explicit `frust compact` has
+  no budget, holds the profile locks for its whole run and reports progress.
 * Dead incremental directories (those of a configuration nobody builds any more) are recognised by the codegen
   units they hold. Besides rlib members and object files, frust reads the DWARF string tables of ELF binaries
   (Linux) for rustc's `<source>/@/<codegen unit>` names, so binaries whose objects are gone are still matched.
@@ -346,6 +386,21 @@ entries use their own key domain, so older versions treat them as misses.
   compiler-compatible session guards before program outputs are removed. Target/profile directories, `deps` and
   `.fingerprint` roots, and Cargo lock files remain. Fresh activity, unreadable state and unknown or user-managed layouts
   are preserved.
+* `frust gc` and `frust compact` work on the whole `FRUST_HOME`: every workspace's central targets (check
+  directories included), the store and the shared metadata. The gc plan lists each workspace with its size and what
+  would be freed in it, then the store and other state; the compaction report lists each workspace's size before, its
+  profiles (and busy ones) and what was removed, compressed and deduplicated there. `frust compact --workspace NAME|PATH`
+  limits a run to one workspace (its directory name, its project name or its project path) and leaves the shared store
+  alone. gc has no such filter, because cache entries, manifests and locks are shared by every workspace.
+* Both commands report progress on stderr, so their reports on stdout stay parseable. On a terminal one status line
+  is rewritten in place with the phase, items done of the announced total, bytes measured or freed, the workspace or
+  profile at hand, elapsed time and an ETA once the phase has a total. In a log they print a line when each phase starts
+  and at most one more every 5 seconds. `--quiet` silences progress; `--progress` forces it even with
+  `FRUST_RENDER=off`, which otherwise turns it off. gc's phases are `scan store`, `size store entries`,
+  `check idle targets`, `measure targets`, `plan targets`, `plan home`, `remove` (one item per planned removal, scoped by
+  workspace and class) and `tidy`; compaction's are `measure`, `lock profiles`, `remove superseded`, `collect files`,
+  `compress and dedupe` (one item per file; the two are interleaved by size) and `measure again`. The counts come from
+  the work itself, and automatic maintenance passes report to a no-op.
 
 ## Sharing a repo between builds
 
@@ -356,14 +411,36 @@ entries use their own key domain, so older versions treat them as misses.
 * Builds in different profiles (debug and release) run in parallel. Cargo locks each profile directory separately, and so
   does frust. A `--target` build also takes the host slot of its profile (build scripts and proc macros live there), so it
   queues behind other builds of that profile, including builds for other targets. This applies to `build`, `check`,
-  `clippy`, `test` and `bench` with a determinable profile; other commands, or a config that relocates outputs, lock the
-  whole target directory.
-* Builds in the same profile with different commands (`check` then `build`, `-p a` then `-p b`) queue in order.
+  `clippy`, `test`, `bench` and `doc` with a determinable profile; other commands, or a config that relocates outputs,
+  lock the whole target directory.
+* `doc` holds its profile's slots plus a `doc@output` slot. Cargo builds the dependencies of a doc run in the profile
+  directory (under that profile's build lock) and writes `target/doc`, which no profile lock covers, so two doc runs
+  of different profiles must still queue while `doc` and a build of the other profile run side by side.
+* `check` and `clippy` build in their own directory, `<toolchain id>-check` beside the build target
+  (`frust where check` prints it). Cargo takes an exclusive lock on each profile directory of a target directory and a
+  check shares no unit with a build in the same profile, so with one directory they only waited on each other. With
+  two they run side by side, each with its own frust lock, no-op records and auto-compaction; identical checks still
+  join. The directory is a normal central target, so gc, compaction, `frust stats` and `frust doctor` age and list it
+  like any other, `fcargo clean` removes both, and a partial clean (`-p`, `--release`, `--target`) is applied to both.
+  The cache key is untouched. The cost is one more copy of the host-only units (build scripts and proc macros, which
+  check builds in full) per workspace. It applies only while frust owns the target directory: a `CARGO_TARGET_DIR`,
+  `--target-dir`, configured `target-dir` or `FRUST_TARGET=local` keeps check and build together, as does
+  `FRUST_CHECK_DIR=off`.
+* Builds in the same profile and directory with different commands (`build -p a` then `build -p b`) queue in order.
   Cargo serialises them on its own lock anyway; the queue shows who you are waiting for.
 * `frust compact` and `frust gc` take cargo's own per-profile locks without blocking and skip a profile that is
   busy. Maintenance reserves all canonical Cargo profile lock names, including missing ones, so different Cargo
-  versions cannot bypass each other's lock files. `tests/stress.rs` runs eight builds against
-  continuous compaction and gc.
+  versions cannot bypass each other's lock files. A profile is any directory of a target (or of a `<triple>`
+  directory in it) that holds `deps`, so custom profiles such as `harness` are covered. A running Cargo holds
+  `.cargo-build-lock` and `.cargo-artifact-lock` exclusively and `.cargo-lock` shared, and maintenance asks for all
+  three exclusively, so a plain `cargo` build without frust is protected the same way. Every removal inside a profile
+  is rechecked under those locks at execution time, not only when planned. The locks are per profile directory, so
+  a build in one workspace never holds back maintenance of another. `tests/stress.rs` runs eight builds against
+  continuous compaction and gc, and `tests/active_build.rs` runs gc and compaction against a custom profile held by
+  plain Cargo and by fcargo.
+* `frust gc` removes a workspace directory under `targets/` only when it holds nothing but regular files (its
+  `workspace` marker), and never recursively: a build that creates its target between the check and the removal makes
+  the removal fail instead of losing its tree.
 * Queued builds subscribe to directory changes through kqueue on macOS and inotify on Linux, waking promptly when
   ownership or queue state changes. Notifications are hints: FIFO checks and OS locks still decide ownership.
   Timed polling remains as a fallback (15 ms at the front, 10 ms for followers, up to 40 ms behind the front).
@@ -481,7 +558,7 @@ not stamped, since every cargo run copies them again and only cargo runs them.
 versioned binary format with a checksum, so a torn or foreign file is ignored and replaced. At most 256 records are
 kept, each at most 16 MiB; records written more than 30 days ago, stale temporary files and, once a day, records whose
 workspace or target directory vanished are removed when a record is written. A run that the fast path answers still
-runs the daily automatic gc at startup, runs automatic compaction when due as after a cargo no-op, records its run in
+runs the daily automatic gc at startup, starts automatic compaction in the background when due as after a cargo no-op, records its run in
 the event log when the display is on, and may print the update notice.
 
 **Audit.** `FRUST_NOOP=audit` runs cargo anyway whenever the fast path would have answered, and fails the build with

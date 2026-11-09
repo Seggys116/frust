@@ -427,10 +427,10 @@ fn a_restore_beside_cargos_alias_of_a_removed_output_links_instead_of_copying() 
     let (sb, a) = scene_with_build_script("lk-alias");
     build(&sb, &a, "force");
     let profile = sb.central_target(&a).join("debug");
-    let script = walk(&profile.join("build")).into_iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("build_script_build-") && p.extension().is_none())).expect("the build script executable");
-    let hashed = script.file_name().unwrap().to_string_lossy().rsplit_once('-').unwrap().1.to_string();
+    let script = walk(&profile.join("build")).into_iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("build_script_build-") && p.extension().is_none_or(|e| e == std::env::consts::EXE_EXTENSION))).expect("the build script executable");
+    let hashed = script.file_stem().unwrap().to_string_lossy().rsplit_once('-').unwrap().1.to_string();
     // Cargo hard-links the executable to `build-script-build` and removes the hashed name before the next compile of the unit.
-    let alias = script.with_file_name("build-script-build");
+    let alias = script.with_file_name(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
     let _ = fs::remove_file(&alias);
     fs::hard_link(&script, &alias).unwrap();
     fs::remove_file(&script).unwrap();

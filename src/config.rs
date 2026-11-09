@@ -104,6 +104,11 @@ pub fn share_roots() -> bool {
     flag("FRUST_CACHE_SHARE_ROOTS", false)
 }
 
+/// `FRUST_CHECK_DIR`: `check` and `clippy` get their own artifact directory beside the build target, so they never wait on a build; on by default.
+pub fn check_dir() -> bool {
+    flag("FRUST_CHECK_DIR", true)
+}
+
 /// The most slot lock files a store can ever use; gc treats every slot below it as canonical.
 pub const MAX_STORE_SLOTS: usize = 16;
 
@@ -115,6 +120,23 @@ pub fn store_slots() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=MAX_STORE_SLOTS).contains(n))
         .unwrap_or_else(|| default_store_slots(cpus))
+}
+
+/// When deferred stores run relative to the cargo build that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreStart {
+    /// While cargo is still building, at store priority.
+    Eager,
+    /// Queued as job files and started once cargo has exited, so no store competes with the compiles.
+    AfterBuild,
+}
+
+/// `FRUST_STORE_START`: `eager` (default) or `after-build`.
+pub fn store_start() -> StoreStart {
+    match env::var("FRUST_STORE_START").as_deref().map(str::trim) {
+        Ok("after-build") => StoreStart::AfterBuild,
+        _ => StoreStart::Eager,
+    }
 }
 
 fn default_store_slots(cpus: usize) -> usize {

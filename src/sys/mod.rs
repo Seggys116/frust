@@ -23,6 +23,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -88,6 +89,55 @@ impl Meta {
 
 pub fn stat(path: &Path) -> io::Result<Meta> {
     imp::stat(path).map(Meta::pair)
+}
+
+/// What `stat` reports for one directory entry: identity, size and times, following a final symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryStat {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+    pub is_file: bool,
+}
+
+impl EntryStat {
+    pub fn of(meta: &Meta) -> EntryStat {
+        EntryStat { dev: meta.dev(), ino: meta.ino(), size: meta.len(), mtime: meta.mtime(), ctime: meta.ctime(), is_file: meta.is_file() }
+    }
+}
+
+/// Entries of `dir` that `wanted` accepts, with the stat of those `stamped` accepts (`None` where it fails); macOS reads entries in batches, and a set `bulk` lets a later scan skip the listing that chose that.
+pub fn scan_dir(
+    dir: &Path,
+    wanted: impl Fn(&OsStr) -> bool,
+    stamped: impl Fn(&OsStr) -> bool,
+    bulk: &AtomicBool,
+) -> io::Result<Vec<(OsString, Option<EntryStat>)>> {
+    imp::scan_dir(dir, &wanted, &stamped, bulk)
+}
+
+/// Whether a directory can be stat'd while another process writes into it without disturbing that process; Windows handles can block a rename or delete.
+pub const STAT_BESIDE_WRITERS: bool = cfg!(unix);
+
+/// The portable scan: one `stat` per stamped entry.
+#[cfg(any(not(target_os = "macos"), test))]
+fn scan_dir_each(
+    dir: &Path,
+    wanted: &dyn Fn(&OsStr) -> bool,
+    stamped: &dyn Fn(&OsStr) -> bool,
+) -> io::Result<Vec<(OsString, Option<EntryStat>)>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name();
+        if !wanted(&name) {
+            continue;
+        }
+        let stat = stamped(&name).then(|| stat(&entry.path()).ok().map(|meta| EntryStat::of(&meta))).flatten();
+        found.push((name, stat));
+    }
+    Ok(found)
 }
 
 pub fn lstat(path: &Path) -> io::Result<Meta> {
@@ -694,6 +744,19 @@ pub fn seal_inherited_descriptors() {
 /// Below builds but never starved, for stores that builds and drains wait on.
 pub fn lower_store_priority() {
     imp::lower_store_priority()
+}
+
+/// Cargo uplifts a root's artifacts into the profile directory by hard link, which moves the change time of the compiled file; on macOS it copies them.
+pub const CARGO_UPLIFT_LINKS: bool = cfg!(not(target_os = "macos"));
+
+/// CPU time the calling thread has used, in nanoseconds; `None` where the platform cannot say.
+pub fn thread_cpu_ns() -> Option<u64> {
+    imp::thread_cpu_ns()
+}
+
+/// CPU time every thread of this process has used, in nanoseconds.
+pub fn process_cpu_ns() -> Option<u64> {
+    imp::process_cpu_ns()
 }
 
 pub fn fs_type_name(path: &Path) -> Option<String> {

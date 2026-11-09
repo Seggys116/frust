@@ -1,6 +1,7 @@
 //! A profile directory is mutated only while holding cargo's own locks, taken without blocking, so one in use is skipped.
 
 mod sessions;
+mod slice;
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::fsx;
 use crate::paths::Dirs;
+pub use crate::progress::Progress;
+use crate::progress::Silent;
 use crate::stats;
 use crate::sys;
+use slice::{Slices, Yield};
 
 /// The most compression or deduplication could save below this is a few 4 KiB blocks, not worth a rewrite.
 pub const MIN_FILE_BYTES: u64 = 16 * 1024;
@@ -316,13 +320,19 @@ fn on_lowered_thread<R: Send>(lower: fn(), f: impl FnOnce() -> R + Send) -> R {
 
 /// Compressed files keep their data in the resource fork, where extent probing cannot see it, so APFS uses `getattrlist`.
 pub fn physical_size(roots: &[&Path]) -> u64 {
+    physical_sizes(roots, &mut |_, _| {}).iter().sum()
+}
+
+/// Per root, in order, from one walk: sharing with an earlier root is charged to that root, so the parts sum to [`physical_size`].
+pub fn physical_sizes(roots: &[&Path], done: &mut dyn FnMut(usize, u64)) -> Vec<u64> {
     if !cfg!(target_os = "macos") {
-        return fsx::physical_size(roots);
+        return fsx::physical_sizes(roots, done);
     }
     let mut inodes = HashSet::new();
     let mut groups = HashSet::new();
-    let mut total = 0;
-    for root in roots {
+    let mut sizes = Vec::with_capacity(roots.len());
+    for (at, root) in roots.iter().enumerate() {
+        let mut total = 0;
         walk_files(root, &mut |path, meta| {
             if !inodes.insert((meta.dev(), meta.ino())) {
                 return;
@@ -333,8 +343,10 @@ pub fn physical_size(roots: &[&Path]) -> u64 {
                 _ => allocated,
             };
         });
+        done(at, total);
+        sizes.push(total);
     }
-    total
+    sizes
 }
 
 struct AllocationNode {
@@ -1282,7 +1294,12 @@ fn retained_root_time(path: &Path) -> io::Result<(File, SystemTime)> {
 }
 
 /// Caller holds every ProfileLock and excludes live deferred paths; incremental trees are admitted together before any payload is removed.
-pub fn remove_profile_payloads_with(profiles: &[PathBuf], mut removed: impl FnMut(&Path, u64)) -> io::Result<()> {
+pub fn remove_profile_payloads_with(profiles: &[PathBuf], removed: impl FnMut(&Path, u64)) -> io::Result<()> {
+    remove_profile_payloads_until(profiles, None, removed).map(drop)
+}
+
+/// Stops between two payloads once `deadline` passes, with root times restored; false means call again for the rest.
+fn remove_profile_payloads_until(profiles: &[PathBuf], deadline: Option<Instant>, mut removed: impl FnMut(&Path, u64)) -> io::Result<bool> {
     let mut payloads = Vec::new();
     let mut sets = Vec::new();
     let mut root_times = Vec::new();
@@ -1333,7 +1350,12 @@ pub fn remove_profile_payloads_with(profiles: &[PathBuf], mut removed: impl FnMu
     // Root timestamps are restored before session guards drop, including on an interrupted callback.
     let mut root_times = RetainedRootTimes(root_times);
     payloads.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    for (_, path, bytes) in payloads {
+    for (done, (_, path, bytes)) in payloads.into_iter().enumerate() {
+        // At least one payload per call, so a slice spent listing still makes progress.
+        if done > 0 && deadline.is_some_and(|d| Instant::now() >= d) {
+            root_times.restore()?;
+            return Ok(false);
+        }
         if sets.iter().any(|(root, _)| root == &path) {
             guard.as_mut().ok_or_else(incremental_retained)?.remove_root(&path)?;
         } else {
@@ -1341,7 +1363,7 @@ pub fn remove_profile_payloads_with(profiles: &[PathBuf], mut removed: impl FnMu
         }
         removed(&path, bytes);
     }
-    root_times.restore()
+    root_times.restore().map(|()| true)
 }
 
 fn incremental_retained() -> io::Error {
@@ -1417,13 +1439,55 @@ pub struct Report {
     pub allocated_after: u64,
     /// The pass ran out of its time or byte budget and left the rest for the next due pass.
     pub budget_stopped: bool,
+    /// Set when a sliced pass gave way to a build or a changed target; the next due pass continues.
+    pub aborted: Option<&'static str>,
+    pub slices: u32,
+    /// The longest time one slice held Cargo's profile locks.
+    pub longest_slice_ms: u64,
+    /// Keyed by workspace directory name, or `cache store`.
+    pub workspaces: BTreeMap<String, WorkspaceCompaction>,
 }
 
+/// One workspace's share of a pass; the byte counts add up to the report's totals.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkspaceCompaction {
+    pub before: u64,
+    pub profiles: usize,
+    pub busy: usize,
+    pub removed: u64,
+    pub compressed: u64,
+    pub deduped: u64,
+}
+
+fn scope_of(dirs: &Dirs, path: &Path) -> String {
+    stats::workspace_of(dirs, path).unwrap_or_else(|| path.display().to_string())
+}
+
+/// A profile named by its workspace and its path inside it, such as `app-1a2b/35a0f951a33b/harness`.
+fn profile_scope(dirs: &Dirs, profile: &Path) -> String {
+    match profile.strip_prefix(dirs.targets()) {
+        Ok(rest) => rest.display().to_string(),
+        Err(_) => profile.display().to_string(),
+    }
+}
+
+/// Every workspace's toolchain directories, listed without measuring them; the pass measures each root once itself.
 pub fn central_targets(dirs: &Dirs) -> Vec<PathBuf> {
-    stats::targets(dirs).into_iter().map(|t| t.path).collect()
+    let mut out = Vec::new();
+    let Ok(workspaces) = fs::read_dir(dirs.targets()) else { return out };
+    for workspace in workspaces.flatten() {
+        let Ok(toolchains) = fs::read_dir(workspace.path()) else { continue };
+        out.extend(toolchains.flatten().map(|tc| tc.path()).filter(|path| path.is_dir()));
+    }
+    out.sort();
+    out
 }
 
 pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Report {
+    compact_with(dirs, targets, opts, &mut Silent)
+}
+
+pub fn compact_with(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions, progress: &mut dyn Progress) -> Report {
     let mut report = Report { supported: apfs::SUPPORTED, ..Report::default() };
     let store = dirs.store();
     let mut roots: Vec<PathBuf> = targets.to_vec();
@@ -1431,20 +1495,33 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
         roots.push(store.clone());
     }
     let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-    report.physical_before = physical_size(&root_refs);
+    let scopes: Vec<String> = roots.iter().map(|root| scope_of(dirs, root)).collect();
+    progress.phase("measure", Some(roots.len() as u64), "measured");
+    let before = physical_sizes(&root_refs, &mut |at, bytes| progress.item(&scopes[at], bytes));
+    for (scope, bytes) in scopes.iter().zip(&before) {
+        report.workspaces.entry(scope.clone()).or_default().before += bytes;
+    }
+    report.physical_before = before.iter().sum();
 
     // Locks are held for the whole pass because files move between target directories.
     let mut locks = Vec::new();
     let mut profiles = Vec::new();
-    for target in targets {
-        let ours = target.starts_with(dirs.targets());
-        for profile in profile_dirs(target) {
-            match ProfileLock::try_acquire(&profile) {
-                Some(lock) => {
-                    locks.push(lock);
-                    profiles.push((profile, ours));
-                }
-                None => report.busy.push(profile),
+    let found: Vec<(PathBuf, bool)> =
+        targets.iter().flat_map(|target| profile_dirs(target).into_iter().map(move |profile| (profile, target.starts_with(dirs.targets())))).collect();
+    progress.phase("lock profiles", Some(found.len() as u64), "");
+    for (profile, ours) in found {
+        let usage = report.workspaces.entry(scope_of(dirs, &profile)).or_default();
+        match ProfileLock::try_acquire(&profile) {
+            Some(lock) => {
+                usage.profiles += 1;
+                locks.push(lock);
+                progress.item(&profile_scope(dirs, &profile), 0);
+                profiles.push((profile, ours));
+            }
+            None => {
+                usage.busy += 1;
+                progress.item(&format!("{} (busy)", profile_scope(dirs, &profile)), 0);
+                report.busy.push(profile);
             }
         }
     }
@@ -1458,10 +1535,12 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
     }
 
     if opts.remove_superseded {
+        progress.phase("remove superseded", Some(profiles.iter().filter(|(_, ours)| *ours).count() as u64), if opts.dry_run { "reclaimable" } else { "freed" });
         for (profile, ours) in &profiles {
             if !ours {
                 continue;
             }
+            let removed_before = report.removed_bytes;
             let mut doomed = Vec::new();
             let analysis = analyze(profile);
             match &analysis {
@@ -1491,28 +1570,42 @@ pub fn compact(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions) -> Repor
             report.stale_objects += objects.len();
             retain_unprotected(&mut objects, &protection, &mut report);
             remove_or_plan(objects, opts.dry_run, &mut report);
+            progress.item(&profile_scope(dirs, profile), report.removed_bytes.saturating_sub(removed_before));
         }
     }
 
     if apfs::SUPPORTED && (opts.compress || opts.dedupe) {
         let mut candidates = Vec::new();
+        let with_store = opts.include_store && store.is_dir();
+        progress.phase("collect files", Some((profiles.len() + usize::from(with_store)) as u64), "eligible");
+        let mut collect = |root: &Path, in_store: bool, scope: &str, candidates: &mut Vec<Candidate>| {
+            let first = candidates.len();
+            collect_candidates(root, in_store, candidates);
+            progress.item(scope, candidates[first..].iter().map(|c| c.meta.len()).sum());
+        };
         for (profile, _) in &profiles {
-            collect_candidates(profile, false, &mut candidates);
+            collect(profile, false, &profile_scope(dirs, profile), &mut candidates);
         }
-        if opts.include_store && store.is_dir() {
-            collect_candidates(&store, true, &mut candidates);
+        if with_store {
+            collect(&store, true, stats::STORE_SCOPE, &mut candidates);
         }
         retain_unprotected_candidates(&mut candidates, &protection, &mut report);
-        shrink(candidates, opts, &mut ShrinkCtx::plain(), &mut report);
+        let mut ctx = ShrinkCtx::plain();
+        shrink(candidates, opts, &mut ctx, &mut report, progress, &|path| scope_of(dirs, path));
+        crate::noop::restamp(dirs, &ctx.rewrites, false);
     }
 
     drop(locks);
+    for (path, bytes) in &report.removed {
+        report.workspaces.entry(scope_of(dirs, path)).or_default().removed += bytes;
+    }
     report.physical_after = if opts.dry_run {
         report
             .physical_before
             .saturating_sub(report.removed_bytes + report.compress_before.saturating_sub(report.compress_after) + report.dedupe_saved)
     } else {
-        physical_size(&root_refs)
+        progress.phase("measure again", Some(roots.len() as u64), "measured");
+        physical_sizes(&root_refs, &mut |at, bytes| progress.item(&scopes[at], bytes)).iter().sum()
     };
     report
 }
@@ -1551,21 +1644,57 @@ struct Budget {
 }
 
 /// State shared by the files of one shrink pass: the optional work budget, the persistent memo and the sampler switch.
-struct ShrinkCtx {
+struct ShrinkCtx<'a> {
     budget: Option<Budget>,
     memo: Option<Memo>,
     memo_path: Option<PathBuf>,
     sample: bool,
     stopped: bool,
+    dir_times: DirTimes,
+    pause: Option<&'a mut dyn Pause>,
+    /// Recorded outputs keep serving the no-op fast path only if their records are restamped for these.
+    rewrites: Vec<crate::noop::Rewrite>,
 }
 
-impl ShrinkCtx {
-    /// No budget, no memo and no sampling: the explicit `frust compact` behaviour.
-    fn plain() -> ShrinkCtx {
-        ShrinkCtx { budget: None, memo: None, memo_path: None, sample: false, stopped: false }
+/// How a shrink pass gives way inside a sliced automatic pass.
+trait Pause {
+    /// Between two files: may release the locks and take them again.
+    fn checkpoint(&mut self) -> Yield;
+    /// Runs `work` with the locks released.
+    fn outside(&mut self, work: &mut dyn FnMut()) -> Yield;
+    /// Hands over rewrites to restamp before the locks are next released.
+    fn note(&mut self, rewrites: Vec<crate::noop::Rewrite>);
+}
+
+struct SlicePause<'s, 'a> {
+    slices: &'s mut Slices<'a>,
+    store: &'s OnceCell<StoreIndex>,
+}
+
+impl Pause for SlicePause<'_, '_> {
+    fn checkpoint(&mut self) -> Yield {
+        checkpoint(self.slices, self.store)
     }
 
-    fn for_auto(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> ShrinkCtx {
+    fn outside(&mut self, work: &mut dyn FnMut()) -> Yield {
+        credit_pause(self.slices.release_while(work).1, self.store)
+    }
+
+    fn note(&mut self, rewrites: Vec<crate::noop::Rewrite>) {
+        self.slices.note(rewrites);
+    }
+}
+
+/// Reading and encoding a file this large takes tens of milliseconds, so a sliced pass does it without the locks.
+const UNLOCKED_ENCODE_BYTES: u64 = 4 * 1024 * 1024;
+
+impl<'a> ShrinkCtx<'a> {
+    /// No budget, no memo and no sampling: the explicit `frust compact` behaviour.
+    fn plain() -> ShrinkCtx<'a> {
+        ShrinkCtx { budget: None, memo: None, memo_path: None, sample: false, stopped: false, dir_times: DirTimes::default(), pause: None, rewrites: Vec::new() }
+    }
+
+    fn for_auto(dirs: &Dirs, target: &Path, opts: &AutoOptions, pause: &'a mut dyn Pause) -> ShrinkCtx<'a> {
         let path = dirs.compact_memo(target);
         ShrinkCtx {
             budget: Some(Budget { deadline: Instant::now() + opts.pass_budget, bytes_left: opts.pass_bytes }),
@@ -1573,10 +1702,55 @@ impl ShrinkCtx {
             memo_path: Some(path),
             sample: true,
             stopped: false,
+            dir_times: DirTimes::default(),
+            pause: Some(pause),
+            rewrites: Vec::new(),
         }
     }
 
+    /// Called under the locks right after `path` was replaced by identical bytes.
+    fn rewritten(&mut self, path: &Path, before: &sys::Meta) {
+        if let Ok(after) = crate::cache::hashing::Stamp::read(path) {
+            self.rewrites.push(crate::noop::Rewrite { path: path.to_path_buf(), before: crate::cache::hashing::Stamp::of(before), after });
+        }
+    }
+
+    /// False when the pass must stop.
+    fn resumed(&mut self, step: Yield) -> bool {
+        match step {
+            Yield::Kept => true,
+            // Another process may have touched these directories while the locks were free.
+            Yield::Resumed(paused) => {
+                self.dir_times = DirTimes::default();
+                if let Some(b) = &mut self.budget {
+                    b.deadline += paused;
+                }
+                true
+            }
+            Yield::Abort => {
+                self.stopped = true;
+                false
+            }
+        }
+    }
+
+    /// None when the pass must stop; an unsliced pass runs `work` in place.
+    fn unlocked<R>(&mut self, mut work: impl FnMut() -> R) -> Option<R> {
+        let Some(pause) = self.pause.as_mut() else { return Some(work()) };
+        pause.note(std::mem::take(&mut self.rewrites));
+        let mut done = None;
+        let step = pause.outside(&mut || done = Some(work()));
+        if self.resumed(step) { done } else { None }
+    }
+
     fn exhausted(&mut self) -> bool {
+        if let Some(pause) = self.pause.as_mut() {
+            pause.note(std::mem::take(&mut self.rewrites));
+            let step = pause.checkpoint();
+            if !self.resumed(step) {
+                return true;
+            }
+        }
         let spent = self.budget.as_ref().is_some_and(|b| b.bytes_left == 0 || Instant::now() >= b.deadline);
         self.stopped |= spent;
         spent
@@ -1777,12 +1951,35 @@ impl Memo {
     }
 }
 
-fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx, report: &mut Report) {
+/// Charges a candidate's savings to its workspace; an empty scope (automatic passes) keeps no breakdown.
+struct Credit<'a> {
+    progress: &'a mut dyn Progress,
+    scope_of: &'a dyn Fn(&Path) -> String,
+}
+
+impl Credit<'_> {
+    fn done(&mut self, c: &Candidate, report: &mut Report, compressed: u64, deduped: u64) {
+        let scope = (self.scope_of)(&c.path);
+        if !scope.is_empty() {
+            let usage = report.workspaces.entry(scope.clone()).or_default();
+            usage.compressed += compressed;
+            usage.deduped += deduped;
+        }
+        self.progress.item(&scope, c.meta.len());
+    }
+}
+
+fn compress_saving(report: &Report) -> u64 {
+    report.compress_before.saturating_sub(report.compress_after)
+}
+
+fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx<'_>, report: &mut Report, progress: &mut dyn Progress, scope_of: &dyn Fn(&Path) -> String) {
+    progress.phase("compress and dedupe", Some(candidates.len() as u64), "examined");
+    let mut tally = Credit { progress, scope_of };
     let mut by_size: BTreeMap<u64, Vec<Candidate>> = BTreeMap::new();
     for c in candidates {
         by_size.entry(c.meta.len()).or_default().push(c);
     }
-    let mut dir_times = DirTimes::default();
     // Largest files first, so a pass cut short by its budget has done the most valuable work.
     'buckets: for (_, mut bucket) in by_size.into_iter().rev() {
         if ctx.exhausted() {
@@ -1794,15 +1991,21 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
                 if ctx.exhausted() {
                     break 'buckets;
                 }
+                let saved = compress_saving(report);
                 if opts.compress && !apfs::is_compressed(&c.meta) {
-                    compress_one(&c, opts.dry_run, &mut dir_times, ctx, report);
+                    compress_one(&c, opts.dry_run, ctx, report);
                 }
+                let saved = compress_saving(report).saturating_sub(saved);
+                tally.done(&c, report, saved, 0);
             }
             continue;
         }
         // One clone group of compressed files means an earlier pass already handled them.
         let clone_ids: HashSet<Option<u64>> = bucket.iter().map(|c| apfs::clone_info(&c.path).map(|i| i.0)).collect();
         if clone_ids.len() == 1 && !clone_ids.contains(&None) && bucket.iter().all(|c| apfs::is_compressed(&c.meta)) {
+            for c in &bucket {
+                tally.done(c, report, 0, 0);
+            }
             continue;
         }
         // The flag marks a digest that came from the memo rather than from reading the file just now.
@@ -1821,7 +2024,10 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
                     ctx.remember_hash(&c.path, &c.meta, digest);
                     groups.entry(digest).or_default().push((c, false));
                 }
-                Err(err) => report.errors.push((c.path.clone(), err.to_string())),
+                Err(err) => {
+                    report.errors.push((c.path.clone(), err.to_string()));
+                    tally.done(&c, report, 0, 0);
+                }
             }
         }
         for (_, mut group) in groups {
@@ -1832,41 +2038,52 @@ fn shrink(candidates: Vec<Candidate>, opts: &CompactOptions, ctx: &mut ShrinkCtx
             group.sort_by_key(|(c, _)| (!apfs::is_compressed(&c.meta), !c.in_store, c.path.clone()));
             let mut members = group.into_iter();
             let Some((canonical, canonical_memoised)) = members.next() else { continue };
+            let saved = compress_saving(report);
             if opts.compress && !apfs::is_compressed(&canonical.meta) {
-                compress_one(&canonical, opts.dry_run, &mut dir_times, ctx, report);
+                compress_one(&canonical, opts.dry_run, ctx, report);
             }
+            let saved = compress_saving(report).saturating_sub(saved);
+            tally.done(&canonical, report, saved, 0);
             let canon_meta = sys::lstat(&canonical.path).ok();
             let canon_clone = apfs::clone_info(&canonical.path).map(|i| i.0);
             for (m, memoised) in members {
-                if canon_clone.is_some() && apfs::clone_info(&m.path).map(|i| i.0) == canon_clone {
-                    continue;
-                }
-                let saved = m.meta.allocated();
-                if opts.dry_run {
-                    report.deduped_files += 1;
-                    report.dedupe_saved += saved;
-                    continue;
-                }
-                if ctx.exhausted() {
-                    break 'buckets;
-                }
-                let Some(cm) = canon_meta.as_ref() else { continue };
-                // A remembered digest is only a hint: the bytes are compared before anything is replaced.
-                if (canonical_memoised || memoised) && !same_bytes(&canonical.path, &m.path).unwrap_or(false) {
-                    ctx.forget(&canonical.meta);
-                    ctx.forget(&m.meta);
-                    continue;
-                }
-                if canonical_memoised || memoised {
-                    ctx.spend(m.meta.len());
-                }
-                match replace_with_clone(&canonical.path, cm, &m, &mut dir_times) {
-                    Ok(()) => {
+                let deduped = 'member: {
+                    if canon_clone.is_some() && apfs::clone_info(&m.path).map(|i| i.0) == canon_clone {
+                        break 'member 0;
+                    }
+                    let saved = m.meta.allocated();
+                    if opts.dry_run {
                         report.deduped_files += 1;
                         report.dedupe_saved += saved;
+                        break 'member saved;
                     }
-                    Err(err) => report.errors.push((m.path.clone(), err.to_string())),
-                }
+                    if ctx.exhausted() {
+                        break 'buckets;
+                    }
+                    let Some(cm) = canon_meta.as_ref() else { break 'member 0 };
+                    // A remembered digest is only a hint: the bytes are compared before anything is replaced.
+                    if (canonical_memoised || memoised) && !same_bytes(&canonical.path, &m.path).unwrap_or(false) {
+                        ctx.forget(&canonical.meta);
+                        ctx.forget(&m.meta);
+                        break 'member 0;
+                    }
+                    if canonical_memoised || memoised {
+                        ctx.spend(m.meta.len());
+                    }
+                    match replace_with_clone(&canonical.path, cm, &m, &mut ctx.dir_times) {
+                        Ok(()) => {
+                            report.deduped_files += 1;
+                            report.dedupe_saved += saved;
+                            ctx.rewritten(&m.path, &m.meta);
+                            saved
+                        }
+                        Err(err) => {
+                            report.errors.push((m.path.clone(), err.to_string()));
+                            0
+                        }
+                    }
+                };
+                tally.done(&m, report, 0, deduped);
             }
         }
     }
@@ -2053,7 +2270,7 @@ fn unchanged(path: &Path, meta: &sys::Meta) -> bool {
     sys::lstat(path).is_ok_and(|now| now.ino() == meta.ino() && now.len() == meta.len() && now.mtime() == meta.mtime())
 }
 
-fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mut ShrinkCtx, report: &mut Report) {
+fn compress_one(c: &Candidate, dry_run: bool, ctx: &mut ShrinkCtx<'_>, report: &mut Report) {
     if ctx.known_incompressible(&c.meta) {
         return;
     }
@@ -2066,7 +2283,15 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
             return;
         }
     }
-    let data = match fs::read(&c.path) {
+    // Whatever changes meanwhile fails the unchanged-file check made under the locks before the rename.
+    let encode = || fs::read(&c.path).map(|data| { let fork = apfs::encode_lzfse_fork(&data); (data, fork) });
+    let encoded = if c.meta.len() >= UNLOCKED_ENCODE_BYTES {
+        let Some(encoded) = ctx.unlocked(encode) else { return };
+        encoded
+    } else {
+        encode()
+    };
+    let (data, fork) = match encoded {
         Ok(d) => d,
         Err(err) => {
             report.errors.push((c.path.clone(), err.to_string()));
@@ -2077,7 +2302,7 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
     if data.len() as u64 != c.meta.len() {
         return;
     }
-    let Some(fork) = apfs::encode_lzfse_fork(&data) else { return };
+    let Some(fork) = fork else { return };
     let before = c.meta.allocated();
     let after = (fork.len() as u64).div_ceil(4096) * 4096;
     if after + 8192 > before || after > before - before / 20 {
@@ -2091,7 +2316,7 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
         return;
     }
     let tmp = fsx::temp_sibling(&c.path);
-    let result = dir_times.rewrite(&c.path, &tmp, |parent| -> io::Result<u64> {
+    let result = ctx.dir_times.rewrite(&c.path, &tmp, |parent| -> io::Result<u64> {
         apfs::write_compressed(&tmp, &c.path, &c.meta, &data, &fork)?;
         verify_same(&tmp, &data)?;
         apfs::set_times(&tmp, c.meta.atime(), c.meta.mtime())?;
@@ -2111,6 +2336,7 @@ fn compress_one(c: &Candidate, dry_run: bool, dir_times: &mut DirTimes, ctx: &mu
             report.compressed_files += 1;
             report.compress_before += before;
             report.compress_after += after;
+            ctx.rewritten(&c.path, &c.meta);
         }
         Err(err) => {
             report.errors.push((c.path.clone(), err.to_string()));
@@ -2125,7 +2351,7 @@ pub fn compress_file(path: &Path) -> io::Result<bool> {
     }
     let mut report = Report::default();
     let candidate = Candidate { path: path.to_path_buf(), meta, in_store: false };
-    compress_one(&candidate, false, &mut DirTimes::default(), &mut ShrinkCtx::plain(), &mut report);
+    compress_one(&candidate, false, &mut ShrinkCtx::plain(), &mut report);
     match report.errors.pop() {
         Some((_, err)) => Err(io::Error::other(err)),
         None => Ok(report.compressed_files == 1),
@@ -2232,6 +2458,8 @@ pub struct AutoOptions {
     pub pass_budget: Duration,
     /// Bytes that stage may read or encode in one pass.
     pub pass_bytes: u64,
+    /// How long one slice may hold Cargo's profile locks before the pass yields to builds; zero holds them for the whole pass.
+    pub slice: Duration,
 }
 
 impl AutoOptions {
@@ -2261,11 +2489,15 @@ impl AutoOptions {
             compress: true,
             pass_budget: Duration::from_secs(2),
             pass_bytes: 512 * 1024 * 1024,
+            slice: Duration::from_millis(var("FRUST_COMPACT_SLICE_MS").and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_SLICE_MS)),
         }
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// On ripgrep most lock holds took under 15 ms; one session removal or compressed write ran past it, up to 340 ms on a loaded machine.
+const DEFAULT_SLICE_MS: u64 = 100;
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct AutoMarker {
     allocated_after: u64,
     /// Time of the last completed pass; skips and incomplete retries preserve it.
@@ -2279,6 +2511,13 @@ struct AutoMarker {
     /// False after a partial or failed pass, so the next due pass retries instead of being skipped.
     #[serde(default = "complete_by_default")]
     complete: bool,
+    /// Cost of the pass that wrote this marker: its slices, the longest lock hold and the CPU it used.
+    #[serde(default)]
+    slices: u32,
+    #[serde(default)]
+    longest_slice_ms: u64,
+    #[serde(default)]
+    cpu_ms: u64,
 }
 
 impl AutoMarker {
@@ -2299,7 +2538,7 @@ fn complete_by_default() -> bool {
 }
 
 fn auto_pass_complete(report: &Report) -> bool {
-    !report.budget_stopped && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0 && report.retained_cache_entries == 0 && report.retained_deferred_paths == 0
+    !report.budget_stopped && report.aborted.is_none() && report.busy.is_empty() && report.errors.is_empty() && report.retained_incremental == 0 && report.retained_cache_entries == 0 && report.retained_deferred_paths == 0
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
@@ -2378,43 +2617,84 @@ fn write_marker(file: &File, record: &AutoMarker) {
     }
 }
 
-/// The caller must hold frust's build lock; cargo's profile locks are also taken without blocking so a plain cargo build is never disturbed.
+/// The hidden `frust compact --auto-background TARGET` entry that runs a due pass detached from any build.
+pub const AUTO_CHILD_FLAG: &str = "--auto-background";
+
+/// One automatic pass in this process; Cargo's profile locks are taken without blocking and released between slices.
 pub fn auto_compact(dirs: &Dirs, target_dir: &Path, cfg: &Config) -> CompactReport {
     auto_compact_with(dirs, target_dir, &AutoOptions::from_env(cfg))
 }
 
-pub fn auto_compact_with(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> CompactReport {
-    let mut report = Report { supported: apfs::SUPPORTED, ..Report::default() };
+/// Why no pass is due, from the marker's age alone; cheap enough for the end of every build.
+fn auto_skip(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> Option<&'static str> {
     if !opts.enabled {
-        report.skipped = Some("disabled by FRUST_AUTO_COMPACT");
-        return report;
+        return Some("disabled by FRUST_AUTO_COMPACT");
     }
     if !target.starts_with(dirs.targets()) {
-        report.skipped = Some("not a frust central target directory");
-        return report;
+        return Some("not a frust central target directory");
     }
     let marker = target.join(AUTO_MARKER);
     if let Ok(meta) = fs::metadata(&marker)
         && marker_age(&meta).is_some_and(|a| a < opts.every)
     {
         if marker_age(&meta).is_some_and(|age| age < opts.every.min(AUTO_RETRY_EVERY)) {
-            report.skipped = Some("not due");
-            return report;
+            return Some("not due");
         }
         let previous = fs::read(&marker).ok().and_then(|b| serde_json::from_slice::<AutoMarker>(&b).ok());
         if previous.as_ref().is_some_and(|p| marker_age(&meta).is_some_and(|age| age < p.interval(opts))) {
-            report.skipped = Some("not due");
-            return report;
+            return Some("not due");
         }
     }
     let central = dirs.targets();
     if target.ancestors().take_while(|p| p.starts_with(&central))
         .any(|p| !sys::lstat(p).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()))
     {
-        report.skipped = Some("unsafe central target path");
+        return Some("unsafe central target path");
+    }
+    None
+}
+
+pub fn auto_compact_with(dirs: &Dirs, target: &Path, opts: &AutoOptions) -> CompactReport {
+    let mut report = Report { supported: apfs::SUPPORTED, ..Report::default() };
+    if let Some(why) = auto_skip(dirs, target, opts) {
+        report.skipped = Some(why);
         return report;
     }
-    at_background_priority(|| auto_compact_pass(dirs, target, opts, report))
+    // Background QoS can starve on a busy machine while holding locks a build waits for; utility yields to builds yet keeps slices short.
+    at_store_priority(|| auto_compact_pass(dirs, target, opts, report))
+}
+
+/// Called once a build has released its lock: a due pass starts as a detached process, so no build waits for it.
+pub fn start_auto(dirs: &Dirs, target: &Path, cfg: &Config) -> &'static str {
+    let opts = AutoOptions::from_env(cfg);
+    if let Some(why) = auto_skip(dirs, target, &opts) {
+        return why;
+    }
+    // Opt-in, like FRUST_GC_SYNC: the invoking command runs the pass itself, after its build lock is released.
+    if matches!(std::env::var("FRUST_COMPACT_SYNC").ok().map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1" | "on" | "true" | "yes")) {
+        let report = auto_compact_with(dirs, target, &opts);
+        return report.skipped.unwrap_or("ran in this process");
+    }
+    // A running pass holds the marker exclusively for its whole run.
+    if let Ok(file) = File::open(target.join(AUTO_MARKER)) {
+        match sys::try_lock(&file, sys::LockKind::Shared) {
+            Ok(()) => drop(CompactionLock(file)),
+            Err(_) => return "another compaction is running",
+        }
+    }
+    let Some(exe) = crate::gc::collector_binary() else { return "no frust binary to run it" };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["compact", AUTO_CHILD_FLAG]).arg(target).env("FRUST_HOME", dirs.root());
+    match sys::spawn_detached(&mut cmd, &[]) {
+        Ok(()) => "started in the background",
+        Err(_) => "the background pass could not start",
+    }
+}
+
+/// The detached child: one pass at background priority that never prints.
+pub fn run_auto_child(dirs: &Dirs, cfg: &Config, target: &Path) -> i32 {
+    let _ = auto_compact(dirs, target, cfg);
+    0
 }
 
 fn marker_age(m: &fs::Metadata) -> Option<Duration> {
@@ -2438,7 +2718,8 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         report.skipped = Some("not due");
         return report;
     }
-    let options_key = format!("{opts:?}");
+    let cpu_before = sys::process_cpu_ns();
+    let options_key = format!("{:?}", AutoOptions { slice: Duration::ZERO, ..opts.clone() });
     let signature = change_signature(dirs, target, &options_key);
     let reassess_age = previous.as_ref().is_none_or(|prev| prev.age_reassessment_due(fsx::unix_now()));
     // Mirrors the growth check below without walking the target: an unchanged tree cannot have grown.
@@ -2449,7 +2730,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         && prev.signature == sig
         && prev.allocated_after <= opts.max_target_bytes
     {
-        let record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries, signature: sig, complete: true };
+        let record = AutoMarker { signature: sig, complete: true, ..prev.clone() };
         write_marker(&file, &record);
         let _ = file.set_modified(SystemTime::now());
         report.skipped = Some("nothing changed since the last pass");
@@ -2466,7 +2747,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     {
         // Every path-crate edit still adds cache entries even when the target is bounded, so prune once enough appear.
         let entries = store_entries(dirs);
-        let mut record = AutoMarker { allocated_after: prev.allocated_after, at_unix: prev.at_unix, store_entries: prev.store_entries, signature: 0, complete: true };
+        let mut record = AutoMarker { signature: 0, complete: true, ..prev.clone() };
         if entries >= prev.store_entries.saturating_add(STORE_ENTRIES_GROWTH) {
             retire_superseded_cache(dirs, &mut report);
             record.store_entries = store_entries(dirs);
@@ -2481,232 +2762,320 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     }
 
     retire_superseded_cache(dirs, &mut report);
-    let mut locks = Vec::new();
-    let mut profiles = Vec::new();
-    for profile in profile_dirs(target) {
-        match ProfileLock::try_acquire(&profile) {
-            Some(lock) => {
-                locks.push(lock);
-                profiles.push(profile);
-            }
-            None => report.busy.push(profile),
-        }
-    }
-    report.profiles = profiles.len();
-    let protection = crate::wrapper::deferred_protection(dirs);
-    report.retained_deferred_paths += usize::from(!protection.is_complete());
-    for profile in &profiles {
-        if protection.protects(profile) {
-            report.retained_deferred_paths += 1;
-        }
-    }
     let store = OnceCell::new();
+    let slice = Some(opts.slice).filter(|s| !s.is_zero());
+    // Reading every store entry needs no profile lock, so a sliced pass does it before taking any.
+    if slice.is_some() && opts.cache_enabled {
+        store.get_or_init(|| StoreIndex::new(&dirs.store()).with_budget(opts.pass_bytes, opts.pass_budget));
+    }
+    let (mut slices, busy) = Slices::begin(dirs, target, profile_dirs(target), slice);
+    report.busy = busy;
+    let profiles = slices.profiles().to_vec();
+    report.profiles = profiles.len();
     let store_index = || store.get_or_init(|| StoreIndex::new(&dirs.store()).with_budget(opts.pass_bytes, opts.pass_budget));
     let covered = |paths: &[(PathBuf, u64)]| opts.cache_enabled && store_index().covers(paths);
     let now = SystemTime::now();
     let older = |t: SystemTime, d: Duration| now.duration_since(t).is_ok_and(|a| a > d);
+    // True when the pass must stop: a build is waiting or running, or the target changed while the locks were free.
+    macro_rules! halt {
+        () => {
+            checkpoint(&mut slices, &store) == Yield::Abort
+        };
+    }
+    // Read-only analysis runs with the locks released; the directory stamp checked on resumption proves nothing changed meanwhile.
+    macro_rules! unlocked {
+        ($e:expr) => {{
+            let (value, step) = slices.release_while(|| $e);
+            value.filter(|_| credit_pause(step, &store) != Yield::Abort)
+        }};
+    }
+    let mut signature = None;
 
-    let built: Vec<(PathBuf, Option<Analysis>, SystemTime)> = profiles
-        .iter()
-        .map(|p| {
-            let a = analyze(p);
+    'work: {
+        if slices.aborted.is_some() {
+            break 'work;
+        }
+        let protection = crate::wrapper::deferred_protection(dirs);
+        report.retained_deferred_paths += usize::from(!protection.is_complete());
+        for profile in &profiles {
+            if protection.protects(profile) {
+                report.retained_deferred_paths += 1;
+            }
+        }
+        let mut built: Vec<(PathBuf, Option<Analysis>, SystemTime)> = Vec::new();
+        for p in &profiles {
+            if halt!() {
+                break 'work;
+            }
+            let Some(a) = unlocked!(analyze(p)) else { break 'work };
             let newest = a.as_ref().and_then(|a| a.built.values().max().copied()).unwrap_or_else(|| newest_mtime(&p.join(".fingerprint")));
-            (p.clone(), a, newest)
-        })
-        .collect();
-    let latest = built.iter().map(|b| b.2).max().unwrap_or(now);
-    let is_current = |t: SystemTime| t >= latest || !older(t, opts.current_window);
-
-    let mut evictable: Vec<(SystemTime, Vec<(PathBuf, u64)>)> = Vec::new();
-    for (profile, analysis, newest) in &built {
-        let current = is_current(*newest);
-        if !current && older(*newest, opts.keep_other_profile) && !protection.protects(profile) {
-            cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
-            let result = remove_profile_payloads_with(std::slice::from_ref(profile), |path, bytes| {
-                report.removed_bytes += bytes;
-                report.removed.push((path.to_path_buf(), bytes));
-            });
-            match result {
-                Ok(()) => report.demoted_profiles.push(profile.clone()),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => report.retained_incremental += 1,
-                Err(error) => report.errors.push((profile.clone(), error.to_string())),
-            }
-            continue;
+            built.push((p.clone(), a, newest));
         }
-        let mut doomed: Vec<(PathBuf, u64)> = Vec::new();
-        let incremental_root = profile.join("incremental");
-        match analysis {
-            Some(a) => {
-                let by_unit = unit_paths(profile, &a.dead);
-                for (hash, paths) in by_unit {
-                    let when = a.built.get(&hash).copied().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let grace = if current { opts.uncached_dead_grace } else { opts.keep_other_profile };
-                    if older(when, grace) || covered(&paths) {
-                        report.dead_units += 1;
-                        doomed.extend(paths);
-                    } else if older(when, opts.dead_incremental_grace) {
-                        // Outputs stay warm for a switch back; the incremental directories, needed only for an edit after it, go now.
-                        let (incremental, rest): (Vec<_>, Vec<_>) = paths.into_iter().partition(|(p, _)| p.starts_with(&incremental_root));
-                        report.dead_incremental += incremental.len();
-                        doomed.extend(incremental);
-                        evictable.push((when, rest));
-                    } else {
-                        evictable.push((when, paths));
-                    }
-                }
-                for d in incremental_dirs(profile, a) {
-                    if doomed.iter().any(|(p, _)| d.path.starts_with(p)) {
-                        continue;
-                    }
-                    let size = || fsx::allocated_size(&d.path);
-                    match d.owner {
-                        IncrementalOwner::Orphan => {
-                            report.dead_incremental += 1;
-                            doomed.push((d.path.clone(), size()));
-                        }
-                        IncrementalOwner::Dead if older(d.touched, opts.dead_incremental_grace) => {
-                            report.dead_incremental += 1;
-                            doomed.push((d.path.clone(), size()));
-                        }
-                        IncrementalOwner::Live if current && older(d.touched, opts.incremental_idle) => {
-                            let live: HashSet<String> = d.units.intersection(&a.live).cloned().collect();
-                            let outputs: Vec<(PathBuf, u64)> = unit_paths(profile, &live).into_values().flatten().collect();
-                            if covered(&outputs) {
-                                report.idle_incremental += 1;
-                                doomed.push((d.path.clone(), size()));
-                            } else {
-                                evictable.push((d.touched, vec![(d.path.clone(), size())]));
-                            }
-                        }
-                        IncrementalOwner::Unknown => {
-                            if let Some(age) = idle_unknown_incremental(&d.path, now) {
-                                if age > opts.incremental_idle {
-                                    report.idle_incremental += 1;
-                                    doomed.push((d.path.clone(), size()));
-                                } else if age > opts.incremental_idle.min(opts.dead_incremental_grace) {
-                                    evictable.push((now - age, vec![(d.path.clone(), size())]));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !current {
-                    for (hash, paths) in unit_paths(profile, &a.live) {
-                        if covered(&paths) {
-                            evictable.push((a.built.get(&hash).copied().unwrap_or(SystemTime::UNIX_EPOCH), paths));
-                        }
-                    }
-                    if let Ok(crates) = fs::read_dir(profile.join("incremental")) {
-                        for krate in crates.flatten() {
-                            if !krate.file_type().is_ok_and(|kind| kind.is_dir()) {
-                                continue;
-                            }
-                            let when = newest_mtime(&krate.path());
-                            evictable.push((when, vec![(krate.path(), fsx::allocated_size(&krate.path()))]));
-                        }
-                    }
-                }
-            }
-            None => report.unclassified.push(profile.clone()),
-        }
-        let sessions: Vec<(PathBuf, u64)> =
-            stale_sessions(profile).into_iter().filter(|(s, _)| !doomed.iter().any(|(p, _)| s.starts_with(p))).collect();
-        report.stale_sessions += sessions.len();
-        doomed.extend(sessions);
-        doomed.extend(crate::gc::profile_temp_files(profile));
-        retain_unprotected(&mut doomed, &protection, &mut report);
-        remove_paths(&doomed, &mut report);
-        cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
-        // After the sessions are gone, the aliases only they shared are single links.
-        let mut objects = stale_objects(profile);
-        report.stale_objects += objects.len();
-        retain_unprotected(&mut objects, &protection, &mut report);
-        remove_paths(&objects, &mut report);
-    }
+        let latest = built.iter().map(|b| b.2).max().unwrap_or(now);
+        let is_current = |t: SystemTime| t >= latest || !older(t, opts.current_window);
 
-    // Removals only shrink the target, so one that began under the cap is still under it.
-    let mut size = if report.allocated_before <= opts.max_target_bytes || report.removed.is_empty() {
-        report.allocated_before
-    } else {
-        allocated(target)
-    };
-    if size > opts.max_target_bytes {
-        evictable.sort_by_key(|e| e.0);
-        for (_, paths) in evictable {
-            if size <= opts.max_target_bytes {
-                break;
+        let mut evictable: Vec<(SystemTime, Vec<(PathBuf, u64)>)> = Vec::new();
+        for (profile, analysis, newest) in &built {
+            if halt!() {
+                break 'work;
             }
-            let mut live: Vec<(PathBuf, u64)> = paths.into_iter().filter(|(p, _)| p.exists()).collect();
-            retain_unprotected(&mut live, &protection, &mut report);
-            let before = report.removed_bytes;
-            remove_paths(&live, &mut report);
-            let freed = report.removed_bytes - before;
-            report.budget_evicted += freed;
-            size = size.saturating_sub(freed);
-        }
-    }
-
-    if apfs::SUPPORTED && opts.compress {
-        let mut candidates = Vec::new();
-        let mut hot: HashMap<u64, HashSet<u64>> = HashMap::new();
-        for (profile, _, newest) in built.iter().filter(|b| b.0.exists()) {
-            let from = candidates.len();
-            collect_candidates(profile, false, &mut candidates);
-            if !is_current(*newest) {
+            let current = is_current(*newest);
+            if !current && older(*newest, opts.keep_other_profile) && !protection.protects(profile) {
+                cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
+                // Each call removes what fits in the slice and restores the root times before the locks are released.
+                let result = loop {
+                    let step = remove_profile_payloads_until(std::slice::from_ref(profile), slices.deadline(), |path, bytes| {
+                        report.removed_bytes += bytes;
+                        report.removed.push((path.to_path_buf(), bytes));
+                    });
+                    match step {
+                        Ok(true) => break Ok(()),
+                        Ok(false) if resume(&mut slices, &store) == Yield::Abort => break 'work,
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
+                    }
+                };
+                match result {
+                    Ok(()) => report.demoted_profiles.push(profile.clone()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => report.retained_incremental += 1,
+                    Err(error) => report.errors.push((profile.clone(), error.to_string())),
+                }
                 continue;
             }
-            for c in candidates.split_off(from) {
-                let category = c.path.strip_prefix(profile).map(Category::of).unwrap_or(Category::Other);
-                let fresh = c.meta.modified().is_ok_and(|t| !older(t, opts.hot_window));
-                if !(opts.hot_categories.contains(&category) && fresh) {
-                    candidates.push(c);
-                    continue;
+            let mut doomed: Vec<(PathBuf, u64)> = Vec::new();
+            let incremental_root = profile.join("incremental");
+            match analysis {
+                Some(a) => {
+                    let Some(by_unit) = unlocked!(unit_paths(profile, &a.dead)) else { break 'work };
+                    for (hash, paths) in by_unit {
+                        if halt!() {
+                            break 'work;
+                        }
+                        let when = a.built.get(&hash).copied().unwrap_or(SystemTime::UNIX_EPOCH);
+                        let grace = if current { opts.uncached_dead_grace } else { opts.keep_other_profile };
+                        if older(when, grace) || covered(&paths) {
+                            report.dead_units += 1;
+                            doomed.extend(paths);
+                        } else if older(when, opts.dead_incremental_grace) {
+                            // Outputs stay warm for a switch back; the incremental directories, needed only for an edit after it, go now.
+                            let (incremental, rest): (Vec<_>, Vec<_>) = paths.into_iter().partition(|(p, _)| p.starts_with(&incremental_root));
+                            report.dead_incremental += incremental.len();
+                            doomed.extend(incremental);
+                            evictable.push((when, rest));
+                        } else {
+                            evictable.push((when, paths));
+                        }
+                    }
+                    let Some(found) = unlocked!(incremental_dirs(profile, a)) else { break 'work };
+                    for d in found {
+                        if halt!() {
+                            break 'work;
+                        }
+                        if doomed.iter().any(|(p, _)| d.path.starts_with(p)) {
+                            continue;
+                        }
+                        let size = || fsx::allocated_size(&d.path);
+                        match d.owner {
+                            IncrementalOwner::Orphan => {
+                                report.dead_incremental += 1;
+                                doomed.push((d.path.clone(), size()));
+                            }
+                            IncrementalOwner::Dead if older(d.touched, opts.dead_incremental_grace) => {
+                                report.dead_incremental += 1;
+                                doomed.push((d.path.clone(), size()));
+                            }
+                            IncrementalOwner::Live if current && older(d.touched, opts.incremental_idle) => {
+                                let live: HashSet<String> = d.units.intersection(&a.live).cloned().collect();
+                                let outputs: Vec<(PathBuf, u64)> = unit_paths(profile, &live).into_values().flatten().collect();
+                                if covered(&outputs) {
+                                    report.idle_incremental += 1;
+                                    doomed.push((d.path.clone(), size()));
+                                } else {
+                                    evictable.push((d.touched, vec![(d.path.clone(), size())]));
+                                }
+                            }
+                            IncrementalOwner::Unknown => {
+                                if let Some(age) = idle_unknown_incremental(&d.path, now) {
+                                    if age > opts.incremental_idle {
+                                        report.idle_incremental += 1;
+                                        doomed.push((d.path.clone(), size()));
+                                    } else if age > opts.incremental_idle.min(opts.dead_incremental_grace) {
+                                        evictable.push((now - age, vec![(d.path.clone(), size())]));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !current {
+                        for (hash, paths) in unit_paths(profile, &a.live) {
+                            if halt!() {
+                                break 'work;
+                            }
+                            if covered(&paths) {
+                                evictable.push((a.built.get(&hash).copied().unwrap_or(SystemTime::UNIX_EPOCH), paths));
+                            }
+                        }
+                        if let Ok(crates) = fs::read_dir(profile.join("incremental")) {
+                            for krate in crates.flatten() {
+                                if !krate.file_type().is_ok_and(|kind| kind.is_dir()) {
+                                    continue;
+                                }
+                                let when = newest_mtime(&krate.path());
+                                evictable.push((when, vec![(krate.path(), fsx::allocated_size(&krate.path()))]));
+                            }
+                        }
+                    }
                 }
-                if let Some((id, _)) = apfs::clone_info(&c.path) {
-                    hot.entry(c.meta.len()).or_default().insert(id);
+                None => report.unclassified.push(profile.clone()),
+            }
+            let Some((sessions, temps)) = unlocked!((stale_sessions(profile), crate::gc::profile_temp_files(profile))) else { break 'work };
+            let sessions: Vec<(PathBuf, u64)> = sessions.into_iter().filter(|(s, _)| !doomed.iter().any(|(p, _)| s.starts_with(p))).collect();
+            report.stale_sessions += sessions.len();
+            doomed.extend(sessions);
+            doomed.extend(temps);
+            retain_unprotected(&mut doomed, &protection, &mut report);
+            if !remove_paths_with(&doomed, &mut report, &mut || halt!()) {
+                break 'work;
+            }
+            cleanup_session_leftovers_unprotected(profile, opts.dead_incremental_grace, &protection, &mut report);
+            if halt!() {
+                break 'work;
+            }
+            // After the sessions are gone, the aliases only they shared are single links.
+            let Some(mut objects) = unlocked!(stale_objects(profile)) else { break 'work };
+            report.stale_objects += objects.len();
+            retain_unprotected(&mut objects, &protection, &mut report);
+            if !remove_paths_with(&objects, &mut report, &mut || halt!()) {
+                break 'work;
+            }
+        }
+
+        // Removals only shrink the target, so one that began under the cap is still under it.
+        let mut size = if report.allocated_before <= opts.max_target_bytes || report.removed.is_empty() {
+            report.allocated_before
+        } else {
+            allocated(target)
+        };
+        if size > opts.max_target_bytes {
+            evictable.sort_by_key(|e| e.0);
+            for (_, paths) in evictable {
+                if size <= opts.max_target_bytes {
+                    break;
+                }
+                if halt!() {
+                    break 'work;
+                }
+                let mut live: Vec<(PathBuf, u64)> = paths.into_iter().filter(|(p, _)| p.exists()).collect();
+                retain_unprotected(&mut live, &protection, &mut report);
+                let before = report.removed_bytes;
+                let finished = remove_paths_with(&live, &mut report, &mut || halt!());
+                let freed = report.removed_bytes - before;
+                report.budget_evicted += freed;
+                size = size.saturating_sub(freed);
+                if !finished {
+                    break 'work;
                 }
             }
         }
-        let sizes: HashSet<u64> = candidates.iter().map(|c| c.meta.len()).collect();
-        if opts.cache_enabled && !sizes.is_empty() {
-            for (len, paths) in &store_index().by_size {
-                if !sizes.contains(len) {
-                    continue;
-                }
-                for path in paths {
-                    // Compressing a store copy alone would stop it sharing blocks with its target clone.
-                    if hot.get(len).is_some_and(|ids| apfs::clone_info(path).is_some_and(|(id, _)| ids.contains(&id))) {
+
+        if apfs::SUPPORTED && opts.compress {
+            // Listing needs no lock: every rewrite checks its file is unchanged under the locks first.
+            let collect = || {
+                let mut candidates = Vec::new();
+                let mut hot: HashMap<u64, HashSet<u64>> = HashMap::new();
+                for (profile, _, newest) in built.iter().filter(|b| b.0.exists()) {
+                    let from = candidates.len();
+                    collect_candidates(profile, false, &mut candidates);
+                    if !is_current(*newest) {
                         continue;
                     }
-                    if let Ok(meta) = sys::lstat(path) {
-                        candidates.push(Candidate { path: path.clone(), meta, in_store: true });
+                    for c in candidates.split_off(from) {
+                        let category = c.path.strip_prefix(profile).map(Category::of).unwrap_or(Category::Other);
+                        let fresh = c.meta.modified().is_ok_and(|t| !older(t, opts.hot_window));
+                        if !(opts.hot_categories.contains(&category) && fresh) {
+                            candidates.push(c);
+                            continue;
+                        }
+                        if let Some((id, _)) = apfs::clone_info(&c.path) {
+                            hot.entry(c.meta.len()).or_default().insert(id);
+                        }
                     }
                 }
+                let sizes: HashSet<u64> = candidates.iter().map(|c| c.meta.len()).collect();
+                if opts.cache_enabled && !sizes.is_empty() {
+                    for (len, paths) in &store_index().by_size {
+                        if !sizes.contains(len) {
+                            continue;
+                        }
+                        for path in paths {
+                            // Compressing a store copy alone would stop it sharing blocks with its target clone.
+                            if hot.get(len).is_some_and(|ids| apfs::clone_info(path).is_some_and(|(id, _)| ids.contains(&id))) {
+                                continue;
+                            }
+                            if let Ok(meta) = sys::lstat(path) {
+                                candidates.push(Candidate { path: path.clone(), meta, in_store: true });
+                            }
+                        }
+                    }
+                }
+                candidates
+            };
+            let Some(mut candidates) = unlocked!(collect()) else { break 'work };
+            let mut pause = SlicePause { slices: &mut slices, store: &store };
+            let mut ctx = ShrinkCtx::for_auto(dirs, target, opts, &mut pause);
+            retain_unprotected_candidates(&mut candidates, &protection, &mut report);
+            shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report, &mut Silent, &|_| String::new());
+            let stopped = ctx.stopped;
+            let rewrites = std::mem::take(&mut ctx.rewrites);
+            ctx.finish();
+            slices.note(rewrites);
+            report.budget_stopped = stopped && slices.aborted.is_none();
+            if slices.aborted.is_some() {
+                break 'work;
             }
         }
-        let mut ctx = ShrinkCtx::for_auto(dirs, target, opts);
-        retain_unprotected_candidates(&mut candidates, &protection, &mut report);
-        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
-        report.budget_stopped = ctx.stopped;
-        ctx.finish();
+        // Taken under cargo's locks so no build can change the tree between the pass and its signature.
+        signature = change_signature(dirs, target, &options_key);
     }
-    // Taken under cargo's locks so no build can change the tree between the pass and its signature.
-    let signature = change_signature(dirs, target, &options_key);
-    drop(locks);
+    slices.finish();
+    report.aborted = slices.aborted;
+    report.slices = slices.slices;
+    report.longest_slice_ms = slices.longest.as_millis() as u64;
     let changed = !report.removed.is_empty() || report.compressed_files > 0 || report.deduped_files > 0 || !report.errors.is_empty();
     report.allocated_after = if changed { allocated(target) } else { report.allocated_before };
     let complete = auto_pass_complete(&report);
+    let cpu_ms = cpu_before.zip(sys::process_cpu_ns()).map_or(0, |(before, after)| after.saturating_sub(before) / 1_000_000);
     let record = AutoMarker {
         allocated_after: report.allocated_after,
         at_unix: if complete { fsx::unix_now() } else { previous.as_ref().map_or(0, |p| p.at_unix) },
         store_entries: store_entries(dirs),
         signature: signature.unwrap_or(0),
         complete,
+        slices: report.slices,
+        longest_slice_ms: report.longest_slice_ms,
+        cpu_ms,
     };
     write_marker(&file, &record);
     let _ = file.set_modified(SystemTime::now());
     report
+}
+
+/// A slice boundary; time spent yielded does not count against the pass's coverage budget.
+fn checkpoint(slices: &mut Slices<'_>, store: &OnceCell<StoreIndex>) -> Yield {
+    credit_pause(slices.checkpoint(), store)
+}
+
+/// Ends the slice now, as a step that stopped at the slice deadline asks for.
+fn resume(slices: &mut Slices<'_>, store: &OnceCell<StoreIndex>) -> Yield {
+    credit_pause(slices.yield_now(), store)
+}
+
+fn credit_pause(step: Yield, store: &OnceCell<StoreIndex>) -> Yield {
+    if let (Yield::Resumed(paused), Some(index)) = (step, store.get()) {
+        index.proofs.borrow_mut().budget.deadline += paused;
+    }
+    step
 }
 
 fn retire_superseded_cache(dirs: &Dirs, report: &mut Report) {
@@ -2793,7 +3162,15 @@ fn cleanup_session_leftovers(profile: &Path, grace: Duration, report: &mut Repor
 }
 
 fn remove_paths(paths: &[(PathBuf, u64)], report: &mut Report) {
+    remove_paths_with(paths, report, &mut || false);
+}
+
+/// False when `halt` stopped it between two paths.
+fn remove_paths_with(paths: &[(PathBuf, u64)], report: &mut Report, halt: &mut dyn FnMut() -> bool) -> bool {
     for (path, bytes) in paths {
+        if halt() {
+            return false;
+        }
         // A session inside an incremental directory removed just before is already gone.
         if !path.exists() {
             continue;
@@ -2812,6 +3189,7 @@ fn remove_paths(paths: &[(PathBuf, u64)], report: &mut Report) {
             Err(err) => report.errors.push((path.clone(), err.to_string())),
         }
     }
+    true
 }
 
 /// Files with several links are listed rather than summed, so a link seen from two subtrees is counted once.
@@ -4057,6 +4435,59 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn progress_covers_every_phase_and_the_workspace_breakdown_adds_up_to_the_report() {
+        use crate::progress::Recorder;
+        let root = scratch("progress");
+        let dirs = Dirs::at(&root);
+        let mut targets = Vec::new();
+        for ws in ["alpha-0000", "beta-0000"] {
+            let target = dirs.targets().join(ws).join("tc");
+            let profile = target.join("harness");
+            unit_dir(&profile, "app", "aaaaaaaaaaaaaaaa", "bin-app", "0a00000000000000", &[], 7);
+            unit_dir(&profile, "app", "bbbbbbbbbbbbbbbb", "bin-app", "0b00000000000000", &[], 7);
+            set_mtime(&profile.join(".fingerprint/app-aaaaaaaaaaaaaaaa"), 100);
+            set_mtime(&profile.join(".fingerprint/app-bbbbbbbbbbbbbbbb"), 10);
+            fs::write(profile.join("deps/data.bin"), vec![b'x'; 64 * 1024]).unwrap();
+            targets.push(target);
+        }
+        let held = dirs.targets().join("gamma-0000").join("tc").join("debug");
+        fs::create_dir_all(held.join("deps")).unwrap();
+        let lock = ProfileLock::try_acquire(&held).unwrap();
+        targets.push(dirs.targets().join("gamma-0000").join("tc"));
+
+        let mut recorded = Recorder::default();
+        let report = compact_with(&dirs, &targets, &CompactOptions { include_store: false, ..CompactOptions::full() }, &mut recorded);
+        drop(lock);
+        let mut expected = vec!["measure", "lock profiles", "remove superseded"];
+        if apfs::SUPPORTED {
+            expected.extend(["collect files", "compress and dedupe"]);
+        }
+        expected.push("measure again");
+        assert_eq!(recorded.phases(), expected);
+        for phase in recorded.phases() {
+            let (totals, items) = recorded.items(phase);
+            assert_eq!(totals, [Some(items.len() as u64)], "{phase} announced its real item count");
+        }
+        assert_eq!(recorded.bytes("measure"), report.physical_before);
+        assert_eq!(recorded.bytes("measure again"), report.physical_after);
+        assert_eq!(recorded.bytes("remove superseded"), report.removed_bytes);
+        assert!(report.removed_bytes > 0 && report.dead_units == 2, "{report:?}");
+        assert!(recorded.items("lock profiles").1.iter().any(|(scope, _)| scope == "gamma-0000/tc/debug (busy)"));
+        let ws = &report.workspaces;
+        assert_eq!(ws.keys().map(String::as_str).collect::<Vec<_>>(), ["alpha-0000", "beta-0000", "gamma-0000"]);
+        assert_eq!((ws["alpha-0000"].profiles, ws["beta-0000"].profiles, ws["gamma-0000"].busy), (1, 1, 1));
+        assert!(ws["alpha-0000"].removed > 0 && ws["beta-0000"].removed > 0 && ws["gamma-0000"].removed == 0);
+        assert_eq!(ws.values().map(|w| w.before).sum::<u64>(), report.physical_before);
+        assert_eq!(ws.values().map(|w| w.removed).sum::<u64>(), report.removed_bytes);
+        assert_eq!(ws.values().map(|w| w.compressed).sum::<u64>(), report.compress_before.saturating_sub(report.compress_after));
+        assert_eq!(ws.values().map(|w| w.deduped).sum::<u64>(), report.dedupe_saved);
+        if apfs::SUPPORTED {
+            assert_eq!(recorded.items("compress and dedupe").1.len(), 2, "both large files were examined");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("frust-maint-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -4141,6 +4572,29 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_retirement_cut_by_its_slice_deadline_still_progresses_and_resumes() {
+        let profile = scratch("sliced-retire").join("debug");
+        for sub in ["deps", ".fingerprint"] {
+            fs::create_dir_all(profile.join(sub)).unwrap();
+        }
+        for n in 0..3 {
+            fs::write(profile.join("deps").join(format!("libx{n}-0123456789abcdef.rlib")), [n; 64]).unwrap();
+        }
+        fs::write(profile.join(".cargo-lock"), b"").unwrap();
+        let deps_time = fs::metadata(profile.join("deps")).unwrap().modified().unwrap();
+        let mut removed = Vec::new();
+        let mut calls = 0;
+        while !remove_profile_payloads_until(std::slice::from_ref(&profile), Some(Instant::now()), |path, _| removed.push(path.to_path_buf())).unwrap() {
+            calls += 1;
+            assert_eq!(removed.len(), calls, "every cut call removes exactly one payload");
+            assert_eq!(fs::metadata(profile.join("deps")).unwrap().modified().unwrap(), deps_time, "root times are restored before each cut");
+        }
+        assert_eq!(removed.len(), 3);
+        assert!(profile.join(".cargo-lock").exists() && profile.join("deps").is_dir() && fs::read_dir(profile.join("deps")).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(profile.parent().unwrap());
+    }
+
+    #[test]
     fn budget_stops_a_pass_between_files() {
         let mut unlimited = ShrinkCtx::plain();
         unlimited.spend(u64::MAX);
@@ -4173,7 +4627,7 @@ mod tests {
         let mut ctx = ShrinkCtx::plain();
         ctx.budget = Some(Budget { deadline: Instant::now(), bytes_left: 0 });
         let mut report = Report::default();
-        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report);
+        shrink(candidates, &CompactOptions::after_build(), &mut ctx, &mut report, &mut Silent, &|_| String::new());
         assert!(ctx.stopped);
         assert_eq!((report.deduped_files, report.compressed_files), (0, 0));
         assert!(report.errors.is_empty());

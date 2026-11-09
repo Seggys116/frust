@@ -458,3 +458,42 @@ impl Fixture {
         fx
     }
 }
+
+/// The hashed build script executable, which compaction compresses at once on macOS.
+fn build_script_exe(target: &Path) -> PathBuf {
+    let build = target.join("debug").join("build");
+    for unit in fs::read_dir(&build).unwrap().flatten() {
+        for file in fs::read_dir(unit.path()).unwrap().flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.starts_with("build_script_build-") && !name.ends_with(".d") && file.path().is_file() {
+                return file.path();
+            }
+        }
+    }
+    panic!("no build script executable under {}", build.display());
+}
+
+#[test]
+fn a_compaction_pass_that_rewrites_outputs_keeps_the_record_served() {
+    let mut fx = Fixture::new("noop-compact", &app_files());
+    fx.env.push(("FRUST_AUTO_COMPACT".into(), "off".into()));
+    let (out, trace) = fx.run(&["build"], "on");
+    assert_success(&out);
+    assert_eq!(trace["record"], "build", "{trace}");
+    fx.fast(&["build"]);
+    let target = fx.target();
+    let script = build_script_exe(&target);
+    let before = frust::sys::stat(&script).unwrap().ino();
+    let _ = fs::remove_file(target.join(frust::compact::AUTO_MARKER));
+    let pass = fx.sb.bin("frust").args(["compact", frust::compact::AUTO_CHILD_FLAG]).arg(&target).output().unwrap();
+    assert_success(&pass);
+    if cfg!(target_os = "macos") {
+        assert_ne!(frust::sys::stat(&script).unwrap().ino(), before, "the pass rewrote a recorded output");
+    }
+    fx.fast(&["build"]);
+    fx.audited(&["build"]);
+
+    fx.edit("src/main.rs", &format!("{MAIN}// edited after compaction\n"));
+    fx.declines_then_fast(&["build"]);
+    assert_eq!(fx.app_output("debug"), "one||e1|1");
+}

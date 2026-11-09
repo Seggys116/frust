@@ -49,6 +49,13 @@ pub struct Record {
     /// Empty for a unit; `passthrough` for an uncached compiler call and `store` for a store helper's outcome.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// For a store outcome, the CPU time the storing thread spent on the store; `total_ms` is its wall time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cpu_ms: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 pub const FALLBACKS_KEPT: usize = 8;
@@ -86,6 +93,7 @@ impl Record {
             restore_key: String::new(),
             miss_reason: String::new(),
             kind: String::new(),
+            cpu_ms: 0,
         }
     }
 
@@ -144,11 +152,12 @@ pub fn passthrough(begun: Instant) {
     append_event(Some(sink), &record);
 }
 
-/// Records a store step's outcome; a helper has no unit record, so this is its only trace.
-pub fn store_outcome(sink: Option<&Path>, krate: &str, outcome: &str) {
+/// Records a store step's outcome with its wall and CPU milliseconds; a helper has no unit record, so this is its only trace.
+pub fn store_outcome(sink: Option<&Path>, krate: &str, outcome: &str, spent: (u64, u64)) {
     let mut record = Record::new(krate, false, false, false);
     record.kind = "store".to_string();
     record.store_mode = outcome.to_string();
+    (record.total_ms, record.cpu_ms) = spent;
     append_event(sink, &record);
 }
 
@@ -267,13 +276,14 @@ mod tests {
         let path = s.0.join("timings.jsonl");
         let events = events_path(&path);
         assert_eq!(events, s.0.join("timings.jsonl.events"));
-        store_outcome(Some(&path), "winapi", "skip:input-changed");
+        store_outcome(Some(&path), "winapi", "skip:input-changed", (0, 0));
         assert!(!events.exists() && !path.exists(), "a consumed sink is not recreated");
         std::fs::write(&events, "").unwrap();
-        store_outcome(Some(&path), "winapi", "skip:input-changed");
+        store_outcome(Some(&path), "winapi", "skip:input-changed", (9, 4));
         assert!(!path.exists(), "the unit records stay one line per unit");
         let record: Record = serde_json::from_str(std::fs::read_to_string(&events).unwrap().trim_end()).unwrap();
         assert_eq!((record.kind.as_str(), record.krate.as_str(), record.store_mode.as_str()), ("store", "winapi", "skip:input-changed"));
+        assert_eq!((record.total_ms, record.cpu_ms), (9, 4));
     }
 
     #[test]

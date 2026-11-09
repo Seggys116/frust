@@ -225,7 +225,8 @@ fn discover_linker(_debug: bool) -> Result<PathBuf, &'static str> {
 
 #[cfg(target_os = "macos")]
 fn discover_linker(debug: bool) -> Result<PathBuf, &'static str> {
-    discovery::discover().map_err(|failure| {
+    // A loaded host can push a cold xcrun past the deadline once; the retry finds it warm.
+    discovery::discover().or_else(|failure| if failure.timed_out() { discovery::discover() } else { Err(failure) }).map_err(|failure| {
         if debug {
             eprintln!("frust-wrap: native linker discovery: {}", failure.diagnostic());
         }
@@ -341,6 +342,11 @@ mod discovery {
     }
 
     impl Failure {
+        #[cfg(target_os = "macos")]
+        pub(super) fn timed_out(&self) -> bool {
+            self.stage == Stage::Deadline
+        }
+
         pub(super) fn diagnostic(&self) -> String {
             let evidence = &self.evidence;
             let (stdout, stdout_used) = escaped(&evidence.stdout, 256);

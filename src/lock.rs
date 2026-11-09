@@ -636,6 +636,32 @@ pub fn target_activity(dirs: &Dirs, target: &Path) -> io::Result<Option<SystemTi
     }
 }
 
+/// A live ticket: a frust build is waiting for the target.
+pub fn build_waiting(dirs: &Dirs, target: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(lock_dir(dirs, target).join("queue")) else { return false };
+    entries.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        !name.starts_with('.') && live_ticket(&e.path(), &name).is_some()
+    })
+}
+
+/// A live waiting ticket or a held build lock: a frust build wants the target or is using it.
+pub fn build_pending(dirs: &Dirs, target: &Path) -> bool {
+    if build_waiting(dirs, target) {
+        return true;
+    }
+    match File::open(lock_dir(dirs, target).join("lock")) {
+        Ok(level) => match sys::try_lock(&level, LockKind::Exclusive) {
+            Ok(()) => {
+                let _ = sys::unlock(&level);
+                false
+            }
+            Err(_) => true,
+        },
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
+}
+
 pub fn try_target_maintenance(dirs: &Dirs, target: &Path) -> io::Result<Option<TargetMaintenanceGuard>> {
     if target_activity(dirs, target)?.is_none() {
         return Ok(None);

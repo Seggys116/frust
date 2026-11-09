@@ -1,4 +1,4 @@
-//! Dependency debuginfo tuning is on by default, applies to dev-like profiles, and yields to user profiles and `FRUST_TUNE=off`.
+//! Dependency debuginfo tuning is on by default, applies to dev-like profiles, and yields to user debug settings and `FRUST_TUNE=off`.
 
 mod common;
 
@@ -76,13 +76,45 @@ fn release_builds_are_not_tuned() {
     assert!(!stderr(&out).contains("debug=0"));
 }
 
-#[test]
-fn a_user_profile_blocks_the_default_tuning() {
-    let sb = Sandbox::new("tuning-profile");
-    let ws = project(&sb, "\n[profile.dev]\nopt-level = 1\n");
-    let out = fcargo(&sb, &ws, &["build", "-v"], None);
+fn outdep_debuginfo(extra: &str, args: &[&str], name: &str) -> bool {
+    let sb = Sandbox::new(name);
+    let ws = project(&sb, extra);
+    let out = fcargo(&sb, &ws, args, None);
     assert_success(&out);
-    assert!(rustc_line(&stderr(&out), "outdep").contains("debuginfo=2"));
+    rustc_line(&stderr(&out), "outdep").contains("debuginfo=")
+}
+
+#[test]
+fn a_user_dev_debug_setting_blocks_the_default_tuning() {
+    assert!(outdep_debuginfo("\n[profile.dev]\ndebug = 1\n", &["build", "-v"], "tuning-user-debug"));
+}
+
+#[test]
+fn a_release_only_profile_still_tunes_dev_builds() {
+    assert!(!outdep_debuginfo("\n[profile.release]\nlto = true\nstrip = true\n", &["build", "-v"], "tuning-release-profile"));
+}
+
+#[test]
+fn dev_settings_unrelated_to_debuginfo_still_tune() {
+    assert!(!outdep_debuginfo("\n[profile.dev]\nopt-level = 1\n", &["build", "-v"], "tuning-dev-opt"));
+}
+
+#[test]
+fn package_overrides_block_only_when_they_set_debug_keys() {
+    assert!(!outdep_debuginfo("\n[profile.dev.package.foo]\nopt-level = 3\n", &["build", "-v"], "tuning-pkg-opt"));
+    assert!(outdep_debuginfo("\n[profile.dev.package.\"*\"]\ndebug = 2\n", &["build", "-v"], "tuning-pkg-debug"));
+}
+
+#[test]
+fn a_test_profile_debug_setting_blocks_only_test_builds() {
+    let extra = "\n[profile.test]\ndebug = 1\n";
+    assert!(!outdep_debuginfo(extra, &["build", "-v"], "tuning-test-profile-build"));
+    assert!(outdep_debuginfo(extra, &["test", "--no-run", "-v"], "tuning-test-profile-test"));
+}
+
+#[test]
+fn a_cli_config_debug_setting_blocks_the_default_tuning() {
+    assert!(outdep_debuginfo("", &["build", "-v", "--config", "profile.dev.debug=1"], "tuning-cli-debug"));
 }
 
 #[test]

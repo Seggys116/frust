@@ -16,6 +16,7 @@ pub mod linking;
 pub mod lock;
 pub mod noop;
 pub mod paths;
+pub mod progress;
 pub mod run;
 pub mod share_roots;
 pub mod signals;

@@ -15,6 +15,7 @@ pub fn per_run(name: &str) -> bool {
     matches!(name, "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS" | "FRUST_EVENTS" | ENV)
         || name.starts_with("CARGO_TERM_")
         || name.starts_with("FRUST_EXEC_")
+        || name.starts_with("FRUST_INTERNAL_")
         || name == crate::store_broker::CAPABILITY_ENV
         || name == crate::wrapper::SLOT_SUPERVISOR_ENV
 }
