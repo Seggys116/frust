@@ -376,6 +376,7 @@ impl Plan {
             record.extern_bytes_hashed = stats.extern_hashed;
             record.extern_bytes_memo = stats.extern_memo;
             record.native_dir_bytes_hashed = stats.native_dir_hashed;
+            record.tool_bytes_hashed = stats.tool_hashed;
             record
         });
         Some(Plan {
@@ -4264,6 +4265,7 @@ struct PrekeyStats {
     extern_hashed: u64,
     extern_memo: u64,
     native_dir_hashed: u64,
+    tool_hashed: u64,
 }
 
 impl PrekeyStats {
@@ -4621,10 +4623,12 @@ impl KeyContext<'_> {
                     PathArg::Extern { .. } => {}
                     PathArg::Tool(program) => {
                         let path = self.linker_tool(program)?;
+                        let before = self.hasher.tally();
                         let hashed = self
                             .hasher
                             .hash(&path, true)
                             .map_err(|e| format!("cannot read linker {}: {e}", path.display()))?;
+                        stats.tool_hashed += self.hasher.tally().0 - before.0;
                         if !hashed.stable {
                             return Err(format!(
                                 "linker {} changed while being hashed",
@@ -4950,6 +4954,7 @@ mod tests {
             );
             assert_eq!(before.watched.len(), 1);
             assert_eq!(before.watched[0].0, driver);
+            assert_eq!((after.stats.tool_hashed, after.stats.extern_hashed), (10, 0), "the linker's bytes count as tool bytes");
             assert_ne!(before.watched[0].1, after.watched[0].1);
             assert!(
                 after.extern_hashes.is_empty(),

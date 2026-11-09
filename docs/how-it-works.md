@@ -231,7 +231,7 @@ in a single write as it exits; passthrough invocations write nothing, and with t
 touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans describe the unit), `prekey_ms`,
 `extern_files` (`--extern` inputs hashed for the key), `extern_bytes_hashed` (bytes of them actually read),
 `extern_bytes_memo` (bytes served from a hash memo, attested records included), `native_dir_bytes_hashed` (bytes read
-for `-L` directories), `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
+for `-L` directories), `tool_bytes_hashed` (bytes of a `-C linker` binary read rather than served from a hash memo), `lookup_ms` (first cache lookup, excluding restore), `keywait_ms`, `restore_ms`, `rustc_ms`, `freeze_ms`,
 `spawn_ms` (job write plus helper start or broker submit), `inline_store_ms`, `total_ms`, and `store_mode`:
 `hit`, `deferred` (helper), `queued` (broker), `queued:slots` (job file waiting for a helper),
 `queued:after-build` (job file the front end drains once cargo exits),

@@ -622,6 +622,8 @@ struct TimingLine {
     #[serde(default)]
     native_dir_bytes_hashed: u64,
     #[serde(default)]
+    tool_bytes_hashed: u64,
+    #[serde(default)]
     restore_paths: BTreeMap<String, u64>,
     #[serde(default)]
     restore_fallbacks: Vec<String>,
@@ -685,6 +687,52 @@ struct TimingSummary {
     // The no-op fast path's decision per build with what that build recorded, and the first distinct changed paths or variables behind a decline.
     noop_decisions: BTreeMap<String, usize>,
     noop_details: Vec<String>,
+    // The executor's decision per build with what became of its plan, as `<decision> (plan <outcome>)`.
+    exec_decisions: BTreeMap<String, usize>,
+    tool_bytes_hashed: u64,
+    // The first distinct stderr lines of any build that were not cargo status lines a no-op record may stand in for.
+    cargo_notes: Vec<String>,
+    // One entry per build in the order they ran, capped at SAMPLES_KEPT.
+    samples: Vec<BuildSample>,
+}
+
+const SAMPLES_KEPT: usize = 200;
+const NOTES_PER_SAMPLE: usize = 3;
+const NOTE_CHARS: usize = 240;
+const HIT_CRATES_PER_SAMPLE: usize = 40;
+
+// One frust build of a row: what the no-op fast path and the executor decided, what the wrappers did, and what cargo printed.
+#[derive(Debug, Default, PartialEq, Serialize)]
+struct BuildSample {
+    ms: u64,
+    noop: String,
+    record: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    detail: String,
+    exec: String,
+    plan: String,
+    units: usize,
+    hits: usize,
+    prekey_ms: u64,
+    prekey_max_ms: u64,
+    tool_bytes_hashed: u64,
+    // Crates restored from the store, which cargo recompiled although the fast path or the executor might have kept them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hit_crates: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+}
+
+fn trace_key(decision: &str, outcome_label: &str, outcome: &str) -> String {
+    if outcome.is_empty() || outcome == "none" { decision.to_string() } else { format!("{decision} ({outcome_label} {outcome})") }
+}
+
+// Stderr lines other than status lines a synthesised no-op record replaces, ANSI-stripped and cut to NOTE_CHARS.
+fn cargo_notes(stderr: &str) -> Vec<String> {
+    stderr.lines()
+        .filter(|line| !line.trim().is_empty() && !crate::noop::silent_status(line))
+        .map(|line| crate::ui::term::strip_ansi(line).trim_end().chars().take(NOTE_CHARS).collect())
+        .collect()
 }
 
 impl TimingSummary {
@@ -693,11 +741,45 @@ impl TimingSummary {
             let Ok(trace) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
             let field = |name: &str| trace.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let (decision, record, detail) = (field("noop"), field("record"), field("detail"));
-            let key = if record.is_empty() || record == "none" { decision.clone() } else { format!("{decision} (record {record})") };
-            *self.noop_decisions.entry(key).or_default() += 1;
+            *self.noop_decisions.entry(trace_key(&decision, "record", &record)).or_default() += 1;
             if !detail.is_empty() {
                 crate::timings::note_reason(&mut self.noop_details, &format!("{decision}: {detail}"));
             }
+            let exec = field("exec");
+            if !exec.is_empty() {
+                *self.exec_decisions.entry(trace_key(&exec, "plan", &field("plan"))).or_default() += 1;
+            }
+        }
+    }
+
+    // Call after add_build and add_noop_trace for the same build; `trace` is that build's no-op trace and `stderr` what it printed.
+    fn add_sample(&mut self, ms: u64, records: &[TimingLine], trace: &str, stderr: &str) {
+        let last = trace.lines().rev().find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok());
+        let field = |name: &str| last.as_ref().and_then(|t| t.get(name)).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut sample = BuildSample {
+            ms, noop: field("noop"), record: field("record"), detail: field("detail"), exec: field("exec"), plan: field("plan"),
+            ..BuildSample::default()
+        };
+        let mut hit_crates = BTreeSet::new();
+        for r in records.iter().filter(|r| !matches!(r.kind.as_str(), "passthrough" | "store")) {
+            sample.units += 1;
+            sample.prekey_ms += r.prekey_ms;
+            sample.prekey_max_ms = sample.prekey_max_ms.max(r.prekey_ms);
+            sample.tool_bytes_hashed += r.tool_bytes_hashed;
+            if r.store_mode == "hit" {
+                sample.hits += 1;
+                hit_crates.insert(r.krate.clone());
+            }
+        }
+        sample.hit_crates = hit_crates.into_iter().take(HIT_CRATES_PER_SAMPLE).collect();
+        self.tool_bytes_hashed += sample.tool_bytes_hashed;
+        let notes = cargo_notes(stderr);
+        for note in &notes {
+            crate::timings::note_reason(&mut self.cargo_notes, note);
+        }
+        sample.notes = notes.into_iter().take(NOTES_PER_SAMPLE).collect();
+        if self.samples.len() < SAMPLES_KEPT {
+            self.samples.push(sample);
         }
     }
 
@@ -867,6 +949,12 @@ fn sharing_lines(timings: &BTreeMap<String, TimingSummary>) -> Vec<String> {
                 line.push_str(&format!("; declined on: {}", t.noop_details.join(" | ")));
             }
             lines.push(line);
+        }
+        if !t.exec_decisions.is_empty() {
+            lines.push(format!("{label}: executor: {}", t.exec_decisions.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")));
+        }
+        if !t.cargo_notes.is_empty() {
+            lines.push(format!("{label}: printed besides status lines: {}", t.cargo_notes.join(" | ")));
         }
     }
     lines
@@ -1730,9 +1818,8 @@ impl Rig<'_> {
             let _ = fs::write(crate::timings::events_path(file), "");
         }
         // timed() waits for the deferred stores before returning, so the next row starts quiet; the wait is recorded as drain.
-        let (ms, drain_ms) = timed(ctx, tool.is_frust(), &mut cmd)
-            .map(|run| (run.millis as f64, run.store_drain_millis.unwrap_or(0)))
-            .map_err(|e| format!("{row} build with {}: {e}", tool.label()))?;
+        let run = timed(ctx, tool.is_frust(), &mut cmd).map_err(|e| format!("{row} build with {}: {e}", tool.label()))?;
+        let (ms, drain_ms) = (run.millis as f64, run.store_drain_millis.unwrap_or(0));
         if let (Some(file), Some(column)) = (timing_file, column) {
             let events = crate::timings::events_path(&file);
             let text = fs::read_to_string(&file).unwrap_or_default() + &fs::read_to_string(&events).unwrap_or_default();
@@ -1746,10 +1833,13 @@ impl Rig<'_> {
             let mut timings = column.timings.borrow_mut();
             let summary = timings.entry(row.to_string()).or_default();
             summary.add_build(&records, drain_ms);
-            if let Some(trace) = noop_trace {
-                summary.add_noop_trace(&fs::read_to_string(&trace).unwrap_or_default());
+            let trace = noop_trace.map(|trace| {
+                let text = fs::read_to_string(&trace).unwrap_or_default();
                 let _ = fs::remove_file(&trace);
-            }
+                text
+            }).unwrap_or_default();
+            summary.add_noop_trace(&trace);
+            summary.add_sample(run.millis, &records, &trace, &run.cargo_stderr);
         }
         Ok(ms)
     }
@@ -2719,6 +2809,54 @@ mod tests {
         let mut cold = TimingSummary::default();
         cold.add_noop_trace(r#"{"detail":"","noop":"miss:none","record":"build","t":1}"#);
         assert!(sharing_lines(&BTreeMap::from([("cold".to_string(), cold)])).is_empty(), "only the no-op row reports the fast path");
+    }
+
+    #[test]
+    fn each_build_keeps_its_executor_and_noop_decisions_restores_and_what_cargo_printed_besides_status() {
+        let records = parse_timings(concat!(
+            r#"{"crate":"syn","store_mode":"hit","prekey_ms":90,"tool_bytes_hashed":700}"#, "\n",
+            r#"{"crate":"quote","store_mode":"hit","prekey_ms":3}"#, "\n",
+            r#"{"crate":"tokio","store_mode":"deferred","prekey_ms":1}"#, "\n",
+            r#"{"crate":"","store_mode":"passthrough","kind":"passthrough","prekey_ms":500}"#, "\n",
+        ));
+        let trace = concat!(
+            r#"{"detail":"D:\\w\\src\\lib.rs","exec":"decline:outputs changed","noop":"miss:changed","plan":"skip:uncovered unit, adopting 27","record":"skip:diagnostics","t":1}"#, "\n",
+        );
+        let stderr = concat!(
+            "\x1b[1m\x1b[32m   Compiling\x1b[0m syn v2.0.0\n",
+            "warning: unused import: `winapi_util::Handle`\n",
+            "  --> crates\\ignore\\src\\walk.rs:9:5\n",
+            "\n",
+            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.18s\n",
+        );
+        let mut summary = TimingSummary::default();
+        summary.add_build(&records, 0);
+        summary.add_noop_trace(trace);
+        summary.add_sample(4180, &records, trace, stderr);
+        summary.add_noop_trace(r#"{"detail":"","noop":"fast","record":"none","t":2}"#);
+        summary.add_sample(20, &[], r#"{"detail":"","noop":"fast","record":"none","t":2}"#, "");
+        assert_eq!(summary.exec_decisions, BTreeMap::from([("decline:outputs changed (plan skip:uncovered unit, adopting 27)".to_string(), 1)]));
+        assert_eq!(summary.tool_bytes_hashed, 700);
+        assert_eq!(summary.cargo_notes, ["warning: unused import: `winapi_util::Handle`", "  --> crates\\ignore\\src\\walk.rs:9:5"]);
+        let [edit, fast] = &summary.samples[..] else { panic!("one sample per build: {:?}", summary.samples) };
+        assert_eq!((edit.ms, edit.units, edit.hits, edit.prekey_ms, edit.prekey_max_ms, edit.tool_bytes_hashed), (4180, 3, 2, 94, 90, 700));
+        assert_eq!((edit.exec.as_str(), edit.plan.as_str(), edit.record.as_str()), ("decline:outputs changed", "skip:uncovered unit, adopting 27", "skip:diagnostics"));
+        assert_eq!(edit.hit_crates, ["quote", "syn"]);
+        assert_eq!(edit.notes.len(), 2);
+        assert_eq!((fast.noop.as_str(), fast.exec.as_str(), fast.units), ("fast", "", 0));
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["samples"][0]["detail"], "D:\\w\\src\\lib.rs");
+        assert!(json["samples"][1].get("detail").is_none() && json["samples"][1].get("notes").is_none(), "empty lists and details are left out");
+        let lines = sharing_lines(&BTreeMap::from([("edit_first".to_string(), summary)]));
+        assert_eq!(lines[lines.len() - 2..], [
+            "first edit: executor: decline:outputs changed (plan skip:uncovered unit, adopting 27) 1".to_string(),
+            "first edit: printed besides status lines: warning: unused import: `winapi_util::Handle` |   --> crates\\ignore\\src\\walk.rs:9:5".to_string(),
+        ]);
+        let mut capped = TimingSummary::default();
+        for _ in 0..SAMPLES_KEPT + 5 {
+            capped.add_sample(1, &[], "", "");
+        }
+        assert_eq!(capped.samples.len(), SAMPLES_KEPT);
     }
 
     #[test]

@@ -380,6 +380,11 @@ fn status_word(line: &str) -> Option<String> {
     (body.len() != plain.len() && word.chars().next().is_some_and(|c| c.is_ascii_uppercase())).then(|| word.to_string())
 }
 
+/// A cargo status line a synthesised record may stand in for; any other stderr line keeps a build from being recorded as `diagnostics`.
+pub fn silent_status(line: &str) -> bool {
+    status_word(line).is_some_and(|word| SILENT_STATUS.contains(&word.as_str()))
+}
+
 fn normalised(line: &str) -> String {
     match finished_split(line) {
         Some((head, _)) => format!("{head} in <t>"),
@@ -787,10 +792,10 @@ impl Gate {
             if *stream != Stream::Err {
                 continue;
             }
-            let word = status_word(line).unwrap_or_default();
-            if !SILENT_STATUS.contains(&word.as_str()) {
+            if !silent_status(line) {
                 return Err("diagnostics");
             }
+            let word = status_word(line).unwrap_or_default();
             if finished.is_some() {
                 return Err("output after Finished");
             }

@@ -24,6 +24,9 @@ pub struct Record {
     pub extern_bytes_hashed: u64,
     pub extern_bytes_memo: u64,
     pub native_dir_bytes_hashed: u64,
+    /// Bytes of linker or other tool binaries read to key the unit, rather than served from a hash memo.
+    #[serde(default)]
+    pub tool_bytes_hashed: u64,
     pub lookup_ms: u64,
     pub keywait_ms: u64,
     pub restore_ms: u64,
@@ -79,6 +82,7 @@ impl Record {
             extern_bytes_hashed: 0,
             extern_bytes_memo: 0,
             native_dir_bytes_hashed: 0,
+            tool_bytes_hashed: 0,
             lookup_ms: 0,
             keywait_ms: 0,
             restore_ms: 0,
@@ -246,6 +250,7 @@ mod tests {
         record.extern_bytes_hashed = 11;
         record.extern_bytes_memo = 12;
         record.native_dir_bytes_hashed = 13;
+        record.tool_bytes_hashed = 14;
         record.restore_paths.insert("link".to_string(), 2);
         note_reason(&mut record.restore_fallbacks, "link:os32");
         record.restore_key = "abc".to_string();
@@ -295,13 +300,13 @@ mod tests {
         let object = value.as_object().unwrap();
         for name in [
             "crate", "path_unit", "primary", "incremental", "prekey_ms", "extern_files", "extern_bytes_hashed",
-            "extern_bytes_memo", "native_dir_bytes_hashed", "lookup_ms", "keywait_ms", "restore_ms", "rustc_ms",
+            "extern_bytes_memo", "native_dir_bytes_hashed", "tool_bytes_hashed", "lookup_ms", "keywait_ms", "restore_ms", "rustc_ms",
             "freeze_ms", "spawn_ms", "store_mode", "inline_store_ms", "total_ms", "restore_paths", "restore_fallbacks",
             "restore_key", "miss_reason",
         ] {
             assert!(object.contains_key(name), "missing {name}");
         }
-        assert_eq!(object.len(), 22, "a unit record carries no kind");
+        assert_eq!(object.len(), 23, "a unit record carries no kind");
         assert_eq!(object["restore_paths"]["link"], 2);
         assert_eq!(object["restore_fallbacks"][0], "link:os32");
         assert_eq!(object["crate"], "serde");
