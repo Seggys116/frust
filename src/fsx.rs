@@ -312,6 +312,43 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+const PACKED_MAGIC: &[u8; 4] = b"FRZ1";
+const PACKED_HEADER: usize = 8;
+
+/// LZ4-packs a small structured record (JSON or binary) behind a magic and its raw length.
+pub fn pack(raw: &[u8]) -> Vec<u8> {
+    let Ok(len) = u32::try_from(raw.len()) else { return raw.to_vec() };
+    let mut out = Vec::with_capacity(PACKED_HEADER + lz4_flex::block::get_maximum_output_size(raw.len()));
+    out.extend_from_slice(PACKED_MAGIC);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&lz4_flex::block::compress(raw));
+    out
+}
+
+/// The raw record behind `bytes`; bytes written before packing pass through unchanged, and a packed record over `max` raw bytes or failing to decode is `None`.
+pub fn unpack(bytes: &[u8], max: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let Some(rest) = bytes.strip_prefix(PACKED_MAGIC) else {
+        return (bytes.len() <= max).then_some(std::borrow::Cow::Borrowed(bytes));
+    };
+    let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    if len > max {
+        return None;
+    }
+    let mut raw = vec![0; len];
+    let written = lz4_flex::block::decompress_into(&rest[4..], &mut raw).ok()?;
+    (written == len).then_some(std::borrow::Cow::Owned(raw))
+}
+
+/// Reads a record that may be packed; one that cannot be unpacked within `max` raw bytes is `InvalidData`.
+pub fn read_packed(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let stored = fs::read(path)?;
+    match unpack(&stored, max) {
+        Some(std::borrow::Cow::Owned(raw)) => Ok(raw),
+        Some(std::borrow::Cow::Borrowed(_)) => Ok(stored),
+        None => Err(io::Error::new(io::ErrorKind::InvalidData, "record cannot be unpacked")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +359,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_packed_record_round_trips_smaller_and_an_unpacked_one_passes_through() {
+        let raw = br#"{"path":"/w/repos/ripgrep/Cargo.toml","stamp":null}"#.repeat(200);
+        let packed = pack(&raw);
+        assert!(packed.len() * 4 < raw.len(), "{} packed from {}", packed.len(), raw.len());
+        assert_eq!(unpack(&packed, raw.len()).unwrap().as_ref(), raw.as_slice());
+        assert_eq!(unpack(&raw, raw.len()).unwrap().as_ref(), raw.as_slice(), "a record from before packing reads as it was");
+        assert!(unpack(&packed, raw.len() - 1).is_none(), "the raw size cap holds for packed records");
+        assert!(unpack(&raw, raw.len() - 1).is_none());
+        assert!(unpack(&packed[..packed.len() / 2], raw.len()).is_none(), "a truncated record is refused");
+        assert!(unpack(&packed[..6], raw.len()).is_none());
+        assert_eq!(unpack(&pack(b""), 0).unwrap().as_ref(), b"");
     }
 
     #[test]

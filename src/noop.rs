@@ -18,7 +18,7 @@ use crate::sys;
 use crate::ui::term;
 
 const MAGIC: &[u8; 8] = b"FRNOOP\0\0";
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 const HEADER: usize = 8 + 4 + 8;
 const CHECKSUM: usize = 16;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -203,12 +203,13 @@ impl<'a> Reader<'a> {
 }
 
 pub fn encode(record: &Record) -> Vec<u8> {
+    let mut head = Writer(Vec::new());
+    head.str(&record.key);
+    head.str(&record.display);
+    head.str(&record.cwd);
+    head.str(&record.target);
+    head.str(&record.root);
     let mut w = Writer(Vec::new());
-    w.str(&record.key);
-    w.str(&record.display);
-    w.str(&record.cwd);
-    w.str(&record.target);
-    w.str(&record.root);
     w.u64(record.created_unix);
     w.u8(match record.origin {
         Origin::Build => 1,
@@ -247,7 +248,10 @@ pub fn encode(record: &Record) -> Vec<u8> {
         });
         w.str(line);
     }
-    let payload = w.0;
+    // The head stays plain so a prune reads the paths from a prefix; the rest, mostly paths, is LZ4-packed.
+    let mut payload = head.0;
+    payload.extend_from_slice(&(w.0.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&lz4_flex::block::compress(&w.0));
     let mut out = Vec::with_capacity(HEADER + payload.len() + CHECKSUM);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
@@ -260,12 +264,21 @@ pub fn encode(record: &Record) -> Vec<u8> {
 /// `None` for another format, a torn or damaged file, or trailing bytes.
 pub fn decode(bytes: &[u8]) -> Option<Record> {
     let payload = verified_payload(bytes)?;
-    let mut r = Reader { buf: payload, at: 0 };
-    let key = r.str()?;
-    let display = r.str()?;
-    let cwd = r.str()?;
-    let target = r.str()?;
-    let root = r.str()?;
+    let mut head = Reader { buf: payload, at: 0 };
+    let key = head.str()?;
+    let display = head.str()?;
+    let cwd = head.str()?;
+    let target = head.str()?;
+    let root = head.str()?;
+    let raw_len = head.u32()? as usize;
+    if raw_len > MAX_RECORD_BYTES {
+        return None;
+    }
+    let mut body = vec![0; raw_len];
+    if lz4_flex::block::decompress_into(&payload[head.at..], &mut body).ok()? != raw_len {
+        return None;
+    }
+    let mut r = Reader { buf: &body, at: 0 };
     let created_unix = r.u64()?;
     let origin = match r.u8()? {
         1 => Origin::Build,
@@ -307,7 +320,7 @@ pub fn decode(bytes: &[u8]) -> Option<Record> {
         };
         replay.push((stream, r.str()?));
     }
-    (r.at == payload.len()).then_some(Record { key, display, cwd, target, root, created_unix, origin, units, profiles, env, entries, replay })
+    (r.at == body.len()).then_some(Record { key, display, cwd, target, root, created_unix, origin, units, profiles, env, entries, replay })
 }
 
 fn verified_payload(bytes: &[u8]) -> Option<&[u8]> {
@@ -1699,6 +1712,23 @@ mod tests {
         let mut longer = bytes;
         longer.push(0);
         assert_eq!(decode(&longer), None, "trailing bytes are a torn write");
+    }
+
+    #[test]
+    fn a_record_with_many_inputs_is_stored_packed_and_a_format_1_record_is_ignored() {
+        let mut record = sample();
+        record.entries = (0..2000)
+            .map(|n| Entry { path: format!("/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/f{n}.rs"), stamp: None })
+            .collect();
+        let raw: usize = record.entries.iter().map(|e| e.path.len() + 5).sum();
+        let bytes = encode(&record);
+        assert!(bytes.len() * 4 < raw, "{} stored for {raw} raw bytes", bytes.len());
+        assert_eq!(decode(&bytes), Some(record.clone()));
+        assert_eq!(peek_paths(&bytes[..HEADER + 200]), Some(("/w".to_string(), "/t".to_string())), "the paths are read from the head alone");
+        let mut older = bytes;
+        older[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode(&older), None);
+        assert_eq!(peek_paths(&older), None, "an older record is discarded by the next prune");
     }
 
     #[test]
