@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::{Dirs, short_hash, slug};
 use crate::toolchain::memo::{self, Digest};
-use crate::toolchain::{CacheOutcome, resolve_tool};
+use crate::toolchain::{CacheOutcome, direct_binary, resolve_tool};
 
 /// Bump when the entry layout or the meaning of its key changes.
 const LOCATE_FORMAT: &str = "frust-locate-v1";
@@ -140,10 +140,14 @@ fn locate_key(cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsSt
 
 pub fn locate(cwd: &Path, toolchain: Option<&OsStr>, manifest_path: Option<&OsStr>) -> Option<PathBuf> {
     let cargo = resolve_tool("cargo")?;
-    let mut cmd = Command::new(cargo);
-    if let Some(tc) = toolchain {
-        cmd.arg(tc);
-    }
+    let mut cmd = match direct_binary(&cargo, "cargo", toolchain, cwd) {
+        Some(direct) => Command::new(direct),
+        None => {
+            let mut cmd = Command::new(cargo);
+            cmd.args(toolchain);
+            cmd
+        }
+    };
     cmd.args(["locate-project", "--workspace", "--message-format", "plain"]);
     if let Some(manifest) = manifest_path {
         cmd.arg("--manifest-path").arg(manifest);
@@ -205,6 +209,15 @@ mod tests {
         let check = check_target(&build);
         assert_eq!(check.parent(), build.parent());
         assert_eq!(check.file_name().unwrap(), "abc123-check");
+    }
+
+    #[test]
+    fn locating_answers_what_the_cargo_proxy_answers() {
+        let Some(cargo) = resolve_tool("cargo") else { return };
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let out = Command::new(cargo).args(["locate-project", "--workspace", "--message-format", "plain"]).current_dir(&cwd).output().unwrap();
+        let proxied = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        assert_eq!(locate(&cwd, None, None), Some(crate::sys::canonicalize(proxied.parent().unwrap()).unwrap()));
     }
 
     #[test]

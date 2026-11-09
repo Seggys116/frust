@@ -218,6 +218,8 @@ struct Plan {
     session: OnceLock<cache::session::Produced>,
     /// An input outside the profile that changed too close to the compile, found by the freeze; no store of this compile can pass its check.
     too_new_input: OnceLock<PathBuf>,
+    /// Outputs hashed as rustc announced them, with whether that hash was attested already.
+    announced_hashes: Mutex<HashMap<PathBuf, (hashing::Hashed, bool)>>,
 }
 
 struct Shared {
@@ -386,6 +388,7 @@ impl Plan {
             bulk_scan: AtomicBool::new(false),
             session: OnceLock::new(),
             too_new_input: OnceLock::new(),
+            announced_hashes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -474,6 +477,7 @@ impl Plan {
             bulk_scan: AtomicBool::new(false),
             session: job.session.clone().map(OnceLock::from).unwrap_or_default(),
             too_new_input: OnceLock::new(),
+            announced_hashes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1000,11 +1004,13 @@ impl Plan {
             }
         };
         let pipe = child.stderr.take().expect("stderr was piped");
-        let forwarder = thread::spawn(move || forward(pipe));
+        let (announce, announced) = std::sync::mpsc::channel();
+        let forwarder = thread::spawn(move || forward(pipe, announce));
         let warm = self.link_dirs_to_warm();
         let budget = (!warm.is_empty()).then(|| worker_budget(2));
         let concurrent = budget.as_ref().is_some_and(|b| b.threads > 1);
         let (preexisting, status) = thread::scope(|scope| {
+            scope.spawn(|| self.hash_announced(announced));
             let warming = concurrent.then(|| scope.spawn(|| self.warm_link_dirs(&warm)));
             let preexisting = early.unwrap_or_else(|| scan_earlier(true));
             let status = child.wait();
@@ -1530,6 +1536,38 @@ impl Plan {
         }
     }
 
+    /// Libraries are hashed as rustc announces them, overlapping its exit; metadata is attested at once since cargo starts dependents on its notification.
+    fn hash_announced(&self, announced: impl IntoIterator<Item = Vec<u8>>) {
+        // A store that takes commitments reads each output anyway.
+        let commits = self.context.compression_requested && cache::payload::compression_supported(&self.dirs.tmp()) && !self.linked_storage();
+        if !self.may_have_dependents() || self.skips_store() || commits {
+            return;
+        }
+        for line in announced {
+            let Some((path, metadata)) = self.announced_library(&line) else { continue };
+            let Ok(hashed) = hashing::hash_with_stamp(&path) else { continue };
+            if !hashed.stable || hashed.stamp.size < hashing::ATTEST_MIN_BYTES {
+                continue;
+            }
+            let attested = metadata && self.hasher.attest(&path, &hashed.hash, &hashed.stamp);
+            self.announced_hashes.lock().unwrap_or_else(PoisonError::into_inner).insert(path, (hashed, attested));
+        }
+    }
+
+    /// A library or metadata file rustc announced in this output directory; the flag marks metadata.
+    fn announced_library(&self, line: &[u8]) -> Option<(PathBuf, bool)> {
+        let value = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+        let metadata = match value.get("emit")?.as_str()? {
+            "metadata" => true,
+            "link" => false,
+            _ => return None,
+        };
+        let path = Path::new(value.get("artifact")?.as_str()?);
+        let local = path.parent() == Some(self.parsed.out_dir.as_path()) || path.parent().is_none();
+        let name = path.file_name()?.to_str()?;
+        (local && is_dependency_artifact(name)).then(|| (self.output_dir_abs.join(name), metadata))
+    }
+
     /// A restored library is hashed once here instead of once by every dependent; `bytes` skips files too small to be attested.
     fn attest_restored(&self, path: &Path, bytes: u64) {
         if bytes >= hashing::ATTEST_MIN_BYTES
@@ -1541,6 +1579,13 @@ impl Plan {
     }
 
     fn attest_by_reading(&self, path: &Path, stamp: &Stamp) {
+        let announced = self.announced_hashes.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+        if let Some((hashed, attested)) = announced.filter(|(hashed, _)| hashed.stamp == *stamp) {
+            if !attested {
+                self.hasher.attest(path, &hashed.hash, stamp);
+            }
+            return;
+        }
         if stamp.size >= hashing::ATTEST_MIN_BYTES
             && let Ok(hashed) = hashing::hash_with_stamp(path)
             && hashed.stable
@@ -3878,8 +3923,8 @@ fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
     plan.prune_superseded(&job.superseded.iter().filter_map(|(name, stamp)| Some((name.clone(), stamp.stamp()?))).collect::<Vec<_>>());
 }
 
-/// Lines are forwarded as they arrive because cargo needs artifact notifications in real time.
-fn forward(pipe: impl io::Read) -> Vec<u8> {
+/// Lines are forwarded as they arrive because cargo needs artifact notifications in real time; artifact lines are then passed to `announce`.
+fn forward(pipe: impl io::Read, announce: std::sync::mpsc::Sender<Vec<u8>>) -> Vec<u8> {
     let mut reader = BufReader::new(pipe);
     let mut captured = Vec::new();
     let mut line = Vec::new();
@@ -3891,6 +3936,10 @@ fn forward(pipe: impl io::Read) -> Vec<u8> {
                 let mut out = io::stderr().lock();
                 let _ = out.write_all(&line);
                 let _ = out.flush();
+                drop(out);
+                if line.starts_with(b"{\"$message_type\":\"artifact\"") {
+                    let _ = announce.send(line.clone());
+                }
                 captured.extend_from_slice(&line);
             }
         }
@@ -6589,6 +6638,56 @@ mod tests {
             let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
             dependent.hash(&lib, true).unwrap();
             assert_eq!(dependent.tally().0 == 0, attested, "uplift_links={uplift_links} previous_uplifted={previous_uplifted}");
+        }
+    }
+
+    fn announced(name: &str, emit: &str) -> Vec<u8> {
+        format!("{}\n", serde_json::json!({"$message_type": "artifact", "artifact": format!("target/debug/deps/{name}"), "emit": emit})).into_bytes()
+    }
+
+    #[test]
+    fn announced_metadata_is_attested_before_rustc_exits() {
+        let s = Scratch::new("announced-rmeta");
+        let (mut job, _, rlib) = relative_job(&s);
+        job.context.compression_requested = false;
+        let rmeta = rlib.with_file_name("libk.rmeta");
+        fs::write(&rmeta, vec![b'm'; hashing::ATTEST_MIN_BYTES as usize * 2]).unwrap();
+        if !hashing::fs_trusted(&rmeta) {
+            return;
+        }
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        plan.hash_announced(vec![announced("k.d", "dep-info"), announced("libk.rmeta", "metadata")]);
+        let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
+        assert_eq!(dependent.hash(&rmeta, true).unwrap().hash, hashing::hash_with_stamp(&rmeta).unwrap().hash);
+        assert_eq!(dependent.tally().0, 0, "a dependent started on the notification reads the producer's hash");
+    }
+
+    #[test]
+    fn an_announced_library_is_read_once_and_only_while_its_stamp_holds() {
+        let s = Scratch::new("announced-rlib");
+        let (mut job, _, rlib) = relative_job(&s);
+        job.context.compression_requested = false;
+        let size = hashing::ATTEST_MIN_BYTES as usize * 2 + 3;
+        let captured = ["k.d", "libk.rlib"].iter().map(|name| String::from_utf8(announced(name, "link")).unwrap()).collect::<String>();
+        for replaced in [false, true] {
+            fs::write(&rlib, vec![b'a'; size]).unwrap();
+            if !hashing::fs_trusted(&rlib) {
+                return;
+            }
+            let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+            hashing::take_hashed_sizes();
+            plan.hash_announced(vec![announced("libk.rlib", "link")]);
+            if replaced {
+                let fresh = rlib.with_file_name("fresh.tmp");
+                fs::write(&fresh, vec![b'b'; size]).unwrap();
+                sys::rename(&fresh, &rlib).unwrap();
+            }
+            plan.freeze_with_capture(captured.as_bytes(), job.spawned_ns.parse().unwrap(), &HashMap::new(), cache::payload::capture).unwrap();
+            let reads = hashing::take_hashed_sizes().into_iter().filter(|&n| n == size as u64).count();
+            assert_eq!(reads, if replaced { 2 } else { 1 }, "replaced={replaced}");
+            let dependent = Hasher::new(Some(plan.dirs.hashmemo()), Vec::new());
+            assert_eq!(dependent.hash(&rlib, true).unwrap().hash, blake3::hash(&fs::read(&rlib).unwrap()).to_hex().to_string(), "replaced={replaced}");
+            assert_eq!(dependent.tally().0, 0, "replaced={replaced}");
         }
     }
 
