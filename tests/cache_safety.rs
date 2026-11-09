@@ -375,7 +375,7 @@ fn gc_retains_old_manifests_that_still_serve_current_cache_entries() {
     for manifest in frust::cache::keyed_items(&dirs.manifests()) {
         let path = manifest;
         let data: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert_eq!(data["format"], 7);
         age(&path, Duration::from_secs(40 * 86_400));
         manifests.push(path);

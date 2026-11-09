@@ -1283,7 +1283,7 @@ fn manifest_snapshot(
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     let mut references = Vec::new();
-    if let Ok(manifest) = serde_json::from_slice::<References>(&contents) {
+    if let Some(manifest) = fsx::unpack(&contents, cache::MAX_MANIFEST_BYTES).and_then(|raw| serde_json::from_slice::<References>(&raw).ok()) {
         for candidate in manifest.candidates {
             let usage = manifest_reference(store, &candidate.key)?;
             references.push((candidate.key, usage));

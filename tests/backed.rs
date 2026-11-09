@@ -69,7 +69,7 @@ fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
 fn manifest_formats(sb: &Sandbox) -> Vec<u64> {
     manifests(sb)
         .iter()
-        .filter_map(|path| serde_json::from_slice::<serde_json::Value>(&fs::read(path).ok()?).ok()?["format"].as_u64())
+        .filter_map(|path| serde_json::from_slice::<serde_json::Value>(&frust::fsx::read_packed(path, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok()?["format"].as_u64())
         .collect()
 }
 
@@ -385,7 +385,7 @@ fn off_keeps_ordinary_payloads_and_older_manifests_and_entries_still_restore() {
     }
     assert_eq!(manifest_formats(&sb).iter().filter(|f| **f == 8).count(), 0);
     for path in manifests(&sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         value["format"] = serde_json::json!(4);
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     }

@@ -64,7 +64,7 @@ fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
 fn stored(sb: &Sandbox) -> usize {
     manifests(sb)
         .iter()
-        .filter_map(|p| serde_json::from_slice::<serde_json::Value>(&fs::read(p).ok()?).ok())
+        .filter_map(|p| serde_json::from_slice::<serde_json::Value>(&frust::fsx::read_packed(p, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok())
         .filter(|m| m["candidates"].as_array().is_some_and(|c| !c.is_empty()))
         .count()
 }
