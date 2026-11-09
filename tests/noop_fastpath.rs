@@ -303,7 +303,7 @@ fn a_build_in_flight_makes_the_fast_path_decline() {
     for path in [held_by_cargo, held_by_frust] {
         let file = File::options().read(true).write(true).open(&path).unwrap();
         frust::sys::lock(&file, frust::sys::LockKind::Exclusive).unwrap();
-        let child = fx.command(&["build"], "on").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = fx.command(&["build"], "on").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
         // Released only once the child is past its check: it holds frust's build lock (waiting on cargo's) or queues for it.
         let pid = child.id();
         let past_check = || {
@@ -313,10 +313,13 @@ fn a_build_in_flight_makes_the_fast_path_decline() {
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while !past_check() {
+            assert!(child.try_wait().unwrap().is_none(), "the build finished without waiting for {}", path.display());
             assert!(std::time::Instant::now() < deadline, "the build never reached the build lock");
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        // Nothing may write the target while its lock is held elsewhere, so the build is still waiting.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(child.try_wait().unwrap().is_none(), "the build finished while {} was held", path.display());
         frust::sys::unlock(&file).unwrap();
         let out = child.wait_with_output().unwrap();
         assert_success(&out);
