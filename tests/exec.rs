@@ -553,3 +553,71 @@ fn a_manifest_written_as_the_build_starts_leaves_cargo_fingerprints_alone() {
     assert_eq!(trace["plan"], "written", "the edit's cargo run is planned: {trace}");
     assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "no run removed a fingerprint of a unit cargo built under a journal");
 }
+
+/// Cargo's dep-info timestamp for a library unit, which it sets to the start of the unit's compile.
+fn depinfo_time(fx: &Fixture, package: &str) -> std::time::SystemTime {
+    let fingerprints = fx.target().join("debug").join(".fingerprint");
+    let dep = format!("dep-lib-{package}");
+    let dir = fs::read_dir(&fingerprints).unwrap().flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{package}-")) && e.path().join(&dep).is_file())
+        .unwrap_or_else(|| panic!("no fingerprint for {package}"));
+    fs::metadata(dir.path().join(dep)).unwrap().modified().unwrap()
+}
+
+fn set_mtime(path: &Path, when: std::time::SystemTime) {
+    fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+}
+
+/// Writes a source dated as if saved after its next compile starts, which records it as a doubt.
+fn write_doubtful(path: &Path, text: &str, ahead: u64) {
+    write(path, text);
+    set_mtime(path, std::time::SystemTime::now() + std::time::Duration::from_secs(ahead));
+}
+
+/// A source saved just before its compile started is a doubt cargo settles by its own timestamps, so the next edit
+/// elsewhere is still replayed and leaves that unit as cargo would: unchanged.
+#[test]
+fn a_source_saved_just_before_its_compile_does_not_send_the_next_edit_to_cargo() {
+    let fx = Fixture::new("exec-saved-before", &lib_and_bin());
+    assert_success(&fx.run("on").0);
+    let lib = fx.dir.join("applib/src/lib.rs");
+    write_doubtful(&lib, "pub fn value() -> u32 {\n    2\n}\n", 30);
+    assert_success(&fx.run("on").0);
+    set_mtime(&lib, depinfo_time(&fx, "applib") - std::time::Duration::from_millis(50));
+    fx.edit("app/src/main.rs", &format!("{MAIN}// edited\n"));
+    let out = fx.replayed(1);
+    assert!(!stderr(&out).contains("Compiling applib"), "cargo finds applib fresh: {}", stderr(&out));
+    assert_eq!(fx.output("app"), "2");
+    assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "cargo agrees with the replay");
+}
+
+/// A source written after its compile started is stale to cargo, and the executor rebuilds it and its dependents alike.
+#[test]
+fn a_source_written_after_its_compile_started_is_rebuilt_as_cargo_would() {
+    let fx = Fixture::new("exec-written-after", &lib_and_bin());
+    assert_success(&fx.run("on").0);
+    let lib = fx.dir.join("applib/src/lib.rs");
+    write_doubtful(&lib, "pub fn value() -> u32 {\n    3\n}\n", 120);
+    assert_success(&fx.run("on").0);
+    fx.audited();
+    fx.replayed(2);
+    assert_eq!(fx.output("app"), "3");
+}
+
+/// A doubtful source in a unit another edit dirties anyway is simply recompiled.
+#[test]
+fn a_doubtful_source_in_a_unit_edited_again_is_replayed() {
+    let mut files = lib_and_bin();
+    files[2].1 = "mod extra;\npub fn value() -> u32 {\n    extra::one()\n}\n".to_string();
+    files.push(("applib/src/extra.rs", "pub fn one() -> u32 {\n    1\n}\n".to_string()));
+    let fx = Fixture::new("exec-doubt-dirty", &files);
+    assert_success(&fx.run("on").0);
+    let lib = fx.dir.join("applib/src/lib.rs");
+    write_doubtful(&lib, "mod extra;\npub fn value() -> u32 {\n    extra::one() + 1\n}\n", 30);
+    assert_success(&fx.run("on").0);
+    set_mtime(&lib, depinfo_time(&fx, "applib") - std::time::Duration::from_millis(50));
+    fx.edit("applib/src/extra.rs", "pub fn one() -> u32 {\n    10\n}\n");
+    fx.replayed(2);
+    assert_eq!(fx.output("app"), "11");
+    assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "cargo agrees with the replay");
+}
