@@ -300,7 +300,10 @@ impl Gate {
         }).collect());
         for (u, unit) in plan.units.iter().enumerate() {
             if !dirty[u] {
-                if unit.stamps.iter().any(|e| !e.current_output()) {
+                if let Some(moved) = unit.stamps.iter().find(|e| !e.current_output()) {
+                    if self.debug {
+                        eprintln!("frust: executor: {} was {:?}, now {:?}", moved.path, moved.stamp, plan::stamp(Path::new(&moved.path)));
+                    }
                     return Err("outputs changed");
                 }
                 continue;
