@@ -61,6 +61,11 @@ impl Entry {
         stamp(Path::new(&self.path)) == self.stamp
     }
 
+    /// Changed too close to its compile, or missing: whether the compile saw today's content is unknown.
+    pub fn poisoned(&self) -> bool {
+        self.stamp == Some(POISON)
+    }
+
     /// An output is the same file with the same contents; its change time moves when the cache links it into an entry.
     pub fn current_output(&self) -> bool {
         match (stamp(Path::new(&self.path)), self.stamp) {
@@ -492,7 +497,7 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
     let mut uncovered: Vec<PathBuf> = Vec::new();
     let mut gaps = 0usize;
     // Each message's checks only read the target, so they run spread over threads and are applied in message order.
-    let steps = par_map(&rec.messages, |msg| assess(msg, &candidates, fresh_from, rec.target));
+    let steps = par_map(&rec.messages, |msg| assess(msg, &candidates, fresh_from, rec.target, rec.launched_ns));
     for (msg, step) in rec.messages.iter().zip(steps) {
         match step? {
             Step::Skip => {}
@@ -585,7 +590,7 @@ enum Step {
     Unit(Box<(Unit, Vec<PathBuf>)>),
 }
 
-fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, target: &Path) -> Result<Step, Refused> {
+fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, target: &Path, launched_ns: i128) -> Result<Step, Refused> {
     match msg.get("reason").and_then(|r| r.as_str()) {
         Some("compiler-artifact") => {}
         Some("build-script-executed") => return Ok(Step::Script),
@@ -639,6 +644,8 @@ fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, 
     }
     let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
     let (mut inputs, env_deps) = match &c.previous {
+        // Cargo found the unit fresh, settling the doubt for inputs older than this run, as cargo does.
+        Some(prev) if fresh && prev.inputs.iter().any(Entry::poisoned) => read_inputs(a, Path::new(&c.cwd), target, launched_ns)?,
         Some(prev) => (prev.inputs.clone(), prev.env_deps.clone()),
         None => read_inputs(a, Path::new(&c.cwd), target, i128::from(c.t))?,
     };

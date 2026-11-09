@@ -314,6 +314,10 @@ impl Gate {
                 return Err("build script would rerun");
             }
         }
+        // Cargo may still find such a unit fresh, and every doubt runs cargo.
+        if plan.units.iter().any(|u| u.inputs.iter().any(plan::Entry::poisoned)) {
+            return Err("input written as it was compiled");
+        }
         let total = plan.units.len();
         let dirty = with_dependents(plan, plan.units.iter().map(|u| {
             u.inputs.iter().any(|e| !e.current()) || u.env_deps.iter().any(|(k, v)| self.unit_env(plan, u, k) != *v)
