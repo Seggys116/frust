@@ -314,13 +314,10 @@ impl Gate {
                 return Err("build script would rerun");
             }
         }
-        // Cargo may still find such a unit fresh, and every doubt runs cargo.
-        if plan.units.iter().any(|u| u.inputs.iter().any(plan::Entry::poisoned)) {
-            return Err("input written as it was compiled");
-        }
         let total = plan.units.len();
         let dirty = with_dependents(plan, plan.units.iter().map(|u| {
-            u.inputs.iter().any(|e| !e.current()) || u.env_deps.iter().any(|(k, v)| self.unit_env(plan, u, k) != *v)
+            let changed = |e: &plan::Entry| if e.poisoned() { stale_to_cargo(u, e) } else { !e.current() };
+            u.inputs.iter().any(changed) || u.env_deps.iter().any(|(k, v)| self.unit_env(plan, u, k) != *v)
         }).collect());
         for (u, unit) in plan.units.iter().enumerate() {
             // Outputs another build rewrote since the plan was written, dirty or not, mean only cargo knows what is current.
@@ -693,6 +690,18 @@ fn target_has_plans(dirs: &Dirs, own: &Path, target: &Path) -> bool {
 }
 
 /// Cargo's rule: a unit rebuilds when any dependency did.
+/// An input written as it was compiled is judged as cargo judges it: stale once newer than the unit's dep-info, which
+/// cargo (or a replay) dates to the start of that compile; with the dep-info or the input gone, cargo recompiles too.
+fn stale_to_cargo(unit: &plan::Unit, input: &plan::Entry) -> bool {
+    let fingerprint = Path::new(&unit.fingerprint);
+    let (Some(dir), Some(name)) = (fingerprint.parent(), fingerprint.file_name().and_then(|n| n.to_str())) else { return true };
+    let modified = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (modified(&dir.join(format!("dep-{name}"))), modified(Path::new(&input.path))) {
+        (Some(reference), Some(written)) => written > reference,
+        _ => true,
+    }
+}
+
 fn with_dependents(plan: &Plan, mut marked: Vec<bool>) -> Vec<bool> {
     let mut dependents = vec![Vec::new(); plan.units.len()];
     for (u, unit) in plan.units.iter().enumerate() {
