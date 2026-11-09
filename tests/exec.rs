@@ -217,9 +217,11 @@ fn replayed_outputs_are_byte_identical_to_plain_cargo() {
     fx.edit("applib/src/lib.rs", "pub fn value() -> u32 {\n    5\n}\n");
     fx.replayed(2);
     let deps = fx.target().join("debug").join("deps");
+    // An msvc link stamps the time and a fresh PDB signature into the executable, so no two links there are byte identical.
+    let linked_reproducibly = !cfg!(windows);
     let compared = |name: &fs::DirEntry| {
         let n = name.file_name().to_string_lossy().into_owned();
-        (n.starts_with("libapplib-") && (n.ends_with(".rlib") || n.ends_with(".rmeta"))) || (n.starts_with("app-") && !n.contains('.'))
+        (n.starts_with("libapplib-") && (n.ends_with(".rlib") || n.ends_with(".rmeta"))) || (linked_reproducibly && n.starts_with("app-") && !n.contains('.'))
     };
     let snapshot = |dir: &Path| -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir).unwrap().flatten().filter(compared)
@@ -228,7 +230,8 @@ fn replayed_outputs_are_byte_identical_to_plain_cargo() {
         files
     };
     let replayed = snapshot(&deps);
-    assert_eq!(replayed.len(), 3, "rlib, rmeta and executable: {:?}", replayed.iter().map(|f| &f.0).collect::<Vec<_>>());
+    let expected = if linked_reproducibly { 3 } else { 2 };
+    assert_eq!(replayed.len(), expected, "rlib, rmeta and executable: {:?}", replayed.iter().map(|f| &f.0).collect::<Vec<_>>());
     // The replay left cargo nothing to do, so cargo's record of the two units is removed to make it compile them.
     for entry in fs::read_dir(fx.target().join("debug").join(".fingerprint")).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -519,6 +522,29 @@ fn a_package_whose_build_script_watches_everything_declines_from_stats_alone() {
     fx.edit("src/main.rs", "fn main() {\n    println!(\"4\");\n}\n");
     fx.replayed(1);
     assert_eq!(fx.output("app"), "4");
+}
+
+/// A path package's cdylib keeps cargo's name without a hash, as executables do on windows-msvc, where every test here covers it.
+#[cfg(not(windows))]
+#[test]
+fn an_output_named_without_a_hash_is_planned_and_replayed() {
+    let lib = |n: u32| format!("#[no_mangle]\npub extern \"C\" fn value() -> u32 {{\n    {n}\n}}\n");
+    let files = vec![
+        ("Cargo.toml", "[workspace]\nmembers = [\"plugin\"]\nresolver = \"2\"\n".to_string()),
+        ("plugin/Cargo.toml", "[package]\nname = \"plugin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n".to_string()),
+        ("plugin/src/lib.rs", lib(1)),
+    ];
+    let fx = Fixture::new("exec-unhashed", &files);
+    let (out, trace) = fx.run("on");
+    assert_success(&out);
+    assert_eq!(trace["plan"], "written", "trace {trace}");
+    fx.edit("plugin/src/lib.rs", &lib(2));
+    fx.replayed(1);
+    fx.edit("plugin/src/lib.rs", &lib(3));
+    fx.audited();
+    fx.edit("plugin/src/lib.rs", &lib(4));
+    fx.replayed(1);
+    assert_eq!(cargo_rebuilds(&fx), Vec::<String>::new(), "cargo itself finds the replayed unit fresh");
 }
 
 #[test]

@@ -1073,7 +1073,7 @@ fn within(path: &str, base: &str, windows: bool) -> bool {
     !base.is_empty() && path.starts_with(&base)
 }
 
-fn is_hash(text: &str) -> bool {
+pub(crate) fn is_hash(text: &str) -> bool {
     text.len() == 16 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 

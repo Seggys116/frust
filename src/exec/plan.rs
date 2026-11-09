@@ -665,12 +665,8 @@ fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, 
     let package = if local { format!("{pkg_name} v{version} ({dir})") } else { format!("{pkg_name} v{version}") };
     let (desc, fix) = describe(msg, local);
     let profile = profile_root(&a.out_dir);
-    let hash = a.extra.trim_start_matches('-');
-    let fp_dir = profile.join(".fingerprint").join(format!("{pkg_name}-{hash}"));
     let fp_name = fingerprint_file(msg).ok_or("unknown unit kind")?;
-    if hash.is_empty() || !fp_dir.is_dir() {
-        return Err("unrecognised fingerprint layout".into());
-    }
+    let fp_dir = fingerprint_dir(&profile, &pkg_name, &a.extra, &fp_name).ok_or("unrecognised fingerprint layout")?;
     let script = msg.pointer("/target/kind/0").and_then(|k| k.as_str()) == Some("custom-build");
     let (mut inputs, env_deps) = match &c.previous {
         // Cargo found the unit fresh, settling the doubt for inputs older than this run, as cargo does.
@@ -715,6 +711,22 @@ fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, 
         ms: c.ms,
     };
     Ok(Step::Unit(Box::new((unit, outs))))
+}
+
+/// Cargo's fingerprint directory of a unit; without `-C extra-filename` (path cdylibs, windows-msvc executables) it is the package's only one holding `fp_name`.
+fn fingerprint_dir(profile: &Path, pkg_name: &str, extra: &str, fp_name: &str) -> Option<PathBuf> {
+    let fingerprints = profile.join(".fingerprint");
+    let hash = extra.trim_start_matches('-');
+    if !hash.is_empty() {
+        let dir = fingerprints.join(format!("{pkg_name}-{hash}"));
+        return dir.is_dir().then_some(dir);
+    }
+    let mut found = fs::read_dir(&fingerprints).ok()?.flatten().map(|e| e.path()).filter(|dir| {
+        let named = dir.file_name().and_then(OsStr::to_str).and_then(|n| n.rsplit_once('-'));
+        named.is_some_and(|(p, h)| p == pkg_name && crate::noop::is_hash(h)) && dir.join(fp_name).is_file()
+    });
+    let dir = found.next()?;
+    found.next().is_none().then_some(dir)
 }
 
 /// An order-preserving map over a few scoped threads; plan recording is bound by stat and read calls.
@@ -993,8 +1005,8 @@ mod tests {
         let a = parse_argv(&argv, Path::new("/w")).unwrap();
         assert_eq!((a.crate_name.as_str(), a.extra.as_str(), a.incremental, a.test), ("applib", "-a4f8", true, false));
         assert_eq!(a.externs, vec![PathBuf::from("/t/debug/deps/libdep-1.rmeta"), PathBuf::from("/s/libcore.rlib")]);
-        let outs: Vec<String> = outputs(&a).iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert_eq!(outs[..3], ["/t/debug/deps/applib-a4f8.d", "/t/debug/deps/libapplib-a4f8.rmeta", "/t/debug/deps/libapplib-a4f8.rlib"]);
+        let deps = Path::new("/t/debug/deps");
+        assert_eq!(outputs(&a)[..3], [deps.join("applib-a4f8.d"), deps.join("libapplib-a4f8.rmeta"), deps.join("libapplib-a4f8.rlib")]);
         assert!(parse_argv(&args(&["rustc", "@args.txt"]), Path::new("/w")).is_none());
         assert!(parse_argv(&args(&["rustc", "--crate-name", "x", "--out-dir", "o", "--emit=link=/x"]), Path::new("/w")).is_none());
         let bin = parse_argv(&args(&["rustc", "--crate-name", "app", "--crate-type", "bin", "--emit=dep-info,link", "--out-dir", "d", "-Cextra-filename=-9"]), Path::new("/w")).unwrap();
@@ -1031,6 +1043,23 @@ mod tests {
         let a = Argv { crate_name: "my_app".into(), extra: "-0123".into(), out_dir: "/t/deps".into(), ..Argv::default() };
         assert_eq!(uplift_names(Path::new("/t/deps/my_app-0123"), &a, "my-app"), vec!["my_app", "my-app"]);
         assert_eq!(uplift_names(Path::new("/t/deps/libmy_app-0123.rlib"), &a, "my_app"), vec!["libmy_app.rlib"]);
+    }
+
+    #[test]
+    fn an_unhashed_unit_takes_the_only_fingerprint_holding_its_file_and_never_guesses() {
+        let profile = crate::fsx::temp_sibling(&std::env::temp_dir().join("frust-plan-fingerprint"));
+        let fp = profile.join(".fingerprint");
+        for (dir, file) in [("app-4e7dc2d6835c5d74", "bin-app"), ("app-0123456789abcdef", "test-bin-app"), ("app-tool-1111111111111111", "bin-app")] {
+            fs::create_dir_all(fp.join(dir)).unwrap();
+            fs::write(fp.join(dir).join(file), b"").unwrap();
+        }
+        assert_eq!(fingerprint_dir(&profile, "app", "", "bin-app"), Some(fp.join("app-4e7dc2d6835c5d74")));
+        assert_eq!(fingerprint_dir(&profile, "app", "-0123456789abcdef", "lib-app"), Some(fp.join("app-0123456789abcdef")));
+        assert_eq!(fingerprint_dir(&profile, "app", "-fedcba9876543210", "bin-app"), None);
+        fs::create_dir_all(fp.join("app-aaaaaaaaaaaaaaaa")).unwrap();
+        fs::write(fp.join("app-aaaaaaaaaaaaaaaa").join("bin-app"), b"").unwrap();
+        assert_eq!(fingerprint_dir(&profile, "app", "", "bin-app"), None, "two builds of the executable leave it ambiguous");
+        fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]
