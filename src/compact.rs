@@ -964,6 +964,28 @@ pub fn stale_objects(profile: &Path) -> Vec<(PathBuf, u64)> {
     out
 }
 
+/// Removes the per-compile objects of unit `stem` in `dir` named by `candidates` that `unchanged` still accepts and its current artifacts do not name; returns how many went.
+pub fn prune_unit_objects(dir: &Path, stem: &str, candidates: &[String], unchanged: impl Fn(&str, &sys::Meta) -> bool) -> usize {
+    let prefix = format!("{stem}.");
+    let candidates: Vec<&String> = candidates.iter().filter(|name| name.starts_with(&prefix) && crate::cache::is_incremental_object(name)).collect();
+    if candidates.is_empty() || artifact_hash(stem).is_none() {
+        return 0;
+    }
+    let current = current_objects(dir, stem);
+    // Only artifacts that name objects present here prove which objects are current.
+    if !current.iter().any(|name| name.starts_with(&prefix) && sys::lstat(&dir.join(name)).is_ok_and(|meta| meta.is_file())) {
+        return 0;
+    }
+    let mut removed = 0;
+    for name in candidates.into_iter().filter(|name| !current.contains(name.as_str())) {
+        let path = dir.join(name);
+        if sys::lstat(&path).is_ok_and(|meta| meta.is_file() && unchanged(name, &meta)) && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum IncrementalOwner {
     Live,
@@ -2518,6 +2540,9 @@ struct AutoMarker {
     longest_slice_ms: u64,
     #[serde(default)]
     cpu_ms: u64,
+    /// Files in the target after the pass; zero when unknown.
+    #[serde(default)]
+    files_after: u64,
 }
 
 impl AutoMarker {
@@ -2542,6 +2567,8 @@ fn auto_pass_complete(report: &Report) -> bool {
 }
 
 const STORE_ENTRIES_GROWTH: u64 = 32;
+/// Hard-linked object aliases add files but no bytes, yet every directory scan pays for each one.
+const TARGET_FILES_GROWTH: u64 = 4096;
 
 fn store_entries(dirs: &Dirs) -> u64 {
     let Ok(shards) = fs::read_dir(dirs.store()) else { return 0 };
@@ -2738,11 +2765,13 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         report.allocated_after = prev.allocated_after;
         return report;
     }
-    report.allocated_before = allocated(target);
+    let files_before;
+    (report.allocated_before, files_before) = allocated_and_files(target);
     if let Some(prev) = &previous
         && prev.complete
         && !reassess_age
         && report.allocated_before < prev.allocated_after.saturating_add(opts.min_growth)
+        && files_before < prev.files_after.saturating_add(TARGET_FILES_GROWTH)
         && report.allocated_before <= opts.max_target_bytes
     {
         // Every path-crate edit still adds cache entries even when the target is bounded, so prune once enough appear.
@@ -3043,7 +3072,8 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
     report.slices = slices.slices;
     report.longest_slice_ms = slices.longest.as_millis() as u64;
     let changed = !report.removed.is_empty() || report.compressed_files > 0 || report.deduped_files > 0 || !report.errors.is_empty();
-    report.allocated_after = if changed { allocated(target) } else { report.allocated_before };
+    let files_after;
+    (report.allocated_after, files_after) = if changed { allocated_and_files(target) } else { (report.allocated_before, files_before) };
     let complete = auto_pass_complete(&report);
     let cpu_ms = cpu_before.zip(sys::process_cpu_ns()).map_or(0, |(before, after)| after.saturating_sub(before) / 1_000_000);
     let record = AutoMarker {
@@ -3055,6 +3085,7 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
         slices: report.slices,
         longest_slice_ms: report.longest_slice_ms,
         cpu_ms,
+        files_after,
     };
     write_marker(&file, &record);
     let _ = file.set_modified(SystemTime::now());
@@ -3194,12 +3225,18 @@ fn remove_paths_with(paths: &[(PathBuf, u64)], report: &mut Report, halt: &mut d
 
 /// Files with several links are listed rather than summed, so a link seen from two subtrees is counted once.
 fn allocated(root: &Path) -> u64 {
-    type Part = (u64, Vec<(u64, u64, u64)>);
+    allocated_and_files(root).0
+}
+
+/// Allocated bytes, each hard-linked inode counted once, and the number of files.
+fn allocated_and_files(root: &Path) -> (u64, u64) {
+    type Part = (u64, Vec<(u64, u64, u64)>, u64);
     let parts = walk_parallel(
         root,
         &|_: &str, _: bool| false,
         &Part::default,
         &|acc: &mut Part, _: &Path, m: &sys::Meta| {
+            acc.2 += 1;
             if m.nlink() <= 1 {
                 acc.0 += m.allocated();
             } else {
@@ -3208,16 +3245,17 @@ fn allocated(root: &Path) -> u64 {
         },
     );
     let mut seen = HashSet::new();
-    let mut total = 0;
-    for (single, linked) in parts {
+    let (mut total, mut files) = (0, 0);
+    for (single, linked, count) in parts {
         total += single;
+        files += count;
         for (dev, ino, bytes) in linked {
             if seen.insert((dev, ino)) {
                 total += bytes;
             }
         }
     }
-    total
+    (total, files)
 }
 
 struct CoverageGroup {
@@ -4377,6 +4415,43 @@ mod tests {
         fs::remove_file(deps.join(format!("lib{stem}.rlib"))).unwrap();
         assert!(stale_objects(&root.join("debug")).is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unit_objects_prune_only_unchanged_candidates_the_artifacts_do_not_name() {
+        let deps = std::env::temp_dir().join(format!("frust-prune-objects-{}", std::process::id()));
+        fs::create_dir_all(&deps).unwrap();
+        let stem = "lib-0123456789abcdef";
+        let name = |cgu: &str, tag: &str| format!("{stem}.{cgu}.{tag}.rcgu.o");
+        for (cgu, tag) in [("c1", "t1"), ("c2", "t1"), ("c3", "t1"), ("c1", "t2"), ("c2", "t2")] {
+            fs::write(deps.join(name(cgu, tag)), b"o").unwrap();
+        }
+        let other = "other-1111111111111111.c1.t1.rcgu.o";
+        fs::write(deps.join(other), b"o").unwrap();
+        let mut ar = b"!<arch>\n".to_vec();
+        for n in [name("c1", "t2"), name("c2", "t2"), name("c3", "t1")] {
+            ar.extend(ar_header(&format!("#1/{}", n.len()), n.len()));
+            ar.extend(n.as_bytes());
+            if n.len() % 2 == 1 {
+                ar.push(b'\n');
+            }
+        }
+        let rlib = deps.join(format!("lib{stem}.rlib"));
+        fs::write(&rlib, &ar).unwrap();
+        let candidates: Vec<String> = [name("c1", "t1"), name("c2", "t1"), name("c3", "t1"), other.to_string(), format!("{stem}.d")].into();
+        let changed = name("c2", "t1");
+        let removed = prune_unit_objects(&deps, stem, &candidates, |n, _| n != changed);
+        assert_eq!(removed, 1);
+        let left = |n: &str| deps.join(n).exists();
+        assert!(!left(&name("c1", "t1")), "an unchanged earlier object is pruned");
+        assert!(left(&changed), "a rewritten name stays");
+        assert!(left(&name("c3", "t1")), "a name the artifact still uses stays");
+        assert!(left(other) && left(&name("c1", "t2")) && left(&name("c2", "t2")));
+
+        // Without an artifact naming a present object, nothing is proven stale.
+        fs::remove_file(&rlib).unwrap();
+        assert_eq!(prune_unit_objects(&deps, stem, &candidates, |_, _| true), 0);
+        let _ = fs::remove_dir_all(&deps);
     }
 
     #[test]

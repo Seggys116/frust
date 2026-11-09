@@ -960,6 +960,10 @@ impl Plan {
         // Taken after any wait and before rustc starts: an input changed after this may have been read in its old state.
         let spawned_ns = hashing::now_ns();
         let scan_earlier = |compiling: bool| -> HashMap<String, Stamp> {
+            // An unstored output needs no leftover check unless the shared-key verdict reads it.
+            if self.skips_store() && self.shared.is_none() {
+                return HashMap::new();
+            }
             let scanned = self
                 .prefixed_outputs(|_| true)
                 .into_iter()
@@ -1063,6 +1067,7 @@ impl Plan {
                     ));
                     self.retire_superseded_orphans();
                 }
+                self.prune_superseded(&self.superseded_objects(&preexisting));
                 self.probe.set(|r| r.inline_store_ms = timings::ms(store_started));
                 self.debug(&format!(
                     "compiled {} in {compile_ms}ms, stored in {}ms",
@@ -1280,6 +1285,7 @@ impl Plan {
                 .map(|_| self.cwd.join(keylock_path(&self.dirs, &self.prekey))),
             retired: retired.iter().map(|entry| cache::Retired { path: self.cwd.join(&entry.path), ..entry.clone() }).collect(),
             session: self.session.get().cloned(),
+            superseded: self.superseded_objects(preexisting).into_iter().map(|(name, stamp)| (name, StampWire::of(&stamp))).collect(),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
@@ -1671,6 +1677,30 @@ impl Plan {
             }
         }
         found
+    }
+
+    /// The unit's incremental objects found before rustc started; each compile hard-links its objects under fresh names, so these belong to earlier compiles.
+    fn superseded_objects(&self, preexisting: &HashMap<String, Stamp>) -> Vec<(String, Stamp)> {
+        let prefix = format!("{}{}.", self.parsed.crate_name, self.parsed.extra_filename);
+        preexisting
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix) && cache::is_incremental_object(name))
+            .map(|(name, stamp)| (name.clone(), *stamp))
+            .collect()
+    }
+
+    /// Left in place they make every later scan of the directory slower; a name rewritten since or still named by the unit's artifacts stays.
+    fn prune_superseded(&self, superseded: &[(String, Stamp)]) {
+        if superseded.is_empty() {
+            return;
+        }
+        let stamps: HashMap<&str, &Stamp> = superseded.iter().filter(|(name, _)| cache::safe_file_name(name)).map(|(name, stamp)| (name.as_str(), stamp)).collect();
+        let names: Vec<String> = stamps.keys().map(|name| name.to_string()).collect();
+        let stem = format!("{}{}", self.parsed.crate_name, self.parsed.extra_filename);
+        let removed = crate::compact::prune_unit_objects(&self.output_dir_abs, &stem, &names, |name, meta| {
+            stamps.get(name).is_some_and(|before| same_file(before, &Stamp::of(meta)))
+        });
+        self.debug(&format!("{removed} superseded objects of {} pruned", self.parsed.crate_name));
     }
 
     /// Incremental rustc never removes earlier per-compile names, so files unchanged since before rustc started are left out of the entry.
@@ -2636,6 +2666,9 @@ struct StoreJob {
     /// The incremental session the compile finalized, shared into the entry by the store; older readers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<cache::session::Produced>,
+    /// Earlier compiles' incremental objects of the unit, as found before rustc started; older readers ignore them and compaction prunes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    superseded: Vec<(String, StampWire)>,
 }
 
 impl StoreJob {
@@ -2687,6 +2720,7 @@ impl BrokerJob {
                 .inputs
                 .iter()
                 .any(|(path, stamp)| !path.is_absolute() || stamp.stamp().is_none())
+            || job.superseded.iter().any(|(name, stamp)| !cache::safe_file_name(name) || stamp.stamp().is_none())
             || job.names.is_empty()
             || job.names.iter().any(|name| !cache::safe_file_name(name))
             || job.names.iter().collect::<BTreeSet<_>>().len() != job.names.len()
@@ -3841,6 +3875,7 @@ fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
     ) {
         plan.note_store(&format!("error:{}", cache::payload::error_label(&error)));
     }
+    plan.prune_superseded(&job.superseded.iter().filter_map(|(name, stamp)| Some((name.clone(), stamp.stamp()?))).collect::<Vec<_>>());
 }
 
 /// Lines are forwarded as they arrive because cargo needs artifact notifications in real time.
@@ -6031,6 +6066,7 @@ mod tests {
             key_lock: None,
             retired: Vec::new(),
             session: None,
+            superseded: Vec::new(),
         };
         (job, src, rlib)
     }
@@ -6256,7 +6292,11 @@ mod tests {
         assert!(!try_key_lock(&other).unwrap());
         let wrong = File::create(s.0.join("wrong-key")).unwrap();
         assert!(BrokerJob::decode(&encode(&job), &dirs, Some(&wrong)).is_err());
-        let mutations: [fn(&mut StoreJob); 12] = [
+        let mutations: [fn(&mut StoreJob); 13] = [
+            |job: &mut StoreJob| {
+                let stamp = job.outputs[0].1.clone();
+                job.superseded.push(("../escape.c.t.rcgu.o".to_string(), stamp));
+            },
             |job: &mut StoreJob| job.home = PathBuf::from("relative-home"),
             |job: &mut StoreJob| job.cwd = PathBuf::from("relative-cwd"),
             |job: &mut StoreJob| {

@@ -63,6 +63,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * A bare explicit linker such as `rust-lld` (from `-C linker`, cargo config or `RUSTFLAGS`) is also resolved in the toolchain sysroot, so those units are cached instead of silently compiled uncached.
 * A cache bypass caused by an unresolved linker is now visible: one stderr line per reason, `skip:linker` in `FRUST_TIMINGS`, and a `frust doctor` warning that names the linker.
 * A pending deferred store no longer protects the rest of the cache from eviction once its scan budget is exhausted.
+* Edits no longer get slower the more of them there have been. With unpacked debuginfo (the macOS default) rustc links every incremental object into `deps/` under a new name on each compile and never removes the old names, so frust's output scans visited about 256 more entries per ripgrep edit (51,000 after 200 edits: a 124 ms scan beside rustc and 72 ms after it). The store (or an inline store) of each compile now removes the unit's objects that existed before rustc started, unless they were rewritten since or the unit's current artifacts still name them; automatic compaction also runs once a target gains 4096 files, not only 64 MiB; and a test harness that is not stored is no longer scanned.
 
 ## [0.3.0]
 

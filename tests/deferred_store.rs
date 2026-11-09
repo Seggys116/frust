@@ -703,3 +703,45 @@ fn the_hidden_argument_is_not_mistaken_for_a_compiler_command() {
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "a compiler command line that merely contains the flag is passed through: {}", stderr(&out));
 }
+
+/// The tags of `app`'s per-compile incremental objects in `deps/`; rustc never removes an earlier compile's names itself.
+fn object_tags(deps: &Path) -> std::collections::BTreeSet<String> {
+    fs::read_dir(deps)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("app-") && frust::cache::is_incremental_object(&name)).then(|| name.split('.').nth(2).map(str::to_string)).flatten()
+        })
+        .collect()
+}
+
+#[test]
+fn superseded_incremental_objects_do_not_pile_up_across_edits() {
+    let sb = Sandbox::new("deferred-objects");
+    let project = sb.project("app", &[], "fn main() {}\n");
+    let source = project.join("src").join("main.rs");
+    let target = sb.central_target(&project);
+    let mut filler = String::new();
+    for i in 0..24 {
+        filler.push_str(&format!("pub mod m{i} {{ pub fn f(x: u64) -> u64 {{ x.wrapping_mul({i} + 3) ^ {i} }} }}\n"));
+    }
+    for value in 0..8 {
+        fs::write(&source, format!("fn main() {{ println!(\"{{}}\", {value} + m{}::f(0) * 0); }}\n{filler}", value % 24)).unwrap();
+        common::settle(&source);
+        // Both the helper's store and an inline one prune.
+        if value % 2 == 0 {
+            build_deferred(&sb, &project);
+            wait_for_stores(&sb, 1);
+        } else {
+            build_inline(&sb, &project);
+        }
+        assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), value.to_string());
+        let tags = object_tags(&target.join("debug").join("deps"));
+        if cfg!(target_os = "macos") {
+            assert!(!tags.is_empty(), "unpacked debuginfo keeps the current compile's objects");
+        }
+        assert!(tags.len() <= 1, "after build {value}, objects of {} compiles remain: {tags:?}", tags.len());
+    }
+}

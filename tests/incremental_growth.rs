@@ -269,7 +269,7 @@ fn incremental_state_stays_bounded_and_builds_stay_incremental_under_auto_compac
     assert!(report.skipped.is_none() && report.errors.is_empty(), "{report:?}");
 
     let mut baseline: Option<u64> = None;
-    let mut stale_objects_removed = 0usize;
+    let mut aliases_left_by_builds = 0usize;
     for step in 1..=EDITS {
         // Each feature toggle makes the other mid and app variant dead; their incremental directories must not pile up.
         if step == 15 || step == 30 {
@@ -292,10 +292,10 @@ fn incremental_state_stays_bounded_and_builds_stay_incremental_under_auto_compac
         };
         assert_eq!(compiled, expected, "step {step}: only the edited crate and its dependents recompile");
         assert_eq!(stdout(&run_binary(&target, "debug", "app")).trim(), chain.expected().to_string(), "step {step}");
+        aliases_left_by_builds += compact::stale_objects(&profile).len();
 
         let report = compact::auto_compact_with(&dirs, &target, &opts);
         assert!(report.skipped.is_none() && report.errors.is_empty(), "step {step}: {report:?}");
-        stale_objects_removed += report.stale_objects;
         let again = build(&sb, &chain.app, chain.args());
         assert!(again.is_empty(), "step {step}: compaction made something stale: {again:?}");
 
@@ -317,8 +317,8 @@ fn incremental_state_stays_bounded_and_builds_stay_incremental_under_auto_compac
         assert!(size <= base + base / 2 + 512 * 1024, "step {step}: incremental state grew from {base} to {size} bytes: {a:?}");
     }
     if cfg!(target_os = "macos") {
-        // On macOS rustc keeps objects in deps/ and every compile adds aliases under new names; compaction must remove them.
-        assert!(stale_objects_removed > 0, "superseded object aliases were found and removed");
+        // On macOS rustc keeps objects in deps/ and every compile adds aliases under new names; each compile's store removes the earlier ones before compaction runs.
+        assert_eq!(aliases_left_by_builds, 0, "superseded object aliases outlived the store of the compile that replaced them");
         // Every edit of base stores new cache entries for base and mid; only the newest few per unit stay.
         for (krate, units) in [("base", 1), ("mid", 2)] {
             let entries = frust::stats::entry_dirs(&dirs)

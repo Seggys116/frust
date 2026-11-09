@@ -240,6 +240,49 @@ fn write_auto_marker(target: &Path, marker: &serde_json::Value) {
     fs::write(target.join(compact::AUTO_MARKER), serde_json::to_vec(marker).unwrap()).unwrap();
 }
 
+#[test]
+fn object_aliases_that_add_no_bytes_still_make_a_pass_due() {
+    let sb = Sandbox::new("auto-alias-growth");
+    let dirs = Dirs::at(sb.home());
+    let target = dirs.targets().join("alias-growth");
+    let deps = target.join("debug").join("deps");
+    let session = target.join("debug").join("incremental").join("app-1abc").join("s-0000000001-0000001-0000000000000000000000000");
+    fs::create_dir_all(&deps).unwrap();
+    fs::create_dir_all(&session).unwrap();
+    fs::write(session.join("dep-graph.bin"), b"current session").unwrap();
+    fs::write(session.parent().unwrap().join("s-0000000001-0000001.lock"), b"").unwrap();
+    let object = session.join("c0.o");
+    fs::write(&object, vec![1u8; 4096]).unwrap();
+    let stem = "app-0123456789abcdef";
+    let current = format!("{stem}.c0.t0.rcgu.o");
+    fs::hard_link(&object, deps.join(&current)).unwrap();
+    let mut ar = b"!<arch>\n".to_vec();
+    let header = format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", format!("#1/{}", current.len()), 0, 0, 0, 644, current.len());
+    ar.extend(header.as_bytes());
+    ar.extend(current.as_bytes());
+    if current.len() % 2 == 1 {
+        ar.push(b'\n');
+    }
+    fs::write(deps.join(format!("lib{stem}.rlib")), &ar).unwrap();
+
+    let mut opts = eager();
+    opts.min_growth = 64 * 1024 * 1024;
+    opts.compress = false;
+    opts.cache_enabled = false;
+    let first = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(first.skipped.is_none() && first.errors.is_empty(), "{first:?}");
+
+    // Earlier compiles' names of the same object, as rustc leaves them: thousands of entries, no new bytes.
+    let aliases: Vec<PathBuf> = (1..=4200).map(|tag| deps.join(format!("{stem}.c0.t{tag}.rcgu.o"))).collect();
+    for alias in &aliases {
+        fs::hard_link(&object, alias).unwrap();
+    }
+    let due = compact::auto_compact_with(&dirs, &target, &opts);
+    assert!(due.skipped.is_none() && due.errors.is_empty(), "file growth alone makes a pass due: {due:?}");
+    assert!(aliases.iter().all(|alias| !alias.exists()), "the pass prunes the aliases");
+    assert!(deps.join(&current).exists() && object.exists());
+}
+
 fn age_reassessment_cleans_unchanged_target(signature_matches: bool) {
     let sb = Sandbox::new(if signature_matches { "auto-age-signature" } else { "auto-age-growth" });
     let dirs = Dirs::at(sb.home());

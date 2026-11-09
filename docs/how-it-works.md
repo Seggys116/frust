@@ -292,7 +292,10 @@ The cost and sizing: deleting or replacing the target name leaves the store file
 survive `cargo clean`. `frust gc` counts a linked file that still has another name as zero bytes and an orphaned one
 in full, and drops every orphaned linked entry older than the newest of its unit (grouped by the unit records, not by
 prekey) at once, so frust never holds more than cargo does. A stale incremental object name left in a target does not
-keep a superseded entry. The hash of a linked output is taken by the store, not on the compile's critical path: the
+keep a superseded entry. Such names pile up because, with unpacked debuginfo, rustc links each compile's objects into
+`deps/` under fresh names and never removes the old ones; the store of each compile (deferred or inline) removes the
+unit's objects that existed before rustc started, unless one was rewritten since or the unit's current artifacts still
+name it, so the output scans of later edits stay the same size. The hash of a linked output is taken by the store, not on the compile's critical path: the
 store makes the link first and hashes through the new name, and the output must keep its inode, size, modification time
 and mode from before the link to the end of the read. That one read also attests a library again, since the new name
 moved its change time: only when the full stamp, change time included, held for the whole read and the link count grew,
@@ -352,7 +355,8 @@ entries use their own key domain, so older versions treat them as misses.
   record still matches, so a record that was already stale is never revived and the next unchanged build is still
   answered by the fast path. Between hourly reassessments, a completed pass can be skipped when
   a change signature (modification times and entry names of a few directories per profile, plus the number of cache
-  entries) matches the last complete pass, or when the target grew by less than 64 MiB since then. Once an hour has
+  entries) matches the last complete pass, or when the target grew by less than 64 MiB and 4096 files since then
+  (hard-linked object aliases add files but no bytes). Once an hour has
   elapsed since the last completed full pass,
   the next due check reassesses idle sessions, expired profiles and settled files even without further growth.
   A busy profile, exhausted work budget or error leaves a pass incomplete without resetting that successful-pass
