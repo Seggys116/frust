@@ -105,10 +105,7 @@ fn records(root: &Path) -> Vec<Vec<OsString>> {
                 bytes = &bytes[4..];
                 let length = length.checked_mul(2).unwrap();
                 assert!(bytes.len() >= length, "incomplete UTF-16 argument");
-                let units: Vec<_> = bytes[..length]
-                    .chunks_exact(2)
-                    .map(|unit| u16::from_le_bytes(unit.try_into().unwrap()))
-                    .collect();
+                let units: Vec<_> = bytes[..length].as_chunks::<2>().0.iter().map(|unit| u16::from_le_bytes(*unit)).collect();
                 args.push(OsString::from_wide(&units));
                 bytes = &bytes[length..];
             }
