@@ -4548,7 +4548,8 @@ mod tests {
         assert_eq!(recorded.bytes("measure again"), report.physical_after);
         assert_eq!(recorded.bytes("remove superseded"), report.removed_bytes);
         assert!(report.removed_bytes > 0 && report.dead_units == 2, "{report:?}");
-        assert!(recorded.items("lock profiles").1.iter().any(|(scope, _)| scope == "gamma-0000/tc/debug (busy)"));
+        let busy = format!("{} (busy)", Path::new("gamma-0000").join("tc").join("debug").display());
+        assert!(recorded.items("lock profiles").1.iter().any(|(scope, _)| *scope == busy));
         let ws = &report.workspaces;
         assert_eq!(ws.keys().map(String::as_str).collect::<Vec<_>>(), ["alpha-0000", "beta-0000", "gamma-0000"]);
         assert_eq!((ws["alpha-0000"].profiles, ws["beta-0000"].profiles, ws["gamma-0000"].busy), (1, 1, 1));

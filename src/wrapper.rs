@@ -6504,7 +6504,8 @@ mod tests {
 
     fn relative_job(s: &Scratch) -> (StoreJob, PathBuf, PathBuf) {
         let (mut job, src, rlib) = fixture(s);
-        *job.args.last_mut().unwrap() = "target/debug/deps".to_string();
+        // Native separators, as cargo passes them: the hash memo keys a library by the path text dependents name it by.
+        *job.args.last_mut().unwrap() = Path::new("target").join("debug").join("deps").display().to_string();
         job.home = PathBuf::from("cache-home");
         job.dep_text = "target/debug/deps/k.d: lib.rs\n\nlib.rs:\n".to_string();
         fs::write(rlib.with_file_name("k.d"), &job.dep_text).unwrap();

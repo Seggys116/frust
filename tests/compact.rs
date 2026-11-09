@@ -264,6 +264,13 @@ fn object_aliases_that_add_no_bytes_still_make_a_pass_due() {
         ar.push(b'\n');
     }
     fs::write(deps.join(format!("lib{stem}.rlib")), &ar).unwrap();
+    // NTFS gives a file at most 1024 names, so there the aliases spread over several objects of the session.
+    let count: usize = 4200;
+    let per_object = if cfg!(windows) { 1000 } else { count };
+    let sources: Vec<PathBuf> = (0..count.div_ceil(per_object)).map(|i| if i == 0 { object.clone() } else { session.join(format!("c{i}.o")) }).collect();
+    for source in &sources[1..] {
+        fs::write(source, vec![1u8; 4096]).unwrap();
+    }
 
     let mut opts = eager();
     opts.min_growth = 64 * 1024 * 1024;
@@ -273,9 +280,9 @@ fn object_aliases_that_add_no_bytes_still_make_a_pass_due() {
     assert!(first.skipped.is_none() && first.errors.is_empty(), "{first:?}");
 
     // Earlier compiles' names of the same object, as rustc leaves them: thousands of entries, no new bytes.
-    let aliases: Vec<PathBuf> = (1..=4200).map(|tag| deps.join(format!("{stem}.c0.t{tag}.rcgu.o"))).collect();
-    for alias in &aliases {
-        fs::hard_link(&object, alias).unwrap();
+    let aliases: Vec<PathBuf> = (1..=count).map(|tag| deps.join(format!("{stem}.c0.t{tag}.rcgu.o"))).collect();
+    for (i, alias) in aliases.iter().enumerate() {
+        fs::hard_link(&sources[i / per_object], alias).unwrap();
     }
     let due = compact::auto_compact_with(&dirs, &target, &opts);
     assert!(due.skipped.is_none() && due.errors.is_empty(), "file growth alone makes a pass due: {due:?}");

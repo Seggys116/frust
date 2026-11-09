@@ -440,7 +440,9 @@ fn a_restore_beside_cargos_alias_of_a_removed_output_links_instead_of_copying() 
         }
     }
     build(&sb, &a, "force");
-    let stored = script_entry_files(&sb);
+    // On windows-msvc the script's PDB is stored as a link beside it.
+    let executable = |name: &str| Path::new(name).extension().is_none_or(|e| e == std::env::consts::EXE_EXTENSION);
+    let stored: Vec<_> = script_entry_files(&sb).into_iter().filter(|(_, f)| executable(&f.name)).collect();
     assert_eq!(stored.len(), 1, "{stored:?}");
     let (dir, file) = &stored[0];
     assert_eq!(ino(&dir.join(&file.stored)), ino(&script), "the restored executable is the store file's inode, not a copy");
