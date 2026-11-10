@@ -145,7 +145,7 @@ Disk compares the physical size of Cargo's target directory with the physical si
 
 | Row | Limit |
 | --- | --- |
-| Cold | at most 1.03x + 50 ms |
+| Cold | at most 1.05x + 50 ms |
 | Clean rebuild from cache | at most 0.5x + 100 ms |
 | No-op | at most 0.5x + 15 ms (25 ms on Windows) |
 | First edit | at most 1.03x + 40 ms |

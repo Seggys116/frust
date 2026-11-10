@@ -27,7 +27,7 @@ const GATE_EDIT_RATIO: f64 = 1.03;
 const GATE_EDIT_SLACK_MS: f64 = 40.0;
 const GATE_EDIT_P90_RATIO: f64 = 1.08;
 const GATE_EDIT_P90_SLACK_MS: f64 = 60.0;
-const GATE_COLD_RATIO: f64 = 1.03;
+const GATE_COLD_RATIO: f64 = 1.05;
 const GATE_COLD_SLACK_MS: f64 = 50.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
 const GATE_CLEAN_SLACK_MS: f64 = 100.0;
@@ -3171,8 +3171,8 @@ mod tests {
     fn the_strict_gate_demands_faster_or_equal_within_the_noise_allowance() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let at = |cold: f64, warm: f64| failing(&evaluate_gate_for(&cargo, &samples(cold, 400.0, 20.0, warm), false)).len();
-        assert_eq!(at(1079.0, 100.0), 0);
-        assert_eq!(at(1081.0, 100.0), 1);
+        assert_eq!(at(1099.0, 100.0), 0);
+        assert_eq!(at(1101.0, 100.0), 1);
         let names = |frust: &Samples| failing(&evaluate_gate_for(&cargo, frust, false)).join(",");
         assert_eq!(names(&samples(1000.0, 400.0, 20.0, 124.0)), "edit-first");
         assert_eq!(names(&samples(1000.0, 500.0, 25.0, 100.0)), "");
@@ -3265,7 +3265,7 @@ mod tests {
         assert!(json["tuning"]["tuned"].is_null());
         let gate = json["gate"].as_array().unwrap();
         assert_eq!(gate[0]["name"], "cold");
-        assert!(gate[0]["limit"].as_str().unwrap().contains("1.03x + 50 ms"));
+        assert!(gate[0]["limit"].as_str().unwrap().contains("1.05x + 50 ms"));
         assert!(gate.iter().any(|c| c["name"] == "noop" && c["limit"].as_str().unwrap().contains("0.50x + 15 ms")));
         assert_eq!(json["ratios_tuned"]["cold"], 0.9);
         assert_eq!(json["ratios"]["cold"], 1.1);

@@ -30,6 +30,9 @@ use crate::share_roots::{self, ROOT_TOKEN, Root};
 use crate::sys::{self, LockKind};
 use crate::timings;
 
+// Smaller restored files cost less to fault in than to hint.
+const PREFETCH_MIN_BYTES: u64 = 16 * 1024;
+
 const ENV_DENY_PREFIXES: &[&str] = &[
     "CARGO_TERM_",
     "CARGO_BUILD_",
@@ -947,8 +950,8 @@ impl Plan {
                 if !file.dir {
                     fsx::touch(&dst);
                     self.attest_restored(&dst, file.bytes);
-                    // A clone starts with an empty page cache, so ask the kernel to read dependency artifacts ahead of the next compile.
-                    if file.encoding.is_raw() && matches!(dst.extension().and_then(|e| e.to_str()), Some("rlib" | "rmeta")) {
+                    // A clone starts with an empty page cache, so ask the kernel to read restored artifacts ahead of the next compile.
+                    if file.encoding.is_raw() && file.bytes >= PREFETCH_MIN_BYTES {
                         sys::prefetch(&dst, file.bytes);
                     }
                 }
