@@ -156,16 +156,19 @@ pub fn run(args: Vec<OsString>) -> i32 {
     passthrough(&args)
 }
 
-/// The front end's `-vV` text for an exact `rustc -vV` call on the binary it probed, which cargo makes twice on every build without a cached answer.
+/// What the binary the front end probed prints for a plain version query: cargo asks `-vV` twice on every build without a cached answer, and build scripts such as libc's and autocfg's ask through the wrapper too.
 fn probed_version(args: &[OsString]) -> Option<String> {
     probed_version_in(args, |name| env::var_os(name))
 }
 
 fn probed_version_in(args: &[OsString], var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
-    let [tool, flag] = args else { return None };
-    if flag != "-vV" {
-        return None;
-    }
+    let (tool, flags) = args.split_first()?;
+    let flags: Vec<&str> = flags.iter().map(|flag| flag.to_str()).collect::<Option<_>>()?;
+    let verbose = match flags[..] {
+        ["-vV" | "-Vv"] | ["--version", "--verbose"] | ["--verbose", "--version"] => true,
+        ["-V" | "--version"] => false,
+        _ => return None,
+    };
     let text = var(PROBED_VERBOSE_ENV)?.into_string().ok().filter(|text| !text.is_empty() && !text.contains(char::REPLACEMENT_CHARACTER))?;
     let exe = var(PROBED_EXE_ENV).filter(|exe| !exe.is_empty())?;
     if var("FRUST_RUSTC_ID")? != *crate::paths::short_hash(&text) {
@@ -173,12 +176,11 @@ fn probed_version_in(args: &[OsString], var: impl Fn(&str) -> Option<OsString>) 
     }
     let probed = |path: &Path| sys::canonicalize(path).is_ok_and(|real| real.as_os_str() == exe);
     let tool = Path::new(tool);
-    if probed(tool) {
-        return Some(text);
-    }
     // A rustup proxy runs the binary of the toolchain it selects here.
-    let direct = crate::toolchain::direct_binary(tool, "rustc", None, &env::current_dir().ok()?)?;
-    probed(&direct).then_some(text)
+    let same = probed(tool) || probed(&crate::toolchain::direct_binary(tool, "rustc", None, &env::current_dir().ok()?)?);
+    // rustc prints the short form as the first line of the verbose one.
+    let short = text.split_inclusive('\n').next().filter(|line| line.ends_with('\n'))?;
+    same.then(|| if verbose { text.clone() } else { short.to_string() })
 }
 
 /// The `-vV` text of the probed compiler and the canonical path of the binary that printed it, set by the front end.
@@ -4930,8 +4932,19 @@ mod tests {
         let spelled = dir.join(".").join("rustc");
         assert_eq!(probed_version_in(&call(&[spelled.as_os_str(), vv]), env_of(id.clone())), Some(text.clone()), "another spelling of the same binary");
         assert_eq!(probed_version_in(&call(&[other.as_os_str(), vv]), env_of(id.clone())), None, "another binary");
-        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), OsStr::new("-V")]), env_of(id.clone())), None);
-        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv, OsStr::new("-")]), env_of(id.clone())), None);
+        let short = Some("rustc 1.0.0 (abc 2026-01-01)\n".to_string());
+        for flags in [&["-V"][..], &["--version"]] {
+            let args: Vec<&OsStr> = std::iter::once(exe.as_os_str()).chain(flags.iter().map(OsStr::new)).collect();
+            assert_eq!(probed_version_in(&call(&args), env_of(id.clone())), short, "{flags:?}");
+        }
+        for flags in [&["-Vv"][..], &["--version", "--verbose"], &["--verbose", "--version"]] {
+            let args: Vec<&OsStr> = std::iter::once(exe.as_os_str()).chain(flags.iter().map(OsStr::new)).collect();
+            assert_eq!(probed_version_in(&call(&args), env_of(id.clone())), Some(text.clone()), "{flags:?}");
+        }
+        for flags in [&["-vV", "-"][..], &["--rustc", "--version"], &["--version", "--verbose", "-v"], &["--print", "sysroot"]] {
+            let args: Vec<&OsStr> = std::iter::once(exe.as_os_str()).chain(flags.iter().map(OsStr::new)).collect();
+            assert_eq!(probed_version_in(&call(&args), env_of(id.clone())), None, "{flags:?}");
+        }
         assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv]), env_of("000000000000".to_string())), None, "text that is not the probed id");
         assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv]), |_: &str| None), None, "no probe");
     }

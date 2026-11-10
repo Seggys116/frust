@@ -239,9 +239,9 @@ for `-L` directories), `tool_bytes_hashed` (bytes of a `-C linker` binary read r
 not be resolved, and `skip:test` a test or bench executable that was compiled but not stored. Stages a run did not reach are 0.
 Store outcomes go to `<file>.events` when that file exists, with `kind` `store`, the outcome in `store_mode`, the
 store's wall time in `total_ms` and the CPU time of the thread that stored in `cpu_ms`. Uncached compiler calls go
-there too, with `kind` `passthrough`; `store_mode` `answered` marks a `rustc -vV` call cargo makes through the wrapper
-that the wrapper answered with the probe's text, because it named the probed binary (or a rustup proxy selecting it),
-so no compiler started.
+there too, with `kind` `passthrough`; `store_mode` `answered` marks a plain version query (`-vV`, `--version --verbose`,
+`-V`, `--version`) that cargo or a build script made through the wrapper and that the wrapper answered from the probe's
+`-vV` text, because it named the probed binary (or a rustup proxy selecting it), so no compiler started.
 
 ## Cache payload storage
 

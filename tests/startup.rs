@@ -9,7 +9,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{Sandbox, assert_success, stderr, stdout};
+use common::{Sandbox, assert_success, settle, stderr, stdout};
 
 const PINNED: &str = "1.98.1";
 
@@ -131,7 +131,21 @@ fn second_build_uses_both_caches() {
 #[test]
 fn cargo_gets_the_probed_compiler_version_without_another_rustc() {
     let sb = Sandbox::new("startup-vv");
-    let app = sb.project("app", &[], "fn main() {}\n");
+    let app = sb.project("app", &[], "fn main() { print!(\"{}\", env!(\"SEEN_VERSION\")); }\n");
+    // The way libc's build script asks: through the wrapper cargo hands it.
+    let script = "use std::process::Command;\n\
+        fn main() {\n\
+        let rustc = std::env::var_os(\"RUSTC\").unwrap();\n\
+        let mut cmd = match std::env::var_os(\"RUSTC_WRAPPER\").filter(|w| !w.is_empty()) {\n\
+        Some(wrapper) => { let mut cmd = Command::new(wrapper); cmd.arg(rustc); cmd }\n\
+        None => Command::new(rustc),\n\
+        };\n\
+        let out = cmd.arg(\"--version\").output().unwrap();\n\
+        assert!(out.status.success());\n\
+        println!(\"cargo:rustc-env=SEEN_VERSION={}\", String::from_utf8(out.stdout).unwrap().trim_end());\n\
+        }\n";
+    fs::write(app.join("build.rs"), script).unwrap();
+    settle(&app.join("build.rs"));
     fs::create_dir_all(sb.home()).unwrap();
     let timings = sb.home().join("timings.jsonl");
     fs::write(&timings, "").unwrap();
@@ -140,7 +154,7 @@ fn cargo_gets_the_probed_compiler_version_without_another_rustc() {
     let out = fcargo(&sb, &app, &["build"], &[("FRUST_TIMINGS", &timings)]);
     assert_success(&out);
     let answered = fs::read_to_string(&events).unwrap().lines().filter(|line| line.contains("\"store_mode\":\"answered\"")).count();
-    assert!(answered >= 1, "cargo's -vV calls were answered: {}", fs::read_to_string(&events).unwrap());
+    assert!(answered >= 3, "cargo's -vV and the build script's --version were answered: {}", fs::read_to_string(&events).unwrap());
 
     let rustc = Command::new("rustc").arg("-vV").env_remove("RUSTUP_TOOLCHAIN").current_dir(&app).output().unwrap();
     assert_success(&rustc);
@@ -150,7 +164,9 @@ fn cargo_gets_the_probed_compiler_version_without_another_rustc() {
         outputs.values().any(|o| o["stdout"].as_str() == Some(stdout(&rustc).as_str()) && o["success"] == true),
         "cargo cached the very text rustc prints: {info}"
     );
-    assert!(bin_file(&sb.central_target(&app), "app").is_file());
+    let short = Command::new("rustc").arg("--version").env_remove("RUSTUP_TOOLCHAIN").current_dir(&app).output().unwrap();
+    let seen = Command::new(bin_file(&sb.central_target(&app), "app")).output().unwrap();
+    assert_eq!(stdout(&seen), stdout(&short).trim_end(), "the build script saw what rustc prints");
 }
 
 #[test]
