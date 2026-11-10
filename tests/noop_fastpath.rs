@@ -106,6 +106,9 @@ impl Fixture {
         assert_success(&out);
         let noop = trace["noop"].as_str().unwrap_or("");
         assert!(noop.starts_with("miss:"), "expected a decline, trace {trace}; stderr:\n{}", stderr(&out));
+        // Kept in the trace so a later assertion on it shows what the build printed.
+        let mut trace = trace;
+        trace["stderr"] = stderr(&out).into();
         trace
     }
 
