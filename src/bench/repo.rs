@@ -1613,13 +1613,19 @@ fn build_args(packages: &[RepoPackage], package: Option<&str>, features: Option<
     args
 }
 
+// The path as it appears after `file://` in a package id: forward slashes, no verbatim prefix, a leading slash before a drive letter.
+fn file_url_path(path: &Path) -> String {
+    let text = canonical(path).to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
+    if text.starts_with('/') { text } else { format!("/{text}") }
+}
+
 /// A package id names its checkout's path, so the arguments of a copy of the repository must name the copy instead.
 fn retarget_args(args: &[String], from: &Path, to: &Path) -> Vec<String> {
     if from == to {
         return args.to_vec();
     }
-    let url = |path: &Path| canonical(path).to_string_lossy().replace('\\', "/");
-    let (old, new) = (url(from), url(to));
+    let (old, new) = (file_url_path(from), file_url_path(to));
     args.iter().map(|arg| if arg.starts_with("path+file://") { arg.replacen(&old, &new, 1) } else { arg.clone() }).collect()
 }
 
@@ -2566,7 +2572,7 @@ mod tests {
         let b = std::env::temp_dir().join("frust-retarget-b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        let url = |p: &Path| canonical(p).to_string_lossy().replace('\\', "/");
+        let url = file_url_path;
         let args = vec!["-p".to_string(), format!("path+file://{}/tokio#tokio@1.40.0", url(&a)), "--features".into(), "full".into()];
         let moved = retarget_args(&args, &a, &b);
         assert_eq!(moved[1], format!("path+file://{}/tokio#tokio@1.40.0", url(&b)));
