@@ -574,6 +574,10 @@ pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     imp::reflink(src, dst)
 }
 
+pub fn prefetch(path: &Path, len: u64) {
+    imp::prefetch(path, len)
+}
+
 pub fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     imp::copy_symlink(src, dst)
 }

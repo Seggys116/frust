@@ -947,6 +947,10 @@ impl Plan {
                 if !file.dir {
                     fsx::touch(&dst);
                     self.attest_restored(&dst, file.bytes);
+                    // A clone starts with an empty page cache, so ask the kernel to read dependency artifacts ahead of the next compile.
+                    if file.encoding.is_raw() && matches!(dst.extension().and_then(|e| e.to_str()), Some("rlib" | "rmeta")) {
+                        sys::prefetch(&dst, file.bytes);
+                    }
                 }
             }
             Ok(file.bytes)

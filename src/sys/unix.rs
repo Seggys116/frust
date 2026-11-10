@@ -660,6 +660,17 @@ pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+#[cfg(target_os = "macos")]
+pub fn prefetch(path: &Path, len: u64) {
+    let Ok(file) = File::open(path) else { return };
+    let advice = libc::radvisory { ra_offset: 0, ra_count: len.min(i32::MAX as u64) as libc::c_int };
+    // SAFETY: the descriptor is open and `advice` is a valid radvisory for the call duration; the hint may be ignored.
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &advice) };
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn prefetch(_path: &Path, _len: u64) {}
+
 #[cfg(target_os = "linux")]
 pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     if fs::symlink_metadata(src)?.is_dir() {
