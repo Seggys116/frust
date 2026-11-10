@@ -175,10 +175,14 @@ pub fn clones_unavailable(staged: &Path) -> bool {
 }
 
 // Volumes without a change time (FAT-style) would fail every stability check, so they keep raw payloads.
+// A private file is read, not the shared directory, whose change time moves whenever another process stages an entry.
 fn probe_allows_compression(staged: &Path, reflinks: impl FnOnce(&Path) -> bool) -> bool {
     let steady_ctime = || -> io::Result<bool> {
-        let first = sys::stat(staged)?;
-        Ok(first.ctime() == sys::stat(staged)?.ctime())
+        sys::stat(staged)?;
+        let probe = Temporary(fsx::temp_sibling(&staged.join("ctime-probe")));
+        let file = OpenOptions::new().write(true).create_new(true).open(&probe.0)?;
+        let first = sys::fstat(&file)?;
+        Ok(first.ctime() == sys::fstat(&file)?.ctime())
     };
     !reflinks(staged) && steady_ctime().unwrap_or(false)
 }
@@ -1450,6 +1454,26 @@ mod tests {
         assert!(probe_allows_compression(&scratch.0, |_| false));
         assert!(!probe_allows_compression(&scratch.0, |_| true));
         assert!(!probe_allows_compression(&scratch.0.join("missing"), |_| false));
+    }
+
+    #[test]
+    fn other_processes_writing_into_the_probed_directory_do_not_turn_compression_off() {
+        let scratch = Scratch::new();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (dir, stop) = (scratch.0.clone(), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let staged = fsx::temp_sibling(&dir.join("entry"));
+                    let _ = fs::create_dir(&staged);
+                    let _ = fs::remove_dir(&staged);
+                }
+            })
+        };
+        let refused = (0..500).filter(|_| !probe_allows_compression(&scratch.0, |_| false)).count();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        assert_eq!(refused, 0, "a busy directory's change time moved between the two reads in {refused} of 500 probes");
     }
 
     #[test]
