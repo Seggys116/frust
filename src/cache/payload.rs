@@ -1022,6 +1022,82 @@ pub fn adopt(store_file: &Path, dst: &Path) -> Result<bool, String> {
     Err(format!("rename:{}", last.map_or_else(String::new, |error| error_label(&error))))
 }
 
+/// Whether stores on the volume of `tmp` keep large outputs as names of the target file, as the wrapper decides it.
+pub fn links_targets(tmp: &Path) -> bool {
+    let mode = BackedMode::from_env();
+    mode != BackedMode::Off && (mode == BackedMode::Force || clones_unavailable(tmp))
+}
+
+/// NTFS allows 1024 names per file; a share leaves room below it for Cargo's own aliases.
+pub const SHARE_MAX_LINKS: u64 = 1000;
+
+/// What [`prove_copy`] read: a store copy and a target file holding the same bytes, each under the identity it had while read.
+#[derive(Debug, Clone)]
+pub struct ProvenCopy {
+    pub len: u64,
+    pub hash: String,
+    pub mode: u32,
+    store: sys::Meta,
+    target: sys::Meta,
+}
+
+fn hash_steady(path: &Path, seen: &sys::Meta) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| format!("open:{}", error_label(&error)))?;
+    let before = sys::fstat(&file).map_err(|error| format!("stat:{}", error_label(&error)))?;
+    let (read, hash) = hash_open(&file, before.len()).map_err(|error| format!("read:{}", error_label(&error)))?;
+    let after = sys::fstat(&file).map_err(|error| format!("stat:{}", error_label(&error)))?;
+    if !same_content(seen, &before) || !same_content(&before, &after) || read != before.len() {
+        return Err("changed".into());
+    }
+    Ok(hash)
+}
+
+/// Succeeds when `store_file`, the only name of its inode, holds exactly the bytes and mode of the target file on the same volume.
+pub fn prove_copy(store_file: &Path, target: &Path) -> Result<ProvenCopy, String> {
+    let store = sys::lstat(store_file).map_err(|error| format!("store:{}", error_label(&error)))?;
+    let placed = sys::lstat(target).map_err(|error| format!("target:{}", error_label(&error)))?;
+    if !store.is_file() || !placed.is_file() || store.dev() != placed.dev() || store.ino() == placed.ino() {
+        return Err("not-a-copy".into());
+    }
+    if store.nlink() != 1 {
+        return Err(format!("store-nlink={}", store.nlink()));
+    }
+    if placed.nlink() >= SHARE_MAX_LINKS {
+        return Err(format!("target-nlink={}", placed.nlink()));
+    }
+    if store.len() != placed.len() || store.len() < LINKED_MIN_BYTES || store.mode() != placed.mode() {
+        return Err("target-differs".into());
+    }
+    let hash = hash_steady(store_file, &store)?;
+    if hash_steady(target, &placed)? != hash {
+        return Err("bytes-differ".into());
+    }
+    Ok(ProvenCopy { len: store.len(), hash, mode: store.mode(), store, target: placed })
+}
+
+/// Replaces the proven store copy with a new name of the target's inode, through a temporary name and one rename, so readers see either file and both hold the same bytes.
+pub fn share_copy(store_file: &Path, target: &Path, proven: &ProvenCopy) -> Result<(), String> {
+    let tmp = Temporary(fsx::temp_sibling(store_file));
+    link_retrying(target, &tmp.0).map_err(|error| format!("link:{}", error_label(&error)))?;
+    if !sys::lstat(&tmp.0).is_ok_and(|linked| same_content(&linked, &proven.target)) {
+        return Err("target-moved".into());
+    }
+    if !sys::lstat(store_file).is_ok_and(|now| same_content(&now, &proven.store) && now.nlink() == 1) {
+        return Err("store-moved".into());
+    }
+    let mut last = None;
+    for attempt in 0..3 {
+        match sys::rename(&tmp.0, store_file) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = Some(error),
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    Err(format!("rename:{}", last.map_or_else(String::new, |error| error_label(&error))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
