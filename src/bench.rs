@@ -2128,7 +2128,7 @@ fn growth_store_records(dirs: &Dirs) -> Result<Vec<(String, crate::cache::EntryM
         }
         let metadata = entry.join("meta.json");
         if !sys::lstat(&metadata).is_ok_and(|meta| meta.is_file()) { return Err(format!("missing growth entry record {}", metadata.display())); }
-        let record: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&metadata).map_err(|error| error.to_string())?)
+        let record: crate::cache::EntryMeta = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&entry).map_err(|error| error.to_string())?)
             .map_err(|error| format!("{}: {error}", metadata.display()))?;
         let groups = crate::cache::metadata_slice::validate_groups(&record.files).map_err(|error| error.to_string())?;
         if !record.stderr_present(&entry) {

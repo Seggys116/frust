@@ -22,7 +22,7 @@ fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
 }
 
 fn manifest_values(sb: &Sandbox) -> Vec<serde_json::Value> {
-    manifests(sb).iter().filter_map(|p| serde_json::from_slice(&fs::read(p).ok()?).ok()).collect()
+    manifests(sb).iter().filter_map(|p| serde_json::from_slice(&frust::fsx::read_packed(p, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok()).collect()
 }
 
 fn recorded_stamps(sb: &Sandbox) -> usize {
@@ -122,7 +122,7 @@ fn manifests_in_an_older_format_are_ignored_and_rewritten() {
     build(&sb, &a);
 
     for path in manifests(&sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         value.as_object_mut().unwrap().remove("format");
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
@@ -194,7 +194,7 @@ fn leaf_source_dev(sb: &Sandbox) -> u64 {
 fn forge_leaf_hashes(sb: &Sandbox) -> usize {
     let mut forged = 0;
     for path in manifests(sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         for candidate in value["candidates"].as_array_mut().unwrap() {
             for input in candidate["inputs"].as_array_mut().unwrap() {
                 if input["path"].as_str().is_some_and(|p| Path::new(p).ends_with(Path::new("src").join("lib.rs"))) && input["stamp"].is_object() {

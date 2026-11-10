@@ -34,6 +34,8 @@ const BACKED_MANIFEST_FORMAT: u32 = 8;
 
 /// The backed format before entries held their text inline.
 const LEGACY_BACKED_MANIFEST_FORMAT: u32 = 6;
+/// Raw bytes a packed manifest or entry record may unpack to.
+pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// Text kept inside the entry record stays under this size; anything larger is a separate file in the entry.
 pub const INLINE_TEXT_LIMIT: usize = 64 * 1024;
@@ -200,7 +202,7 @@ impl Cache {
     }
 
     fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
-        let bytes = fs::read(self.manifest_path(prekey)).ok()?;
+        let bytes = fsx::read_packed(&self.manifest_path(prekey), MAX_MANIFEST_BYTES).ok()?;
         let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
         matches!(manifest.format, 3 | 4 | 5 | LEGACY_BACKED_MANIFEST_FORMAT | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
     }
@@ -211,7 +213,7 @@ impl Cache {
         struct Files { #[serde(default)] files: Vec<LinkedProbe> }
         #[derive(Deserialize)]
         struct LinkedProbe { #[serde(default)] encoding: payload::Encoding }
-        fs::read(self.entry_dir(key).join("meta.json")).ok()
+        read_entry_meta_bytes(&self.entry_dir(key)).ok()
             .and_then(|bytes| serde_json::from_slice::<Files>(&bytes).ok())
             .is_some_and(|meta| meta.files.iter().any(|file| file.encoding == payload::Encoding::Linked))
     }
@@ -255,7 +257,7 @@ impl Cache {
             candidates: rows,
         };
         if let Ok(json) = serde_json::to_vec(&manifest) {
-            let _ = fsx::write_atomic(&self.manifest_path(prekey), &json);
+            let _ = fsx::write_atomic(&self.manifest_path(prekey), &fsx::pack(&json));
         }
     }
 
@@ -269,8 +271,7 @@ impl Cache {
             return None;
         }
         let dir = self.entry_dir(key);
-        let meta: EntryMeta =
-            serde_json::from_slice(&fs::read(dir.join("meta.json")).ok()?).ok()?;
+        let meta = read_entry_meta(&dir)?;
         Some((dir, meta))
     }
 
@@ -556,7 +557,7 @@ impl Cache {
         if proof.identity != (current.entry.dev, current.entry.ino) { return Err(io::Error::other("retired child identity changed")); }
         #[derive(Deserialize)]
         struct Reference { prekey: Option<serde_json::Value>, incremental_unit: Option<serde_json::Value> }
-        if let Ok(bytes) = fs::read(doomed.join("meta.json"))
+        if let Ok(bytes) = read_entry_meta_bytes(&doomed)
             && let Ok(reference) = serde_json::from_slice::<Reference>(&bytes)
         {
             // A malformed ownership hint must not disable cleanup through the other hint.
@@ -615,7 +616,7 @@ impl Cache {
         manifest.candidates.retain(|row| !self.reference_absent(&row.key));
         if manifest.candidates.len() == before { return; }
         if manifest.candidates.is_empty() { let _ = fs::remove_file(path); }
-        else if let Ok(bytes) = serde_json::to_vec(&manifest) { let _ = fsx::write_atomic(&path, &bytes); }
+        else if let Ok(bytes) = serde_json::to_vec(&manifest) { let _ = fsx::write_atomic(&path, &fsx::pack(&bytes)); }
     }
 
     fn reference_absent(&self, key: &str) -> bool {
@@ -1154,8 +1155,17 @@ pub fn trust_summary(dirs: &Dirs, now: SystemTime) -> TrustSummary {
 
 /// Lists keys of manifests in any format: the reader ignores `format`, and fields it does not know (a stamp's birth time) or lacks are skipped or defaulted.
 pub fn manifest_keys(path: &Path) -> Option<Vec<String>> {
-    let manifest: Manifest = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let manifest: Manifest = serde_json::from_slice(&fsx::read_packed(path, MAX_MANIFEST_BYTES).ok()?).ok()?;
     Some(manifest.candidates.into_iter().map(|c| c.key).collect())
+}
+
+/// The raw `meta.json` of an entry directory, packed or written plain by an older frust.
+pub fn read_entry_meta_bytes(dir: &Path) -> std::io::Result<Vec<u8>> {
+    fsx::read_packed(&dir.join("meta.json"), MAX_MANIFEST_BYTES)
+}
+
+pub fn read_entry_meta(dir: &Path) -> Option<EntryMeta> {
+    serde_json::from_slice(&read_entry_meta_bytes(dir).ok()?).ok()
 }
 
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
@@ -1803,6 +1813,27 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_is_written_packed_and_a_plain_one_from_an_older_frust_still_reads() {
+        let (dir, cache) = scratch("packed-manifest");
+        let prekey = key(0x97);
+        publish_referenced_entry(&cache, 1, &prekey);
+        let inputs: Vec<Input> = (0..100)
+            .map(|n| Input { path: format!("/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/f{n}.rs"), hash: "8a".repeat(32), stamp: None })
+            .collect();
+        let candidate = Candidate { inputs, envs: Vec::new(), key: key(1) };
+        cache.add_candidate(&prekey, candidate.clone());
+        let path = cache.manifest_path(&prekey);
+        let json = serde_json::to_vec(&Manifest { format: MANIFEST_FORMAT, candidates: vec![candidate.clone()] }).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() * 2 < json.len() as u64, "the manifest is packed");
+        assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
+        assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
+        fs::write(&path, &json).unwrap();
+        assert_eq!(cache.candidates(&prekey), vec![candidate]);
+        assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn retirement_prunes_missing_rows_in_order_and_leaves_unchanged_manifests_alone() {
         let (dir, cache) = scratch("prompt-manifest");
         let prekey = key(0x91);
@@ -1814,7 +1845,7 @@ mod tests {
         cache.remove_entry(&key(1));
         assert_eq!(cache.candidates(&prekey), vec![empty_candidate(2), empty_candidate(4)]);
         let bytes = fs::read(&path).unwrap();
-        assert_eq!(serde_json::from_slice::<Manifest>(&bytes).unwrap().format, 3);
+        assert_eq!(serde_json::from_slice::<Manifest>(&fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap().format, 3);
         let identity = sys::lstat(&path).unwrap();
         let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
         cache.prune_manifest_guarded(&guard, &prekey);
@@ -2089,17 +2120,17 @@ mod tests {
             key: key(1),
         };
         cache.add_candidate(&prekey, candidate.clone());
-        let current = fs::read_to_string(&path).unwrap();
+        let current = String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert!(current.contains("\"format\":7"));
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
         for legacy_format in [3, 4, 5] {
             fs::write(&path, current.replace("\"format\":7", &format!("\"format\":{legacy_format}"))).unwrap();
             assert_eq!(cache.candidates(&prekey), vec![candidate.clone()], "format {legacy_format} entries remain reusable");
             cache.add_candidate(&prekey, candidate.clone());
-            assert!(fs::read_to_string(&path).unwrap().contains("\"format\":7"),
+            assert!(String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap().contains("\"format\":7"),
                 "even an unchanged legacy candidate migrates");
         }
-        let stored: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let stored: Manifest = serde_json::from_slice(&fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert_ne!(stored.format, 3, "old readers reject the new manifest");
         assert_eq!(cache.candidates(&prekey), vec![candidate]);
         assert_eq!(
@@ -2292,7 +2323,7 @@ mod tests {
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
 
         let path = cache.manifest_path(&prekey);
-        let text = fs::read_to_string(&path).unwrap();
+        let text = String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert!(
             text.contains(&format!("\"format\":{MANIFEST_FORMAT}")),
             "{text}"
@@ -2339,7 +2370,7 @@ mod tests {
         fs::write(backed.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         cache.publish(&backed, &key(2)).unwrap();
         let format_of = |prekey: &str| {
-            let value: serde_json::Value = serde_json::from_slice(&fs::read(cache.manifest_path(prekey)).unwrap()).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&cache.manifest_path(prekey), MAX_MANIFEST_BYTES).unwrap()).unwrap();
             value["format"].as_u64().unwrap()
         };
         let (plain, mixed) = (key(0x7a), key(0x7b));

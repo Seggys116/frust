@@ -89,7 +89,7 @@ exec rustc "$@"
     {
         for entry in frust::cache::keyed_items(&sb.home().join("store")) {
             let meta: EntryMeta =
-                serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+                serde_json::from_slice(&frust::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
             if meta.crate_name != "slice_fixture" {
                 continue;
             }

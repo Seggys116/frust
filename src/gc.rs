@@ -378,7 +378,9 @@ fn scan_entries_with(dirs: &Dirs, progress: &mut dyn Progress) -> Vec<ScannedEnt
             Ok(mut file) => {
                 let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                 let mut bytes = Vec::new();
-                let meta = file.read_to_end(&mut bytes).ok().and_then(|_| serde_json::from_slice::<cache::EntryMeta>(&bytes).ok());
+                let meta = file.read_to_end(&mut bytes).ok()
+                    .and_then(|_| fsx::unpack(&bytes, cache::MAX_MANIFEST_BYTES))
+                    .and_then(|raw| serde_json::from_slice::<cache::EntryMeta>(&raw).ok());
                 (used, meta)
             }
             Err(_) => (SystemTime::UNIX_EPOCH, None),
@@ -1283,7 +1285,7 @@ fn manifest_snapshot(
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     let mut references = Vec::new();
-    if let Ok(manifest) = serde_json::from_slice::<References>(&contents) {
+    if let Some(manifest) = fsx::unpack(&contents, cache::MAX_MANIFEST_BYTES).and_then(|raw| serde_json::from_slice::<References>(&raw).ok()) {
         for candidate in manifest.candidates {
             let usage = manifest_reference(store, &candidate.key)?;
             references.push((candidate.key, usage));
@@ -2570,7 +2572,7 @@ mod tests {
         for n in 1..=3 {
             let key = format!("{n:040x}");
             let path = store_entry(&root, &key, &[("libx-0123456789abcdef.rlib", 64), ("x-0123456789abcdef.c1.t1.rcgu.o", 64)], 0);
-            let mut meta: cache::EntryMeta = serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
+            let mut meta: cache::EntryMeta = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&path).unwrap()).unwrap();
             meta.prekey = Some(prekey.clone());
             meta.incremental_unit = Some(unit.clone());
             fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
@@ -2780,7 +2782,7 @@ mod tests {
         );
         let meta_path = path.join("meta.json");
         let mut meta: cache::EntryMeta =
-            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         meta.files[0].bytes = 100 * 1024 * 1024;
         meta.files[0].encoding = cache::payload::Encoding::Lz4BlocksV1;
         meta.files[0].stored_bytes = Some(fsx::allocated_size(&path.join("f0")));
@@ -2900,7 +2902,7 @@ mod tests {
             let entry = linked_entry_of(&home, &format!("{i:02x}{}", "1".repeat(38)), &target, age, &format!("{i:02x}").repeat(20));
             fs::remove_file(&target).unwrap();
             let meta_path = entry.join("meta.json");
-            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
             value["source"] = serde_json::json!("path");
             fs::write(&meta_path, serde_json::to_vec(&value).unwrap()).unwrap();
             File::options().write(true).open(&meta_path).unwrap().set_modified(SystemTime::now() - Duration::from_secs(age)).unwrap();
@@ -2938,7 +2940,7 @@ mod tests {
         assert_eq!(dropped, vec![entries[0].clone()]);
 
         let meta_path = entries[0].join("meta.json");
-        let mut meta: cache::EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let mut meta: cache::EntryMeta = serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         meta.files[0].name = "x-0123456789abcdef.c1.t1.rcgu.o".into();
         let modified = fs::metadata(&meta_path).unwrap().modified().unwrap();
         fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
@@ -2960,7 +2962,7 @@ mod tests {
             let meta_path = path.join("meta.json");
             let modified = fs::metadata(&meta_path).unwrap().modified().unwrap();
             let mut meta: cache::EntryMeta =
-                serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+                serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
             assert!(
                 meta.incremental_unit.is_none(),
                 "legacy metadata defaults to no explicit unit"
@@ -2987,7 +2989,7 @@ mod tests {
         assert_eq!(superseded, entries[..2]);
         assert!(entries[2..].iter().all(|path| path.exists()));
         let meta: cache::EntryMeta =
-            serde_json::from_slice(&fs::read(entries[3].join("meta.json")).unwrap()).unwrap();
+            serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&entries[3]).unwrap()).unwrap();
         assert_eq!(meta.incremental_unit, Some("ab".repeat(20)));
         assert_ne!(
             IncrementalUnit::Explicit("ab".repeat(20)),

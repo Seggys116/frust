@@ -3373,7 +3373,7 @@ impl StoreIndex {
             &StoreScan::default,
             &|acc: &mut StoreScan, path: &Path, meta: &sys::Meta| {
                 if path.file_name().is_some_and(|n| n == "meta.json") {
-                    if let Ok(bytes) = fs::read(path)
+                    if let Ok(bytes) = fsx::read_packed(path, crate::cache::MAX_MANIFEST_BYTES)
                         && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
                         && let Some(parent) = path.parent()
                         && entry.stderr_present(parent)
@@ -4134,7 +4134,7 @@ mod tests {
         fs::remove_file(&stored).unwrap();
         fs::hard_link(&artifact, &stored).unwrap();
         let meta_path = entry.join("meta.json");
-        let mut meta: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let mut meta: crate::cache::EntryMeta = serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         let file = &mut meta.files[0];
         file.encoding = crate::cache::payload::Encoding::Linked;
         file.stored_bytes = Some(128 * 1024);
@@ -4166,7 +4166,7 @@ mod tests {
         assert!(!limited.covers(&paths), "decoded verification counts against the budget");
         assert!(!StoreIndex::new(&store).with_budget(u64::MAX, Duration::ZERO).covers(&paths));
         let meta_path = entry.join("meta.json");
-        let mut meta: crate::cache::EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let mut meta: crate::cache::EntryMeta = serde_json::from_slice(&crate::fsx::read_packed(&meta_path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         meta.files[0].content_hash = Some("0".repeat(64));
         fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
         assert!(!StoreIndex::new(&store).covers(&paths), "a metadata hash mismatch cannot cover an artifact");

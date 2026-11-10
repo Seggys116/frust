@@ -67,7 +67,7 @@ impl Cache {
         if !stat.is_file() {
             return;
         }
-        let Ok(bytes) = fs::read(&path) else { return };
+        let Ok(bytes) = fsx::read_packed(&path, super::MAX_MANIFEST_BYTES) else { return };
         let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
         let Some(object) = value.as_object_mut() else { return };
         if object.get("source").and_then(|source| source.as_str()).is_none() {
@@ -82,7 +82,7 @@ impl Cache {
         }
         object.insert("workspaces".to_owned(), serde_json::json!(list));
         let Ok(out) = serde_json::to_vec(&value) else { return };
-        if fsx::write_atomic(&path, &out).is_err() {
+        if fsx::write_atomic(&path, &fsx::pack(&out)).is_err() {
             return;
         }
         if keep_stamp
@@ -113,7 +113,7 @@ impl Cache {
     fn release_entry(&self, key: &str, workspace: &str, evict_registry: bool) -> Option<u64> {
         let snapshot = self.retirement_snapshot(key)?;
         let dir = self.entry_dir(key);
-        let bytes = fs::read(dir.join("meta.json")).ok()?;
+        let bytes = super::read_entry_meta_bytes(&dir).ok()?;
         if !mentions(&bytes, workspace) {
             return None;
         }
@@ -270,7 +270,7 @@ mod tests {
         assert!(!list.contains(&"a".to_string()), "the oldest user is forgotten first");
         cache.note_workspace(&key(2), "a");
         assert!(workspaces(&cache, 2).is_empty());
-        let meta = fs::read_to_string(cache.entry_dir(&key(2)).join("meta.json")).unwrap();
+        let meta = String::from_utf8(crate::cache::read_entry_meta_bytes(&cache.entry_dir(&key(2))).unwrap()).unwrap();
         assert!(!meta.contains("workspaces"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -280,11 +280,11 @@ mod tests {
         let (dir, cache) = scratch("unknown");
         publish(&cache, 1, Some((SOURCE_REGISTRY, &["a"])));
         let path = cache.entry_dir(&key(1)).join("meta.json");
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         value["future"] = serde_json::json!({"x": 1});
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         cache.note_workspace(&key(1), "b");
-        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert_eq!(after["future"], serde_json::json!({"x": 1}));
         fs::remove_dir_all(dir).unwrap();
     }

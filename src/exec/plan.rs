@@ -201,7 +201,8 @@ pub fn load_if(path: &Path, wanted: impl FnOnce(&[u8]) -> bool) -> Option<Plan> 
     if meta.len() > MAX_PLAN_BYTES {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let stored = fs::read(path).ok()?;
+    let bytes = crate::fsx::unpack(&stored, MAX_PLAN_BYTES as usize)?;
     if !wanted(&bytes) {
         return None;
     }
@@ -216,7 +217,7 @@ pub fn save(path: &Path, plan: &Plan) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    crate::fsx::write_atomic(path, &serde_json::to_vec(plan).map_err(io::Error::other)?)
+    crate::fsx::write_atomic(path, &crate::fsx::pack(&serde_json::to_vec(plan).map_err(io::Error::other)?))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1102,5 +1103,25 @@ mod tests {
         let expected = [root.to_string_lossy().into_owned(), root.join("crates").to_string_lossy().into_owned()];
         assert_eq!(holders, expected.iter().map(String::as_str).collect::<Vec<_>>(), "nothing above the workspace root is listed");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_plan_is_saved_packed_and_a_plain_one_from_an_older_frust_still_loads() {
+        let dir = crate::fsx::temp_sibling(&std::env::temp_dir().join("frust-plan-packed"));
+        let graph = (0..200).map(|n| Entry { path: format!("/w/repos/ripgrep/crates/c{n}/Cargo.toml"), stamp: None }).collect();
+        let plan = Plan {
+            format: FORMAT, key: "k".into(), cwd: "/w/repos/ripgrep".into(), target: "/t".into(), finished: String::new(), graph,
+            layout: Vec::new(), scripts: Vec::new(), units: Vec::new(), messages: Vec::new(), env_common: Vec::new(),
+        };
+        let json = serde_json::to_vec(&plan).unwrap();
+        let packed = dir.join("packed.plan");
+        save(&packed, &plan).unwrap();
+        assert!(fs::metadata(&packed).unwrap().len() * 4 < json.len() as u64, "the saved plan is packed");
+        assert_eq!(load(&packed), Some(plan.clone()));
+        assert!(load_if(&packed, |bytes| std::str::from_utf8(bytes).is_ok_and(|text| text.contains("crates/c199"))).is_some(), "the byte test sees the raw record");
+        let plain = dir.join("plain.plan");
+        fs::write(&plain, &json).unwrap();
+        assert_eq!(load(&plain), Some(plan));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

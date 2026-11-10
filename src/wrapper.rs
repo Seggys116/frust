@@ -2331,10 +2331,7 @@ impl Plan {
             stderr: stderr_file,
             stderr_inline,
         };
-        fs::write(
-            staged.join("meta.json"),
-            serde_json::to_vec(&meta).map_err(io::Error::other)?,
-        )?;
+        fs::write(staged.join("meta.json"), fsx::pack(&serde_json::to_vec(&meta).map_err(io::Error::other)?))?;
         Ok(meta)
     }
 
@@ -7342,8 +7339,9 @@ mod tests {
             })
             .collect();
         assert_eq!(actual, declared);
-        let published: EntryMeta =
-            serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+        let json = serde_json::to_vec(&meta).unwrap();
+        assert!(fs::metadata(entry.join("meta.json")).unwrap().len() < json.len() as u64, "the entry record is packed");
+        let published = cache::read_entry_meta(&entry).unwrap();
         assert_eq!(
             serde_json::to_value(&published).unwrap(),
             serde_json::to_value(&meta).unwrap()

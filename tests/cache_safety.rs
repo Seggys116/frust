@@ -179,7 +179,7 @@ fn crafted_entry_metadata_cannot_escape_the_output_directory() {
     let mut patched = 0;
     for entry in frust::cache::keyed_items(&sb.home().join("store")) {
         let meta_path = entry.join("meta.json");
-        let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let mut meta: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&meta_path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         let files = meta["files"].as_array_mut().unwrap();
         let mut evil = files[0].clone();
         evil["name"] = serde_json::Value::String("../../escaped-by-frust".into());
@@ -375,7 +375,7 @@ fn gc_retains_old_manifests_that_still_serve_current_cache_entries() {
     for manifest in frust::cache::keyed_items(&dirs.manifests()) {
         let path = manifest;
         let data: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         assert_eq!(data["format"], 7);
         age(&path, Duration::from_secs(40 * 86_400));
         manifests.push(path);

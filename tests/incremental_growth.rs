@@ -172,7 +172,7 @@ fn maintenance_retains_the_two_latest_incremental_states_for_restores() {
         assert!(build(&sb, &project, &[]).is_empty(), "maintenance must leave the current state fresh");
     }
     let entries = frust::cache::keyed_items(&dirs.store()).into_iter()
-        .filter_map(|entry| fs::read(entry.join("meta.json")).ok())
+        .filter_map(|entry| frust::cache::read_entry_meta_bytes(&entry).ok())
         .filter_map(|bytes| serde_json::from_slice::<frust::cache::EntryMeta>(&bytes).ok())
         .filter(|meta| meta.incremental_unit.is_some())
         .count();
@@ -324,7 +324,7 @@ fn incremental_state_stays_bounded_and_builds_stay_incremental_under_auto_compac
             let entries = frust::stats::entry_dirs(&dirs)
                 .into_iter()
                 .filter(|e| {
-                    fs::read(e.path.join("meta.json"))
+                    frust::cache::read_entry_meta_bytes(&e.path)
                         .ok()
                         .and_then(|b| serde_json::from_slice::<frust::cache::EntryMeta>(&b).ok())
                         .is_some_and(|m| m.crate_name == krate)
