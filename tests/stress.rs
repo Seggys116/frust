@@ -160,6 +160,16 @@ fn different_binaries_and_profiles_in_one_workspace_all_succeed() {
 
 #[test]
 fn debug_and_release_builds_run_in_parallel() {
+    // Each profile alone, in a sandbox of its own, sets what two sequential builds cost on this machine.
+    let alone = |args: &[&str]| {
+        let sb = Sandbox::new("parallel-solo");
+        let ws = workspace(&sb);
+        let started = Instant::now();
+        let done = concurrently(&sb, &ws, &[args.to_vec()]);
+        assert_success(&done[0]);
+        started.elapsed()
+    };
+    let solo = alone(&["build", "-p", "app"]) + alone(&["build", "--release", "-p", "app"]);
     let sb = Sandbox::new("parallel");
     let ws = workspace(&sb);
     let started = Instant::now();
@@ -168,10 +178,10 @@ fn debug_and_release_builds_run_in_parallel() {
     for d in &done {
         assert_success(d);
     }
-    // Two sequential builds would each pay the slow build script.
+    // Waiting for each other would repeat the slow build script and the one-after-the-other compile.
     assert!(
-        wall < Duration::from_millis(GATE_SLEEP_MS * 2 + 4500),
-        "debug and release took {wall:?}; they must not wait for each other"
+        wall + Duration::from_millis(GATE_SLEEP_MS / 2) < solo,
+        "debug and release took {wall:?} together against {solo:?} one after the other; they must not wait for each other"
     );
 }
 

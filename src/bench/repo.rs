@@ -1612,6 +1612,16 @@ fn build_args(packages: &[RepoPackage], package: Option<&str>, features: Option<
     args
 }
 
+/// A package id names its checkout's path, so the arguments of a copy of the repository must name the copy instead.
+fn retarget_args(args: &[String], from: &Path, to: &Path) -> Vec<String> {
+    if from == to {
+        return args.to_vec();
+    }
+    let url = |path: &Path| canonical(path).to_string_lossy().replace('\\', "/");
+    let (old, new) = (url(from), url(to));
+    args.iter().map(|arg| if arg.starts_with("path+file://") { arg.replacen(&old, &new, 1) } else { arg.clone() }).collect()
+}
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(read) = fs::read_dir(dir) else { return };
     let mut paths: Vec<PathBuf> = read.flatten().map(|entry| entry.path()).collect();
@@ -1818,7 +1828,8 @@ impl Rig<'_> {
         if let Some(column) = column {
             self.quiesce(column);
         }
-        let mut args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        let owned = retarget_args(&self.args, &self.repo, repo);
+        let mut args: Vec<&str> = owned.iter().map(String::as_str).collect();
         if tool == Tool::CargoTuned {
             args.extend(CARGO_TUNED_CONFIG);
         }
@@ -2546,6 +2557,22 @@ mod tests {
         }
         assert!(parse_packages(&meta, Some("tokio@1.39.0")).is_err());
         assert_eq!(parse_packages(&meta, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_copy_of_the_repository_gets_package_ids_naming_the_copy() {
+        let a = std::env::temp_dir().join("frust-retarget-a");
+        let b = std::env::temp_dir().join("frust-retarget-b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let url = |p: &Path| canonical(p).to_string_lossy().replace('\\', "/");
+        let args = vec!["-p".to_string(), format!("path+file://{}/tokio#tokio@1.40.0", url(&a)), "--features".into(), "full".into()];
+        let moved = retarget_args(&args, &a, &b);
+        assert_eq!(moved[1], format!("path+file://{}/tokio#tokio@1.40.0", url(&b)));
+        assert_eq!((moved[0].as_str(), moved[2].as_str(), moved[3].as_str()), ("-p", "--features", "full"));
+        assert_eq!(retarget_args(&args, &a, &a), args);
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
     }
 
     #[test]
