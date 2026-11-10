@@ -1828,7 +1828,7 @@ impl Rig<'_> {
         if let Some(column) = column {
             self.quiesce(column);
         }
-        let owned = retarget_args(&self.args, &self.repo, repo);
+        let owned = retarget_args(&self.args, self.repo, repo);
         let mut args: Vec<&str> = owned.iter().map(String::as_str).collect();
         if tool == Tool::CargoTuned {
             args.extend(CARGO_TUNED_CONFIG);
