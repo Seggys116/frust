@@ -1287,11 +1287,8 @@ fn candidates(msg: &serde_json::Value, profile: &Path, package: &str, crate_name
         }
     }
     if unit.fingerprints.is_empty() || unit.fingerprints.len() > MAX_CANDIDATES {
-        if cfg!(windows) {
-            let names: Vec<String> = fs::read_dir(profile.join(".fingerprint")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-            eprintln!("frust-diag: unit not found package {package:?} crate {crate_name:?} file {file:?} kind {kind:?} fingerprints {names:?}");
-        }
-        return Err("unit not found");
+        let names: Vec<String> = fs::read_dir(profile.join(".fingerprint")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        return Err(Box::leak(format!("unit not found (diag package {package:?} crate {crate_name:?} file {file:?} kind {kind:?} profile {} fingerprints {names:?} count {})", profile.display(), unit.fingerprints.len()).into_boxed_str()));
     }
     Ok(unit)
 }

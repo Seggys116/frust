@@ -595,16 +595,16 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
         let mut depfiles = Vec::new();
         let mut ok = true;
         for (_, dest) in &plan.units[i].uplifts {
+            // Debug info and import libraries share the executable's stem but cargo writes the dep-info for the binary alone.
+            if Path::new(dest).extension().is_some_and(|e| ["pdb", "lib", "exp"].iter().any(|x| e.eq_ignore_ascii_case(x))) {
+                continue;
+            }
             let file = Path::new(dest).with_extension("d");
             if !file.is_file() || file == Path::new(dest) {
                 continue;
             }
             let expected = depfile_text(&plan, i, dest);
-            let actual = fs::read_to_string(&file);
-            if cfg!(windows) && !actual.as_ref().is_ok_and(|t| *t == expected) {
-                eprintln!("frust-diag: depfile {} expected {:?} actual {:?}", file.display(), expected, actual);
-            }
-            ok &= actual.is_ok_and(|t| t == expected);
+            ok &= fs::read_to_string(&file).is_ok_and(|t| t == expected);
             depfiles.push((dest.clone(), file.to_string_lossy().into_owned()));
         }
         plan.units[i].depfiles = depfiles;

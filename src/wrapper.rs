@@ -6548,7 +6548,7 @@ mod tests {
         // Native separators, as cargo passes them: the hash memo keys a library by the path text dependents name it by.
         *job.args.last_mut().unwrap() = Path::new("target").join("debug").join("deps").display().to_string();
         job.home = PathBuf::from("cache-home");
-        job.dep_text = "target/debug/deps/k.d: lib.rs\n\nlib.rs:\n".to_string();
+        job.dep_text = format!("{}: lib.rs\n\nlib.rs:\n", Path::new("target").join("debug").join("deps").join("k.d").display());
         fs::write(rlib.with_file_name("k.d"), &job.dep_text).unwrap();
         job.outputs = job
             .names
