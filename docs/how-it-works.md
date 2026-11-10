@@ -7,7 +7,7 @@ Details behind the README: cache correctness, disk usage, locking, platforms and
 The cache uses a two-step key, the same idea as ccache's direct mode.
 
 1. A *pre-key* is derived from the toolchain, the normalised command line, `CARGO_*` environment, the
-   working directory, and the **contents** of every `--extern` library, native library directory and explicitly selected linker executable. A bare linker name (`-C linker=NAME`, a cargo config `linker` or rustflags, `RUSTFLAGS`) is resolved on `PATH` first (with `PATHEXT` on Windows), then in the directories rustc searches in the toolchain sysroot: `lib/rustlib/<host>/bin`, its `gcc-ld` and its `self-contained` subdirectories, so rustup's `rust-lld` resolves. The sysroot comes from the toolchain probe and is passed to the wrapper by `fcargo` (`FRUST_SYSROOT`, `FRUST_HOST`). A name that resolves nowhere, or an unreadable executable, bypasses caching rather than being keyed by a guess. The bypass is visible: the wrapper prints one `frust-wrap: cache bypassed: ...` line per reason (repeated only after gc clears its marker in the state directory's `tmp`), the timing record says `skip:linker`, and `frust doctor` warns with the same reason using the same resolution code.
+   working directory, and the **contents** of every `--extern` library, native library directory and explicitly selected linker executable. A bare linker name (`-C linker=NAME`, a cargo config `linker` or rustflags, `RUSTFLAGS`) is resolved on `PATH` first (with `PATHEXT` on Windows), then in the directories rustc searches in the toolchain sysroot: `lib/rustlib/<host>/bin`, its `gcc-ld` and its `self-contained` subdirectories, so rustup's `rust-lld` resolves. The sysroot comes from the toolchain probe and is passed to the wrapper by `fcargo` (`FRUST_SYSROOT`, `FRUST_HOST`); on Linux and macOS a rustup toolchain's sysroot is read off its layout (`<root>/bin/rustc` beside its `rustc_driver` library and `<root>/lib/rustlib/<host>`, the way rustc derives it), and anything else, including loader path variables such as `LD_LIBRARY_PATH`, asks `rustc --print sysroot`. A name that resolves nowhere, or an unreadable executable, bypasses caching rather than being keyed by a guess. The bypass is visible: the wrapper prints one `frust-wrap: cache bypassed: ...` line per reason (repeated only after gc clears its marker in the state directory's `tmp`), the timing record says `skip:linker`, and `frust doctor` warns with the same reason using the same resolution code.
 2. Earlier real compiles record, per pre-key, the exact source files they read (from rustc's own dep-info,
    with content hashes) and every environment variable the compile observed (`env!`, `option_env!`,
    tracked env in proc macros). A candidate matches only if every file still has its recorded content hash
@@ -227,7 +227,7 @@ misses or waits on the key lock.
 ### Timing records
 
 With `FRUST_TIMINGS=<file>` set, each wrapper that handles a cacheable compile appends one JSON line to the file
-in a single write as it exits; passthrough invocations write nothing, and with the variable unset no file is
+in a single write as it exits; passthrough invocations write no unit record, and with the variable unset no file is
 touched. Fields: `crate`, `path_unit`, `primary`, `incremental` (booleans describe the unit), `prekey_ms`,
 `extern_files` (`--extern` inputs hashed for the key), `extern_bytes_hashed` (bytes of them actually read),
 `extern_bytes_memo` (bytes served from a hash memo, attested records included), `native_dir_bytes_hashed` (bytes read
@@ -238,7 +238,10 @@ for `-L` directories), `tool_bytes_hashed` (bytes of a `-C linker` binary read r
 `inline:<reason>` or `skip:<reason>`; `skip:linker` marks a unit that ran uncached because its explicit linker could
 not be resolved, and `skip:test` a test or bench executable that was compiled but not stored. Stages a run did not reach are 0.
 Store outcomes go to `<file>.events` when that file exists, with `kind` `store`, the outcome in `store_mode`, the
-store's wall time in `total_ms` and the CPU time of the thread that stored in `cpu_ms`.
+store's wall time in `total_ms` and the CPU time of the thread that stored in `cpu_ms`. Uncached compiler calls go
+there too, with `kind` `passthrough`; `store_mode` `answered` marks a `rustc -vV` call cargo makes through the wrapper
+that the wrapper answered with the probe's text, because it named the probed binary (or a rustup proxy selecting it),
+so no compiler started.
 
 ## Cache payload storage
 
