@@ -120,8 +120,8 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
     let expected = frust::cache::hash_file(&source).unwrap();
     let mut latest_cached = false;
     let mut lib0_records = std::collections::HashSet::new();
-    for manifest in frust::cache::keyed_items(&home.join("manifests")) {
-        let value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&manifest, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+    for (_, _, raw) in frust::cache::Cache::new(&frust::paths::Dirs::at(&home)).packed_manifests() {
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         for candidate in value["candidates"].as_array().unwrap() {
             let key = candidate["key"].as_str().unwrap();
             let entry = home.join("store").join(key);

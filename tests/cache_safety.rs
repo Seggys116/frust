@@ -5,7 +5,7 @@ mod common;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use common::{Sandbox, age, assert_success, run_binary, stdout};
 use frust::gc::{self, Class, GcOptions};
@@ -179,7 +179,7 @@ fn crafted_entry_metadata_cannot_escape_the_output_directory() {
     let mut patched = 0;
     for entry in frust::cache::keyed_items(&sb.home().join("store")) {
         let meta_path = entry.join("meta.json");
-        let mut meta: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&meta_path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let mut meta: serde_json::Value = serde_json::from_slice(&frust::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
         let files = meta["files"].as_array_mut().unwrap();
         let mut evil = files[0].clone();
         evil["name"] = serde_json::Value::String("../../escaped-by-frust".into());
@@ -274,6 +274,12 @@ fn fake_manifest(home: &Path, prekey: &str, keys: &[&str]) -> PathBuf {
     path
 }
 
+/// A per-file manifest is kept when the file survives or gc's tidy pass moved it into the manifest log.
+fn manifest_kept(dirs: &Dirs, path: &Path) -> bool {
+    let prekey = path.file_stem().unwrap().to_str().unwrap();
+    path.exists() || frust::cache::Cache::new(dirs).packed_manifests().iter().any(|(key, _, _)| key == prekey)
+}
+
 /// Options under which entries aged for the metadata tests are not themselves expired.
 fn keep_aged_entries() -> GcOptions {
     GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) }
@@ -353,8 +359,9 @@ fn gc_prunes_stale_metadata_and_leftover_temp_files() {
 
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(failures.is_empty(), "{failures:?}");
-    assert!(!orphan_manifest.exists() && !stale_lock.exists() && !orphan_history.exists() && !dead.exists());
-    assert!(ancient_manifest.exists() && kept_manifest.exists() && held_lock.exists() && live_history.exists() && mine.exists() && artifact.exists());
+    assert!(!manifest_kept(&dirs, &orphan_manifest) && !stale_lock.exists() && !orphan_history.exists() && !dead.exists());
+    assert!(manifest_kept(&dirs, &fresh_orphan), "the fresh manifest survives, moved into the log");
+    assert!(manifest_kept(&dirs, &ancient_manifest) && manifest_kept(&dirs, &kept_manifest) && held_lock.exists() && live_history.exists() && mine.exists() && artifact.exists());
     drop(holder);
 }
 
@@ -371,20 +378,18 @@ fn gc_retains_old_manifests_that_still_serve_current_cache_entries() {
             .unwrap(),
     );
     let dirs = Dirs::at(sb.home());
-    let mut manifests = Vec::new();
-    for manifest in frust::cache::keyed_items(&dirs.manifests()) {
-        let path = manifest;
-        let data: serde_json::Value =
-            serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
-        assert_eq!(data["format"], 7);
-        age(&path, Duration::from_secs(40 * 86_400));
-        manifests.push(path);
-    }
+    let store = frust::cache::Cache::new(&dirs);
+    let manifests = store.packed_manifests();
     assert!(!manifests.is_empty());
-    let plan = gc::plan(&dirs, &GcOptions::new(u64::MAX));
-    for path in &manifests {
-        assert!(!plan_has(&plan, Class::Metadata, path));
+    assert!(frust::cache::keyed_items(&dirs.manifests()).is_empty(), "manifests live in the log");
+    let aged = SystemTime::now() - Duration::from_secs(40 * 86_400);
+    for (prekey, _, raw) in &manifests {
+        let data: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(data["format"], 7);
+        store.put_packed_manifest(prekey, aged.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), raw).unwrap();
     }
+    let plan = gc::plan(&dirs, &GcOptions::new(u64::MAX));
+    assert!(!plan_has(&plan, Class::Metadata, &dirs.manifest_pack()));
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(failures.is_empty(), "{failures:?}");
     assert_success(
@@ -446,17 +451,18 @@ fn gc_expires_idle_manifests_and_rechecks_usage_replacement_and_republication() 
     );
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(failures.is_empty(), "{failures:?}");
-    assert!(!fixtures[0].2.exists(), "a genuinely idle manifest expires");
+    assert!(!manifest_kept(&dirs, &fixtures[0].2), "a genuinely idle manifest expires");
     assert!(
-        fixtures[1].2.exists(),
+        manifest_kept(&dirs, &fixtures[1].2),
         "a hit after planning preserves its manifest"
     );
     assert!(
-        fixtures[2].2.exists(),
+        manifest_kept(&dirs, &fixtures[2].2),
         "replacement invalidates the planned file identity"
     );
-    assert!(
-        fixtures[3].2.exists(),
+    assert_eq!(
+        store.candidates(&fixtures[3].1).len(),
+        1,
         "unchanged candidate republication refreshes usage"
     );
 }
@@ -475,7 +481,7 @@ fn gc_rechecks_orphan_manifests_against_entries_published_after_planning() {
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(failures.is_empty(), "{failures:?}");
     assert!(
-        manifest.exists(),
+        manifest_kept(&dirs, &manifest),
         "a newly surviving reference invalidates orphan removal"
     );
 }
@@ -497,7 +503,7 @@ fn gc_requires_actual_eviction_before_removing_an_active_manifest() {
     let (_, failures) = gc::execute(&dirs, &plan);
     assert!(failures.is_empty(), "{failures:?}");
     assert!(
-        manifest.exists(),
+        manifest_kept(&dirs, &manifest),
         "a planned eviction does not prove the reference disappeared"
     );
 }

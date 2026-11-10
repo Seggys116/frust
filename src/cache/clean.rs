@@ -67,7 +67,8 @@ impl Cache {
         if !stat.is_file() {
             return;
         }
-        let Ok(bytes) = fsx::read_packed(&path, super::MAX_MANIFEST_BYTES) else { return };
+        let Ok(bytes) = super::entry_meta_bytes(&self.entry_dir(key), key, &self.dirs.entry_pack()) else { return };
+        let logged = stat.len() == 0;
         let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
         let Some(object) = value.as_object_mut() else { return };
         if object.get("source").and_then(|source| source.as_str()).is_none() {
@@ -82,7 +83,8 @@ impl Cache {
         }
         object.insert("workspaces".to_owned(), serde_json::json!(list));
         let Ok(out) = serde_json::to_vec(&value) else { return };
-        if fsx::write_atomic(&path, &fsx::pack(&out)).is_err() {
+        let written = if logged { self.rewrite_entry_record(key, &out) } else { fsx::write_atomic(&path, &fsx::pack(&out)) };
+        if written.is_err() {
             return;
         }
         if keep_stamp
@@ -279,13 +281,25 @@ mod tests {
     fn rewriting_attribution_preserves_fields_this_version_does_not_know() {
         let (dir, cache) = scratch("unknown");
         publish(&cache, 1, Some((SOURCE_REGISTRY, &["a"])));
-        let path = cache.entry_dir(&key(1)).join("meta.json");
-        let mut value: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let entry = cache.entry_dir(&key(1));
+        assert_eq!(fs::metadata(entry.join("meta.json")).unwrap().len(), 0, "the record lives in the entry log");
+        let mut value: serde_json::Value = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
         value["future"] = serde_json::json!({"x": 1});
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let guard = UnitRecordsGuard::acquire(&cache.dirs).unwrap();
+        cache.rewrite_entry_record(&key(1), &serde_json::to_vec(&value).unwrap()).unwrap();
+        drop(guard);
         cache.note_workspace(&key(1), "b");
-        let after: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&path, crate::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
         assert_eq!(after["future"], serde_json::json!({"x": 1}));
+        assert_eq!(after["workspaces"], serde_json::json!(["a", "b"]));
+        let plain = cache.entry_dir(&key(2));
+        publish(&cache, 2, Some((SOURCE_REGISTRY, &["a"])));
+        let mut legacy: serde_json::Value = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&plain).unwrap()).unwrap();
+        legacy["future"] = serde_json::json!(2);
+        fs::write(plain.join("meta.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        cache.note_workspace(&key(2), "b");
+        let after: serde_json::Value = serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&plain).unwrap()).unwrap();
+        assert_eq!((after["future"].clone(), after["workspaces"].clone()), (serde_json::json!(2), serde_json::json!(["a", "b"])), "a record an older frust kept in the file is edited in place");
         fs::remove_dir_all(dir).unwrap();
     }
 

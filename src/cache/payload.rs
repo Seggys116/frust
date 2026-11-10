@@ -783,6 +783,7 @@ pub enum Placement {
 
 /// Stores a large output as a second name of the target file; any link failure leaves no staged name and falls back to a copy.
 /// The stamp is set when the link's own read proved the recorded hash under the stamp the output now carries.
+#[cfg(test)]
 pub(crate) fn store_linked(
     src: &Path,
     dst: &Path,
@@ -790,13 +791,37 @@ pub(crate) fn store_linked(
     commitment: Option<&Commitment>,
     capture: bool,
 ) -> io::Result<(StoredPayload, Option<StoreProof>, Option<Stamp>)> {
+    store_linked_noting(src, dst, compress, commitment, capture, &mut None)
+}
+
+/// As [`store_linked`], also writing into `declined` why the link was not taken when the output was copied instead.
+pub(crate) fn store_linked_noting(
+    src: &Path,
+    dst: &Path,
+    compress: bool,
+    commitment: Option<&Commitment>,
+    capture: bool,
+    declined: &mut Option<String>,
+) -> io::Result<(StoredPayload, Option<StoreProof>, Option<Stamp>)> {
     match link_commitment(src, dst, commitment) {
         Ok((payload, stamp)) => Ok((payload, None, stamp)),
-        Err(_) => {
+        Err(error) => {
+            *declined = Some(decline_reason(&error));
             let _ = fs::remove_file(dst);
             store_proven(src, dst, compress, commitment, capture).map(|(payload, proof)| (payload, proof, None))
         }
     }
+}
+
+/// The error label followed by its message, bounded so a record stays small.
+pub fn decline_reason(error: &io::Error) -> String {
+    let mut reason = format!("{}: {error}", error_label(error));
+    if reason.len() > 160 {
+        let mut end = 160;
+        while !reason.is_char_boundary(end) { end -= 1; }
+        reason.truncate(end);
+    }
+    reason
 }
 
 fn copy_hashed(source: &File, len: u64, out: &mut impl Write) -> io::Result<(u64, String)> {
@@ -1048,6 +1073,7 @@ mod tests {
 
     fn metadata(payload: StoredPayload) -> StoredFile {
         StoredFile {
+            link_declined: None,
             name: "artifact".into(),
             stored: "f0".into(),
             text: false,
@@ -1241,6 +1267,24 @@ mod tests {
         assert_eq!(restore_linked(&staged, &dst, &file).unwrap(), Placement::Linked, "a passing sharing violation still links");
         assert_eq!(sys::lstat(&dst).unwrap().ino(), sys::lstat(&staged).unwrap().ino());
         assert!(LINK_FAULTS.with(|faults| faults.borrow().is_empty()));
+    }
+
+    #[test]
+    fn a_store_that_cannot_link_copies_and_names_why() {
+        let scratch = Scratch::new();
+        let src = scratch.0.join("libx.rlib");
+        fs::write(&src, pattern(70_000)).unwrap();
+        let dst = scratch.0.join("f0");
+        inject_link_faults((0..=LINK_RETRY_MS.len()).map(|_| busy()));
+        let mut declined = None;
+        let (payload, _, _) = store_linked_noting(&src, &dst, false, None, false, &mut declined).unwrap();
+        assert_ne!(payload.encoding, Encoding::Linked);
+        assert_eq!(fs::read(&dst).unwrap(), fs::read(&src).unwrap());
+        assert!(declined.as_deref().is_some_and(|reason| reason.starts_with("ResourceBusy: ")), "{declined:?}");
+        let mut linked = None;
+        let (payload, _, _) = store_linked_noting(&src, &scratch.0.join("f1"), false, None, false, &mut linked).unwrap();
+        assert_eq!((payload.encoding, linked), (Encoding::Linked, None));
+        assert!(decline_reason(&io::Error::other("x".repeat(400))).len() <= 160);
     }
 
     #[test]

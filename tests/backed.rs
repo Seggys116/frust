@@ -56,21 +56,17 @@ fn entries(sb: &Sandbox, krate: &str) -> Vec<(PathBuf, EntryMeta)> {
     found
 }
 
-fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
-        if file.extension().is_some_and(|e| e == "json") {
-            found.push(file);
-        }
-    }
-    found
+fn manifest_cache(sb: &Sandbox) -> frust::cache::Cache {
+    frust::cache::Cache::new(&frust::paths::Dirs::at(sb.home()))
+}
+
+/// Every manifest of the log as `(prekey, written, value)`.
+fn manifests(sb: &Sandbox) -> Vec<(String, u64, serde_json::Value)> {
+    manifest_cache(sb).packed_manifests().into_iter().map(|(prekey, written, raw)| (prekey, written, serde_json::from_slice(&raw).unwrap())).collect()
 }
 
 fn manifest_formats(sb: &Sandbox) -> Vec<u64> {
-    manifests(sb)
-        .iter()
-        .filter_map(|path| serde_json::from_slice::<serde_json::Value>(&frust::fsx::read_packed(path, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok()?["format"].as_u64())
-        .collect()
+    manifests(sb).iter().filter_map(|(_, _, value)| value["format"].as_u64()).collect()
 }
 
 fn leaf_library(target: &Path, extension: &str) -> PathBuf {
@@ -384,10 +380,9 @@ fn off_keeps_ordinary_payloads_and_older_manifests_and_entries_still_restore() {
         assert!(file.inline.is_some() || dir.join(&file.stored).exists(), "{} keeps its payload", file.name);
     }
     assert_eq!(manifest_formats(&sb).iter().filter(|f| **f == 8).count(), 0);
-    for path in manifests(&sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+    for (prekey, written, mut value) in manifests(&sb) {
         value["format"] = serde_json::json!(4);
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        manifest_cache(&sb).put_packed_manifest(&prekey, written, &serde_json::to_vec(&value).unwrap()).unwrap();
     }
     build(&sb, &b, "force");
     assert_eq!(sb.count_cache("hit", "leaf"), 1, "{:#?}", sb.cache_events());

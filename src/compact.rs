@@ -3367,15 +3367,18 @@ fn regular_key(path: &Path) -> Option<FileKey> {
 impl StoreIndex {
     fn new(store: &Path) -> StoreIndex {
         let mut index = StoreIndex::default();
+        let entry_log = store.parent().and_then(|home| crate::cache::pack::Log::read(&home.join(crate::paths::ENTRY_PACK)).ok());
         let parts = walk_parallel(
             store,
             &|_: &str, _: bool| false,
             &StoreScan::default,
             &|acc: &mut StoreScan, path: &Path, meta: &sys::Meta| {
                 if path.file_name().is_some_and(|n| n == "meta.json") {
-                    if let Ok(bytes) = fsx::read_packed(path, crate::cache::MAX_MANIFEST_BYTES)
-                        && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
+                    if let Ok(stored) = fs::read(path)
                         && let Some(parent) = path.parent()
+                        && let Some(key) = parent.file_name().and_then(|name| name.to_str())
+                        && let Some(bytes) = crate::cache::record_or_logged(&stored, key, entry_log.as_ref())
+                        && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
                         && entry.stderr_present(parent)
                         && let Ok(groups) = crate::cache::metadata_slice::validate_groups(&entry.files)
                         && (cfg!(unix) || groups.iter().all(|group| group.slice_indices.is_empty()))
@@ -3926,6 +3929,7 @@ mod tests {
         let meta = crate::cache::EntryMeta {
             crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: None, source: None, workspaces: Vec::new(), session: None,
             files: vec![crate::cache::StoredFile {
+                link_declined: None,
                 name: source.file_name().unwrap().to_str().unwrap().into(), stored: "f0".into(), text: false, bytes: file.bytes, dir: false,
                 encoding: file.encoding, stored_bytes: file.stored_bytes, decoded_bytes: file.decoded_bytes, content_hash: file.content_hash, metadata_slice: None, mode: None, inline: None,
             }], stderr: "stderr".into(), stderr_inline: String::new(),
@@ -3956,11 +3960,13 @@ mod tests {
         fs::create_dir_all(&entry).unwrap();
         let stored = crate::cache::payload::store(&source, &entry.join("f0"), compress).unwrap();
         let base = crate::cache::StoredFile {
+            link_declined: None,
             name: "libapp-0123456789abcdef.rlib".into(), stored: "f0".into(), text: false, bytes: stored.bytes,
             encoding: stored.encoding, stored_bytes: stored.stored_bytes, decoded_bytes: stored.decoded_bytes,
             content_hash: stored.content_hash, metadata_slice: None, dir: false, mode: None, inline: None,
         };
         let target = crate::cache::StoredFile {
+            link_declined: None,
             name: artifact.file_name().unwrap().to_string_lossy().into_owned(), stored: "f1".into(), text: false,
             bytes: fsx::allocated_size(&artifact), encoding: crate::cache::payload::Encoding::Raw, stored_bytes: None,
             decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None, inline: None,

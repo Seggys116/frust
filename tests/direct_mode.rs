@@ -11,18 +11,21 @@ use common::{Sandbox, assert_success, run_binary, settle, stdout};
 const LEAF_V1: &str = "pub fn value() -> u32 { 41 }\n";
 const MAIN: &str = "fn main() { println!(\"{}\", leaf::value()); }\n";
 
-fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
-        if file.extension().is_some_and(|e| e == "json") {
-            found.push(file);
-        }
-    }
-    found
+fn manifest_cache(sb: &Sandbox) -> frust::cache::Cache {
+    frust::cache::Cache::new(&frust::paths::Dirs::at(sb.home()))
+}
+
+/// Every manifest of the log as `(prekey, written, value)`.
+fn manifests(sb: &Sandbox) -> Vec<(String, u64, serde_json::Value)> {
+    manifest_cache(sb).packed_manifests().into_iter().map(|(prekey, written, raw)| (prekey, written, serde_json::from_slice(&raw).unwrap())).collect()
 }
 
 fn manifest_values(sb: &Sandbox) -> Vec<serde_json::Value> {
-    manifests(sb).iter().filter_map(|p| serde_json::from_slice(&frust::fsx::read_packed(p, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok()).collect()
+    manifests(sb).into_iter().map(|(_, _, value)| value).collect()
+}
+
+fn put_manifest(sb: &Sandbox, prekey: &str, written: u64, value: &serde_json::Value) {
+    manifest_cache(sb).put_packed_manifest(prekey, written, &serde_json::to_vec(value).unwrap()).unwrap();
 }
 
 fn recorded_stamps(sb: &Sandbox) -> usize {
@@ -121,10 +124,9 @@ fn manifests_in_an_older_format_are_ignored_and_rewritten() {
     wait_for_settle_margin();
     build(&sb, &a);
 
-    for path in manifests(&sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+    for (prekey, written, mut value) in manifests(&sb) {
         value.as_object_mut().unwrap().remove("format");
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        put_manifest(&sb, &prekey, written, &value);
     }
     clean(&sb, &a);
     build(&sb, &a);
@@ -193,8 +195,7 @@ fn leaf_source_dev(sb: &Sandbox) -> u64 {
 // Rewrites the recorded content hash of every stamped `lib.rs` input and leaves the stamps themselves untouched.
 fn forge_leaf_hashes(sb: &Sandbox) -> usize {
     let mut forged = 0;
-    for path in manifests(sb) {
-        let mut value: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
+    for (prekey, written, mut value) in manifests(sb) {
         for candidate in value["candidates"].as_array_mut().unwrap() {
             for input in candidate["inputs"].as_array_mut().unwrap() {
                 if input["path"].as_str().is_some_and(|p| Path::new(p).ends_with(Path::new("src").join("lib.rs"))) && input["stamp"].is_object() {
@@ -203,7 +204,7 @@ fn forge_leaf_hashes(sb: &Sandbox) -> usize {
                 }
             }
         }
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        put_manifest(sb, &prekey, written, &value);
     }
     forged
 }

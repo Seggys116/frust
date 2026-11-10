@@ -53,6 +53,7 @@ fn wipe_cache(sb: &Sandbox) {
     for dir in ["store", "manifests"] {
         let _ = fs::remove_dir_all(sb.home().join(dir));
     }
+    let _ = fs::remove_file(sb.home().join("manifests.pack"));
 }
 
 fn clean(sb: &Sandbox, project: &Path) {
