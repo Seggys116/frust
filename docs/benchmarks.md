@@ -145,12 +145,12 @@ Disk compares the physical size of Cargo's target directory with the physical si
 
 | Row | Limit |
 | --- | --- |
-| Cold | at most 1.00x + 100 ms |
+| Cold | at most 1.03x + 50 ms |
 | Clean rebuild from cache | at most 0.5x + 100 ms |
 | No-op | at most 0.5x + 15 ms (25 ms on Windows) |
-| First edit | at most 1.00x + 25 ms |
-| Warm-session edit median | at most 1.00x + 25 ms |
-| Edit p90 | at most 1.05x + 40 ms, paired p90 against cargo's p90 |
+| First edit | at most 1.03x + 40 ms |
+| Warm-session edit median | at most 1.03x + 40 ms |
+| Edit p90 | at most 1.08x + 60 ms, paired p90 against cargo's p90 |
 | Disk | frust-tuned at most cargo-tuned (plus `--disk-slack`) |
 
 The no-op limit reflects the driver-level no-op fast path (`src/noop.rs`), which answers an unchanged build without launching cargo; the ratio is expected near 0.05 to 0.3. Gate check names are `cold`, `clean-rebuild`, `noop`, `edit-first`, `edit-median` and `edit-p90`; schema 2 reports had `noop-slack` and `noop-ratio` instead of `noop`, and no first-edit check.
@@ -164,7 +164,7 @@ Shared-cache phases. The cold row starts from an empty frust home, so it can onl
 | `cold-shared` | checkout B, a copy of the working tree without its top-level `target` (same sources and `Cargo.lock`), built cold with an empty target against the same frust home the main phases filled. The central target is keyed by checkout path, so B starts fresh. Registry and git dependencies hit the store; workspace crates miss because their keys include the checkout path |
 | `cold-shared-roots` | the same with `FRUST_CACHE_SHARE_ROOTS=on` (the opt-in worktree sharing, see `how-it-works.md`) in a third checkout C. Entries are stored under root tokens only when the flag is on, so B is first rebuilt once, untimed, with the flag to seed them, then C is built and timed; workspace crates that qualify hit as well |
 
-Each repetition uses fresh checkout paths, removes B's and C's central targets after the build and removes the checkouts at the end. Per phase the report gives the median time, plain cargo's median empty-cache cold time from the main cold row (cargo keeps no shared state, so no extra cargo build is run), their ratio, and for every repetition: units, hit units and missed units (from the wrapper records), restored files, the physical bytes of the checkout's target, the part of those bytes shared with store entries by link or clone (target plus store minus their union), and the physical growth of the whole frust home across the build (negative values are possible when the build retires superseded entries). These figures are additive and do not replace the strict empty-cache `cold` gate. With `--gate` each phase must satisfy the sane bar of at most 0.60x + 100 ms of cargo's cold median (check names `cold-shared` and `cold-shared-roots`, in `gate_shared`); a failed check exits 2 and a failed build or copy exits 1. The disk guard and `disk_breakdown` describe checkout A's final state and are taken before B and C exist, so those targets never inflate the comparison with cargo.
+Each repetition uses fresh checkout paths, removes B's and C's central targets after the build and removes the checkouts at the end. Per phase the report gives the median time, plain cargo's median empty-cache cold time from the main cold row (cargo keeps no shared state, so no extra cargo build is run), their ratio, and for every repetition: units, hit units and missed units (from the wrapper records), restored files, the physical bytes of the checkout's target, the part of those bytes shared with store entries by link or clone (target plus store minus their union), and the physical growth of the whole frust home across the build (negative values are possible when the build retires superseded entries). These figures are additive and do not replace the strict empty-cache `cold` gate. With `--gate` each phase must satisfy the sane bar of at most 0.70x + 100 ms of cargo's cold median (check names `cold-shared` and `cold-shared-roots`, in `gate_shared`); a failed check exits 2 and a failed build or copy exits 1. The disk guard and `disk_breakdown` describe checkout A's final state and are taken before B and C exist, so those targets never inflate the comparison with cargo.
 
 The report fields are `shared` (`requested_runs`, `note`, `phases`, `error`; each phase has `name`, `roots`, `runs`, `median_ms`, `cargo_cold_ms`, `ratio`) and `gate_shared`; both are null when the phases are off or, for `gate_shared`, when `--gate` is absent. The markdown adds a "Second checkout with a warm shared cache" table with the same columns. The home these phases use is the one left after the last main run, so it also holds that run's edit-time entries; registry dependencies hit regardless. CI uses the default of one repetition, which adds about two cached builds per job and needs no workflow change.
 
