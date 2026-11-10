@@ -1297,6 +1297,7 @@ mod tests {
 
     fn record(name: &str, stored: &str) -> StoredFile {
         StoredFile {
+            link_declined: None,
             name: name.into(),
             stored: stored.into(),
             text: false,

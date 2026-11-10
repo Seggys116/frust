@@ -2157,6 +2157,7 @@ impl Plan {
             let stored = format!("f{i}");
             let text = name.ends_with(".d");
             let mut inline = None;
+            let mut link_declined = None;
             let (payload, proof) = if text {
                 let raw = if name == dep_info.0 {
                     dep_info.1.to_string()
@@ -2182,12 +2183,13 @@ impl Plan {
                     None,
                 )
             } else if wants_linked[i] {
-                let (payload, proof, proven) = cache::payload::store_linked(
+                let (payload, proof, proven) = cache::payload::store_linked_noting(
                     &src,
                     &staged.join(&stored),
                     compress,
                     commitments.and_then(|c| c.get(name)),
                     false,
+                    &mut link_declined,
                 )?;
                 // The new name moved the output's change time, voiding the attestation its dependents look up.
                 if payload.encoding == cache::payload::Encoding::Linked
@@ -2240,6 +2242,7 @@ impl Plan {
                     metadata_slice: None,
                     mode: payload.mode,
                     inline,
+                    link_declined,
                 },
                 proof,
             ))
@@ -2264,6 +2267,7 @@ impl Plan {
             let (base, proof) = normal[base_index].as_ref().unwrap();
             let src = out_dir.join(name);
             let target = StoredFile {
+                link_declined: None,
                 name: name.clone(),
                 stored: format!("f{i}"),
                 text: false,

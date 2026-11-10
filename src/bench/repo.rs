@@ -335,11 +335,11 @@ fn count_cache_entries(store: &Path) -> usize {
 }
 
 fn measure_disk_breakdown(dirs: &Dirs, cargo_target: &Path, cargo_physical: u64) -> Result<DiskBreakdown, String> {
-    let named = [dirs.store(), dirs.targets(), dirs.manifests(), dirs.tmp(), dirs.manifest_pack()];
+    let named = [dirs.store(), dirs.targets(), dirs.manifests(), dirs.tmp(), dirs.manifest_pack(), dirs.entry_pack()];
     let other: Vec<PathBuf> = fs::read_dir(dirs.root()).map_err(|e| format!("{}: {e}", dirs.root().display()))?
         .flatten().map(|entry| entry.path()).filter(|path| !named.contains(path)).collect();
-    let [store, targets, manifests, tmp, manifest_pack] = named;
-    let groups: Vec<Vec<PathBuf>> = vec![vec![store.clone()], vec![targets], vec![manifests, manifest_pack], vec![tmp], other]
+    let [store, targets, manifests, tmp, manifest_pack, entry_pack] = named;
+    let groups: Vec<Vec<PathBuf>> = vec![vec![store.clone(), entry_pack], vec![targets], vec![manifests, manifest_pack], vec![tmp], other]
         .into_iter().map(|paths| paths.into_iter().filter(|p| fs::symlink_metadata(p).is_ok()).collect()).collect();
     let flat: Vec<&Path> = groups.iter().flatten().map(PathBuf::as_path).collect();
     let mut end = 0;
@@ -374,6 +374,8 @@ struct StoreFile {
     encoding: String,
     // The store file is its inode's only name, so no target can share it.
     lone: bool,
+    // Why the store step copied an output it meant to link, as the wrapper recorded it.
+    link_declined: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -397,6 +399,9 @@ struct EntryUse {
     lone_files: usize,
     // How the last restore of this entry placed its files, from the timing records.
     last_restore: Option<String>,
+    // Distinct reasons the store step gave for copying outputs it meant to link.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    link_declined: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -410,6 +415,8 @@ struct StoreOnly {
     top_entries: Vec<EntryUse>,
     by_class: Vec<GroupBytes>,
     by_extension: Vec<GroupBytes>,
+    // Store-only bytes by the error label of a declined link; files the store never meant to link are not counted.
+    by_link_decline: Vec<GroupBytes>,
 }
 
 impl StoreOnly {
@@ -424,6 +431,7 @@ impl StoreOnly {
             top_entries: Vec::new(),
             by_class: Vec::new(),
             by_extension: Vec::new(),
+            by_link_decline: Vec::new(),
         }
     }
 }
@@ -469,6 +477,7 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
     }
     let mut classes: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
     let mut extensions: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    let mut declines: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
     let mut uses = Vec::new();
     for (key, group) in &entries {
         let first = group[0];
@@ -479,7 +488,16 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
         *total = (total.0 + bytes, total.1 + group.len());
         let mut kinds: Vec<String> = Vec::new();
         let mut encodings: Vec<String> = Vec::new();
+        let mut link_declined: Vec<String> = Vec::new();
         for file in group {
+            if let Some(reason) = file.link_declined.as_deref().filter(|_| file.bytes > 0) {
+                let label = reason.split(':').next().unwrap_or(reason);
+                let total = declines.entry(label).or_default();
+                *total = (total.0 + file.bytes, total.1 + 1);
+                if !link_declined.iter().any(|known| known == reason) {
+                    link_declined.push(reason.to_string());
+                }
+            }
             let ext = extension_group(&file.name);
             let total = extensions.entry(ext).or_default();
             *total = (total.0 + file.bytes, total.1 + 1);
@@ -503,6 +521,7 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
             encodings,
             lone_files: group.iter().filter(|f| f.lone).count(),
             last_restore: restores.get(*key).cloned(),
+            link_declined,
         });
     }
     uses.retain(|u| u.bytes > 0);
@@ -518,6 +537,7 @@ fn summarize_store_only(files: &[StoreFile], unreadable_entries: usize, top: usi
         top_entries: uses,
         by_class: group_list(&CLASSES, &classes),
         by_extension: group_list(&EXTENSIONS, &extensions),
+        by_link_decline: group_list(&declines.keys().copied().collect::<Vec<_>>(), &declines),
     }
 }
 
@@ -548,6 +568,7 @@ fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
                 bytes: 0,
                 encoding,
                 lone: sys::lstat(&path).is_ok_and(|m| m.is_file() && m.nlink() == 1),
+                link_declined: stored.link_declined.clone(),
             });
             paths.push(path);
         }
@@ -968,22 +989,27 @@ fn store_only_lines(s: &StoreOnly) -> Vec<String> {
     if s.status != "ok" {
         return vec![format!("Store-only bytes: {} ({}).", s.status, s.reason.as_deref().unwrap_or("no detail"))];
     }
-    vec![
+    let mut lines = vec![
         format!("Store-only bytes: {} in {} payload files of {} entries, not shared with targets by hardlink or extent.",
             human_bytes(s.total_bytes), s.files, s.entries),
         format!("Store-only by crate class: {}.", store_group_text(&s.by_class)),
         format!("Store-only by file kind: {}.", store_group_text(&s.by_extension)),
-    ]
+    ];
+    if !s.by_link_decline.is_empty() {
+        lines.push(format!("Store-only by declined link: {}.", store_group_text(&s.by_link_decline)));
+    }
+    lines
 }
 
 fn store_top_rows(s: &StoreOnly, limit: usize) -> Vec<Vec<String>> {
-    let header = ["crate", "version", "source", "kinds", "files", "store-only", "encodings", "lone", "last restore"];
+    let header = ["crate", "version", "source", "kinds", "files", "store-only", "encodings", "lone", "last restore", "link declined"];
     let mut rows = vec![header.iter().map(|h| h.to_string()).collect::<Vec<_>>()];
     for e in s.top_entries.iter().take(limit) {
         rows.push(vec![
             e.crate_name.clone(), e.version.clone(), e.source.clone().unwrap_or_else(|| "-".to_string()),
             e.kinds.join(","), e.files.to_string(), human_bytes(e.bytes), e.encodings.join(","), e.lone_files.to_string(),
             e.last_restore.clone().unwrap_or_else(|| "-".to_string()),
+            if e.link_declined.is_empty() { "-".to_string() } else { e.link_declined.join("; ") },
         ]);
     }
     rows
@@ -2601,7 +2627,7 @@ mod tests {
     }
 
     fn sf(key: &str, krate: &str, source: Option<&str>, name: &str, bytes: u64) -> StoreFile {
-        StoreFile { key: key.into(), krate: krate.into(), version: "1.0.0".into(), source: source.map(String::from), name: name.into(), bytes, encoding: "linked".into(), lone: bytes > 0 }
+        StoreFile { key: key.into(), krate: krate.into(), version: "1.0.0".into(), source: source.map(String::from), name: name.into(), bytes, encoding: "linked".into(), lone: bytes > 0, link_declined: None }
     }
 
     fn synthetic_store() -> Vec<StoreFile> {
@@ -2633,6 +2659,23 @@ mod tests {
     }
 
     #[test]
+    fn declined_links_are_tallied_by_label_and_named_per_entry() {
+        let mut files = synthetic_store();
+        files[0].encoding = "raw".into();
+        files[0].link_declined = Some("os5: Access is denied. (os error 5)".into());
+        files[1].link_declined = Some("os5: Access is denied. (os error 5)".into());
+        files[3].link_declined = Some("InvalidData: artifact changed while committing".into());
+        files[7].link_declined = Some("os32: never counted, no store-only bytes".into());
+        let summary = summarize_store_only(&files, 0, 10, &BTreeMap::new());
+        let declined: Vec<(&str, u64, usize)> = summary.by_link_decline.iter().map(|g| (g.name.as_str(), g.bytes, g.files)).collect();
+        assert_eq!(declined, [("InvalidData", 500, 1), ("os5", 1300, 2)]);
+        assert_eq!(summary.top_entries[0].link_declined, ["os5: Access is denied. (os error 5)"]);
+        assert_eq!(store_top_rows(&summary, 1)[1][9], "os5: Access is denied. (os error 5)");
+        assert!(store_only_lines(&summary).iter().any(|line| line.starts_with("Store-only by declined link: ")));
+        assert!(!store_only_lines(&summarize_store_only(&synthetic_store(), 0, 3, &BTreeMap::new())).iter().any(|line| line.contains("declined")));
+    }
+
+    #[test]
     fn store_only_top_entries_are_ordered_capped_and_skip_empty_entries() {
         let restores = BTreeMap::from([("k1".to_string(), "clean_rebuild: copy 2 (copy:link:os32;adopt:link:os32)".to_string())]);
         let summary = summarize_store_only(&synthetic_store(), 0, 3, &restores);
@@ -2649,7 +2692,7 @@ mod tests {
         let rows = store_top_rows(&all, 2);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1][..3], ["serde", "1.0.0", "registry"]);
-        assert_eq!(rows[1][6..], ["linked", "3", "clean_rebuild: copy 2 (copy:link:os32;adopt:link:os32)"]);
+        assert_eq!(rows[1][6..], ["linked", "3", "clean_rebuild: copy 2 (copy:link:os32;adopt:link:os32)", "-"]);
         assert_eq!(store_top_rows(&all, 10)[4][2], "path");
         let unsupported = StoreOnly::unsupported("no extents".into());
         assert!(store_only_lines(&unsupported)[0].contains("unsupported (no extents)"));

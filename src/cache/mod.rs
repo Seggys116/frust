@@ -89,6 +89,9 @@ pub struct StoredFile {
     /// The text of a dep-info file kept in the record itself, so the entry holds no file for it; absent for entries that store it as `stored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline: Option<String>,
+    /// Why an output meant to be stored as a link to the target file was copied instead: an OS error code or error kind, then the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_declined: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1396,6 +1399,7 @@ mod tests {
         fs::create_dir_all(&entry).unwrap();
         fs::create_dir_all(&target).unwrap();
         let linked = |name: &str, stored: &str| StoredFile {
+            link_declined: None,
             name: name.into(), stored: stored.into(), text: false, bytes: 8192, encoding: payload::Encoding::Linked,
             stored_bytes: None, decoded_bytes: None, content_hash: None, metadata_slice: None, dir: false, mode: None, inline: None,
         };
