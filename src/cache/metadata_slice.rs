@@ -2082,7 +2082,7 @@ mod tests {
                 .expect("set retained cache entry directory"),
         );
         let meta: super::super::EntryMeta =
-            serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+            serde_json::from_slice(&crate::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
         validate_groups(&meta.files).unwrap();
         let requested = std::env::var("FRUST_METADATA_DECODE_NAME").ok();
         let base = meta

@@ -179,7 +179,7 @@ fn crafted_entry_metadata_cannot_escape_the_output_directory() {
     let mut patched = 0;
     for entry in frust::cache::keyed_items(&sb.home().join("store")) {
         let meta_path = entry.join("meta.json");
-        let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let mut meta: serde_json::Value = serde_json::from_slice(&frust::fsx::read_packed(&meta_path, frust::cache::MAX_MANIFEST_BYTES).unwrap()).unwrap();
         let files = meta["files"].as_array_mut().unwrap();
         let mut evil = files[0].clone();
         evil["name"] = serde_json::Value::String("../../escaped-by-frust".into());

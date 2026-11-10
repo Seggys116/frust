@@ -34,7 +34,7 @@ const BACKED_MANIFEST_FORMAT: u32 = 8;
 
 /// The backed format before entries held their text inline.
 const LEGACY_BACKED_MANIFEST_FORMAT: u32 = 6;
-/// Raw bytes a packed manifest may unpack to.
+/// Raw bytes a packed manifest or entry record may unpack to.
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// Text kept inside the entry record stays under this size; anything larger is a separate file in the entry.
@@ -213,7 +213,7 @@ impl Cache {
         struct Files { #[serde(default)] files: Vec<LinkedProbe> }
         #[derive(Deserialize)]
         struct LinkedProbe { #[serde(default)] encoding: payload::Encoding }
-        fs::read(self.entry_dir(key).join("meta.json")).ok()
+        read_entry_meta_bytes(&self.entry_dir(key)).ok()
             .and_then(|bytes| serde_json::from_slice::<Files>(&bytes).ok())
             .is_some_and(|meta| meta.files.iter().any(|file| file.encoding == payload::Encoding::Linked))
     }
@@ -271,8 +271,7 @@ impl Cache {
             return None;
         }
         let dir = self.entry_dir(key);
-        let meta: EntryMeta =
-            serde_json::from_slice(&fs::read(dir.join("meta.json")).ok()?).ok()?;
+        let meta = read_entry_meta(&dir)?;
         Some((dir, meta))
     }
 
@@ -558,7 +557,7 @@ impl Cache {
         if proof.identity != (current.entry.dev, current.entry.ino) { return Err(io::Error::other("retired child identity changed")); }
         #[derive(Deserialize)]
         struct Reference { prekey: Option<serde_json::Value>, incremental_unit: Option<serde_json::Value> }
-        if let Ok(bytes) = fs::read(doomed.join("meta.json"))
+        if let Ok(bytes) = read_entry_meta_bytes(&doomed)
             && let Ok(reference) = serde_json::from_slice::<Reference>(&bytes)
         {
             // A malformed ownership hint must not disable cleanup through the other hint.
@@ -1158,6 +1157,15 @@ pub fn trust_summary(dirs: &Dirs, now: SystemTime) -> TrustSummary {
 pub fn manifest_keys(path: &Path) -> Option<Vec<String>> {
     let manifest: Manifest = serde_json::from_slice(&fsx::read_packed(path, MAX_MANIFEST_BYTES).ok()?).ok()?;
     Some(manifest.candidates.into_iter().map(|c| c.key).collect())
+}
+
+/// The raw `meta.json` of an entry directory, packed or written plain by an older frust.
+pub fn read_entry_meta_bytes(dir: &Path) -> std::io::Result<Vec<u8>> {
+    fsx::read_packed(&dir.join("meta.json"), MAX_MANIFEST_BYTES)
+}
+
+pub fn read_entry_meta(dir: &Path) -> Option<EntryMeta> {
+    serde_json::from_slice(&read_entry_meta_bytes(dir).ok()?).ok()
 }
 
 pub fn hash_file(path: &Path) -> std::io::Result<String> {

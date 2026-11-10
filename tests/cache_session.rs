@@ -68,7 +68,7 @@ fn app_entries(sb: &Sandbox) -> Vec<(u64, bool)> {
     let mut found = Vec::new();
     let mut dirs: Vec<PathBuf> = fs::read_dir(sb.home().join("store")).into_iter().flatten().flatten().map(|e| e.path()).collect();
     while let Some(dir) = dirs.pop() {
-        let Ok(text) = fs::read_to_string(dir.join("meta.json")) else {
+        let Ok(text) = frust::cache::read_entry_meta_bytes(&dir).map(|b| String::from_utf8_lossy(&b).into_owned()) else {
             dirs.extend(fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
             continue;
         };

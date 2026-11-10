@@ -125,7 +125,7 @@ fn settled_growth_caches_edited_sources_retires_versions_and_keeps_final_build_f
         for candidate in value["candidates"].as_array().unwrap() {
             let key = candidate["key"].as_str().unwrap();
             let entry = home.join("store").join(key);
-            let Ok(bytes) = fs::read(entry.join("meta.json")) else { continue };
+            let Ok(bytes) = frust::cache::read_entry_meta_bytes(&entry) else { continue };
             let meta: frust::cache::EntryMeta = serde_json::from_slice(&bytes).unwrap();
             if meta.crate_name != "lib0" { continue; }
             lib0_records.insert(key.to_string());
@@ -154,7 +154,7 @@ fn assert_retained_growth_snapshot(home: &std::path::Path, evidence: &serde_json
     let mut complete = std::collections::HashSet::new();
     let mut incremental_units = std::collections::HashMap::<String, usize>::new();
     for entry in frust::cache::keyed_items(&home.join("store")) {
-        let metadata: frust::cache::EntryMeta = serde_json::from_slice(&fs::read(entry.join("meta.json")).unwrap()).unwrap();
+        let metadata: frust::cache::EntryMeta = serde_json::from_slice(&frust::cache::read_entry_meta_bytes(&entry).unwrap()).unwrap();
         assert!(metadata.stderr_present(&entry));
         for group in frust::cache::metadata_slice::validate_groups(&metadata.files).unwrap() {
             let backing = &metadata.files[group.base_index];

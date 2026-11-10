@@ -150,7 +150,7 @@ impl Ws {
     fn stored_entries(&self, krate: &str) -> usize {
         let mut count = 0;
         for entry in frust::cache::keyed_items(&self.sb.home().join("store")) {
-            let meta = fs::read_to_string(entry.join("meta.json")).unwrap_or_default();
+            let meta = frust::cache::read_entry_meta_bytes(&entry).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
             if meta.contains(&format!("\"crate_name\":\"{krate}\"")) {
                 count += 1;
             }

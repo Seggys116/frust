@@ -70,7 +70,7 @@ impl Fixture {
     fn entries(&self) -> BTreeMap<PathBuf, EntryMeta> {
         let mut entries = BTreeMap::new();
         for path in frust::cache::keyed_items(&self.sandbox.home().join("store")) {
-            let meta: EntryMeta = serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
+            let meta: EntryMeta = serde_json::from_slice(&frust::cache::read_entry_meta_bytes(&path).unwrap()).unwrap();
             assert_eq!(meta.crate_name, "app");
             entries.insert(path, meta);
         }

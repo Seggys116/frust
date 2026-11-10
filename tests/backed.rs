@@ -46,7 +46,7 @@ fn app_output(sb: &Sandbox, project: &Path) -> String {
 fn entries(sb: &Sandbox, krate: &str) -> Vec<(PathBuf, EntryMeta)> {
     let mut found = Vec::new();
     for entry in frust::cache::keyed_items(&sb.home().join("store")) {
-        let Ok(bytes) = fs::read(entry.join("meta.json")) else { continue };
+        let Ok(bytes) = frust::cache::read_entry_meta_bytes(&entry) else { continue };
         if let Ok(meta) = serde_json::from_slice::<EntryMeta>(&bytes)
             && meta.crate_name == krate
         {
