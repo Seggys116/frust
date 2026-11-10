@@ -94,6 +94,16 @@ pub struct StoredFile {
     pub link_declined: Option<String>,
 }
 
+/// A raw store file of an entry, the only name of its inode, which a target file with the same name may also hold.
+#[derive(Debug, Clone)]
+pub struct StoreCopy {
+    pub key: String,
+    pub index: usize,
+    pub path: PathBuf,
+    pub name: String,
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryMeta {
     pub crate_name: String,
@@ -386,6 +396,94 @@ impl Cache {
         let frame = pack::encode(key, fsx::unix_now(), Some(raw)).ok_or_else(|| io::Error::other("entry record too large"))?;
         pack::commit(&path, &log, &frame, crate::lock::shared_mode(&self.dirs))?;
         fsx::write_atomic(&self.entry_dir(key).join("meta.json"), b"")
+    }
+
+    /// Raw output files that may become names of a target file's inode: only in entries that hold a linked file or recorded a declined link, so in the backed key domain, and never a metadata slice's base.
+    pub fn shareable_copies(&self) -> Vec<StoreCopy> {
+        let mut copies = Vec::new();
+        for dir in keyed_items(&self.dirs.store()) {
+            let Some(key) = dir.file_name().and_then(|name| name.to_str()).filter(|name| valid_key(name)).map(str::to_owned) else { continue };
+            let Some(meta) = read_entry_meta(&dir) else { continue };
+            let backed = meta.files.iter().any(|file| file.encoding == payload::Encoding::Linked || file.link_declined.is_some());
+            if !backed || meta.files.iter().any(|file| file.metadata_slice.is_some() || file.encoding == payload::Encoding::InlineMetadataSliceV1) {
+                continue;
+            }
+            for (index, file) in meta.files.iter().enumerate() {
+                if !file.encoding.is_raw() || file.text || file.dir || file.inline.is_some() || !safe_file_name(&file.stored) || !safe_file_name(&file.name) {
+                    continue;
+                }
+                let path = dir.join(&file.stored);
+                if let Ok(stat) = sys::lstat(&path)
+                    && stat.is_file()
+                    && stat.nlink() == 1
+                    && stat.len() >= payload::LINKED_MIN_BYTES
+                {
+                    copies.push(StoreCopy { key: key.clone(), index, path, name: file.name.clone(), len: stat.len() });
+                }
+            }
+        }
+        copies
+    }
+
+    /// Makes a store copy a linked file sharing `target`'s inode once both are proven to hold the same bytes; the record is rewritten before the file, and either record restores from either file.
+    pub fn share_copy(&self, copy: &StoreCopy, target: &Path) -> Result<(), String> {
+        let proven = payload::prove_copy(&copy.path, target)?;
+        {
+            let _guard = UnitRecordsGuard::acquire(&self.dirs).map_err(|error| format!("guard:{}", payload::error_label(&error)))?;
+            let dir = self.entry_dir(&copy.key);
+            let marker = dir.join("meta.json");
+            let stat = fs::symlink_metadata(&marker).map_err(|_| "entry-gone".to_string())?;
+            let bytes = entry_meta_bytes(&dir, &copy.key, &self.dirs.entry_pack()).map_err(|_| "record-unreadable".to_string())?;
+            let meta: EntryMeta = serde_json::from_slice(&bytes).map_err(|_| "record-unreadable".to_string())?;
+            let file = meta.files.get(copy.index).ok_or("record-changed")?;
+            if !file.encoding.is_raw() || file.text || file.dir || file.name != copy.name || dir.join(&file.stored) != copy.path {
+                return Err("record-changed".into());
+            }
+            // A manifest still in the plain format would hand the linked file to a writer that cannot restore it.
+            if !meta.files.iter().any(|file| file.encoding == payload::Encoding::Linked) && !self.manifest_backed_guarded(meta.prekey.as_deref(), &copy.key) {
+                return Err("manifest-plain".into());
+            }
+            // Edited as a generic value so fields written by newer versions survive.
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "record-unreadable".to_string())?;
+            let record = value.get_mut("files").and_then(|files| files.get_mut(copy.index)).and_then(|file| file.as_object_mut()).ok_or("record-changed")?;
+            record.insert("encoding".into(), serde_json::json!(payload::Encoding::Linked));
+            record.insert("stored_bytes".into(), serde_json::json!(proven.len));
+            record.insert("decoded_bytes".into(), serde_json::json!(proven.len));
+            record.insert("content_hash".into(), serde_json::json!(proven.hash));
+            record.insert("mode".into(), serde_json::json!(proven.mode));
+            record.remove("link_declined");
+            let out = serde_json::to_vec(&value).map_err(|_| "record-unwritable".to_string())?;
+            let written = if stat.len() == 0 { self.rewrite_entry_record(&copy.key, &out) } else { fsx::write_atomic(&marker, &fsx::pack(&out)) };
+            written.map_err(|error| format!("record:{}", payload::error_label(&error)))?;
+            // The marker's time is the entry's last use, which this rewrite is not.
+            if let Ok(modified) = stat.modified()
+                && let Ok(file) = File::options().write(true).open(&marker)
+            {
+                let _ = file.set_modified(modified);
+            }
+        }
+        payload::share_copy(&copy.path, target, &proven)
+    }
+
+    /// True when no manifest a plain-format reader accepts lists `key`: the prekey's manifest is absent, does not list it, or is or becomes backed.
+    fn manifest_backed_guarded(&self, prekey: Option<&str>, key: &str) -> bool {
+        let Some(prekey) = prekey.filter(|prekey| valid_key(prekey)) else { return false };
+        let log = pack::Log::read(&self.dirs.manifest_pack()).map_err(|_| ());
+        let read = |log: &Result<pack::Log, ()>| match log {
+            Ok(log) if log.contains(prekey) => Self::packed_manifest(log, prekey),
+            _ => self.read_legacy_manifest(prekey),
+        };
+        let lists = |manifest: &Option<Manifest>| manifest.as_ref().is_some_and(|m| m.candidates.iter().any(|c| c.key == key));
+        let backed = |manifest: &Option<Manifest>| manifest.as_ref().is_some_and(|m| matches!(m.format, LEGACY_BACKED_MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT));
+        let manifest = read(&log);
+        if !lists(&manifest) || backed(&manifest) {
+            return true;
+        }
+        let Some(mut manifest) = manifest else { return false };
+        manifest.format = BACKED_MANIFEST_FORMAT;
+        self.write_manifest(log.as_ref().map_err(|_| ()), prekey, Some(&manifest));
+        let again = read(&pack::Log::read(&self.dirs.manifest_pack()).map_err(|_| ()));
+        !lists(&again) || backed(&again)
     }
 
     /// Drops log records whose entry is provably gone and frames newer ones replaced; returns the bytes the log no longer occupies.

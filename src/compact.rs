@@ -1616,6 +1616,12 @@ pub fn compact_with(dirs: &Dirs, targets: &[PathBuf], opts: &CompactOptions, pro
         shrink(candidates, opts, &mut ctx, &mut report, progress, &|path| scope_of(dirs, path));
         crate::noop::restamp(dirs, &ctx.rewrites, false);
     }
+    if !apfs::SUPPORTED && opts.dedupe && opts.include_store && !opts.dry_run && crate::cache::payload::links_targets(&dirs.tmp()) {
+        let live: Vec<PathBuf> = profiles.iter().map(|(profile, _)| profile.clone()).collect();
+        let mut rewrites = Vec::new();
+        share_store_copies(dirs, plan_shares(dirs, &live), &protection, u64::MAX, &mut report, &mut rewrites, &mut || false);
+        crate::noop::restamp(dirs, &rewrites, false);
+    }
 
     drop(locks);
     for (path, bytes) in &report.removed {
@@ -2431,6 +2437,87 @@ fn verify_same(path: &Path, expected: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Target files of `profiles` named as one of `names`, large enough to share; incremental sessions and fingerprints hold none.
+fn target_files_named(profiles: &[PathBuf], names: &HashSet<String>) -> HashMap<String, Vec<(PathBuf, sys::Meta)>> {
+    let skip = |name: &str, is_dir: bool| is_dir && (name == "incremental" || name == ".fingerprint" || name.ends_with("-working"));
+    let mut found: HashMap<String, Vec<(PathBuf, sys::Meta)>> = HashMap::new();
+    for profile in profiles {
+        let parts = walk_parallel(profile, &skip, &Vec::new, &|acc: &mut Vec<(PathBuf, sys::Meta)>, path: &Path, meta: &sys::Meta| {
+            if meta.is_file()
+                && meta.len() >= crate::cache::payload::LINKED_MIN_BYTES
+                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| names.contains(n))
+            {
+                acc.push((path.to_path_buf(), meta.clone()));
+            }
+        });
+        for (path, meta) in parts.into_iter().flatten() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            found.entry(name).or_default().push((path, meta));
+        }
+    }
+    for files in found.values_mut() {
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    found
+}
+
+/// The store copies that may be shared and the target files named like them; reading needs no lock, since every share proves both files first.
+struct SharePlan {
+    copies: Vec<crate::cache::StoreCopy>,
+    targets: HashMap<String, Vec<(PathBuf, sys::Meta)>>,
+}
+
+fn plan_shares(dirs: &Dirs, profiles: &[PathBuf]) -> SharePlan {
+    let copies = crate::cache::Cache::new(dirs).shareable_copies();
+    if copies.is_empty() {
+        return SharePlan { copies, targets: HashMap::new() };
+    }
+    let names: HashSet<String> = copies.iter().map(|copy| copy.name.clone()).collect();
+    SharePlan { targets: target_files_named(profiles, &names), copies }
+}
+
+/// Where the volume has no clones, a store copy whose bytes a target file also holds becomes a name of that file's inode, so a link declined when the entry was stored is not permanent; the caller holds the profiles' locks. False when `halt` stopped the pass.
+fn share_store_copies(
+    dirs: &Dirs,
+    plan: SharePlan,
+    protection: &crate::wrapper::DeferredProtection,
+    mut bytes_left: u64,
+    report: &mut Report,
+    rewrites: &mut Vec<crate::noop::Rewrite>,
+    halt: &mut dyn FnMut() -> bool,
+) -> bool {
+    let cache = crate::cache::Cache::new(dirs);
+    let SharePlan { copies, targets } = plan;
+    for copy in copies {
+        let Some(found) = targets.get(&copy.name) else { continue };
+        for (target, meta) in found.iter().filter(|(_, meta)| meta.len() == copy.len) {
+            if halt() {
+                return false;
+            }
+            // Both files are read in full to prove them equal.
+            let cost = copy.len.saturating_mul(2);
+            if cost > bytes_left {
+                report.budget_stopped = true;
+                return true;
+            }
+            if protection.protects_file(target, meta) {
+                continue;
+            }
+            bytes_left -= cost;
+            let saved = sys::lstat(&copy.path).map_or(0, |stored| stored.allocated());
+            if cache.share_copy(&copy, target).is_ok() {
+                report.deduped_files += 1;
+                report.dedupe_saved += saved;
+                if let Ok(after) = crate::cache::hashing::Stamp::read(target) {
+                    rewrites.push(crate::noop::Rewrite { path: target.clone(), before: crate::cache::hashing::Stamp::of(meta), after });
+                }
+                break;
+            }
+        }
+    }
+    true
+}
+
 fn replace_with_clone(canonical: &Path, canon_meta: &sys::Meta, m: &Candidate, dir_times: &mut DirTimes) -> io::Result<()> {
     if !unchanged(canonical, canon_meta) {
         return Err(io::Error::other("canonical copy changed"));
@@ -3061,6 +3148,16 @@ fn auto_compact_pass(dirs: &Dirs, target: &Path, opts: &AutoOptions, mut report:
             slices.note(rewrites);
             report.budget_stopped = stopped && slices.aborted.is_none();
             if slices.aborted.is_some() {
+                break 'work;
+            }
+        }
+        if !apfs::SUPPORTED && opts.cache_enabled && crate::cache::payload::links_targets(&dirs.tmp()) {
+            let live: Vec<PathBuf> = built.iter().map(|b| b.0.clone()).filter(|p| p.exists()).collect();
+            let Some(plan) = unlocked!(plan_shares(dirs, &live)) else { break 'work };
+            let mut rewrites = Vec::new();
+            let finished = share_store_copies(dirs, plan, &protection, opts.pass_bytes, &mut report, &mut rewrites, &mut || halt!());
+            slices.note(rewrites);
+            if !finished {
                 break 'work;
             }
         }
@@ -3792,6 +3889,107 @@ mod apfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored_record(name: &str, stored: &str, path: &Path, linked: bool, declined: Option<&str>) -> crate::cache::StoredFile {
+        let meta = sys::lstat(path).unwrap();
+        crate::cache::StoredFile {
+            name: name.into(), stored: stored.into(), text: false, bytes: meta.allocated(), dir: false,
+            encoding: if linked { crate::cache::payload::Encoding::Linked } else { crate::cache::payload::Encoding::Raw },
+            stored_bytes: linked.then_some(meta.len()), decoded_bytes: linked.then_some(meta.len()),
+            content_hash: linked.then(|| crate::cache::hash_file(path).unwrap()), metadata_slice: None,
+            mode: linked.then_some(meta.mode()), inline: None, link_declined: declined.map(str::to_owned),
+        }
+    }
+
+    fn share_entry(dirs: &Dirs, key: &str, prekey: Option<&str>, files: Vec<crate::cache::StoredFile>) -> PathBuf {
+        let entry = dirs.store().join(key);
+        let meta = crate::cache::EntryMeta {
+            crate_name: "app".into(), version: "1".into(), compile_ms: 1, created_unix: 1, incremental_unit: None, prekey: prekey.map(str::to_owned),
+            source: None, workspaces: Vec::new(), session: None, files, stderr: String::new(), stderr_inline: String::new(),
+        };
+        fs::write(entry.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        entry
+    }
+
+    #[test]
+    fn a_declined_store_copy_becomes_a_name_of_the_target_inode_only_when_the_bytes_match() {
+        let root = fsx::temp_sibling(&std::env::temp_dir().join("frust-share-copies"));
+        let dirs = Dirs::at(root.join("home"));
+        let deps = root.join("target/debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let body = |seed: u8| (0..96 * 1024).map(|i| (i % 251) as u8 ^ seed).collect::<Vec<u8>>();
+        let write = |name: &str, seed: u8| {
+            let path = deps.join(name);
+            fs::write(&path, body(seed)).unwrap();
+            path
+        };
+        let (dll, pdb, rlib, other) = (write("macro-0123456789abcdef.dll", 1), write("macro-0123456789abcdef.pdb", 2), write("libdep-0123456789abcdef.rlib", 3), write("libplain-0123456789abcdef.rlib", 4));
+        let stale = write("libstale-0123456789abcdef.rlib", 5);
+        let entry = |key: &str| {
+            let dir = dirs.store().join(key);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // A proc-macro whose dll link was declined at store time, beside a debug-info file that was linked.
+        let declined = entry(&"a".repeat(40));
+        fs::copy(&dll, declined.join("f0")).unwrap();
+        fs::hard_link(&pdb, declined.join("f1")).unwrap();
+        let files = vec![
+            stored_record("macro-0123456789abcdef.dll", "f0", &declined.join("f0"), false, Some("os32: in use")),
+            stored_record("macro-0123456789abcdef.pdb", "f1", &declined.join("f1"), true, None),
+        ];
+        share_entry(&dirs, &"a".repeat(40), None, files);
+        // Every link declined and the prekey's manifest in the plain format: the manifest is made backed first.
+        let prekey = "c".repeat(40);
+        let alone = entry(&"b".repeat(40));
+        fs::copy(&rlib, alone.join("f0")).unwrap();
+        share_entry(&dirs, &"b".repeat(40), Some(&prekey), vec![stored_record("libdep-0123456789abcdef.rlib", "f0", &alone.join("f0"), false, Some("os5: denied"))]);
+        let manifests = dirs.manifests();
+        fs::create_dir_all(&manifests).unwrap();
+        let manifest = serde_json::json!({"format": 7, "candidates": [{"inputs": [], "envs": [], "key": "b".repeat(40)}]});
+        fs::write(manifests.join(format!("{prekey}.json")), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        // An entry of the plain key domain keeps its copy: writers unaware of linked files read it.
+        let plain = entry(&"d".repeat(40));
+        fs::copy(&other, plain.join("f0")).unwrap();
+        share_entry(&dirs, &"d".repeat(40), None, vec![stored_record("libplain-0123456789abcdef.rlib", "f0", &plain.join("f0"), false, None)]);
+        // A copy whose target was rebuilt with other bytes of the same length stays a copy.
+        let rebuilt = entry(&"e".repeat(40));
+        fs::write(rebuilt.join("f0"), body(9)).unwrap();
+        fs::hard_link(&pdb, rebuilt.join("f1")).unwrap();
+        share_entry(&dirs, &"e".repeat(40), None, vec![
+            stored_record("libstale-0123456789abcdef.rlib", "f0", &rebuilt.join("f0"), false, None),
+            stored_record("macro-0123456789abcdef.pdb", "f1", &rebuilt.join("f1"), true, None),
+        ]);
+
+        let mut report = Report::default();
+        let mut rewrites = Vec::new();
+        let profiles = [root.join("target/debug")];
+        assert!(share_store_copies(&dirs, plan_shares(&dirs, &profiles), &crate::wrapper::deferred_protection(&dirs), u64::MAX, &mut report, &mut rewrites, &mut || false));
+        assert_eq!(report.deduped_files, 2, "{:?}", report.errors);
+        assert_eq!(rewrites.len(), 2, "each target whose change time moved is restamped");
+        let ino = |path: &Path| sys::lstat(path).unwrap().ino();
+        assert_eq!(ino(&declined.join("f0")), ino(&dll));
+        assert_eq!(ino(&alone.join("f0")), ino(&rlib));
+        assert_ne!(ino(&plain.join("f0")), ino(&other));
+        assert_ne!(ino(&rebuilt.join("f0")), ino(&stale));
+        let raw = crate::cache::pack::find(&dirs.manifest_pack(), &prekey, crate::cache::MAX_MANIFEST_BYTES)
+            .map(|(_, raw)| raw)
+            .unwrap_or_else(|| crate::fsx::read_packed(&manifests.join(format!("{prekey}.json")), crate::cache::MAX_MANIFEST_BYTES).unwrap());
+        let format = serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["format"].as_u64();
+        assert_eq!(format, Some(8), "the manifest listing a newly linked entry is backed");
+
+        let record = crate::cache::read_entry_meta(&declined).unwrap();
+        let file = &record.files[0];
+        assert_eq!(file.encoding, crate::cache::payload::Encoding::Linked);
+        assert!(file.link_declined.is_none());
+        crate::cache::payload::verify_in_place(&dll, file).unwrap();
+        assert!(crate::cache::read_entry_meta(&rebuilt).unwrap().files[0].encoding.is_raw());
+        // Once the target is gone, the store file is its only copy and moves back in as a link.
+        fs::remove_file(&dll).unwrap();
+        assert_eq!(crate::cache::payload::restore_linked(&declined.join("f0"), &dll, file).unwrap(), crate::cache::payload::Placement::Linked);
+        assert_eq!(fs::read(&dll).unwrap(), body(1));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn compaction_retires_only_superseded_cache_states_and_prunes_known_manifests() {
