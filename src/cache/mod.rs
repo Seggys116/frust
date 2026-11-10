@@ -4,6 +4,7 @@ pub mod clean;
 pub mod depinfo;
 pub mod hashing;
 pub mod metadata_slice;
+pub mod pack;
 pub mod payload;
 pub mod rustc_args;
 pub mod session;
@@ -201,10 +202,40 @@ impl Cache {
             .unwrap_or_default()
     }
 
+    /// The packed record wins; a prekey the log does not hold, or a log that cannot be read, falls back to its per-file manifest.
     fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
-        let bytes = fsx::read_packed(&self.manifest_path(prekey), MAX_MANIFEST_BYTES).ok()?;
-        let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
-        matches!(manifest.format, 3 | 4 | 5 | LEGACY_BACKED_MANIFEST_FORMAT | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
+        match pack::Log::read(&self.dirs.manifest_pack()) {
+            Ok(log) if log.contains(prekey) => Self::packed_manifest(&log, prekey),
+            _ => self.read_legacy_manifest(prekey),
+        }
+    }
+
+    fn packed_manifest(log: &pack::Log, prekey: &str) -> Option<Manifest> {
+        parse_manifest(&log.get(prekey, MAX_MANIFEST_BYTES)?.1)
+    }
+
+    fn read_legacy_manifest(&self, prekey: &str) -> Option<Manifest> {
+        parse_manifest(&fsx::read_packed(&self.manifest_path(prekey), MAX_MANIFEST_BYTES).ok()?)
+    }
+
+    /// Writes the manifest of `prekey` into the log, or tombstones it when `manifest` is `None`; the per-file manifest goes once the log holds it.
+    fn write_manifest(&self, log: Result<&pack::Log, ()>, prekey: &str, manifest: Option<&Manifest>) {
+        let path = self.dirs.manifest_pack();
+        let raw = match manifest.map(serde_json::to_vec) {
+            Some(Ok(json)) => Some(json),
+            Some(Err(_)) => return,
+            None => None,
+        };
+        let packed = log.ok().zip(pack::encode(prekey, fsx::unix_now(), raw.as_deref()))
+            .is_some_and(|(log, frame)| pack::commit(&path, log, &frame, crate::lock::shared_mode(&self.dirs)).is_ok());
+        let legacy = self.manifest_path(prekey);
+        if packed {
+            let _ = fs::remove_file(legacy);
+        } else if let Some(raw) = raw {
+            let _ = fsx::write_atomic(&legacy, &fsx::pack(&raw));
+        } else {
+            let _ = fs::remove_file(legacy);
+        }
     }
 
     /// Reads `meta.json` for the one marker a manifest format depends on; an unreadable entry counts as not linked.
@@ -228,7 +259,12 @@ impl Cache {
     fn add_candidate_guarded(&self, guard: &UnitRecordsGuard, prekey: &str, candidate: Candidate) {
         if !self.has_entry(&candidate.key) { return; }
         self.mark_used_guarded(guard, &candidate.key);
-        let manifest = self.read_manifest(prekey);
+        let log = pack::Log::read(&self.dirs.manifest_pack()).map_err(|_| ());
+        let packed = log.as_ref().is_ok_and(|log| log.contains(prekey));
+        let manifest = match &log {
+            Ok(log) if packed => Self::packed_manifest(log, prekey),
+            _ => self.read_legacy_manifest(prekey),
+        };
         // A manifest that ever listed a backed entry stays in the backed format.
         let format = if manifest.as_ref().is_some_and(|m| matches!(m.format, LEGACY_BACKED_MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT))
             || self.entry_is_linked(&candidate.key)
@@ -249,16 +285,15 @@ impl Cache {
                 rows.push(old);
             }
         }
-        if current_format && unchanged_front && rows.len() == before {
+        // An unchanged per-file manifest is still moved into the log.
+        if current_format && unchanged_front && rows.len() == before && (packed || log.is_err()) {
             return;
         }
         let manifest = Manifest {
             format,
             candidates: rows,
         };
-        if let Ok(json) = serde_json::to_vec(&manifest) {
-            let _ = fsx::write_atomic(&self.manifest_path(prekey), &fsx::pack(&json));
-        }
+        self.write_manifest(log.as_ref().map_err(|_| ()), prekey, Some(&manifest));
     }
 
     /// A stat of `meta.json`, which is written last so its presence means the entry is complete.
@@ -328,7 +363,7 @@ impl Cache {
 
     /// Moves entries, manifests and unit records out of legacy two character directories into their flat trees and removes the emptied directories; a busy metadata lock defers the whole pass.
     pub fn migrate_legacy_layout(&self) {
-        let Ok(Some(_guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return };
+        let Ok(Some(guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return };
         for root in [self.dirs.store(), self.dirs.manifests(), self.units_dir()] {
             let Ok(read) = fs::read_dir(&root) else { continue };
             for shard in read.flatten() {
@@ -349,6 +384,60 @@ impl Cache {
                 let _ = fs::remove_dir(&path);
             }
         }
+        self.fold_legacy_manifests(&guard);
+    }
+
+    /// Moves readable per-file manifests into the log, keeping their write time, and drops the directory once nothing is left in it.
+    fn fold_legacy_manifests(&self, _guard: &UnitRecordsGuard) {
+        let root = self.dirs.manifests();
+        let Ok(log) = pack::Log::read(&self.dirs.manifest_pack()) else { return };
+        let (mut frames, mut folded, mut seen) = (Vec::new(), Vec::new(), std::collections::HashSet::new());
+        for path in keyed_items(&root) {
+            let Some(prekey) = path.file_name().and_then(|name| name.to_str()).and_then(|name| name.strip_suffix(".json")).filter(|key| valid_key(key)) else { continue };
+            let Ok(meta) = sys::lstat(&path) else { continue };
+            if !meta.is_file() || meta.file_type().is_symlink() { continue; }
+            if !log.contains(prekey) && seen.insert(prekey.to_owned()) {
+                let Some(manifest) = self.read_legacy_manifest(prekey) else { continue };
+                let written = meta.modified().ok().and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |age| age.as_secs());
+                let Some(frame) = serde_json::to_vec(&manifest).ok().and_then(|json| pack::encode(prekey, written, Some(&json))) else { continue };
+                frames.extend_from_slice(&frame);
+            }
+            folded.push(path);
+        }
+        if !frames.is_empty() && pack::commit(&self.dirs.manifest_pack(), &log, &frames, crate::lock::shared_mode(&self.dirs)).is_err() { return; }
+        for path in folded {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir(&root);
+    }
+
+    /// Every manifest record of the log as `(prekey, written unix seconds, raw json)`; per-file manifests are not included.
+    pub fn packed_manifests(&self) -> Vec<(String, u64, Vec<u8>)> {
+        let Ok(log) = pack::Log::read(&self.dirs.manifest_pack()) else { return Vec::new() };
+        let mut out: Vec<_> = log.keys().filter_map(|prekey| log.get(prekey, MAX_MANIFEST_BYTES).map(|(written, raw)| (prekey.to_owned(), written, raw))).collect();
+        out.sort();
+        out
+    }
+
+    /// Replaces the log record of `prekey` with `raw` as if written at `written_s`, under the metadata lock; for tools and tests that age or rewrite records.
+    pub fn put_packed_manifest(&self, prekey: &str, written_s: u64, raw: &[u8]) -> io::Result<()> {
+        if !valid_key(prekey) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid prekey")); }
+        let _guard = UnitRecordsGuard::acquire(&self.dirs)?;
+        let path = self.dirs.manifest_pack();
+        let log = pack::Log::read(&path)?;
+        let frame = pack::encode(prekey, written_s, Some(raw)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
+        pack::commit(&path, &log, &frame, crate::lock::shared_mode(&self.dirs))
+    }
+
+    /// Rewrites the manifest log without superseded frames; returns the bytes it no longer occupies.
+    pub fn compact_manifest_pack(&self) -> u64 {
+        let Ok(Some(_guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return 0 };
+        let path = self.dirs.manifest_pack();
+        let Ok(log) = pack::Log::read(&path) else { return 0 };
+        if log.dead_bytes() == 0 { return 0; }
+        let before = fsx::allocated_size(&path);
+        if pack::rewrite(&path, &log, |_| false, crate::lock::shared_mode(&self.dirs)).is_err() { return 0; }
+        before.saturating_sub(fsx::allocated_size(&path))
     }
 
     /// False only when a pack file exists but cannot be trusted.
@@ -605,6 +694,18 @@ impl Cache {
     }
 
     fn prune_manifest_guarded(&self, _guard: &UnitRecordsGuard, prekey: &str) {
+        if let Ok(log) = pack::Log::read(&self.dirs.manifest_pack())
+            && log.contains(prekey)
+        {
+            let Some(mut manifest) = Self::packed_manifest(&log, prekey) else { return };
+            if manifest.candidates.iter().any(|row| !valid_key(&row.key)) { return; }
+            let before = manifest.candidates.len();
+            manifest.candidates.retain(|row| !self.reference_absent(&row.key));
+            if manifest.candidates.len() == before { return; }
+            let kept = (!manifest.candidates.is_empty()).then_some(&manifest);
+            self.write_manifest(Ok(&log), prekey, kept);
+            return;
+        }
         let path = self.manifest_path(prekey);
         if real_directory(&self.dirs.manifests()).is_none()
             || path.parent().and_then(real_directory).is_none()
@@ -1153,6 +1254,11 @@ pub fn trust_summary(dirs: &Dirs, now: SystemTime) -> TrustSummary {
     summary
 }
 
+fn parse_manifest(bytes: &[u8]) -> Option<Manifest> {
+    let manifest: Manifest = serde_json::from_slice(bytes).ok()?;
+    matches!(manifest.format, 3 | 4 | 5 | LEGACY_BACKED_MANIFEST_FORMAT | MANIFEST_FORMAT | BACKED_MANIFEST_FORMAT).then_some(manifest)
+}
+
 /// Lists keys of manifests in any format: the reader ignores `format`, and fields it does not know (a stamp's birth time) or lacks are skipped or defaulted.
 pub fn manifest_keys(path: &Path) -> Option<Vec<String>> {
     let manifest: Manifest = serde_json::from_slice(&fsx::read_packed(path, MAX_MANIFEST_BYTES).ok()?).ok()?;
@@ -1188,6 +1294,15 @@ pub fn safe_file_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed_text(cache: &Cache, prekey: &str) -> String {
+        let log = pack::Log::read(&cache.dirs.manifest_pack()).unwrap();
+        String::from_utf8(log.get(prekey, MAX_MANIFEST_BYTES).unwrap().1).unwrap()
+    }
+
+    fn manifest_present(cache: &Cache, prekey: &str) -> bool {
+        pack::Log::read(&cache.dirs.manifest_pack()).unwrap().contains(prekey) || cache.manifest_path(prekey).exists()
+    }
 
     fn key(n: u8) -> String {
         format!("{n:02x}").repeat(20)
@@ -1822,14 +1937,46 @@ mod tests {
             .collect();
         let candidate = Candidate { inputs, envs: Vec::new(), key: key(1) };
         cache.add_candidate(&prekey, candidate.clone());
-        let path = cache.manifest_path(&prekey);
         let json = serde_json::to_vec(&Manifest { format: MANIFEST_FORMAT, candidates: vec![candidate.clone()] }).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() * 2 < json.len() as u64, "the manifest is packed");
+        let frame = pack::Log::read(&cache.dirs.manifest_pack()).unwrap().frame(&prekey).unwrap().len();
+        assert!(frame * 2 < json.len(), "the manifest is packed");
+        assert!(!cache.manifest_path(&prekey).exists(), "it lives in the log, not in a file of its own");
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
-        assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
-        fs::write(&path, &json).unwrap();
-        assert_eq!(cache.candidates(&prekey), vec![candidate]);
-        assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
+        for (older, bytes) in [(key(0x98), json.clone()), (key(0x99), fsx::pack(&json))] {
+            let path = cache.manifest_path(&older);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(cache.candidates(&older), vec![candidate.clone()], "a per-file manifest from an older frust still reads");
+            assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn maintenance_folds_per_file_manifests_into_the_log_and_keeps_unreadable_ones() {
+        let (dir, cache) = scratch("fold-manifests");
+        publish_entry(&cache, 1);
+        let json = serde_json::to_vec(&Manifest { format: MANIFEST_FORMAT, candidates: vec![empty_candidate(1)] }).unwrap();
+        let (flat, sharded, broken) = (key(0x81), key(0x82), key(0x83));
+        let flat_path = cache.dirs.manifests().join(format!("{flat}.json"));
+        let sharded_path = Cache::legacy(&cache.dirs.manifests(), &sharded).with_extension("json");
+        fs::create_dir_all(sharded_path.parent().unwrap()).unwrap();
+        fs::write(&flat_path, fsx::pack(&json)).unwrap();
+        fs::write(&sharded_path, &json).unwrap();
+        fs::write(cache.dirs.manifests().join(format!("{broken}.json")), b"interrupted").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        File::options().write(true).open(&flat_path).unwrap().set_modified(old).unwrap();
+        cache.migrate_legacy_layout();
+        assert_eq!(cache.candidates(&flat), vec![empty_candidate(1)]);
+        assert_eq!(cache.candidates(&sharded), vec![empty_candidate(1)]);
+        assert!(!flat_path.exists() && !sharded_path.exists());
+        let log = pack::Log::read(&cache.dirs.manifest_pack()).unwrap();
+        assert_eq!(log.get(&flat, MAX_MANIFEST_BYTES).unwrap().0, 1_600_000_000, "the write time carries over for gc");
+        assert!(!log.contains(&broken));
+        assert!(cache.dirs.manifests().join(format!("{broken}.json")).exists(), "an unreadable manifest is left for gc");
+        fs::remove_file(cache.dirs.manifests().join(format!("{broken}.json"))).unwrap();
+        cache.migrate_legacy_layout();
+        assert!(!cache.dirs.manifests().exists(), "the emptied directory goes");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1876,7 +2023,7 @@ mod tests {
         let retired = cache.retire_entry_guarded(&guard, &key(1), None).unwrap().unwrap();
         drop(guard);
         worker.join().unwrap();
-        assert!(!cache.manifest_path(&prekey).exists());
+        assert!(!manifest_present(&cache, &prekey));
         assert!(!cache.has_entry(&key(1)));
         fsx::remove_any(&retired.path).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -1918,7 +2065,7 @@ mod tests {
         cache.add_candidate(&key(0x9b), empty_candidate(1));
         assert!(!staged.exists());
         assert!(!cache.has_entry(&key(1)));
-        assert!(!cache.manifest_path(&key(0x9b)).exists());
+        assert!(!manifest_present(&cache, &key(0x9b)));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1954,7 +2101,7 @@ mod tests {
         cache.add_candidate(&prekey, empty_candidate(1));
         cache.remove_entry_with(&key(1), |retired| {
             assert!(UnitRecordsGuard::try_acquire(&cache.dirs).unwrap().is_some());
-            assert!(!cache.manifest_path(&prekey).exists());
+            assert!(!manifest_present(&cache, &prekey));
             publish_referenced_entry(&cache, 1, &prekey);
             cache.add_candidate(&prekey, empty_candidate(1));
             assert_eq!(fs::read(retired.join("f0")).unwrap(), [1; 32]);
@@ -2053,7 +2200,7 @@ mod tests {
         cache.add_candidate(&prekey, empty_candidate(1));
         cache.mark_used(&key(1));
         cache.remove_entry(&key(1));
-        assert!(!cache.manifest_path(&prekey).exists());
+        assert!(!manifest_present(&cache, &prekey));
         assert_eq!(fs::metadata(meta).unwrap().modified().unwrap(), SystemTime::UNIX_EPOCH);
         assert!(cache.has_entry(&key(1)));
         fs::remove_dir_all(dir).unwrap();
@@ -2120,24 +2267,22 @@ mod tests {
             key: key(1),
         };
         cache.add_candidate(&prekey, candidate.clone());
-        let current = String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let current = packed_text(&cache, &prekey);
         assert!(current.contains("\"format\":7"));
+        assert!(!path.exists(), "the per-file manifest moved into the log");
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
         for legacy_format in [3, 4, 5] {
+            fs::remove_file(cache.dirs.manifest_pack()).unwrap();
             fs::write(&path, current.replace("\"format\":7", &format!("\"format\":{legacy_format}"))).unwrap();
             assert_eq!(cache.candidates(&prekey), vec![candidate.clone()], "format {legacy_format} entries remain reusable");
             cache.add_candidate(&prekey, candidate.clone());
-            assert!(String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap().contains("\"format\":7"),
-                "even an unchanged legacy candidate migrates");
+            assert!(packed_text(&cache, &prekey).contains("\"format\":7"), "even an unchanged legacy candidate migrates");
+            assert!(!path.exists());
         }
-        let stored: Manifest = serde_json::from_slice(&fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let stored: Manifest = serde_json::from_str(&packed_text(&cache, &prekey)).unwrap();
         assert_ne!(stored.format, 3, "old readers reject the new manifest");
+        assert_eq!(stored.candidates.iter().map(|c| c.key.clone()).collect::<Vec<_>>(), vec![key(1)], "gc can list format seven");
         assert_eq!(cache.candidates(&prekey), vec![candidate]);
-        assert_eq!(
-            manifest_keys(&path),
-            Some(vec![key(1)]),
-            "gc can list format seven"
-        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2323,7 +2468,7 @@ mod tests {
         assert_eq!(cache.candidates(&prekey), vec![candidate.clone()]);
 
         let path = cache.manifest_path(&prekey);
-        let text = String::from_utf8(fsx::read_packed(&path, MAX_MANIFEST_BYTES).unwrap()).unwrap();
+        let text = packed_text(&cache, &prekey);
         assert!(
             text.contains(&format!("\"format\":{MANIFEST_FORMAT}")),
             "{text}"
@@ -2335,6 +2480,8 @@ mod tests {
 
         let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
         value.as_object_mut().unwrap().remove("format");
+        fs::remove_file(cache.dirs.manifest_pack()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(
             cache.candidates(&prekey).is_empty(),
@@ -2370,7 +2517,7 @@ mod tests {
         fs::write(backed.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         cache.publish(&backed, &key(2)).unwrap();
         let format_of = |prekey: &str| {
-            let value: serde_json::Value = serde_json::from_slice(&fsx::read_packed(&cache.manifest_path(prekey), MAX_MANIFEST_BYTES).unwrap()).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&packed_text(&cache, prekey)).unwrap();
             value["format"].as_u64().unwrap()
         };
         let (plain, mixed) = (key(0x7a), key(0x7b));
@@ -2402,14 +2549,13 @@ mod tests {
         };
         cache.add_candidate(&prekey, candidate(1, None));
         cache.add_candidate(&prekey, candidate(2, None));
-        let path = cache.manifest_path(&prekey);
-        let inode = sys::stat(&path).unwrap().ino();
+        let log = fs::read(cache.dirs.manifest_pack()).unwrap();
 
         cache.add_candidate(&prekey, candidate(2, None));
         assert_eq!(
-            sys::stat(&path).unwrap().ino(),
-            inode,
-            "nothing changed, so nothing was rewritten"
+            fs::read(cache.dirs.manifest_pack()).unwrap(),
+            log,
+            "nothing changed, so nothing was written"
         );
 
         cache.add_candidate(&prekey, candidate(2, Some(stamp_record())));
@@ -2468,8 +2614,7 @@ mod tests {
             key: key(1),
         };
         cache.add_candidate(&prekey, candidate.clone());
-        let manifest = cache.manifest_path(&prekey);
-        let before = fs::metadata(&manifest).unwrap().modified().unwrap();
+        let before = fs::read(cache.dirs.manifest_pack()).unwrap();
         let meta = cache.entry_dir(&key(1)).join("meta.json");
         let old = SystemTime::now() - Duration::from_secs(40 * 86_400);
         fs::File::options()
@@ -2484,7 +2629,7 @@ mod tests {
         assert!(
             fs::metadata(&meta).unwrap().modified().unwrap() > old + Duration::from_secs(86_400)
         );
-        assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read(cache.dirs.manifest_pack()).unwrap(), before);
         let _ = fs::remove_dir_all(&dir);
     }
 

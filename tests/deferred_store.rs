@@ -50,21 +50,12 @@ fn clean(sb: &Sandbox, project: &Path) {
     assert_success(&sb.bin("fcargo").arg("clean").current_dir(project).output().unwrap());
 }
 
-fn manifests(sb: &Sandbox) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for file in frust::cache::keyed_items(&sb.home().join("manifests")) {
-        if file.extension().is_some_and(|e| e == "json") {
-            found.push(file);
-        }
-    }
-    found
-}
-
 /// Manifests that list at least one candidate, written only after the entry they name is published.
 fn stored(sb: &Sandbox) -> usize {
-    manifests(sb)
+    frust::cache::Cache::new(&frust::paths::Dirs::at(sb.home()))
+        .packed_manifests()
         .iter()
-        .filter_map(|p| serde_json::from_slice::<serde_json::Value>(&frust::fsx::read_packed(p, frust::cache::MAX_MANIFEST_BYTES).ok()?).ok())
+        .filter_map(|(_, _, raw)| serde_json::from_slice::<serde_json::Value>(raw).ok())
         .filter(|m| m["candidates"].as_array().is_some_and(|c| !c.is_empty()))
         .count()
 }
@@ -167,6 +158,7 @@ fn wipe_cache(sb: &Sandbox) {
     for dir in ["store", "manifests"] {
         let _ = fs::remove_dir_all(sb.home().join(dir));
     }
+    let _ = fs::remove_file(sb.home().join("manifests.pack"));
 }
 
 /// The store finishes after the build returned, the next build hits it, and what it restores equals what rustc itself wrote.

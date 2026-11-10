@@ -43,8 +43,14 @@ impl Dirs {
         self.root.join("store")
     }
 
+    /// Per-prekey manifest files written before the packed log; still read and migrated.
     pub fn manifests(&self) -> PathBuf {
         self.root.join("manifests")
+    }
+
+    /// Every manifest in one append-only record log, so a manifest costs its bytes rather than a block.
+    pub fn manifest_pack(&self) -> PathBuf {
+        self.root.join("manifests.pack")
     }
 
     pub fn targets(&self) -> PathBuf {

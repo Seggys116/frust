@@ -146,6 +146,8 @@ pub struct Plan {
     pub lock_max_idle: Duration,
     target_retirements: HashMap<PathBuf, TargetRetirement>,
     manifest_retirements: HashMap<PathBuf, ManifestRetirement>,
+    /// Records of the manifest log that were idle or orphaned when planned, by prekey.
+    packed_manifest_retirements: HashMap<String, ManifestRetirement>,
     retired_entries: HashMap<PathBuf, cache::RetiredChildProof>,
     unit_retirements: HashMap<PathBuf, UnitRetirement>,
     cache_retirements: HashMap<PathBuf, cache::EntryRetirementSnapshot>,
@@ -1251,9 +1253,11 @@ impl MetadataIdentity {
     }
 }
 
+/// A manifest as planned: a file with its identity, or a log record whose `contents` are its exact frame.
 #[derive(Debug)]
 struct ManifestRetirement {
-    identity: MetadataIdentity,
+    identity: Option<MetadataIdentity>,
+    modified: SystemTime,
     contents: Vec<u8>,
     references: Vec<(String, Option<MetadataIdentity>)>,
     max_idle: Duration,
@@ -1276,36 +1280,57 @@ fn manifest_snapshot(
     path: &Path,
     max_idle: Duration,
 ) -> io::Result<ManifestRetirement> {
-    #[derive(serde::Deserialize)]
-    struct References {
-        candidates: Vec<cache::Candidate>,
-    }
     let mut file = File::open(path)?;
     let before = MetadataIdentity::read(&sys::fstat(&file)?)?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
-    let mut references = Vec::new();
-    if let Some(manifest) = fsx::unpack(&contents, cache::MAX_MANIFEST_BYTES).and_then(|raw| serde_json::from_slice::<References>(&raw).ok()) {
-        for candidate in manifest.candidates {
-            let usage = manifest_reference(store, &candidate.key)?;
-            references.push((candidate.key, usage));
-        }
-    }
+    let references = match fsx::unpack(&contents, cache::MAX_MANIFEST_BYTES) {
+        Some(raw) => manifest_references(store, &raw)?,
+        None => Vec::new(),
+    };
     let after = sys::lstat(path)?;
     if !after.is_file() || before != MetadataIdentity::read(&after)? {
         return Err(io::Error::other("manifest changed while reading"));
     }
     Ok(ManifestRetirement {
-        identity: before,
+        modified: before.modified,
+        identity: Some(before),
         contents,
         references,
         max_idle,
     })
 }
 
+fn manifest_references(store: &cache::Cache, raw: &[u8]) -> io::Result<Vec<(String, Option<MetadataIdentity>)>> {
+    #[derive(serde::Deserialize)]
+    struct References {
+        candidates: Vec<cache::Candidate>,
+    }
+    let mut references = Vec::new();
+    if let Ok(manifest) = serde_json::from_slice::<References>(raw) {
+        for candidate in manifest.candidates {
+            let usage = manifest_reference(store, &candidate.key)?;
+            references.push((candidate.key, usage));
+        }
+    }
+    Ok(references)
+}
+
+/// The live record of `prekey` in the manifest log; `None` when the log no longer holds it.
+fn packed_manifest_snapshot(store: &cache::Cache, log: &cache::pack::Log, prekey: &str, max_idle: Duration) -> io::Result<Option<ManifestRetirement>> {
+    let (Some(frame), Some((written_s, raw))) = (log.frame(prekey), log.get(prekey, cache::MAX_MANIFEST_BYTES)) else { return Ok(None) };
+    Ok(Some(ManifestRetirement {
+        identity: None,
+        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(written_s),
+        contents: frame.to_vec(),
+        references: manifest_references(store, &raw)?,
+        max_idle,
+    }))
+}
+
 impl ManifestRetirement {
     fn eligible(&self, evicted: &HashSet<String>) -> bool {
-        let Some(age) = self.identity.modified.elapsed().ok() else {
+        let Some(age) = self.modified.elapsed().ok() else {
             return false;
         };
         if age < METADATA_GRACE {
@@ -1331,6 +1356,10 @@ impl ManifestRetirement {
         let Ok(current) = manifest_snapshot(store, path, self.max_idle) else {
             return false;
         };
+        self.unchanged_in(&current)
+    }
+
+    fn unchanged_in(&self, current: &ManifestRetirement) -> bool {
         if current.identity != self.identity
             || current.contents != self.contents
             || current.references.len() != self.references.len()
@@ -1373,6 +1402,38 @@ fn plan_manifests(dirs: &Dirs, opts: &GcOptions, evicted: &HashSet<String>, plan
             push_metadata(plan, path);
         }
     }
+    let Ok(log) = cache::pack::Log::read(&dirs.manifest_pack()) else { return };
+    let mut bytes = 0;
+    for prekey in log.keys() {
+        let Ok(Some(snapshot)) = packed_manifest_snapshot(&store, &log, prekey, opts.manifest_max_age) else { continue };
+        if snapshot.eligible(evicted) {
+            bytes += snapshot.contents.len() as u64;
+            plan.packed_manifest_retirements.insert(prekey.to_owned(), snapshot);
+        }
+    }
+    if !plan.packed_manifest_retirements.is_empty() {
+        plan.removals.push(Removal { class: Class::Metadata, path: dirs.manifest_pack(), bytes });
+    }
+}
+
+/// Drops the planned log records that are still exactly as planned and still eligible, under the metadata lock; returns the bytes freed.
+fn retire_packed_manifests(dirs: &Dirs, plan: &Plan) -> io::Result<u64> {
+    let Some(_guard) = cache::UnitRecordsGuard::try_acquire(dirs)? else { return Ok(0) };
+    let store = cache::Cache::new(dirs);
+    let path = dirs.manifest_pack();
+    let log = cache::pack::Log::read(&path)?;
+    let mut retire = HashSet::new();
+    for (prekey, planned) in &plan.packed_manifest_retirements {
+        if let Ok(Some(current)) = packed_manifest_snapshot(&store, &log, prekey, planned.max_idle)
+            && planned.unchanged_in(&current)
+        {
+            retire.insert(prekey.as_str());
+        }
+    }
+    if retire.is_empty() { return Ok(0); }
+    let before = fsx::allocated_size(&path);
+    cache::pack::rewrite(&path, &log, |prekey| retire.contains(prekey), crate::lock::shared_mode(dirs))?;
+    Ok(before.saturating_sub(fsx::allocated_size(&path)))
 }
 
 fn flock_held(path: &Path) -> Option<bool> {
@@ -1665,11 +1726,14 @@ pub fn execute(dirs: &Dirs, plan: &Plan) -> (u64, Vec<(PathBuf, std::io::Error)>
 /// The bytes of every `remove` and `tidy` item add up to the freed total returned.
 pub fn execute_with(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u64, Vec<(PathBuf, std::io::Error)>) {
     let (mut freed, failures) = execute_removals(dirs, plan, progress);
-    progress.phase("tidy", Some(1), "freed");
+    progress.phase("tidy", Some(2), "freed");
     let compacted = plan.hashmemo_log_age.map_or(0, |age| cache::hashing::compact_memo_log(&dirs.hashmemo(), age.as_secs()));
     freed += compacted;
     progress.item("hash memo log", compacted);
     cache::Cache::new(dirs).migrate_legacy_layout();
+    let packed = cache::Cache::new(dirs).compact_manifest_pack();
+    freed += packed;
+    progress.item("manifest log", packed);
     prune_empty_shards(&dirs.hashmemo());
     prune_empty_shards(&dirs.keylocks());
     prune_empty_workspaces(dirs);
@@ -1708,6 +1772,7 @@ fn execute_removals(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u
     let locks = dirs.locks();
     let store = cache::Cache::new(dirs);
     let first_pass = |removal: &Removal| removal.class == Class::CacheEntry || removal.path.starts_with(store.units_dir())
+        || removal.path == dirs.manifest_pack()
         || plan.manifest_retirements.contains_key(&removal.path) || plan.keylock_retirements.contains(&removal.path);
     let scope_of = |removal: &Removal| match stats::workspace_of(dirs, &removal.path) {
         Some(workspace) => format!("{workspace}: {}", removal.class.label()),
@@ -1725,6 +1790,13 @@ fn execute_removals(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u
                 match store.try_retire_entry(snapshot) {
                     Ok(cache::EntryRetirementOutcome::Retired) => freed += removal.bytes,
                     Ok(cache::EntryRetirementOutcome::Busy | cache::EntryRetirementOutcome::Stale) => {}
+                    Err(error) => failures.push((removal.path.clone(), error)),
+                }
+                break 'one;
+            }
+            if removal.path == dirs.manifest_pack() {
+                match retire_packed_manifests(dirs, plan) {
+                    Ok(bytes) => freed += bytes,
                     Err(error) => failures.push((removal.path.clone(), error)),
                 }
                 break 'one;
@@ -2608,8 +2680,10 @@ mod tests {
         let prekey = "bb".repeat(20);
         let entry = store_entry(&root, &key, &[("f0", 64)], 0);
         let row = cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() };
-        store.add_candidate(&prekey, row.clone());
+        // A per-file manifest as an older frust left it.
         let path = dirs.manifests().join(format!("{prekey}.json"));
+        fs::create_dir_all(dirs.manifests()).unwrap();
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({ "format": 7, "candidates": [row] })).unwrap()).unwrap();
         let old = SystemTime::now() - Duration::from_secs(60 * 86_400);
         for path in [&path, &entry.join("meta.json")] { File::options().write(true).open(path).unwrap().set_modified(old).unwrap(); }
         let selected = plan(&dirs, &GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) });
@@ -2625,8 +2699,56 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
-        assert!(path.exists());
+        assert!(!path.exists(), "the upsert moved the manifest into the log");
         assert_eq!(store.candidates(&prekey).len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn age_packed_manifest(dirs: &Dirs, prekey: &str, entry: &Path, old: SystemTime) {
+        let log = cache::pack::Log::read(&dirs.manifest_pack()).unwrap();
+        let (_, raw) = log.get(prekey, cache::MAX_MANIFEST_BYTES).unwrap();
+        let written = old.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        cache::pack::append(&dirs.manifest_pack(), &cache::pack::encode(prekey, written, Some(&raw)).unwrap(), None).unwrap();
+        File::options().write(true).open(entry.join("meta.json")).unwrap().set_modified(old).unwrap();
+    }
+
+    #[test]
+    fn packed_manifest_gc_skips_busy_guard_rechecks_after_upsert_and_then_drops_the_record() {
+        let root = home("packed-manifest-guard-upsert");
+        let dirs = Dirs::at(&root);
+        let store = cache::Cache::new(&dirs);
+        let key = "aa".repeat(20);
+        let prekey = "bb".repeat(20);
+        let kept = "cc".repeat(20);
+        let entry = store_entry(&root, &key, &[("f0", 64)], 0);
+        let row = cache::Candidate { inputs: Vec::new(), envs: Vec::new(), key: key.clone() };
+        store.add_candidate(&prekey, row.clone());
+        store.add_candidate(&kept, row.clone());
+        let old = SystemTime::now() - Duration::from_secs(60 * 86_400);
+        age_packed_manifest(&dirs, &prekey, &entry, old);
+        let opts = GcOptions { cache_max_age: Duration::from_secs(365 * 86_400), ..GcOptions::new(u64::MAX) };
+        let selected = plan(&dirs, &opts);
+        assert!(selected.packed_manifest_retirements.contains_key(&prekey));
+        assert!(!selected.packed_manifest_retirements.contains_key(&kept), "a record written just now is in its grace period");
+        let guard = cache::UnitRecordsGuard::try_acquire(&dirs).unwrap().unwrap();
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
+        assert_eq!(store.candidates(&prekey).len(), 1, "validation and rewrite require the same guard");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_prekey = prekey.clone();
+        let worker = std::thread::spawn(move || { ready_tx.send(()).unwrap(); writer.add_candidate(&writer_prekey, row); });
+        ready_rx.recv().unwrap();
+        drop(guard);
+        worker.join().unwrap();
+        assert!(execute_removals(&dirs, &selected, &mut Silent).1.is_empty());
+        assert_eq!(store.candidates(&prekey).len(), 1, "a use after planning keeps the record");
+        age_packed_manifest(&dirs, &prekey, &entry, old);
+        let (_, failures) = execute(&dirs, &plan(&dirs, &opts));
+        assert!(failures.is_empty());
+        assert!(store.candidates(&prekey).is_empty(), "an idle record is dropped");
+        assert_eq!(store.candidates(&kept).len(), 1);
+        let log = cache::pack::Log::read(&dirs.manifest_pack()).unwrap();
+        assert_eq!(log.dead_bytes(), 0, "gc leaves the log compacted");
         fs::remove_dir_all(root).unwrap();
     }
 

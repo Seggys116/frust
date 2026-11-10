@@ -335,11 +335,11 @@ fn count_cache_entries(store: &Path) -> usize {
 }
 
 fn measure_disk_breakdown(dirs: &Dirs, cargo_target: &Path, cargo_physical: u64) -> Result<DiskBreakdown, String> {
-    let named = [dirs.store(), dirs.targets(), dirs.manifests(), dirs.tmp()];
+    let named = [dirs.store(), dirs.targets(), dirs.manifests(), dirs.tmp(), dirs.manifest_pack()];
     let other: Vec<PathBuf> = fs::read_dir(dirs.root()).map_err(|e| format!("{}: {e}", dirs.root().display()))?
         .flatten().map(|entry| entry.path()).filter(|path| !named.contains(path)).collect();
-    let [store, targets, manifests, tmp] = named;
-    let groups: Vec<Vec<PathBuf>> = vec![vec![store.clone()], vec![targets], vec![manifests], vec![tmp], other]
+    let [store, targets, manifests, tmp, manifest_pack] = named;
+    let groups: Vec<Vec<PathBuf>> = vec![vec![store.clone()], vec![targets], vec![manifests, manifest_pack], vec![tmp], other]
         .into_iter().map(|paths| paths.into_iter().filter(|p| fs::symlink_metadata(p).is_ok()).collect()).collect();
     let flat: Vec<&Path> = groups.iter().flatten().map(PathBuf::as_path).collect();
     let mut end = 0;

@@ -1362,6 +1362,28 @@ fn write_shared_before_rename(
     result
 }
 
+/// An append handle on a shared log, creating it and its parent with the shared mode.
+pub(crate) fn open_shared_append(path: &Path, mode: Option<Mode>) -> io::Result<File> {
+    let mut options = File::options();
+    options.append(true).create(true);
+    sys::with_mode(&mut options, mode.map_or(0o666, |m| m.file));
+    let file = match options.open(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                ensure_dir(parent, mode)?;
+            }
+            options.open(path)?
+        }
+        other => other?,
+    };
+    if let Some(m) = mode
+        && sys::owned_by_me(path)
+    {
+        let _ = sys::set_file_mode(&file, m.file);
+    }
+    Ok(file)
+}
+
 /// A file another user created without group write is opened read-only, which is all `flock` needs.
 pub(crate) fn open_lock_file(path: &Path, mode: Option<Mode>) -> io::Result<File> {
     let mut options = File::options();
