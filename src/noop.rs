@@ -1270,7 +1270,8 @@ fn candidates(msg: &serde_json::Value, profile: &Path, package: &str, crate_name
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
         let Some(hash) = name.rsplit_once('-').filter(|(p, h)| *p == package && is_hash(h)).map(|(_, h)| h.to_string()) else { continue };
-        if !entry.path().join(&file).is_file() {
+        // The executor drops the hash file of a unit it replayed under a changed environment; the .json beside it stays.
+        if !entry.path().join(&file).is_file() && !entry.path().join(format!("{file}.json")).is_file() {
             continue;
         }
         let depdir = match kind {
@@ -1287,8 +1288,7 @@ fn candidates(msg: &serde_json::Value, profile: &Path, package: &str, crate_name
         }
     }
     if unit.fingerprints.is_empty() || unit.fingerprints.len() > MAX_CANDIDATES {
-        let names: Vec<String> = fs::read_dir(profile.join(".fingerprint")).map(|d| d.flatten().map(|e| format!("{}={:?}", e.file_name().to_string_lossy(), fs::read_dir(e.path()).map(|f| f.flatten().map(|x| x.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()).unwrap_or_default())).collect()).unwrap_or_default();
-        return Err(Box::leak(format!("unit not found (diag package {package:?} crate {crate_name:?} file {file:?} kind {kind:?} profile {} fingerprints {names:?} count {})", profile.display(), unit.fingerprints.len()).into_boxed_str()));
+        return Err("unit not found");
     }
     Ok(unit)
 }

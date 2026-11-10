@@ -613,11 +613,7 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
                 continue;
             }
             let expected = depfile_text(&plan, i, dest);
-            let actual = fs::read_to_string(&file);
-            if cfg!(windows) && plan.units[i].run.is_some() && !actual.as_ref().is_ok_and(|t| *t == expected) {
-                eprintln!("frust-diag: depfile {} expected {expected:?} actual {actual:?}", file.display());
-            }
-            ok &= actual.is_ok_and(|t| t == expected);
+            ok &= fs::read_to_string(&file).is_ok_and(|t| t == expected);
             depfiles.push((dest.clone(), file.to_string_lossy().into_owned()));
         }
         plan.units[i].depfiles = depfiles;
@@ -664,11 +660,6 @@ fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, 
     let Some((ci, outs, uplifts)) = found else {
         if !fresh {
             return Err("unrecorded compile".into());
-        }
-        if cfg!(windows) {
-            let cands: Vec<String> = candidates.iter().map(|c| format!("{}:{:?}:{:?}", c.parsed.crate_name, c.parsed.types, outputs(&c.parsed))).collect();
-            let why = format!("uncovered diag filenames {:?} executable {:?} kind {:?} candidates {cands:?}", msg.get("filenames"), msg.get("executable"), msg.pointer("/target/kind"));
-            eprintln!("frust-diag: {why}");
         }
         return Ok(Step::Uncovered(crate::noop::fingerprint_files(msg)));
     };
@@ -746,7 +737,7 @@ fn fingerprint_dir(profile: &Path, pkg_name: &str, extra: &str, fp_name: &str) -
     }
     let mut found = fs::read_dir(&fingerprints).ok()?.flatten().map(|e| e.path()).filter(|dir| {
         let named = dir.file_name().and_then(OsStr::to_str).and_then(|n| n.rsplit_once('-'));
-        named.is_some_and(|(p, h)| p == pkg_name && crate::noop::is_hash(h)) && dir.join(fp_name).is_file()
+        named.is_some_and(|(p, h)| p == pkg_name && crate::noop::is_hash(h)) && (dir.join(fp_name).is_file() || dir.join(format!("{fp_name}.json")).is_file())
     });
     let dir = found.next()?;
     found.next().is_none().then_some(dir)
