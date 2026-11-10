@@ -29,6 +29,30 @@ pub const DIR_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 const READ_BUF: usize = 256 * 1024;
 
+/// Below this a second read costs less than waiting for another process's turn.
+const TURN_MIN_BYTES: u64 = 1024 * 1024;
+const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const TURN_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The turn lock on `path` under `dir`, waited for while another process holds it; `None` lets the caller read without one.
+fn take_turn(dir: &Path, mode: Option<crate::lock::Mode>, path: &Path) -> Option<File> {
+    let mut id = blake3::Hasher::new();
+    id.update(b"frust-hash-turn-v1\0");
+    id.update(path.as_os_str().as_encoded_bytes());
+    crate::lock::ensure_dir(dir, mode).ok()?;
+    let file = crate::lock::open_lock_file(&dir.join(id.finalize().to_hex().as_str()), mode).ok()?;
+    let begun = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        match sys::try_lock(&file, sys::LockKind::Exclusive) {
+            Ok(()) => return Some(file),
+            Err(fs::TryLockError::WouldBlock) if begun.elapsed() < TURN_WAIT => std::thread::sleep(pause),
+            Err(_) => return None,
+        }
+        pause = (pause * 2).min(TURN_POLL_MAX);
+    }
+}
+
 /// A file in the memo directory rewritten to read the filesystem clock; a few millisecond waits outlast the coarsest kernel tick.
 const CLOCK_PROBE: &str = "clock";
 const CLOCK_PROBE_TRIES: u32 = 25;
@@ -445,6 +469,8 @@ pub struct Hasher {
     memo_bytes: AtomicU64,
     /// The last probed change time of the clock probe and its device.
     clock: Mutex<Option<(u64, i128)>>,
+    /// Where processes take turns hashing one large file, so the first read's record serves the rest.
+    turns: Option<(PathBuf, Option<crate::lock::Mode>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,7 +493,26 @@ impl Hasher {
             read_bytes: AtomicU64::new(0),
             memo_bytes: AtomicU64::new(0),
             clock: Mutex::new(None),
+            turns: None,
         }
+    }
+
+    /// Persisted hashes taken through `hash_in_turn` queue behind the same file's hash in other processes of this home.
+    pub fn with_turns(mut self, dirs: &crate::paths::Dirs) -> Hasher {
+        self.turns = Some((dirs.keylocks(), crate::lock::shared_mode(dirs)));
+        self
+    }
+
+    /// A persisted hash that waits while another process reads the same large file, whose record then answers without a second read.
+    pub fn hash_in_turn(&self, path: &Path) -> io::Result<Hashed> {
+        let stamp = Stamp::read(path)?;
+        // Only a file the first read will record is worth waiting for; anything else would be read once per waiter, in series.
+        let recordable = stamp.size >= TURN_MIN_BYTES
+            && self.persist_dir.is_some()
+            && self.believes(path, &stamp)
+            && !stamp.changed_since(now_ns(), SETTLE_MARGIN_NS);
+        let _turn = self.turns.as_ref().filter(|_| recordable).and_then(|(dir, mode)| take_turn(dir, *mode, path));
+        self.hash(path, true)
     }
 
     pub fn audit_attested(mut self, audit: bool) -> Hasher {
@@ -1071,6 +1116,41 @@ mod tests {
         assert!(first.stable);
         fs::write(&file, b"world").unwrap();
         assert_eq!(hasher.hash(&file, false).unwrap().hash, blake3::hash(b"world").to_hex().to_string());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hash_another_process_is_taking_is_awaited_and_served_from_its_record() {
+        let dir = scratch("turns");
+        let tool = dir.join("linker");
+        let dirs = crate::paths::Dirs::at(dir.join("home"));
+        fs::write(&tool, vec![7u8; 2 * TURN_MIN_BYTES as usize]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let size = fs::metadata(&tool).unwrap().len();
+        let hasher = || Hasher::new(Some(dirs.hashmemo()), Vec::new()).with_turns(&dirs);
+        // Held here as another process reading the tool would hold it.
+        let turn = take_turn(&dirs.keylocks(), None, &tool).expect("a free turn is taken");
+        let waiter = std::thread::spawn({
+            let (tool, waiting) = (tool.clone(), hasher());
+            move || {
+                let hashed = waiting.hash_in_turn(&tool).unwrap();
+                (hashed, waiting.tally())
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "a hash in flight elsewhere is waited for");
+        let first = hasher().hash(&tool, true).unwrap();
+        drop(turn);
+        let (served, tally) = waiter.join().unwrap();
+        assert_eq!(served.hash, first.hash);
+        assert_eq!(tally, (0, size), "the record the first read left answers the waiter");
+        let young = dir.join("young-linker");
+        fs::write(&young, vec![8u8; 2 * TURN_MIN_BYTES as usize]).unwrap();
+        let held = take_turn(&dirs.keylocks(), None, &young).expect("a free turn is taken");
+        let unrecorded = hasher();
+        unrecorded.hash_in_turn(&young).unwrap();
+        assert_eq!(unrecorded.tally().0, 2 * TURN_MIN_BYTES, "a file no record can serve is read at once, not after the holder");
+        drop(held);
         let _ = fs::remove_dir_all(&dir);
     }
 
