@@ -1215,12 +1215,8 @@ impl Plan {
         key_lock: &mut Option<File>,
         retired: &[cache::Retired],
     ) -> bool {
-        // Capability probes reuse or delete these exact output names immediately after the wrapper returns.
         if !self.can_defer_store() {
-            self.probe.mode(|| {
-                let reason = if self.cfg.store_sync { "sync" } else { "metadata-only" };
-                format!("inline:{reason}")
-            });
+            self.probe.mode(|| "inline:sync".to_string());
             return false;
         }
         match self.spawn_deferred(captured, compile_ms, spawned_ns, preexisting, key_lock, retired) {
@@ -1248,7 +1244,27 @@ impl Plan {
 
     fn can_defer_store(&self) -> bool {
         !self.cfg.store_sync
-            && !(self.parsed.metadata_only_library && self.parsed.extra_filename.is_empty())
+    }
+
+    /// Capability probes reuse or delete these exact output names immediately after the wrapper returns, so their deferred store reads hard links instead.
+    fn snapshots_outputs(&self) -> bool {
+        self.parsed.metadata_only_library && self.parsed.extra_filename.is_empty()
+    }
+
+    /// An absolute directory in the cache's scratch area holding a hard link of each output; `None` where one cannot be linked.
+    fn snapshot_outputs(&self, names: &[String]) -> Option<PathBuf> {
+        let tmp = self.cwd.join(self.dirs.tmp());
+        fs::create_dir_all(&tmp).ok()?;
+        let dir = tmp.join(format!("outputs-{}-{}", std::process::id(), hashing::now_ns()));
+        fs::create_dir(&dir).ok()?;
+        let linked = names
+            .iter()
+            .all(|name| cache::safe_file_name(name) && fs::hard_link(self.output_dir_abs.join(name), dir.join(name)).is_ok());
+        if linked {
+            return Some(dir);
+        }
+        let _ = fsx::remove_any(&dir);
+        None
     }
 
     fn spawn_deferred(
@@ -1283,6 +1299,13 @@ impl Plan {
         let Some(frozen) = frozen else {
             return self.declined("freeze");
         };
+        let mut snapshot = OutputSnapshot(None);
+        if self.snapshots_outputs() {
+            let Some(dir) = self.snapshot_outputs(&frozen.names) else {
+                return self.declined("metadata-only");
+            };
+            snapshot.0 = Some(dir);
+        }
         let spawn_started = Instant::now();
         let queued = broker.is_some();
         let lent = self.lent(key_lock);
@@ -1355,6 +1378,7 @@ impl Plan {
             retired: retired.iter().map(|entry| cache::Retired { path: self.cwd.join(&entry.path), ..entry.clone() }).collect(),
             session: self.session.get().cloned(),
             superseded: self.superseded_objects(preexisting).into_iter().map(|(name, stamp)| (name, StampWire::of(&stamp))).collect(),
+            outputs_dir: snapshot.0.clone(),
         };
         let bytes: u64 = job.outputs.iter().map(|(_, stamp)| stamp.size).sum();
         lock::ensure_dir(&deferred, None)?;
@@ -1374,6 +1398,7 @@ impl Plan {
         self.probe.set(|r| r.spawn_ms = timings::ms(spawn_started));
         match handed_over {
             Ok(true) => {
+                snapshot.0 = None;
                 let mode = if after_build {
                     "queued:after-build"
                 } else if queue_only {
@@ -2778,12 +2803,35 @@ struct StoreJob {
     /// Earlier compiles' incremental objects of the unit, as found before rustc started; older readers ignore them and compaction prunes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     superseded: Vec<(String, StampWire)>,
+    /// Hard links of a capability probe's outputs in the cache's scratch area, read in place of `--out-dir`; older readers ignore it and skip the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outputs_dir: Option<PathBuf>,
+}
+
+/// Removes a probe's output snapshot unless a job took it over.
+struct OutputSnapshot(Option<PathBuf>);
+
+impl Drop for OutputSnapshot {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = fsx::remove_any(dir);
+        }
+    }
 }
 
 impl StoreJob {
     /// Older binaries accept only their own format number, so a job with shared-key fields is unusable to them.
     fn readable(&self) -> bool {
         self.format == JOB_FORMAT || (self.format == LEGACY_JOB_FORMAT && self.root.is_none() && self.lock_prekey.is_none())
+    }
+
+    /// Only a directory directly inside `tmp` is ever read or removed, so a job file cannot name another one.
+    fn outputs_dir_in(&self, tmp: &Path) -> Result<Option<&Path>, ()> {
+        match self.outputs_dir.as_deref() {
+            None => Ok(None),
+            Some(dir) if dir.is_absolute() && dir.parent() == Some(tmp) && dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("outputs-")) => Ok(Some(dir)),
+            Some(_) => Err(()),
+        }
     }
 }
 
@@ -2830,6 +2878,7 @@ impl BrokerJob {
                 .iter()
                 .any(|(path, stamp)| !path.is_absolute() || stamp.stamp().is_none())
             || job.superseded.iter().any(|(name, stamp)| !cache::safe_file_name(name) || stamp.stamp().is_none())
+            || job.outputs_dir_in(&dirs.tmp()).is_err()
             || job.names.is_empty()
             || job.names.iter().any(|name| !cache::safe_file_name(name))
             || job.names.iter().collect::<BTreeSet<_>>().len() != job.names.len()
@@ -3965,14 +4014,21 @@ fn run_deferred_with(job: &StoreJob, worker_config: &Config) {
             cache::delete_retired(&dirs, entry);
         }
     }
-    let (Some(plan), Some(frozen), Ok(spawned_ns)) = (
-        Plan::from_job(job, worker_config),
+    let plan = Plan::from_job(job, worker_config);
+    let snapshot = plan.as_ref().map(|plan| job.outputs_dir_in(&plan.cwd.join(plan.dirs.tmp())));
+    let _snapshot = OutputSnapshot(snapshot.and_then(Result::ok).flatten().map(Path::to_path_buf));
+    let (Some(mut plan), Some(Ok(snapshot)), Some(frozen), Ok(spawned_ns)) = (
+        plan,
+        snapshot,
         Frozen::from_job(job),
         job.spawned_ns.parse::<i128>(),
     ) else {
         timings::store_outcome(job.timings.as_deref().filter(|path| path.is_absolute()), "", "skip:job-unusable", (0, 0));
         return;
     };
+    if let Some(dir) = snapshot {
+        plan.output_dir_abs = dir.to_path_buf();
+    }
     let dep_info = (frozen.dep_name.as_str(), frozen.dep_text.as_str());
     if let Err(error) = plan.store_outputs(
         job.captured.as_bytes(),
@@ -6305,6 +6361,7 @@ mod tests {
             retired: Vec::new(),
             session: None,
             superseded: Vec::new(),
+            outputs_dir: None,
         };
         (job, src, rlib)
     }
@@ -6352,9 +6409,65 @@ mod tests {
         assert!(!plan.can_defer_store());
         plan.cfg.store_sync = false;
         plan.parsed.metadata_only_library = true;
-        assert!(!plan.can_defer_store());
+        assert!(plan.can_defer_store(), "an unhashed metadata compile defers through its output snapshot");
+        assert!(plan.snapshots_outputs());
         plan.parsed.extra_filename = "-fixture".into();
         assert!(plan.can_defer_store());
+        assert!(!plan.snapshots_outputs());
+    }
+
+    /// A capability probe as proc-macro2's build script runs it: unhashed metadata outputs it deletes as soon as the wrapper returns.
+    fn probe_fixture(s: &Scratch) -> StoreJob {
+        let (mut job, _, rlib) = fixture(s);
+        let out = rlib.parent().unwrap().to_path_buf();
+        fs::remove_file(&rlib).unwrap();
+        fs::write(out.join("libk.rmeta"), b"probe metadata").unwrap();
+        job.args = ["rustc", "--crate-name=k", "--crate-type=lib", "--emit=dep-info,metadata", "--out-dir"].iter().map(|a| a.to_string()).collect();
+        job.args.push(out.display().to_string());
+        job.names = vec!["k.d".to_string(), "libk.rmeta".to_string()];
+        job.outputs = job.names.iter().map(|n| (n.clone(), wire(&out.join(n)))).collect();
+        job
+    }
+
+    #[test]
+    fn a_deferred_probe_store_publishes_from_its_snapshot_after_the_build_script_deletes_the_outputs() {
+        let s = Scratch::new("deferred-probe-snapshot");
+        let mut job = probe_fixture(&s);
+        let plan = Plan::from_job(&job, &Config::from_env()).unwrap();
+        assert!(plan.snapshots_outputs());
+        let snapshot = plan.snapshot_outputs(&job.names).expect("outputs hard-linked");
+        assert!(snapshot.is_absolute() && snapshot.parent() == Some(plan.cwd.join(plan.dirs.tmp()).as_path()));
+        fs::remove_dir_all(&plan.output_dir_abs).unwrap();
+        job.outputs_dir = Some(snapshot.clone());
+        let job: StoreJob = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        run_deferred(&job);
+        assert_eq!(rows(&job), 1, "the probe's entry is published from the snapshot");
+        assert!(!snapshot.exists(), "the store removes its snapshot");
+    }
+
+    #[test]
+    fn a_deferred_probe_store_without_its_snapshot_publishes_nothing() {
+        let s = Scratch::new("deferred-probe-deleted");
+        let job = probe_fixture(&s);
+        let out = Plan::from_job(&job, &Config::from_env()).unwrap().output_dir_abs;
+        fs::remove_dir_all(&out).unwrap();
+        run_deferred(&job);
+        assert_eq!(rows(&job), 0);
+    }
+
+    #[test]
+    fn a_probe_snapshot_outside_the_scratch_directory_is_neither_read_nor_removed() {
+        let s = Scratch::new("deferred-probe-foreign");
+        let mut job = probe_fixture(&s);
+        let foreign = s.0.join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        for name in &job.names {
+            fs::copy(s.0.join("target/debug/deps").join(name), foreign.join(name)).unwrap();
+        }
+        job.outputs_dir = Some(foreign.clone());
+        run_deferred(&job);
+        assert_eq!(rows(&job), 0);
+        assert!(foreign.join("libk.rmeta").is_file());
     }
 
     #[test]
