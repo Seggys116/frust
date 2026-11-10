@@ -549,6 +549,9 @@ pub fn home_var() -> Option<OsString> {
 pub const HOME_VARS: &[&str] = imp::HOME_VARS;
 
 pub const SYSROOT_DYLIB_DIR: &str = imp::SYSROOT_DYLIB_DIR;
+pub const LOADER_PATH_VARS: &[&str] = imp::LOADER_PATH_VARS;
+/// Whether a toolchain's sysroot may be read off its directory layout instead of asking `rustc --print sysroot`.
+pub const SYSROOT_FROM_LAYOUT: bool = imp::SYSROOT_FROM_LAYOUT;
 
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename(from, to)

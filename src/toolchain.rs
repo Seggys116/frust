@@ -139,6 +139,9 @@ pub struct Probe {
     pub id: String,
     /// Empty when `rustc --print sysroot` failed.
     pub sysroot: String,
+    /// The compiler binary that printed `rustc_verbose`, run without a toolchain argument; empty when unknown.
+    #[serde(default)]
+    pub rustc_exe: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +162,7 @@ impl CacheOutcome {
     }
 }
 
-const PROBE_FORMAT: &str = "frust-probe-v2";
+const PROBE_FORMAT: &str = "frust-probe-v3";
 /// Backstop for selection inputs the key cannot see, such as a hand-written `rustc` wrapper script.
 const PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 /// A validated file modified this close to the probe start may have changed mid-probe, so the result is not memoised.
@@ -239,7 +242,9 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
     };
     after_cargo();
     let rustc_handle = spawn(rustc, "rustc", &["-vV"]);
-    let own_handle = spawn(rustc, "rustc", &["--print", "sysroot"]);
+    let rustc_exe = installed.as_deref().and_then(|dir| proxied_binary(dir, rustc, "rustc")).or_else(|| tc.is_none().then(|| rustc.to_path_buf()));
+    let laid_out = rustc_exe.as_deref().and_then(layout_sysroot);
+    let own_handle = laid_out.is_none().then(|| spawn(rustc, "rustc", &["--print", "sysroot"]));
     let mut sysroot_handles = Vec::new();
     // `RUSTC` may name a compiler other than the proxied one `cargo` belongs to.
     if want_sysroot && let Some(proxy) = resolve_tool("rustc").filter(|p| p != rustc) {
@@ -250,7 +255,14 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
         Some(handle) => handle.join().ok().flatten(),
         None => cargo_out,
     };
-    let own_sysroot = own_handle.join().ok().flatten().map(|s| PathBuf::from(s.trim())).filter(|s| s.is_absolute());
+    let printed = |out: Option<String>| out.map(|s| PathBuf::from(s.trim())).filter(|s| s.is_absolute());
+    let host = rustc_out.as_deref().and_then(|text| field(text, "host:")).unwrap_or_default();
+    let own_sysroot = match (own_handle, laid_out) {
+        (Some(handle), _) => printed(handle.join().ok().flatten()),
+        (None, Some(dir)) if !host.is_empty() && dir.join("lib").join("rustlib").join(&host).is_dir() => Some(dir),
+        // A layout without this host's libraries is not one rustc would report, so rustc is asked after all.
+        (None, _) => printed(rustc_exe.as_deref().and_then(|exe| query(exe, None, &["--print", "sysroot"], cwd))),
+    };
     let mut sysroots = Vec::new();
     let mut complete = true;
     if want_sysroot {
@@ -269,7 +281,6 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
         sysroots.clear();
     }
     let (cargo_out, rustc_out) = (cargo_out?, rustc_out?);
-    let host = field(&rustc_out, "host:").unwrap_or_default();
     let release = field(&rustc_out, "release:").unwrap_or_default();
     let id = crate::paths::short_hash(&rustc_out);
     let probe = Probe {
@@ -279,8 +290,31 @@ fn probe_now(rustc: &Path, cargo: &Path, toolchain: Option<&OsStr>, cwd: &Path, 
         host,
         id,
         sysroot: own_sysroot.map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default(),
+        rustc_exe: rustc_exe.and_then(|exe| sys::canonicalize(&exe).ok()).map(|exe| exe.to_string_lossy().into_owned()).unwrap_or_default(),
     };
     Some((probe, sysroots))
+}
+
+/// The sysroot rustc derives from its own `rustc_driver` library, read off the layout of a real, canonically named `bin/rustc`; `None` wherever that could come out differently.
+fn layout_sysroot(exe: &Path) -> Option<PathBuf> {
+    let overridden = sys::LOADER_PATH_VARS.iter().any(|var| env::var_os(var).is_some());
+    (sys::SYSROOT_FROM_LAYOUT && !overridden).then(|| sysroot_layout(exe)).flatten()
+}
+
+fn sysroot_layout(exe: &Path) -> Option<PathBuf> {
+    let root = exe.parent().filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))?.parent()?;
+    let named = exe.file_name().is_some_and(|name| *name == *format!("rustc{}", env::consts::EXE_SUFFIX));
+    let real = fs::symlink_metadata(exe).is_ok_and(|meta| meta.is_file()) && sys::canonicalize(exe).ok().as_deref() == Some(exe);
+    if !named || !real || root.file_name().is_none_or(|name| name == "lib") || !root.join("lib").join("rustlib").is_dir() {
+        return None;
+    }
+    let prefix = format!("{}rustc_driver-", env::consts::DLL_PREFIX);
+    let driver = fs::read_dir(root.join(sys::SYSROOT_DYLIB_DIR)).ok()?.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        name.starts_with(prefix.as_bytes()) && name.ends_with(env::consts::DLL_SUFFIX.as_bytes())
+    });
+    driver.then(|| root.to_path_buf())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -756,9 +790,33 @@ mod tests {
         assert_eq!(Some(probe.rustc_verbose.clone()), query(&rustc, None, &["-vV"], &cwd));
         let sysroot = query(&rustc, None, &["--print", "sysroot"], &cwd).unwrap();
         assert_eq!(probe.sysroot, sysroot.trim());
+        if let Some(dir) = sysroot_layout(Path::new(&probe.rustc_exe)).filter(|_| sys::SYSROOT_FROM_LAYOUT) {
+            assert_eq!(dir.to_string_lossy(), sysroot.trim(), "the layout reading agrees with rustc");
+        }
         assert_eq!(sysroots.first().map(|dir| dir.to_string_lossy().into_owned()), Some(sysroot.trim().to_string()));
         let version = query(&cargo, None, &["-V"], &cwd).unwrap();
         assert_eq!(probe.cargo_version, parse_version(version.split_whitespace().nth(1).unwrap()));
+    }
+
+    #[test]
+    fn a_sysroot_is_read_off_the_layout_only_where_rustc_would_derive_the_same() {
+        let layout_sysroot = sysroot_layout;
+        let root = sys::canonicalize(&env::temp_dir()).unwrap().join(format!("frust-layout-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let exe = root.join("bin").join(format!("rustc{}", env::consts::EXE_SUFFIX));
+        fake_linker(&exe);
+        fs::create_dir_all(root.join("lib").join("rustlib")).unwrap();
+        assert_eq!(layout_sysroot(&exe), None, "no rustc_driver library");
+        let driver = root.join(sys::SYSROOT_DYLIB_DIR).join(format!("{}rustc_driver-abc{}", env::consts::DLL_PREFIX, env::consts::DLL_SUFFIX));
+        fs::write(&driver, b"driver").unwrap();
+        assert_eq!(layout_sysroot(&exe), Some(root.clone()));
+        assert_eq!(layout_sysroot(&root.join("bin").join("..").join("bin").join(exe.file_name().unwrap())), None, "a path that is not canonical");
+        let renamed = root.join("bin").join(format!("rustc-real{}", env::consts::EXE_SUFFIX));
+        fake_linker(&renamed);
+        assert_eq!(layout_sysroot(&renamed), None, "another binary name");
+        fs::remove_dir_all(root.join("lib").join("rustlib")).unwrap();
+        assert_eq!(layout_sysroot(&exe), None, "no rustlib directory");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

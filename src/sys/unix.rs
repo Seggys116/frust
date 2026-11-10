@@ -165,6 +165,9 @@ impl DirectoryWatcher {
 
 pub const HOME_VARS: &[&str] = &["HOME"];
 pub const SYSROOT_DYLIB_DIR: &str = "lib";
+/// Variables searched before an executable's own library path, so the loader may pick a `rustc_driver` other than the one beside `rustc`.
+pub const LOADER_PATH_VARS: &[&str] = &["LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"];
+pub const SYSROOT_FROM_LAYOUT: bool = true;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Ext;

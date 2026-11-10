@@ -54,6 +54,9 @@ impl DirectoryWatcher {
 
 pub const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
 pub const SYSROOT_DYLIB_DIR: &str = "bin";
+pub const LOADER_PATH_VARS: &[&str] = &[];
+// Unverified: path casing and verbatim prefixes may differ from what rustc prints, so rustc is asked.
+pub const SYSROOT_FROM_LAYOUT: bool = false;
 
 type Psid = *mut c_void;
 
