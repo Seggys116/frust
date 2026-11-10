@@ -566,6 +566,10 @@ fn settle_fingerprint(unit: &plan::Unit, inputs: &[plan::Entry], env_deps: &plan
     let cached: Vec<String> = fs::read_to_string(dir.join(format!("output-{name}"))).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default();
     let paths = |list: &[plan::Entry]| list.iter().map(|e| e.path.clone()).collect::<BTreeSet<_>>();
     let same = hash.is_file() && dep.is_file() && paths(&unit.inputs) == paths(inputs) && unit.env_deps == *env_deps && cached == diagnostics;
+    if cfg!(windows) && !same {
+        let (a, b) = (paths(&unit.inputs), paths(inputs));
+        eprintln!("frust-diag: settle hash {} dep {} paths_eq {} only_plan {:?} only_now {:?} env_eq {} diag_eq {} cached {cached:?} now {diagnostics:?}", hash.is_file(), dep.is_file(), a == b, a.difference(&b).collect::<Vec<_>>(), b.difference(&a).collect::<Vec<_>>(), unit.env_deps == *env_deps, cached == diagnostics);
+    }
     if same {
         let when = UNIX_EPOCH + Duration::from_nanos(u64::try_from(spawned_ns).unwrap_or(0));
         if fs::File::options().write(true).open(&dep).and_then(|f| f.set_modified(when)).is_ok() {
