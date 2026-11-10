@@ -1613,20 +1613,9 @@ fn build_args(packages: &[RepoPackage], package: Option<&str>, features: Option<
     args
 }
 
-// The path as it appears after `file://` in a package id: forward slashes, no verbatim prefix, a leading slash before a drive letter.
-fn file_url_path(path: &Path) -> String {
-    let text = canonical(path).to_string_lossy().replace('\\', "/");
-    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
-    if text.starts_with('/') { text } else { format!("/{text}") }
-}
-
-/// A package id names its checkout's path, so the arguments of a copy of the repository must name the copy instead.
-fn retarget_args(args: &[String], from: &Path, to: &Path) -> Vec<String> {
-    if from == to {
-        return args.to_vec();
-    }
-    let (old, new) = (file_url_path(from), file_url_path(to));
-    args.iter().map(|arg| if arg.starts_with("path+file://") { arg.replacen(&old, &new, 1) } else { arg.clone() }).collect()
+// A package id names its checkout's path, so a copy of the repository gets its arguments from its own metadata.
+fn args_in(ctx: &Ctx, repo: &Path, package: Option<&str>, features: Option<&str>) -> Result<Vec<String>, String> {
+    Ok(build_args(&parse_packages(&workspace_metadata(ctx, repo)?, package)?, package, features))
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1793,6 +1782,8 @@ struct Rig<'a> {
     untuned: Column,
     tuned: Column,
     args: Vec<String>,
+    package: Option<String>,
+    features: Option<String>,
     scratch: PathBuf,
     sequence: Cell<u64>,
 }
@@ -1835,7 +1826,7 @@ impl Rig<'_> {
         if let Some(column) = column {
             self.quiesce(column);
         }
-        let owned = retarget_args(&self.args, self.repo, repo);
+        let owned = if repo == self.repo { self.args.clone() } else { args_in(&self.cargo_ctx, repo, self.package.as_deref(), self.features.as_deref())? };
         let mut args: Vec<&str> = owned.iter().map(String::as_str).collect();
         if tool == Tool::CargoTuned {
             args.extend(CARGO_TUNED_CONFIG);
@@ -2141,6 +2132,8 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         untuned: Column::new(&ctx, scratch.join("frust-home"), false),
         tuned: Column::new(&ctx, scratch.join("frust-tuned-home"), true),
         args: build_args(&packages, opts.package.as_deref(), opts.features.as_deref()),
+        package: opts.package.clone(),
+        features: opts.features.clone(),
         scratch: scratch.to_path_buf(),
         sequence: Cell::new(0),
     };
@@ -2568,18 +2561,29 @@ mod tests {
 
     #[test]
     fn a_copy_of_the_repository_gets_package_ids_naming_the_copy() {
-        let a = std::env::temp_dir().join("frust-retarget-a");
-        let b = std::env::temp_dir().join("frust-retarget-b");
-        fs::create_dir_all(&a).unwrap();
-        fs::create_dir_all(&b).unwrap();
-        let url = file_url_path;
-        let args = vec!["-p".to_string(), format!("path+file://{}/tokio#tokio@1.40.0", url(&a)), "--features".into(), "full".into()];
-        let moved = retarget_args(&args, &a, &b);
-        assert_eq!(moved[1], format!("path+file://{}/tokio#tokio@1.40.0", url(&b)));
-        assert_eq!((moved[0].as_str(), moved[2].as_str(), moved[3].as_str()), ("-p", "--features", "full"));
-        assert_eq!(retarget_args(&args, &a, &a), args);
-        let _ = fs::remove_dir_all(&a);
-        let _ = fs::remove_dir_all(&b);
+        let ctx = Ctx {
+            cargo: "cargo".into(),
+            fcargo: "fcargo".into(),
+            home: std::env::temp_dir(),
+            probe_id: String::new(),
+            audit: None,
+            compression: "auto".to_string(),
+            store: StorePolicy::Deferred,
+        };
+        let dir = std::env::temp_dir().join(format!("frust-args-in-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for root in [&a, &b] {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+            fs::write(root.join("src/lib.rs"), "").unwrap();
+        }
+        let in_a = args_in(&ctx, &a, Some("tiny"), Some("full")).unwrap();
+        let in_b = args_in(&ctx, &b, Some("tiny"), Some("full")).unwrap();
+        assert_eq!(in_a[0], "-p");
+        assert_ne!(in_a[1], in_b[1]);
+        assert!(in_a[1].contains("tiny") && in_b[1].contains("tiny"), "{in_a:?} {in_b:?}");
+        assert_eq!((in_a[2].as_str(), in_a[3].as_str()), ("--features", "full"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
