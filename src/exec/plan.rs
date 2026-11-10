@@ -323,6 +323,15 @@ pub fn outputs(a: &Argv) -> Vec<PathBuf> {
         if pdb.is_file() {
             out.push(pdb);
         }
+        // A dynamic library also leaves its import library and export file, uplifted under the unhashed name.
+        if a.types.iter().any(|k| matches!(k.as_str(), "proc-macro" | "dylib" | "cdylib")) {
+            for ext in ["dll.lib", "dll.exp"] {
+                let path = a.out_dir.join(format!("{}{base}.{ext}", std::env::consts::DLL_PREFIX));
+                if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
     }
     out
 }
@@ -991,7 +1000,8 @@ pub fn depfile_text(plan: &Plan, unit: usize, dest: &str) -> String {
             }
         }
     }
-    let render = |p: &Path| p.to_string_lossy().replace(' ', "\\ ");
+    // Cargo writes native separators even where rustc reported a forward slash (an OUT_DIR joined with `/`).
+    let render = |p: &Path| if cfg!(windows) { p.components().collect::<PathBuf>() } else { p.to_path_buf() }.to_string_lossy().replace(' ', "\\ ");
     let mut text = format!("{}:", render(Path::new(dest)));
     for file in &files {
         text.push(' ');
