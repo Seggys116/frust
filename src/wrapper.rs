@@ -121,9 +121,16 @@ pub fn run(args: Vec<OsString>) -> i32 {
         sys::seal_inherited_descriptors();
         return drain_main();
     }
+    let started = Instant::now();
+    if let Some(text) = probed_version(&args) {
+        let mut out = io::stdout().lock();
+        if out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok() {
+            timings::answered(started);
+            return 0;
+        }
+    }
     // SAFETY: startup has opened no files; pipe validation rejects stale descriptor numbers.
     JOBSERVER.get_or_init(|| unsafe { jobserver::Client::from_env_ext(true).client.ok() });
-    let started = Instant::now();
     let journal = crate::exec::journal::begin(&args);
     let cfg = Config::from_env();
     let args = crate::linking::prepare(&args, cfg.debug).unwrap_or(args);
@@ -148,6 +155,35 @@ pub fn run(args: Vec<OsString>) -> i32 {
     timings::passthrough(started);
     passthrough(&args)
 }
+
+/// The front end's `-vV` text for an exact `rustc -vV` call on the binary it probed, which cargo makes twice on every build without a cached answer.
+fn probed_version(args: &[OsString]) -> Option<String> {
+    probed_version_in(args, |name| env::var_os(name))
+}
+
+fn probed_version_in(args: &[OsString], var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
+    let [tool, flag] = args else { return None };
+    if flag != "-vV" {
+        return None;
+    }
+    let text = var(PROBED_VERBOSE_ENV)?.into_string().ok().filter(|text| !text.is_empty() && !text.contains(char::REPLACEMENT_CHARACTER))?;
+    let exe = var(PROBED_EXE_ENV).filter(|exe| !exe.is_empty())?;
+    if var("FRUST_RUSTC_ID")? != *crate::paths::short_hash(&text) {
+        return None;
+    }
+    let probed = |path: &Path| sys::canonicalize(path).is_ok_and(|real| real.as_os_str() == exe);
+    let tool = Path::new(tool);
+    if probed(tool) {
+        return Some(text);
+    }
+    // A rustup proxy runs the binary of the toolchain it selects here.
+    let direct = crate::toolchain::direct_binary(tool, "rustc", None, &env::current_dir().ok()?)?;
+    probed(&direct).then_some(text)
+}
+
+/// The `-vV` text of the probed compiler and the canonical path of the binary that printed it, set by the front end.
+pub(crate) const PROBED_VERBOSE_ENV: &str = "FRUST_RUSTC_VERBOSE";
+pub(crate) const PROBED_EXE_ENV: &str = "FRUST_RUSTC_EXE";
 
 /// Codegen units for incremental dev compiles; rustc's default of 256 costs more in per-object file work than it saves in recompiled code.
 const DEV_CODEGEN_UNITS: &str = "-Ccodegen-units=64";
@@ -4868,6 +4904,36 @@ mod tests {
         }
         args.extend(extra);
         args.into_iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_an_exact_version_query_on_the_probed_binary_is_answered() {
+        let scratch = Scratch::new("probed-version");
+        let dir = sys::canonicalize(&scratch.0).unwrap();
+        let (exe, other) = (dir.join("rustc"), dir.join("rustc-other"));
+        fs::write(&exe, b"compiler").unwrap();
+        fs::write(&other, b"compiler").unwrap();
+        let text = "rustc 1.0.0 (abc 2026-01-01)\nhost: x86_64-test\n".to_string();
+        let id = crate::paths::short_hash(&text);
+        let env_of = |id: String| {
+            let (text, exe) = (text.clone(), exe.clone());
+            move |name: &str| match name {
+                PROBED_VERBOSE_ENV => Some(OsString::from(&text)),
+                PROBED_EXE_ENV => Some(exe.clone().into_os_string()),
+                "FRUST_RUSTC_ID" => Some(OsString::from(&id)),
+                _ => None,
+            }
+        };
+        let call = |args: &[&OsStr]| args.iter().map(|a| a.to_os_string()).collect::<Vec<_>>();
+        let vv = OsStr::new("-vV");
+        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv]), env_of(id.clone())), Some(text.clone()));
+        let spelled = dir.join(".").join("rustc");
+        assert_eq!(probed_version_in(&call(&[spelled.as_os_str(), vv]), env_of(id.clone())), Some(text.clone()), "another spelling of the same binary");
+        assert_eq!(probed_version_in(&call(&[other.as_os_str(), vv]), env_of(id.clone())), None, "another binary");
+        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), OsStr::new("-V")]), env_of(id.clone())), None);
+        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv, OsStr::new("-")]), env_of(id.clone())), None);
+        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv]), env_of("000000000000".to_string())), None, "text that is not the probed id");
+        assert_eq!(probed_version_in(&call(&[exe.as_os_str(), vv]), |_: &str| None), None, "no probe");
     }
 
     #[test]

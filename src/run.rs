@@ -584,6 +584,10 @@ fn moves_outputs(text: &str) -> bool {
 
 fn accelerator_env(cfg: &Config, probe: &Probe) -> Vec<(OsString, OsString)> {
     let mut vars = vec![(os("FRUST_RUSTC_ID"), os(&probe.id))];
+    if !probe.rustc_exe.is_empty() {
+        vars.push((os(crate::wrapper::PROBED_VERBOSE_ENV), os(&probe.rustc_verbose)));
+        vars.push((os(crate::wrapper::PROBED_EXE_ENV), os(&probe.rustc_exe)));
+    }
     if !probe.sysroot.is_empty() {
         vars.push((os("FRUST_SYSROOT"), os(&probe.sysroot)));
         vars.push((os("FRUST_HOST"), os(&probe.host)));

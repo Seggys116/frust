@@ -156,6 +156,16 @@ pub fn passthrough(begun: Instant) {
     append_event(Some(sink), &record);
 }
 
+/// Records a `rustc -vV` call answered from the front end's probe, which spawned no compiler.
+pub fn answered(begun: Instant) {
+    let Some(sink) = target() else { return };
+    let mut record = Record::new("", false, false, false);
+    record.kind = "passthrough".to_string();
+    record.store_mode = "answered".to_string();
+    record.total_ms = ms(begun);
+    append_event(Some(sink), &record);
+}
+
 /// Records a store step's outcome with its wall and CPU milliseconds; a helper has no unit record, so this is its only trace.
 pub fn store_outcome(sink: Option<&Path>, krate: &str, outcome: &str, spent: (u64, u64)) {
     let mut record = Record::new(krate, false, false, false);

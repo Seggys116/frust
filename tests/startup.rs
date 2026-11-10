@@ -129,6 +129,31 @@ fn second_build_uses_both_caches() {
 }
 
 #[test]
+fn cargo_gets_the_probed_compiler_version_without_another_rustc() {
+    let sb = Sandbox::new("startup-vv");
+    let app = sb.project("app", &[], "fn main() {}\n");
+    fs::create_dir_all(sb.home()).unwrap();
+    let timings = sb.home().join("timings.jsonl");
+    fs::write(&timings, "").unwrap();
+    let events = sb.home().join("timings.jsonl.events");
+    fs::write(&events, "").unwrap();
+    let out = fcargo(&sb, &app, &["build"], &[("FRUST_TIMINGS", &timings)]);
+    assert_success(&out);
+    let answered = fs::read_to_string(&events).unwrap().lines().filter(|line| line.contains("\"store_mode\":\"answered\"")).count();
+    assert!(answered >= 1, "cargo's -vV calls were answered: {}", fs::read_to_string(&events).unwrap());
+
+    let rustc = Command::new("rustc").arg("-vV").env_remove("RUSTUP_TOOLCHAIN").current_dir(&app).output().unwrap();
+    assert_success(&rustc);
+    let info: serde_json::Value = serde_json::from_slice(&fs::read(sb.central_target(&app).join(".rustc_info.json")).unwrap()).unwrap();
+    let outputs = info["outputs"].as_object().expect("cargo's rustc cache has outputs");
+    assert!(
+        outputs.values().any(|o| o["stdout"].as_str() == Some(stdout(&rustc).as_str()) && o["success"] == true),
+        "cargo cached the very text rustc prints: {info}"
+    );
+    assert!(bin_file(&sb.central_target(&app), "app").is_file());
+}
+
+#[test]
 fn probe_cache_follows_toolchain_file_and_plus_toolchain() {
     ensure_pinned_toolchain();
     let sb = Sandbox::new("startup-tc");
