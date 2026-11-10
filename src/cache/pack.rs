@@ -41,19 +41,9 @@ pub struct Log {
 impl Log {
     /// A missing log reads as empty; an oversized or unreadable one is an error so callers leave it alone.
     pub fn read(path: &Path) -> io::Result<Log> {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Log::default()),
-            Err(error) => return Err(error),
-        };
-        let meta = named_regular_file(path, &file)?;
-        if meta.len() > MAX_LOG_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "record log is too large"));
-        }
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
-        io::Read::read_to_end(&mut file, &mut bytes)?;
+        let bytes = read_bounded(path)?;
         let mut live = HashMap::new();
-        scan(&bytes, |frame, kind, written_s, key, body| {
+        scan(&bytes, true, |frame, kind, written_s, key, body| {
             if kind == KIND_TOMBSTONE {
                 live.remove(key);
             } else {
@@ -97,6 +87,42 @@ impl Log {
     }
 }
 
+/// The newest intact record of `key`, checksumming only the frames of that key so a lookup stays cheap as the log grows; a damaged newest frame falls back to the one before it.
+pub fn find(path: &Path, key: &str, max: usize) -> Option<(u64, Vec<u8>)> {
+    let bytes = read_bounded(path).ok()?;
+    let mut frames = Vec::new();
+    scan(&bytes, false, |frame, kind, written_s, found, body| {
+        if found == key {
+            frames.push((frame, kind, written_s, body));
+        }
+    });
+    let (_, kind, written_s, body) = frames.into_iter().rev().find(|(frame, ..)| intact(&bytes[frame.clone()]))?;
+    if kind != KIND_RECORD {
+        return None;
+    }
+    Some((written_s, fsx::unpack(&bytes[body], max)?.into_owned()))
+}
+
+/// A missing log reads as empty; anything but a bounded regular file is an error.
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let meta = named_regular_file(path, &file)?;
+    if meta.len() > MAX_LOG_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "record log is too large"));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn intact(frame: &[u8]) -> bool {
+    frame.len() > MAGIC.len() + SUM && blake3::hash(&frame[MAGIC.len()..frame.len() - SUM]).as_bytes()[..SUM] == frame[frame.len() - SUM..]
+}
+
 /// A frame holding `raw` packed under `key`, or a tombstone when `raw` is `None`; `None` for a key the log cannot hold.
 pub fn encode(key: &str, written_s: u64, raw: Option<&[u8]>) -> Option<Vec<u8>> {
     if key.is_empty() || key.len() > MAX_KEY {
@@ -121,8 +147,8 @@ pub fn encode(key: &str, written_s: u64, raw: Option<&[u8]>) -> Option<Vec<u8>> 
     Some(frame)
 }
 
-/// Visits each whole, checksummed frame in order; anything else is skipped a byte at a time until the next frame.
-fn scan(buf: &[u8], mut visit: impl FnMut(Range<usize>, u8, u64, &str, Range<usize>)) {
+/// Visits each whole frame in order, checksummed when `verify` is set; anything else is skipped a byte at a time until the next frame.
+fn scan(buf: &[u8], verify: bool, mut visit: impl FnMut(Range<usize>, u8, u64, &str, Range<usize>)) {
     let mut at = 0;
     while at + HEADER <= buf.len() {
         let Some(rel) = buf[at..].windows(MAGIC.len()).position(|w| w == MAGIC) else { return };
@@ -134,14 +160,13 @@ fn scan(buf: &[u8], mut visit: impl FnMut(Range<usize>, u8, u64, &str, Range<usi
             continue;
         }
         let payload = &buf[at + HEADER..end - SUM];
-        let sum = blake3::hash(&buf[at + MAGIC.len()..end - SUM]);
         let kind = payload[0];
         let written_s = u64::from_le_bytes(payload[1..9].try_into().unwrap());
         let key_len = payload[9] as usize;
         let key = payload.get(10..10 + key_len).and_then(|key| std::str::from_utf8(key).ok());
         match key {
-            Some(key) if sum.as_bytes()[..SUM] == buf[end - SUM..end] && key_len > 0
-                && (kind == KIND_RECORD || (kind == KIND_TOMBSTONE && payload.len() == 10 + key_len)) =>
+            Some(key) if key_len > 0 && (kind == KIND_RECORD || (kind == KIND_TOMBSTONE && payload.len() == 10 + key_len))
+                && (!verify || intact(&buf[at..end])) =>
             {
                 let body = at + HEADER + 10 + key_len..end - SUM;
                 visit(at..end, kind, written_s, key, body);
@@ -190,7 +215,7 @@ pub(crate) fn rewrite(path: &Path, log: &Log, retire: impl Fn(&str) -> bool, mod
 /// Appends `frames` to a log the caller read under the writers' lock, rewriting it instead once superseded frames outweigh live ones.
 pub(crate) fn commit(path: &Path, log: &Log, frames: &[u8], mode: Option<Mode>) -> io::Result<()> {
     let mut newest: HashMap<String, Option<Range<usize>>> = HashMap::new();
-    scan(frames, |frame, kind, _, key, _| {
+    scan(frames, true, |frame, kind, _, key, _| {
         newest.insert(key.to_owned(), (kind == KIND_RECORD).then_some(frame));
     });
     let superseded: usize = newest.keys().filter_map(|key| log.live.get(key)).map(|live| live.frame.1 - live.frame.0).sum();
@@ -242,10 +267,13 @@ mod tests {
         let log = Log::read(&path).unwrap();
         assert_eq!(log.get("a", 1024), Some((3, b"three".to_vec())));
         assert_eq!(log.get("b", 1024), Some((2, b"two".to_vec())));
+        assert_eq!(find(&path, "a", 1024), Some((3, b"three".to_vec())));
         append(&path, &encode("a", 4, None).unwrap(), None).unwrap();
         let log = Log::read(&path).unwrap();
         assert!(!log.contains("a"));
         assert!(log.contains("b"));
+        assert_eq!(find(&path, "a", 1024), None);
+        assert!(find(&dir.join("missing"), "a", 1024).is_none());
         assert_eq!(log.keys().collect::<Vec<_>>(), vec!["b"]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -269,6 +297,9 @@ mod tests {
         let mut keys: Vec<_> = log.keys().collect();
         keys.sort();
         assert_eq!(keys, vec!["a", "d"]);
+        assert_eq!(find(&path, "a", 16), Some((1, b"one".to_vec())));
+        assert_eq!(find(&path, "c", 16), None, "a frame failing its checksum is never served");
+        assert_eq!(find(&path, "d", 16), Some((4, b"four".to_vec())));
         fs::write(&path, &second[..second.len() - 1]).unwrap();
         assert!(Log::read(&path).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -317,5 +348,27 @@ mod tests {
         assert!(encode("", 0, Some(b"x")).is_none());
         assert!(encode(&"k".repeat(MAX_KEY + 1), 0, Some(b"x")).is_none());
         assert!(encode(&"k".repeat(MAX_KEY), 0, Some(b"x")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod damaged {
+    use super::*;
+
+    #[test]
+    fn a_lookup_falls_back_to_the_last_intact_frame_of_its_key() {
+        let dir = std::env::temp_dir().join(format!("frust-pack-damaged-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log");
+        let mut bytes = encode("k", 1, Some(b"old")).unwrap();
+        let mut newer = encode("k", 2, Some(b"new")).unwrap();
+        let middle = newer.len() / 2;
+        newer[middle] ^= 0xff;
+        bytes.extend_from_slice(&newer);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(find(&path, "k", 16), Some((1, b"old".to_vec())));
+        assert_eq!(Log::read(&path).unwrap().get("k", 16), Some((1, b"old".to_vec())));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

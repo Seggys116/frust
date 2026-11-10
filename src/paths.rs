@@ -7,6 +7,9 @@ use crate::sys;
 /// Deferred-store jobs share `Dirs::deferred` with slot locks whose file-name prefix gc keys on.
 pub const DEFERRED_SLOT_PREFIX: &str = "slot-";
 
+/// File name of the entry record log next to `store/`.
+pub const ENTRY_PACK: &str = "entries.pack";
+
 #[derive(Debug, Clone)]
 pub struct Dirs {
     root: PathBuf,
@@ -51,6 +54,11 @@ impl Dirs {
     /// Every manifest in one append-only record log, so a manifest costs its bytes rather than a block.
     pub fn manifest_pack(&self) -> PathBuf {
         self.root.join("manifests.pack")
+    }
+
+    /// The records of store entries whose `meta.json` is an empty marker; the store's sibling, so an entry directory finds it.
+    pub fn entry_pack(&self) -> PathBuf {
+        self.root.join(ENTRY_PACK)
     }
 
     pub fn targets(&self) -> PathBuf {

@@ -204,9 +204,9 @@ impl Cache {
 
     /// The packed record wins; a prekey the log does not hold, or a log that cannot be read, falls back to its per-file manifest.
     fn read_manifest(&self, prekey: &str) -> Option<Manifest> {
-        match pack::Log::read(&self.dirs.manifest_pack()) {
-            Ok(log) if log.contains(prekey) => Self::packed_manifest(&log, prekey),
-            _ => self.read_legacy_manifest(prekey),
+        match pack::find(&self.dirs.manifest_pack(), prekey, MAX_MANIFEST_BYTES) {
+            Some((_, raw)) => parse_manifest(&raw),
+            None => self.read_legacy_manifest(prekey),
         }
     }
 
@@ -327,6 +327,9 @@ impl Cache {
             if !valid_key(key) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid entry key")); }
             let _guard = UnitRecordsGuard::acquire(&self.dirs)?;
             let dest = Self::keyed(self.dirs.store(), key);
+            // A published entry is never replaced, so its record in the log is never either.
+            if dest.join("meta.json").exists() { return Ok(()); }
+            let logged = self.move_record_into_log(staged, key);
             let mut renamed = sys::rename(staged, &dest);
             // The store directory is created only when the first rename finds it missing.
             if renamed.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
@@ -336,12 +339,62 @@ impl Cache {
             match renamed {
                 Ok(()) => Ok(()),
                 Err(_) if dest.join("meta.json").exists() => Ok(()),
-                Err(error) => Err(error),
+                Err(error) => {
+                    if logged { self.forget_entry_record(key); }
+                    Err(error)
+                }
             }
         })();
         // Cleanup can be large and must run after releasing the publication guard.
         if staged.exists() { let _ = fsx::remove_any(staged); }
         result
+    }
+
+    /// Moves the staged record into the entry log and leaves `meta.json` as an empty marker, so the entry costs its record's bytes rather than a block; on any failure the record stays in the file.
+    fn move_record_into_log(&self, staged: &Path, key: &str) -> bool {
+        let marker = staged.join("meta.json");
+        let Ok(raw) = fsx::read_packed(&marker, MAX_MANIFEST_BYTES) else { return false };
+        if raw.is_empty() { return false; }
+        let path = self.dirs.entry_pack();
+        let Ok(log) = pack::Log::read(&path) else { return false };
+        let Some(frame) = pack::encode(key, fsx::unix_now(), Some(&raw)) else { return false };
+        if pack::commit(&path, &log, &frame, crate::lock::shared_mode(&self.dirs)).is_err() { return false; }
+        if fs::write(&marker, b"").is_err() {
+            self.forget_entry_record(key);
+            return false;
+        }
+        true
+    }
+
+    /// Tombstones the log record of `key`; the caller holds the metadata guard.
+    fn forget_entry_record(&self, key: &str) {
+        let path = self.dirs.entry_pack();
+        let Ok(log) = pack::Log::read(&path) else { return };
+        if !log.contains(key) { return; }
+        if let Some(frame) = pack::encode(key, fsx::unix_now(), None) {
+            let _ = pack::commit(&path, &log, &frame, crate::lock::shared_mode(&self.dirs));
+        }
+    }
+
+    /// Replaces the record of a published entry in the log and renews its marker, so identity snapshots taken before see the change; the caller holds the metadata guard.
+    pub(crate) fn rewrite_entry_record(&self, key: &str, raw: &[u8]) -> io::Result<()> {
+        let path = self.dirs.entry_pack();
+        let log = pack::Log::read(&path)?;
+        let frame = pack::encode(key, fsx::unix_now(), Some(raw)).ok_or_else(|| io::Error::other("entry record too large"))?;
+        pack::commit(&path, &log, &frame, crate::lock::shared_mode(&self.dirs))?;
+        fsx::write_atomic(&self.entry_dir(key).join("meta.json"), b"")
+    }
+
+    /// Drops log records whose entry is provably gone and frames newer ones replaced; returns the bytes the log no longer occupies.
+    pub fn compact_entry_pack(&self) -> u64 {
+        let Ok(Some(_guard)) = UnitRecordsGuard::try_acquire(&self.dirs) else { return 0 };
+        let path = self.dirs.entry_pack();
+        let Ok(log) = pack::Log::read(&path) else { return 0 };
+        let gone: std::collections::HashSet<String> = log.keys().filter(|key| self.unit_reference_absent(key)).map(str::to_owned).collect();
+        if gone.is_empty() && log.dead_bytes() == 0 { return 0; }
+        let before = fsx::allocated_size(&path);
+        if pack::rewrite(&path, &log, |key| gone.contains(key), crate::lock::shared_mode(&self.dirs)).is_err() { return 0; }
+        before.saturating_sub(fsx::allocated_size(&path))
     }
 
     pub fn mark_used(&self, key: &str) {
@@ -646,7 +699,9 @@ impl Cache {
         if proof.identity != (current.entry.dev, current.entry.ino) { return Err(io::Error::other("retired child identity changed")); }
         #[derive(Deserialize)]
         struct Reference { prekey: Option<serde_json::Value>, incremental_unit: Option<serde_json::Value> }
-        if let Ok(bytes) = read_entry_meta_bytes(&doomed)
+        let record = entry_meta_bytes(&doomed, key, &self.dirs.entry_pack());
+        self.forget_entry_record(key);
+        if let Ok(bytes) = record
             && let Ok(reference) = serde_json::from_slice::<Reference>(&bytes)
         {
             // A malformed ownership hint must not disable cleanup through the other hint.
@@ -1265,9 +1320,27 @@ pub fn manifest_keys(path: &Path) -> Option<Vec<String>> {
     Some(manifest.candidates.into_iter().map(|c| c.key).collect())
 }
 
-/// The raw `meta.json` of an entry directory, packed or written plain by an older frust.
+/// The raw record of a store entry directory: `meta.json` when it holds bytes (packed, or plain from an older frust), else the record filed under the directory's name in the entry log beside the store.
 pub fn read_entry_meta_bytes(dir: &Path) -> std::io::Result<Vec<u8>> {
-    fsx::read_packed(&dir.join("meta.json"), MAX_MANIFEST_BYTES)
+    let key = dir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let log = dir.parent().and_then(Path::parent).map(|home| home.join(crate::paths::ENTRY_PACK)).unwrap_or_default();
+    entry_meta_bytes(dir, key, &log)
+}
+
+/// The raw record of the entry in `dir` filed under `key`: `meta.json` itself when it holds bytes, else the record in the entry log at `log`.
+pub fn entry_meta_bytes(dir: &Path, key: &str, log: &Path) -> std::io::Result<Vec<u8>> {
+    let raw = fsx::read_packed(&dir.join("meta.json"), MAX_MANIFEST_BYTES)?;
+    if !raw.is_empty() { return Ok(raw); }
+    pack::find(log, key, MAX_MANIFEST_BYTES).map(|(_, raw)| raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry record is not in the entry log"))
+}
+
+/// The record bytes of a `meta.json` already read, looked up in a loaded entry log when the file is an empty marker.
+pub fn record_or_logged(bytes: &[u8], key: &str, log: Option<&pack::Log>) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return log?.get(key, MAX_MANIFEST_BYTES).map(|(_, raw)| raw);
+    }
+    fsx::unpack(bytes, MAX_MANIFEST_BYTES).map(std::borrow::Cow::into_owned)
 }
 
 pub fn read_entry_meta(dir: &Path) -> Option<EntryMeta> {
@@ -1949,6 +2022,34 @@ mod tests {
             assert_eq!(cache.candidates(&older), vec![candidate.clone()], "a per-file manifest from an older frust still reads");
             assert_eq!(manifest_keys(&path), Some(vec![key(1)]));
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn published_records_live_in_the_entry_log_behind_an_empty_marker_until_retired() {
+        let (dir, cache) = scratch("entry-log");
+        let prekey = key(0x84);
+        publish_referenced_entry(&cache, 1, &prekey);
+        cache.add_candidate(&prekey, empty_candidate(1));
+        let entry = cache.entry_dir(&key(1));
+        assert_eq!(fs::metadata(entry.join("meta.json")).unwrap().len(), 0, "the marker holds no bytes");
+        assert!(cache.has_entry(&key(1)));
+        let prekey_of = |dir: &Path| serde_json::from_slice::<serde_json::Value>(&read_entry_meta_bytes(dir).unwrap()).unwrap()["prekey"].clone();
+        assert_eq!(prekey_of(&entry), serde_json::json!(prekey));
+        let staged = cache.stage().unwrap();
+        fs::write(staged.join("meta.json"), serde_json::to_vec(&serde_json::json!({"prekey": key(0x85)})).unwrap()).unwrap();
+        cache.publish(&staged, &key(1)).unwrap();
+        assert_eq!(prekey_of(&entry), serde_json::json!(prekey), "a published record is never replaced");
+        cache.remove_entry(&key(1));
+        assert!(!pack::Log::read(&cache.dirs.entry_pack()).unwrap().contains(&key(1)), "retirement drops the record");
+        assert!(cache.candidates(&prekey).is_empty(), "and still prunes the manifest the record names");
+        publish_entry(&cache, 2);
+        let orphan = pack::encode(&key(3), 0, Some(b"{}")).unwrap();
+        pack::append(&cache.dirs.entry_pack(), &orphan, None).unwrap();
+        cache.compact_entry_pack();
+        let log = pack::Log::read(&cache.dirs.entry_pack()).unwrap();
+        assert!(log.contains(&key(2)) && !log.contains(&key(3)), "compaction drops records of absent entries only");
+        assert_eq!(log.dead_bytes(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -369,6 +369,7 @@ fn scan_entries_with(dirs: &Dirs, progress: &mut dyn Progress) -> Vec<ScannedEnt
     let mut out = Vec::new();
     let store = cache::Cache::new(dirs);
     let records = unit_records(dirs);
+    let entry_log = cache::pack::Log::read(&dirs.entry_pack()).ok();
     let items = cache::keyed_items(&dirs.store());
     progress.phase("scan store", Some(items.len() as u64), "");
     for path in items {
@@ -381,7 +382,7 @@ fn scan_entries_with(dirs: &Dirs, progress: &mut dyn Progress) -> Vec<ScannedEnt
                 let used = file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                 let mut bytes = Vec::new();
                 let meta = file.read_to_end(&mut bytes).ok()
-                    .and_then(|_| fsx::unpack(&bytes, cache::MAX_MANIFEST_BYTES))
+                    .and_then(|_| cache::record_or_logged(&bytes, key, entry_log.as_ref()))
                     .and_then(|raw| serde_json::from_slice::<cache::EntryMeta>(&raw).ok());
                 (used, meta)
             }
@@ -1731,9 +1732,9 @@ pub fn execute_with(dirs: &Dirs, plan: &Plan, progress: &mut dyn Progress) -> (u
     freed += compacted;
     progress.item("hash memo log", compacted);
     cache::Cache::new(dirs).migrate_legacy_layout();
-    let packed = cache::Cache::new(dirs).compact_manifest_pack();
+    let packed = cache::Cache::new(dirs).compact_manifest_pack() + cache::Cache::new(dirs).compact_entry_pack();
     freed += packed;
-    progress.item("manifest log", packed);
+    progress.item("record logs", packed);
     prune_empty_shards(&dirs.hashmemo());
     prune_empty_shards(&dirs.keylocks());
     prune_empty_workspaces(dirs);

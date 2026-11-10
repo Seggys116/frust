@@ -3367,15 +3367,18 @@ fn regular_key(path: &Path) -> Option<FileKey> {
 impl StoreIndex {
     fn new(store: &Path) -> StoreIndex {
         let mut index = StoreIndex::default();
+        let entry_log = store.parent().and_then(|home| crate::cache::pack::Log::read(&home.join(crate::paths::ENTRY_PACK)).ok());
         let parts = walk_parallel(
             store,
             &|_: &str, _: bool| false,
             &StoreScan::default,
             &|acc: &mut StoreScan, path: &Path, meta: &sys::Meta| {
                 if path.file_name().is_some_and(|n| n == "meta.json") {
-                    if let Ok(bytes) = fsx::read_packed(path, crate::cache::MAX_MANIFEST_BYTES)
-                        && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
+                    if let Ok(stored) = fs::read(path)
                         && let Some(parent) = path.parent()
+                        && let Some(key) = parent.file_name().and_then(|name| name.to_str())
+                        && let Some(bytes) = crate::cache::record_or_logged(&stored, key, entry_log.as_ref())
+                        && let Ok(entry) = serde_json::from_slice::<crate::cache::EntryMeta>(&bytes)
                         && entry.stderr_present(parent)
                         && let Ok(groups) = crate::cache::metadata_slice::validate_groups(&entry.files)
                         && (cfg!(unix) || groups.iter().all(|group| group.slice_indices.is_empty()))
