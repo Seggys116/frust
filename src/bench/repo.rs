@@ -528,7 +528,7 @@ fn collect_store_files(store: &Path) -> (Vec<StoreFile>, Vec<PathBuf>, usize) {
     entry_dirs.sort();
     for dir in entry_dirs {
         let Some(key) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        let meta: Option<EntryMeta> = fs::read(dir.join("meta.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let meta: Option<EntryMeta> = crate::cache::read_entry_meta(&dir);
         let Some(meta) = meta else {
             unreadable += 1;
             continue;
