@@ -604,7 +604,11 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
                 continue;
             }
             let expected = depfile_text(&plan, i, dest);
-            ok &= fs::read_to_string(&file).is_ok_and(|t| t == expected);
+            let actual = fs::read_to_string(&file);
+            if cfg!(windows) && plan.units[i].run.is_some() && !actual.as_ref().is_ok_and(|t| *t == expected) {
+                eprintln!("frust-diag: depfile {} expected {expected:?} actual {actual:?}", file.display());
+            }
+            ok &= actual.is_ok_and(|t| t == expected);
             depfiles.push((dest.clone(), file.to_string_lossy().into_owned()));
         }
         plan.units[i].depfiles = depfiles;
@@ -651,6 +655,11 @@ fn assess(msg: &serde_json::Value, candidates: &[Candidate], fresh_from: usize, 
     let Some((ci, outs, uplifts)) = found else {
         if !fresh {
             return Err("unrecorded compile".into());
+        }
+        if cfg!(windows) {
+            let cands: Vec<String> = candidates.iter().map(|c| format!("{}:{:?}:{:?}", c.parsed.crate_name, c.parsed.types, outputs(&c.parsed))).collect();
+            let why = format!("uncovered diag filenames {:?} executable {:?} kind {:?} candidates {cands:?}", msg.get("filenames"), msg.get("executable"), msg.pointer("/target/kind"));
+            eprintln!("frust-diag: {why}");
         }
         return Ok(Step::Uncovered(crate::noop::fingerprint_files(msg)));
     };
