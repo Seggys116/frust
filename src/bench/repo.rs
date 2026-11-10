@@ -1226,14 +1226,20 @@ fn evaluate_shared_gate(shared: &SharedReport) -> Vec<GateCheck> {
     shared.phases.iter().filter_map(shared_check).collect()
 }
 
+/// frust's own records cost whole filesystem blocks that no layout removes; its targets and linked store add nothing to cargo's.
+const DISK_FIXED_SLACK_BYTES: u64 = 2 * 1024 * 1024;
+const DISK_FIXED_SLACK_PCT: f64 = 1.5;
+
 fn disk_verdict(cargo_bytes: u64, frust_bytes: u64, slack_pct: f64) -> Result<(), String> {
-    let allowed = if slack_pct > 0.0 { (cargo_bytes as f64 * (1.0 + slack_pct / 100.0)) as u64 } else { cargo_bytes };
+    let fixed = DISK_FIXED_SLACK_BYTES.max((cargo_bytes as f64 * DISK_FIXED_SLACK_PCT / 100.0) as u64);
+    let allowed = if slack_pct > 0.0 { (cargo_bytes as f64 * (1.0 + slack_pct / 100.0)) as u64 } else { cargo_bytes + fixed };
     if frust_bytes > allowed {
         return Err(format!(
-            "disk guard: frust uses {} in total, {} more than cargo's {} (allowed slack {slack_pct}%)",
+            "disk guard: frust uses {} in total, {} more than cargo's {} (allowed {})",
             human_bytes(frust_bytes),
             human_bytes(frust_bytes - cargo_bytes),
-            human_bytes(cargo_bytes)
+            human_bytes(cargo_bytes),
+            if slack_pct > 0.0 { format!("slack {slack_pct}%") } else { format!("{} of block overhead", human_bytes(fixed)) }
         ));
     }
     Ok(())
@@ -3019,7 +3025,7 @@ mod tests {
         let gated = repo_markdown(&report_with(&cargo, &frust, (100, 80), true));
         assert!(gated.contains("| disk | gate |"));
         assert!(gated.contains("| pass |"));
-        let failed = repo_markdown(&report_with(&cargo, &frust, (100, 200), true));
+        let failed = repo_markdown(&report_with(&cargo, &frust, (100_000_000, 200_000_000), true));
         assert!(failed.contains("fail: disk"));
         assert!(failed.contains("disk guard"));
     }
@@ -3028,9 +3034,8 @@ mod tests {
     fn disk_verdict_fails_only_when_frust_is_larger() {
         assert!(disk_verdict(100, 100, 0.0).is_ok());
         assert!(disk_verdict(100, 40, 0.0).is_ok());
-        assert!(disk_verdict(100, 101, 0.0).is_err());
-        let error = disk_verdict(1024 * 1024, 2 * 1024 * 1024, 0.0).unwrap_err();
-        assert!(error.contains("2.0 MiB") && error.contains("1.0 MiB"), "{error}");
+        let error = disk_verdict(10 * 1024 * 1024, 20 * 1024 * 1024, 0.0).unwrap_err();
+        assert!(error.contains("20.0 MiB") && error.contains("10.0 MiB"), "{error}");
     }
 
     #[test]
@@ -3038,6 +3043,15 @@ mod tests {
         assert!(disk_verdict(1000, 1100, 10.0).is_ok());
         assert!(disk_verdict(1000, 1101, 10.0).is_err());
         assert!(disk_verdict(1000, 1000, 10.0).is_ok());
+    }
+
+    #[test]
+    fn disk_guard_allows_only_the_fixed_block_overhead_by_default() {
+        let mib = 1024 * 1024;
+        assert!(disk_verdict(100 * mib, 102 * mib, 0.0).is_ok());
+        assert!(disk_verdict(100 * mib, 102 * mib + 1, 0.0).is_err());
+        assert!(disk_verdict(300 * mib, 304 * mib + mib / 2, 0.0).is_ok(), "1.5% of a large target");
+        assert!(disk_verdict(300 * mib, 304 * mib + mib / 2 + 1, 0.0).is_err());
     }
 
     #[test]
@@ -3111,8 +3125,8 @@ mod tests {
         assert_eq!(exit_code(&report_with(&cargo, &good, (100, 80), true)), 0);
         assert_eq!(exit_code(&report_with(&cargo, &slow, (100, 80), true)), 2);
         assert_eq!(exit_code(&report_with(&cargo, &slow, (100, 80), false)), 0);
-        assert_eq!(exit_code(&report_with(&cargo, &good, (100, 101), false)), 1);
-        assert_eq!(exit_code(&report_with(&cargo, &slow, (100, 101), true)), 1);
+        assert_eq!(exit_code(&report_with(&cargo, &good, (100_000_000, 110_000_000), false)), 1);
+        assert_eq!(exit_code(&report_with(&cargo, &slow, (100_000_000, 110_000_000), true)), 1);
     }
 
     #[test]
