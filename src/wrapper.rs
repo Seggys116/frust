@@ -314,7 +314,8 @@ impl Plan {
         )
         .with_stamp_trust(stamp_policy(&trust))
         .audit_attested(trust.mode == TrustMode::Audit)
-        .with_violation_sink(violation_sink(&trust, &dirs, &parsed.crate_name));
+        .with_violation_sink(violation_sink(&trust, &dirs, &parsed.crate_name))
+        .with_turns(&dirs);
         let share_root = match share_candidate(&hasher, &cwd, (profile.as_str(), profile_abs.as_path()), args, &parsed) {
             Ok(root) => Some(root),
             Err(reason) => {
@@ -4084,11 +4085,12 @@ fn warm_tool(dirs: &Dirs, tool: &Path, debug: bool) -> io::Result<hashing::Hashe
     let hasher = Hasher::new(Some(dirs.hashmemo()), Vec::new())
         .with_stamp_trust(stamp_policy(&trust))
         .audit_attested(trust.mode == TrustMode::Audit)
-        .with_violation_sink(violation_sink(&trust, dirs, "linker"));
-    hasher.hash(tool, true)
+        .with_violation_sink(violation_sink(&trust, dirs, "linker"))
+        .with_turns(dirs);
+    hasher.hash_in_turn(tool)
 }
 
-/// With an empty memo every unit cargo starts at once would read the linker itself; one read here, while cargo starts, serves them all.
+/// With an empty memo every unit cargo starts at once would read the linker itself; one read here, while cargo starts, serves them all as they wait their turn.
 pub fn warm_tool_hash(dirs: &Dirs, tool: &Path, debug: bool) {
     let (dirs, tool) = (dirs.clone(), tool.to_path_buf());
     thread::spawn(move || {
@@ -4645,7 +4647,7 @@ impl KeyContext<'_> {
                         let before = self.hasher.tally();
                         let hashed = self
                             .hasher
-                            .hash(&path, true)
+                            .hash_in_turn(&path)
                             .map_err(|e| format!("cannot read linker {}: {e}", path.display()))?;
                         stats.tool_hashed += self.hasher.tally().0 - before.0;
                         if !hashed.stable {
