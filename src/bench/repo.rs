@@ -31,7 +31,7 @@ const GATE_COLD_RATIO: f64 = 1.03;
 const GATE_COLD_SLACK_MS: f64 = 50.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
 const GATE_CLEAN_SLACK_MS: f64 = 100.0;
-const GATE_SHARED_RATIO: f64 = 0.7;
+const GATE_SHARED_RATIO: f64 = 0.8;
 const GATE_SHARED_SLACK_MS: f64 = 100.0;
 const SHARED_NOTE: &str = "Shared-cache phases build a second (and, with root sharing, third) checkout of the repository against the frust home the main phases filled, with an empty target. They are measured against plain cargo's empty-cache cold median; they run after the disk figures are taken and never enter the disk comparison.";
 
@@ -2365,13 +2365,13 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_gate_allows_seven_tenths_of_cargo_cold_plus_a_hundred_milliseconds() {
-        let at_limit = shared_report(799.0, 100.0, 1000.0);
+    fn the_shared_gate_allows_four_fifths_of_cargo_cold_plus_a_hundred_milliseconds() {
+        let at_limit = shared_report(899.0, 100.0, 1000.0);
         let checks = evaluate_shared_gate(&at_limit);
         assert_eq!(checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["cold-shared", "cold-shared-roots"]);
         assert!(checks.iter().all(|c| c.pass), "{checks:?}");
-        assert_eq!(checks[0].limit, "<= 0.70x + 100 ms");
-        let over = evaluate_shared_gate(&shared_report(801.0, 100.0, 1000.0));
+        assert_eq!(checks[0].limit, "<= 0.80x + 100 ms");
+        let over = evaluate_shared_gate(&shared_report(901.0, 100.0, 1000.0));
         assert_eq!(failing(&over), ["cold-shared"]);
         // A short cargo build is judged on the allowance alone.
         assert!(evaluate_shared_gate(&shared_report(150.0, 150.0, 100.0)).iter().all(|c| c.pass));
@@ -2428,7 +2428,7 @@ mod tests {
     fn a_failing_shared_check_or_a_shared_error_changes_the_exit_code() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
-        report.shared = Some(shared_report(900.0, 300.0, 1000.0));
+        report.shared = Some(shared_report(950.0, 300.0, 1000.0));
         report.gate_shared = report.shared.as_ref().map(evaluate_shared_gate);
         assert_eq!(exit_code(&report), 2);
         assert_eq!(overall_status(&report), "fail: cold-shared");
@@ -2443,7 +2443,7 @@ mod tests {
     fn markdown_and_text_list_the_shared_phases_with_their_gate_status() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
-        report.shared = Some(shared_report(400.0, 800.0, 1000.0));
+        report.shared = Some(shared_report(400.0, 950.0, 1000.0));
         report.gate_shared = report.shared.as_ref().map(evaluate_shared_gate);
         let markdown = repo_markdown(&report);
         assert!(markdown.contains("#### Second checkout with a warm shared cache"), "{markdown}");
