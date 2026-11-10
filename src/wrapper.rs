@@ -5024,7 +5024,9 @@ mod tests {
     #[test]
     fn a_linker_warmed_by_the_driver_is_served_to_wrappers_from_the_memo() {
         let s = Scratch::new("warm-linker");
-        let linker = crate::toolchain::find_on_path("rustc").expect("the test toolchain is on PATH");
+        // A file younger than the settle margin is never recorded, so wait it out.
+        let linker = env::current_exe().expect("the test binary exists");
+        thread::sleep(Duration::from_millis(2500));
         let wrapper_hasher = |home: &Path| {
             let dirs = Dirs::at(home);
             let trust = Arc::new(TrustGate::new(TrustMode::On, &dirs, false));
@@ -6583,7 +6585,7 @@ mod tests {
             assert!(!plan.cfg.debug);
             assert!(worker_config.debug);
             assert_eq!(plan.cfg.keylock_wait, worker_config.keylock_wait);
-            assert_eq!(plan.profile, "target/debug");
+            assert_eq!(plan.profile.replace('\\', "/"), "target/debug");
             assert_eq!(plan.output_dir_abs, job.cwd.join("target/debug/deps"));
             assert_eq!(plan.dirs.root(), job.cwd.join("cache-home"));
             run_deferred_with(&job, &worker_config);

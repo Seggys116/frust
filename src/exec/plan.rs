@@ -600,7 +600,11 @@ pub fn build(rec: Recorded<'_>) -> Result<Plan, Refused> {
                 continue;
             }
             let expected = depfile_text(&plan, i, dest);
-            ok &= fs::read_to_string(&file).is_ok_and(|t| t == expected);
+            let actual = fs::read_to_string(&file);
+            if cfg!(windows) && !actual.as_ref().is_ok_and(|t| *t == expected) {
+                eprintln!("frust-diag: depfile {} expected {:?} actual {:?}", file.display(), expected, actual);
+            }
+            ok &= actual.is_ok_and(|t| t == expected);
             depfiles.push((dest.clone(), file.to_string_lossy().into_owned()));
         }
         plan.units[i].depfiles = depfiles;
