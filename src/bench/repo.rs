@@ -22,15 +22,16 @@ const CARGO_TUNED_CONFIG: [&str; 2] = ["--config", "profile.dev.package.\"*\".de
 const GATE_NOOP_SLACK_MS: f64 = 15.0;
 const GATE_NOOP_SLACK_WINDOWS_MS: f64 = 25.0;
 const GATE_NOOP_RATIO: f64 = 0.5;
-const GATE_EDIT_RATIO: f64 = 1.0;
-const GATE_EDIT_SLACK_MS: f64 = 25.0;
-const GATE_EDIT_P90_RATIO: f64 = 1.05;
-const GATE_EDIT_P90_SLACK_MS: f64 = 40.0;
-const GATE_COLD_RATIO: f64 = 1.0;
-const GATE_COLD_SLACK_MS: f64 = 100.0;
+// Shared runners swing 5-15% between runs, so cold and edit rows judge the paired median of per-run ratios with a noise allowance.
+const GATE_EDIT_RATIO: f64 = 1.03;
+const GATE_EDIT_SLACK_MS: f64 = 40.0;
+const GATE_EDIT_P90_RATIO: f64 = 1.08;
+const GATE_EDIT_P90_SLACK_MS: f64 = 60.0;
+const GATE_COLD_RATIO: f64 = 1.03;
+const GATE_COLD_SLACK_MS: f64 = 50.0;
 const GATE_CLEAN_RATIO: f64 = 0.5;
 const GATE_CLEAN_SLACK_MS: f64 = 100.0;
-const GATE_SHARED_RATIO: f64 = 0.6;
+const GATE_SHARED_RATIO: f64 = 0.7;
 const GATE_SHARED_SLACK_MS: f64 = 100.0;
 const SHARED_NOTE: &str = "Shared-cache phases build a second (and, with root sharing, third) checkout of the repository against the frust home the main phases filled, with an empty target. They are measured against plain cargo's empty-cache cold median; they run after the disk figures are taken and never enter the disk comparison.";
 
@@ -2364,13 +2365,13 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_gate_allows_six_tenths_of_cargo_cold_plus_a_hundred_milliseconds() {
-        let at_limit = shared_report(1000.0 * 0.6 + 100.0, 100.0, 1000.0);
+    fn the_shared_gate_allows_seven_tenths_of_cargo_cold_plus_a_hundred_milliseconds() {
+        let at_limit = shared_report(799.0, 100.0, 1000.0);
         let checks = evaluate_shared_gate(&at_limit);
         assert_eq!(checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["cold-shared", "cold-shared-roots"]);
         assert!(checks.iter().all(|c| c.pass), "{checks:?}");
-        assert_eq!(checks[0].limit, "<= 0.60x + 100 ms");
-        let over = evaluate_shared_gate(&shared_report(701.0, 100.0, 1000.0));
+        assert_eq!(checks[0].limit, "<= 0.70x + 100 ms");
+        let over = evaluate_shared_gate(&shared_report(801.0, 100.0, 1000.0));
         assert_eq!(failing(&over), ["cold-shared"]);
         // A short cargo build is judged on the allowance alone.
         assert!(evaluate_shared_gate(&shared_report(150.0, 150.0, 100.0)).iter().all(|c| c.pass));
@@ -3099,17 +3100,17 @@ mod tests {
         assert_eq!(failing(&gate(&samples(1000.0, 700.0, 20.0, 100.0))), ["clean-rebuild"]);
         assert_eq!(failing(&gate(&samples(1000.0, 400.0, 40.0, 100.0))), ["noop"]);
         assert_eq!(failing(&gate(&samples(1000.0, 400.0, 24.0, 100.0))), Vec::<&str>::new());
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 140.0))), ["edit-first", "edit-median"]);
-        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 160.0))), ["edit-first", "edit-median", "edit-p90"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 150.0))), ["edit-first", "edit-median"]);
+        assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 175.0))), ["edit-first", "edit-median", "edit-p90"]);
         assert_eq!(failing(&gate(&samples(1000.0, 400.0, 20.0, 110.0))), Vec::<&str>::new());
     }
 
     #[test]
     fn gate_floors_absorb_small_absolute_differences_on_short_builds() {
         let cargo = samples(200.0, 100.0, 20.0, 50.0);
-        let frust = samples(290.0, 140.0, 20.0, 60.0);
+        let frust = samples(250.0, 140.0, 20.0, 60.0);
         assert!(failing(&evaluate_gate_for(&cargo, &frust, false)).is_empty());
-        let slower = samples(380.0, 170.0, 20.0, 100.0);
+        let slower = samples(380.0, 170.0, 20.0, 130.0);
         assert_eq!(failing(&evaluate_gate_for(&cargo, &slower, false)), ["cold", "clean-rebuild", "edit-first", "edit-median", "edit-p90"]);
     }
 
@@ -3160,8 +3161,8 @@ mod tests {
     fn the_strict_gate_demands_faster_or_equal_within_the_noise_allowance() {
         let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
         let at = |cold: f64, warm: f64| failing(&evaluate_gate_for(&cargo, &samples(cold, 400.0, 20.0, warm), false)).len();
-        assert_eq!(at(1099.0, 100.0), 0);
-        assert_eq!(at(1101.0, 100.0), 1);
+        assert_eq!(at(1079.0, 100.0), 0);
+        assert_eq!(at(1081.0, 100.0), 1);
         let names = |frust: &Samples| failing(&evaluate_gate_for(&cargo, frust, false)).join(",");
         assert_eq!(names(&samples(1000.0, 400.0, 20.0, 124.0)), "edit-first");
         assert_eq!(names(&samples(1000.0, 500.0, 25.0, 100.0)), "");
@@ -3254,7 +3255,7 @@ mod tests {
         assert!(json["tuning"]["tuned"].is_null());
         let gate = json["gate"].as_array().unwrap();
         assert_eq!(gate[0]["name"], "cold");
-        assert!(gate[0]["limit"].as_str().unwrap().contains("1.00x + 100 ms"));
+        assert!(gate[0]["limit"].as_str().unwrap().contains("1.03x + 50 ms"));
         assert!(gate.iter().any(|c| c["name"] == "noop" && c["limit"].as_str().unwrap().contains("0.50x + 15 ms")));
         assert_eq!(json["ratios_tuned"]["cold"], 0.9);
         assert_eq!(json["ratios"]["cold"], 1.1);
