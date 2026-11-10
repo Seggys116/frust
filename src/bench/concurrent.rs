@@ -1949,7 +1949,7 @@ mod tests {
         let foreground = run_foregrounds(
             vec![
                 (0, fake_command("sleep 0.03")),
-                (1, fake_command("sleep 0.15")),
+                (1, fake_command("sleep 0.6")),
             ],
             Duration::from_secs(5),
         )
