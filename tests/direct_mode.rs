@@ -335,7 +335,7 @@ fn with_stamp_trust_off_a_forged_record_is_just_a_miss_and_no_violation_is_recor
 
 #[cfg(unix)]
 #[test]
-fn default_deferred_mode_publishes_reused_metadata_probe_outputs_before_returning() {
+fn default_deferred_mode_publishes_reused_metadata_probe_outputs_after_the_build_script_deletes_them() {
     use std::os::unix::fs::PermissionsExt;
 
     struct HelperGate {
@@ -409,8 +409,16 @@ exec rustc "$@"
         let output = command(source).output().unwrap();
         assert_success(&output);
         artifacts.push((fs::read(out_dir.join("proc_macro2.d")).unwrap(), fs::read(out_dir.join("libproc_macro2.rmeta")).unwrap()));
-        assert_eq!(manifest_values(&sb).len(), index + 1, "each probe must be published while helpers are gated: {}", common::stderr(&output));
+        assert_eq!(manifest_values(&sb).len(), index, "a probe store is deferred while helpers are gated: {}", common::stderr(&output));
+        // Build scripts delete the probe directory before the deferred store runs.
         fs::remove_dir_all(&out_dir).unwrap();
+        fs::write(&gate.gate, b"open").unwrap();
+        let begun = std::time::Instant::now();
+        while manifest_values(&sb).len() < index + 1 && begun.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_file(&gate.gate).unwrap();
+        assert_eq!(manifest_values(&sb).len(), index + 1, "each probe must be published from its snapshot: {}", common::stderr(&output));
     }
     assert_eq!(count(), 2);
     assert_ne!(artifacts[0].1, artifacts[1].1);
@@ -430,7 +438,7 @@ exec rustc "$@"
         assert_eq!(count(), expected);
         fs::remove_dir_all(&out_dir).unwrap();
     }
-    assert!(!helper_calls.exists(), "metadata-only unhashed outputs are stored inline");
+    assert_eq!(fs::read_to_string(&helper_calls).unwrap_or_default().lines().count(), 2, "each successful probe is stored by one deferred helper");
     assert_eq!(sb.count_cache("hit", "proc_macro2"), 2);
 }
 
