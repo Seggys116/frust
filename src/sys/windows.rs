@@ -664,6 +664,8 @@ fn cluster_size(path: &Path) -> io::Result<u64> {
 
 pub fn prefetch(_path: &Path, _len: u64) {}
 
+pub fn prefetch_toolchain(_sysroot: &Path, _host: &str) {}
+
 pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     if fs::symlink_metadata(src)?.is_dir() {
         return Err(io::Error::from(io::ErrorKind::Unsupported));

@@ -1137,6 +1137,12 @@ impl Session {
         if executing {
             trace(&self.cfg, started, "executor replays the plan");
         }
+        if !executing {
+            let var = |name: &str| self.env_vars.iter().find(|(key, _)| key == name).map(|(_, value)| PathBuf::from(value));
+            if let (Some(sysroot), Some(host)) = (var("FRUST_SYSROOT"), var("FRUST_HOST")) {
+                sys::prefetch_toolchain(&sysroot, &host.to_string_lossy());
+            }
+        }
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
         }

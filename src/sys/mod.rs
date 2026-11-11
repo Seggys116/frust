@@ -578,6 +578,10 @@ pub fn prefetch(path: &Path, len: u64) {
     imp::prefetch(path, len)
 }
 
+pub fn prefetch_toolchain(sysroot: &Path, host: &str) {
+    imp::prefetch_toolchain(sysroot, host)
+}
+
 pub fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     imp::copy_symlink(src, dst)
 }
