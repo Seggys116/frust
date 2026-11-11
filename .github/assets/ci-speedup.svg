@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 504" width="960" height="504" role="img" aria-labelledby="title description">
+<title id="title">Clean rebuild from the cache</title>
+<desc id="description">How many times faster a clean rebuild with a warm cache is on CI. GitHub Actions run 43099929391, commit f25f73e, rustc 1.99.1, median of 9 runs.</desc>
+<rect width="960" height="504" rx="16" fill="#0d1117"/>
+<g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<text x="32" y="46" font-size="30" fill="#e6edf3" font-weight="650">Clean rebuild from the cache</text>
+<text x="32" y="76" font-size="17" fill="#9ba9b8">cargo time divided by frust time · debug profile · 9 runs, median</text>
+<text x="32" y="140" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="140" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="125" width="560.0" height="20" rx="4" fill="#39d0c3"/>
+<text x="800.0" y="141" font-size="16" fill="#e6edf3" font-weight="600">37.9x</text>
+<text x="32" y="176" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="176" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="161" width="59.3" height="20" rx="4" fill="#39d0c3"/>
+<text x="299.3" y="177" font-size="16" fill="#e6edf3" font-weight="600">4.0x</text>
+<text x="32" y="212" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="212" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="197" width="419.2" height="20" rx="4" fill="#39d0c3"/>
+<text x="659.2" y="213" font-size="16" fill="#e6edf3" font-weight="600">28.4x</text>
+<text x="32" y="248" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="248" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="233" width="270.2" height="20" rx="4" fill="#39d0c3"/>
+<text x="510.2" y="249" font-size="16" fill="#e6edf3" font-weight="600">18.3x</text>
+<text x="32" y="284" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="284" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="269" width="47.4" height="20" rx="4" fill="#39d0c3"/>
+<text x="287.4" y="285" font-size="16" fill="#e6edf3" font-weight="600">3.2x</text>
+<text x="32" y="320" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="320" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="305" width="223.3" height="20" rx="4" fill="#39d0c3"/>
+<text x="463.3" y="321" font-size="16" fill="#e6edf3" font-weight="600">15.1x</text>
+<text x="32" y="356" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="356" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="341" width="116.5" height="20" rx="4" fill="#39d0c3"/>
+<text x="356.5" y="357" font-size="16" fill="#e6edf3" font-weight="600">7.9x</text>
+<text x="32" y="392" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="392" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="377" width="30.5" height="20" rx="4" fill="#39d0c3"/>
+<text x="270.5" y="393" font-size="16" fill="#e6edf3" font-weight="600">2.1x</text>
+<text x="32" y="428" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="428" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="413" width="226.0" height="20" rx="4" fill="#39d0c3"/>
+<text x="466.0" y="429" font-size="16" fill="#e6edf3" font-weight="600">15.3x</text>
+<text x="32" y="480" font-size="14" fill="#9ba9b8">bat gains least because its own crate is compiled again on every clean rebuild.</text>
+</g></svg>

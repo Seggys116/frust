@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540" role="img" aria-labelledby="title description">
+<title id="title">Disk after the benchmark</title>
+<desc id="description">Physical size of cargo&#x27;s target against frust&#x27;s whole home, per CI job. GitHub Actions run 43099929391, commit f25f73e, rustc 1.99.1, median of 9 runs.</desc>
+<rect width="960" height="540" rx="16" fill="#0d1117"/>
+<g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<text x="32" y="46" font-size="30" fill="#e6edf3" font-weight="650">Disk after the benchmark</text>
+<text x="32" y="76" font-size="17" fill="#9ba9b8">MiB, lower is better · frust figure includes store, targets, manifests and tmp · cargo with debug=0 for dependencies</text>
+<text x="32" y="137" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="137" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="118" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="132" width="562.3" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="137" font-size="15" fill="#e6edf3">141 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">142</tspan></text>
+<text x="32" y="177" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="177" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="158" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="172" width="562.6" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="177" font-size="15" fill="#e6edf3">291 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">292</tspan></text>
+<text x="32" y="217" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="217" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="198" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="212" width="562.5" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="217" font-size="15" fill="#e6edf3">82 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">82</tspan></text>
+<text x="32" y="257" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="257" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="238" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="252" width="222.7" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="257" font-size="15" fill="#e6edf3">139 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">55</tspan></text>
+<text x="32" y="297" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="297" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="278" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="292" width="244.2" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="297" font-size="15" fill="#e6edf3">253 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">111</tspan></text>
+<text x="32" y="337" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="337" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="318" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="332" width="163.6" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="337" font-size="15" fill="#e6edf3">85 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">25</tspan></text>
+<text x="32" y="377" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="377" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="230" y="358" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="372" width="566.6" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="377" font-size="15" fill="#e6edf3">164 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">165</tspan></text>
+<text x="32" y="417" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="417" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="230" y="398" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="412" width="562.4" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="417" font-size="15" fill="#e6edf3">366 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">368</tspan></text>
+<text x="32" y="457" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="457" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="230" y="438" width="560" height="11" rx="3" fill="#c2cad4"/>
+<rect x="230" y="452" width="560.3" height="11" rx="3" fill="#39d0c3"/>
+<text x="800" y="457" font-size="15" fill="#e6edf3">121 <tspan fill="#9ba9b8">/</tspan> <tspan fill="#39d0c3">121</tspan></text>
+<text x="32" y="516" font-size="14" fill="#9ba9b8">Equal on Linux and Windows (one stored copy, linked to the target); smaller on macOS, where clones share blocks.</text>
+</g></svg>

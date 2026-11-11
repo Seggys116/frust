@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated warm full/fat LTO rebuild, Cargo 5.06 s versus frust 144 ms, 35.1x faster" width="880">
+<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated clean rebuild from a warm cache on GitHub Actions, ripgrep on Linux, cargo 6.75 s versus frust 178 ms, 37.9x faster" width="880">
 
 **A thin accelerator that sits on top of the Rust toolchain you already have.**
 
@@ -101,17 +101,15 @@ builds of that profile.
 
 ## Results
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/results.svg" alt="Measured isolated debug timings and a separate two-build concurrent cold group; warm debug restore 21.1x faster; isolated cold paired differences reported separately" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-times.svg" alt="Build times on GitHub Actions for bat on Linux, macOS and Windows: clean rebuilds and no-op builds far faster, cold builds and edits within a few percent of cargo" width="760"></p>
 
-Warm debug restores were **21.1× faster**; managed storage was **39.2% smaller** after 200 edits. Cold builds and warm edits still have overhead. [Method and results](docs/benchmarks.md).
+Measured by the Bench workflow on GitHub-hosted Linux, macOS and Windows runners against ripgrep, bat and tokio, nine runs per phase. Clean rebuilds from the cache were **2.1× to 37.9× faster** and no-op builds **3.0× to 19.5× faster**; the whole frust home was **56% to 71% smaller** than cargo's target on macOS and equal elsewhere. Cold builds and edits are bound by rustc, so they tie cargo within a few percent. [Method and results](docs/benchmarks.md#latest-ci-results).
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/release-profiles.svg" alt="Warm release clean rebuilds: defaults 25.3x faster, ThinLTO 35.9x, full/fat LTO 35.1x; median and observed range of seven runs" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-speedup.svg" alt="Clean rebuild from a warm cache on GitHub Actions, cargo time divided by frust time: 2.1x to 37.9x across ripgrep, bat and tokio on Linux, macOS and Windows" width="760"></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 settled edits with compaction checked after each build: Cargo 371.2 MiB versus frust 225.8 MiB, including target, cache and other managed bytes; automatic compression" width="760"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-disk.svg" alt="Disk after the benchmark on GitHub Actions: cargo's target against frust's whole home, equal on Linux and Windows and 56 to 71 percent smaller on macOS" width="760"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-bench.svg" alt="CI benchmark ratios of frust against cargo on Linux, macOS and Windows for ripgrep, bat and tokio: clean rebuilds and no-ops far faster, cold builds and edits tied within a few percent" width="760"></p>
-
-The CI chart is frust divided by Cargo on GitHub-hosted runners, nine runs per phase; lower is faster. Cold builds and edits are rustc-bound ties; [the full tables](docs/benchmarks.md#latest-ci-results) list medians, the shared-cache phases and disk.
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 
