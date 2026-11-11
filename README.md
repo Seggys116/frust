@@ -109,6 +109,10 @@ Warm debug restores were **21.1× faster**; managed storage was **39.2% smaller*
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/growth.svg" alt="Full managed allocation after 200 settled edits with compaction checked after each build: Cargo 371.2 MiB versus frust 225.8 MiB, including target, cache and other managed bytes; automatic compression" width="760"></p>
 
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-bench.svg" alt="CI benchmark ratios of frust against cargo on Linux, macOS and Windows for ripgrep, bat and tokio: clean rebuilds and no-ops far faster, cold builds and edits tied within a few percent" width="760"></p>
+
+The CI chart is frust divided by Cargo on GitHub-hosted runners, nine runs per phase; lower is faster. Cold builds and edits are rustc-bound ties; [the full tables](docs/benchmarks.md#latest-ci-results) list medians, the shared-cache phases and disk.
+
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
 
 ## Updating

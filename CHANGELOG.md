@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-11
+
 ### Added
 
 * `FRUST_TUNE` compiles incremental, unoptimised crates of the dev and test profiles with 64 codegen units instead of rustc's incremental default of 256 when no codegen-units value is set, which cuts the per-object file work rustc and the linker do on every edit; release, custom profiles, dependencies and explicit settings are unchanged, and `FRUST_TUNE=off` restores rustc's default.
@@ -33,6 +35,11 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 * `FRUST_STORE_START=after-build` (default `eager`) queues every deferred store as a job file while cargo runs and lets the front end start the drains once cargo exits, so stores never compete with the compiles; concurrent builds sharing a dependency may then each compile it.
 * Store outcomes in `FRUST_TIMINGS` carry the store's wall time (`total_ms`) and the CPU time of the storing thread (`cpu_ms`).
+* Cargo's `rustc -vV` and `--version` queries, including those of build scripts, are answered from the front end's toolchain probe instead of launching rustc; the probe reads the sysroot from the toolchain's layout on Unix.
+* Manifest and entry logs are packed into append-only checksummed LZ4 record files (`manifests.pack`, `entries.pack`); the earlier per-file formats stay readable.
+* `frust compact` re-links raw store copies to identical target files on volumes without block cloning, so a hard-linked store and target share one copy.
+* On macOS, restored artifacts of 16 KiB or more get a read-ahead hint, because a cloned file starts with an empty page cache.
+* Bench: the shared-cache phases `cold-shared` and `cold-shared-roots` (limit `0.90x + 100 ms` of cargo's cold median, three runs in CI), a fixed disk allowance of the larger of 2 MiB and 1.5%, and opt-in first-edit diagnostics (`--diagnose-first-edit`, `--settle-before-edit-ms`, `--warm-cpu-before-edit-ms`, `FRUST_BENCH_PAGEIN_TRACE`).
 
 ### Changed
 
@@ -58,6 +65,9 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * A `-sys` package's compile records every file of the link directories its build script filled, small object files included, so the final link at the end of a cold build looks them up instead of reading them (bat's binary pre-key: about 20 ms to 5 ms).
 
 ### Fixed
+* The stores of build-script capability probes that emit only metadata are deferred from a hard-linked snapshot of their outputs instead of running inline, which took about 300 ms per build off the critical path of cold macOS builds.
+* The volume probe that decides whether clones are available no longer races with concurrent wrappers, which had left Windows stores uncompressed and unlinked.
+* The edit-loop executor handles Windows builds: proc-macro and cdylib import libraries, executables without an extra filename, separators in dep-info files and the `.pdb` uplift.
 
 * `frust gc` no longer deletes a workspace directory under `targets/` recursively. It removed one that looked empty (or could not be read) with everything in it, so a build that created its target between the check and the removal lost its `deps` mid-build (`failed to write ... deps/lib*.rmeta: No such file or directory`). Now only a directory holding nothing but regular files is removed, without recursion, and its marker is restored when the removal fails.
 * A restore that links a store file into the target gives it a fresh modification time like every other restore, so cargo no longer finds a linked build script or binary older than its dependencies and rebuilds it on every no-op build (ext4, NTFS).

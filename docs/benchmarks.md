@@ -115,6 +115,52 @@ With FRUST_LINK=off and artifact caching off, every edit compiled one main binar
 
 Cohort: `8199243f9160c65744f7285ae3fac0e0793beff0aee416cf7d2bab5f90147fe1`.
 
+## Latest CI results
+
+Measured on GitHub-hosted runners by the Bench workflow (run 43099929391, commit f25f73e), 9 runs per phase, frust-tuned (the shipped default) against plain cargo. Ratios are frust divided by cargo, so lower is faster; disk is frust's whole home divided by tuned cargo's target.
+
+| OS | Repo | Cold | Clean rebuild | No-op | First edit | Warm edit | Edit p90 | Disk | Gate |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | ripgrep | 0.89x | 0.03x | 0.08x | 1.02x | 1.03x | 1.03x | 1.00x | pass |
+| Linux | bat | 0.92x | 0.25x | 0.08x | 0.98x | 0.98x | 0.98x | 1.00x | pass |
+| Linux | tokio | 1.01x | 0.04x | 0.05x | 1.03x | 1.00x | 1.02x | 1.00x | pass |
+| macOS | ripgrep | 0.93x | 0.05x | 0.08x | 0.97x | 0.96x | 0.95x | 0.40x | pass |
+| macOS | bat | 0.97x | 0.31x | 0.10x | 1.02x | 1.03x | 1.00x | 0.44x | pass |
+| macOS | tokio | 1.05x | 0.07x | 0.06x | 0.97x | 0.97x | 0.98x | 0.29x | pass |
+| Windows | ripgrep | 0.91x | 0.13x | 0.25x | 0.99x | 0.99x | 1.01x | 1.01x | pass |
+| Windows | bat | 0.96x | 0.48x | 0.33x | 0.92x | 0.93x | 0.92x | 1.00x | pass |
+| Windows | tokio | 1.03x | 0.07x | 0.18x | 0.99x | 0.98x | 1.00x | 1.00x | pass |
+
+Median milliseconds, cargo then frust-tuned:
+
+| OS | Repo | Cold | Clean rebuild | No-op | First edit | Warm edit | Edit p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | ripgrep | 7032 / 6369 | 6750 / 178 | 29 / 2 | 1676 / 1803 | 1632 / 1700 | 2188 / 2258 |
+| Linux | bat | 23029 / 20902 | 22891 / 5698 | 62 / 5 | 1656 / 1654 | 1652 / 1615 | 1707 / 1668 |
+| Linux | tokio | 4724 / 4713 | 4741 / 167 | 39 / 2 | 2526 / 2581 | 2509 / 2573 | 2664 / 2714 |
+| macOS | ripgrep | 9750 / 9971 | 10154 / 555 | 67 / 6 | 2173 / 2288 | 2170 / 2208 | 3105 / 2956 |
+| macOS | bat | 13837 / 13610 | 14622 / 4554 | 83 / 8 | 1526 / 1470 | 1308 / 1324 | 1510 / 1517 |
+| macOS | tokio | 4185 / 4320 | 4491 / 297 | 52 / 3 | 2430 / 2261 | 2123 / 2090 | 2552 / 2508 |
+| Windows | ripgrep | 24473 / 22010 | 24209 / 3068 | 137 / 34 | 5424 / 5420 | 5452 / 5509 | 7040 / 7107 |
+| Windows | bat | 77525 / 73905 | 77219 / 37391 | 307 / 101 | 4777 / 4410 | 4625 / 4316 | 4924 / 4517 |
+| Windows | tokio | 7942 / 8261 | 8004 / 523 | 83 / 16 | 3906 / 3777 | 3602 / 3606 | 3941 / 3954 |
+
+Second checkout with a warm shared cache, against cargo's empty-cache cold build:
+
+| OS | Repo | Shared cache | Shared cache with root sharing |
+| --- | --- | --- | --- |
+| Linux | ripgrep | 0.34x | 0.04x |
+| Linux | bat | 0.32x | 0.28x |
+| Linux | tokio | 0.60x | 0.62x |
+| macOS | ripgrep | 0.47x | 0.30x |
+| macOS | bat | 0.37x | 0.33x |
+| macOS | tokio | 0.74x | 0.78x |
+| Windows | ripgrep | 0.44x | 0.44x |
+| Windows | bat | 0.57x | 0.57x |
+| Windows | tokio | 0.68x | 0.62x |
+
+Reading the numbers: clean rebuilds from the cache and no-op builds are where frust wins, by roughly 2x to 30x. Cold builds, first edits and warm edits are bound by rustc itself, so frust ties cargo there within a few percent; the gates allow `1.05x + 50 ms` for cold builds and `1.03x + 40 ms` for edits, and a ratio between 1.00x and the limit is a tie, not a win. The shared-cache phases compare a second checkout against cargo's empty-cache cold build (limit `0.90x + 100 ms`); tokio's own crates recompile there because the checkout root differs unless root sharing is on. Disk is frust's whole home against tuned cargo's target: equal on Linux and Windows, where files are hard-linked or stored once, and well under cargo on macOS, where clones share extents. The earlier local figures above remain the single-machine measurements; this section is what the Bench workflow measures on every dispatch.
+
 ## Real repositories and CI
 
 `frust bench --repo PATH` builds an existing checkout with plain Cargo (isolated `CARGO_TARGET_DIR`) and with frust (isolated `FRUST_HOME` and central target), using deferred stores and automatic compression. Dependencies are fetched once before timing.

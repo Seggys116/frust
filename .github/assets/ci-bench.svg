@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 516" width="960" height="516" role="img" aria-labelledby="title description">
+<title id="title">CI benchmark ratios</title>
+<desc id="description">frust-tuned divided by plain cargo on GitHub-hosted Linux, macOS and Windows runners for ripgrep, bat and tokio; lower is faster. Bench run 43099929391, commit f25f73e.</desc>
+<rect width="960" height="516" rx="16" fill="#0d1117"/>
+<g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<text x="32" y="46" font-size="30" fill="#e6edf3" font-weight="650">CI benchmark ratios</text>
+<text x="32" y="76" font-size="17" fill="#9ba9b8">frust divided by Cargo, lower is faster · 9 runs · median · run 43099929391, commit f25f73e</text>
+<text x="306" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">Cold</text>
+<text x="418" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">Clean rebuild</text>
+<text x="530" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">No-op</text>
+<text x="642" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">First edit</text>
+<text x="754" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">Warm edit</text>
+<text x="866" y="122" font-size="15" fill="#c2cad4" font-weight="600" text-anchor="middle">Disk</text>
+<path d="M32 134H928" stroke="#26313d"/>
+<text x="32" y="157" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="157" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="256" y="138" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="306" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.89x</text>
+<rect x="368" y="138" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.03x</text>
+<rect x="480" y="138" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.08x</text>
+<rect x="592" y="138" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.02x</text>
+<rect x="704" y="138" width="100" height="26" rx="6" fill="#a3562f"/>
+<text x="754" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.03x</text>
+<rect x="816" y="138" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="157" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<text x="32" y="191" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="191" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="256" y="172" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="306" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.92x</text>
+<rect x="368" y="172" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.25x</text>
+<rect x="480" y="172" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.08x</text>
+<rect x="592" y="172" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.98x</text>
+<rect x="704" y="172" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.98x</text>
+<rect x="816" y="172" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="191" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<text x="32" y="225" font-size="16" fill="#e6edf3" font-weight="600">Linux</text>
+<text x="120" y="225" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="256" y="206" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="306" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.01x</text>
+<rect x="368" y="206" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.04x</text>
+<rect x="480" y="206" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.05x</text>
+<rect x="592" y="206" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.03x</text>
+<rect x="704" y="206" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<rect x="816" y="206" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="225" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<text x="32" y="259" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="259" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="256" y="240" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="306" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.93x</text>
+<rect x="368" y="240" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.05x</text>
+<rect x="480" y="240" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.08x</text>
+<rect x="592" y="240" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.97x</text>
+<rect x="704" y="240" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.96x</text>
+<rect x="816" y="240" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="866" y="259" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.40x</text>
+<text x="32" y="293" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="293" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="256" y="274" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="306" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.97x</text>
+<rect x="368" y="274" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.31x</text>
+<rect x="480" y="274" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.10x</text>
+<rect x="592" y="274" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.02x</text>
+<rect x="704" y="274" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.03x</text>
+<rect x="816" y="274" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="866" y="293" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.44x</text>
+<text x="32" y="327" font-size="16" fill="#e6edf3" font-weight="600">macOS</text>
+<text x="120" y="327" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="256" y="308" width="100" height="26" rx="6" fill="#a3562f"/>
+<text x="306" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.05x</text>
+<rect x="368" y="308" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.07x</text>
+<rect x="480" y="308" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.06x</text>
+<rect x="592" y="308" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.97x</text>
+<rect x="704" y="308" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.97x</text>
+<rect x="816" y="308" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="866" y="327" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.29x</text>
+<text x="32" y="361" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="361" font-size="16" fill="#9ba9b8">ripgrep</text>
+<rect x="256" y="342" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="306" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.91x</text>
+<rect x="368" y="342" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.13x</text>
+<rect x="480" y="342" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.25x</text>
+<rect x="592" y="342" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.99x</text>
+<rect x="704" y="342" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.99x</text>
+<rect x="816" y="342" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="361" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.01x</text>
+<text x="32" y="395" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="395" font-size="16" fill="#9ba9b8">bat</text>
+<rect x="256" y="376" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="306" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.96x</text>
+<rect x="368" y="376" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.48x</text>
+<rect x="480" y="376" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.33x</text>
+<rect x="592" y="376" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="642" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.92x</text>
+<rect x="704" y="376" width="100" height="26" rx="6" fill="#2a8f7a"/>
+<text x="754" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.93x</text>
+<rect x="816" y="376" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="395" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<text x="32" y="429" font-size="16" fill="#e6edf3" font-weight="600">Windows</text>
+<text x="120" y="429" font-size="16" fill="#9ba9b8">tokio</text>
+<rect x="256" y="410" width="100" height="26" rx="6" fill="#a3562f"/>
+<text x="306" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.03x</text>
+<rect x="368" y="410" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="418" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.07x</text>
+<rect x="480" y="410" width="100" height="26" rx="6" fill="#1f6f5c"/>
+<text x="530" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.18x</text>
+<rect x="592" y="410" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="642" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.99x</text>
+<rect x="704" y="410" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="754" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">0.98x</text>
+<rect x="816" y="410" width="100" height="26" rx="6" fill="#4a6b7a"/>
+<text x="866" y="429" font-size="15" fill="#ffffff" font-weight="600" text-anchor="middle">1.00x</text>
+<text x="32" y="492" font-size="14" fill="#9ba9b8">Cold, first edit and warm edit are close to 1.00x because rustc dominates them; clean rebuild and no-op skip compilation.</text>
+</g></svg>
