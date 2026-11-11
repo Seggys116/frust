@@ -1137,6 +1137,8 @@ pub(super) struct IoSample {
 thread_local! {
     static IO_PROBE_ARMED: Cell<bool> = const { Cell::new(false) };
     static IO_PROBE_RESULT: Cell<Option<(IoSample, IoSample)>> = const { Cell::new(None) };
+    static IO_PROBE_TRACE: RefCell<Option<(PathBuf, bool)>> = const { RefCell::new(None) };
+    static IO_PROBE_TRACER: RefCell<Option<pageio::Tracer>> = const { RefCell::new(None) };
 }
 
 // Returns (Pageins, page size) from `vm_stat` output; either is None when its line is missing.
@@ -1173,21 +1175,40 @@ fn io_sample(tree_first: bool) -> IoSample {
 
 // Called by spawn_capture before the timed spawn; samples only when a diagnosed build armed the probe, and disarms it.
 pub(super) fn io_probe_start() -> Option<IoSample> {
-    IO_PROBE_ARMED.with(|armed| armed.replace(false)).then(|| io_sample(false))
+    if !IO_PROBE_ARMED.with(|armed| armed.replace(false)) {
+        return None;
+    }
+    // The tracer attaches before the counters are read, so its start-up stays outside the clock and the deltas.
+    if let Some((file, fresh)) = IO_PROBE_TRACE.with(RefCell::take) {
+        let tracer = pageio::Tracer::start(&file, fresh);
+        IO_PROBE_TRACER.with(|slot| *slot.borrow_mut() = tracer);
+    }
+    Some(io_sample(false))
 }
 
 // Called by spawn_capture after the child exited and the clock stopped.
 pub(super) fn io_probe_finish(before: Option<IoSample>) {
     if let Some(before) = before {
         IO_PROBE_RESULT.with(|result| result.set(Some((before, io_sample(true)))));
+        stop_tracer();
     }
 }
 
-fn probed<T>(build: impl FnOnce() -> T) -> (T, Option<(IoSample, IoSample)>) {
+fn stop_tracer() {
+    if let Some(tracer) = IO_PROBE_TRACER.with(RefCell::take) {
+        tracer.stop();
+    }
+}
+
+// `trace` is the page-in trace file for this build and whether to truncate it first.
+fn probed<T>(trace: Option<(PathBuf, bool)>, build: impl FnOnce() -> T) -> (T, Option<(IoSample, IoSample)>) {
     IO_PROBE_RESULT.with(|result| result.set(None));
+    IO_PROBE_TRACE.with(|slot| *slot.borrow_mut() = trace);
     IO_PROBE_ARMED.with(|armed| armed.set(true));
     let value = build();
     IO_PROBE_ARMED.with(|armed| armed.set(false));
+    IO_PROBE_TRACE.with(RefCell::take);
+    stop_tracer();
     (value, IO_PROBE_RESULT.with(Cell::take))
 }
 
@@ -1222,6 +1243,8 @@ struct FirstEditDiagnosis {
     settle_before_edit_ms: u64,
     cargo: Vec<FirstEditRun>,
     frust_tuned: Vec<FirstEditRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pagein_trace: Option<pageio::PageinTrace>,
 }
 
 fn opt_count(value: Option<u64>) -> String {
@@ -1625,6 +1648,14 @@ fn repo_markdown(report: &RepoReport) -> String {
     if let Some(d) = &report.first_edit_diagnosis {
         out.push_str(&format!("\n#### First-edit diagnosis (settle {} ms before the edits)\n\n{}\n\n", d.settle_before_edit_ms, d.note));
         out.push_str(&markdown_table(&diagnosis_rows(d)));
+        if let Some(trace) = &d.pagein_trace {
+            out.push_str(&format!("\n##### Page-in trace (`fs_usage -f pageio`, full lists in `{}/{}`)\n\n", trace.dir, pageio::SUMMARY_FILE));
+            for line in pageio::process_lines(trace, pageio::MARKDOWN_TOP) {
+                out.push_str(&format!("- {line}\n"));
+            }
+            out.push('\n');
+            out.push_str(&markdown_table(&pageio::rows(trace, pageio::MARKDOWN_TOP)));
+        }
     }
     if let Some(message) = &report.disk_tuned.message {
         out.push_str(&format!("\n{message}\n"));
@@ -1689,6 +1720,15 @@ fn print_repo(report: &RepoReport) {
         println!("First-edit diagnosis (settle {} ms before the edits):", d.settle_before_edit_ms);
         for line in aligned(&diagnosis_rows(d)) {
             println!("  {line}");
+        }
+        if let Some(trace) = &d.pagein_trace {
+            println!("Page-in trace (full lists in {}/{}):", trace.dir, pageio::SUMMARY_FILE);
+            for line in pageio::process_lines(trace, pageio::MARKDOWN_TOP) {
+                println!("  {line}");
+            }
+            for line in aligned(&pageio::rows(trace, pageio::MARKDOWN_TOP)) {
+                println!("  {line}");
+            }
         }
     }
     if let Some(message) = &report.disk_tuned.message {
@@ -2160,8 +2200,10 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
     let mut samples: [Samples; 4] = Default::default();
     let mut untuned_disk = DiskSnapshot::default();
     let mut diagnosis = (opts.diagnose_first_edit && cfg!(target_os = "macos")).then(|| FirstEditDiagnosis {
-        note: DIAGNOSIS_NOTE, settle_before_edit_ms: opts.settle_before_edit_ms, cargo: Vec::new(), frust_tuned: Vec::new(),
+        note: DIAGNOSIS_NOTE, settle_before_edit_ms: opts.settle_before_edit_ms, cargo: Vec::new(), frust_tuned: Vec::new(), pagein_trace: None,
     });
+    let trace_dir = diagnosis.as_ref().and_then(|_| pageio::trace_dir()).filter(|dir| pageio::prepare(dir));
+    let mut traced: Vec<(&str, PathBuf)> = Vec::new();
     if opts.diagnose_first_edit && diagnosis.is_none() {
         eprintln!("frust bench: warning: --diagnose-first-edit records counters on macOS only; the settle still applies");
     }
@@ -2202,7 +2244,12 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
                 let row = if first { "edit_first" } else { "edit_warm" };
                 let ms = match diagnosis.as_mut().filter(|_| first && matches!(tool, Tool::Cargo | Tool::FrustTuned)) {
                     Some(diagnosis) => {
-                        let (ms, io) = probed(|| rig.build(tool, row));
+                        let trace = trace_dir.as_ref().map(|dir| dir.join(format!("pageio-run{}-{}.txt", run + 1, tool.label())));
+                        let fresh = trace.as_ref().is_some_and(|file| !traced.iter().any(|(_, seen)| seen == file));
+                        if let Some(file) = trace.as_ref().filter(|_| fresh) {
+                            traced.push((tool.label(), file.clone()));
+                        }
+                        let (ms, io) = probed(trace.map(|file| (file, fresh)), || rig.build(tool, row));
                         let record = first_edit_run(run + 1, edit + 1, ms?, io);
                         eprintln!("{}", diagnosis_line(tool, &record));
                         if tool == Tool::Cargo { diagnosis.cargo.push(record.clone()) } else { diagnosis.frust_tuned.push(record.clone()) }
@@ -2224,6 +2271,9 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             // The untuned home is no longer needed once sized, which keeps peak disk use down.
             clear(&rig.untuned.ctx.home)?;
         }
+    }
+    if let (Some(diagnosis), Some(dir)) = (diagnosis.as_mut(), &trace_dir) {
+        diagnosis.pagein_trace = Some(pageio::summarise_dir(dir, &traced, &[Tool::Cargo.label(), Tool::FrustTuned.label()]));
     }
     Ok(Measured { samples, untuned_disk, diagnosis })
 }
@@ -2568,13 +2618,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn an_armed_probe_reads_live_counters_around_one_spawn_only() {
-        let (captured, io) = probed(|| spawn_capture(&mut Command::new("true")));
+        let (captured, io) = probed(None, || spawn_capture(&mut Command::new("true")));
         assert!(captured.unwrap().success);
         let (before, after) = io.expect("the armed spawn is sampled");
         assert!(before.pageins.is_some() && after.page_size.is_some() && after.tree_pageins.is_some() && after.tree_inblock.is_some(), "{after:?}");
         let run = first_edit_run(1, 1, 1.0, Some((before, after)));
         assert!(run.pagein_bytes.is_some() && run.tree_pagein_bytes.is_some());
-        let (_, unarmed) = probed(|| ());
+        let (_, unarmed) = probed(None, || ());
         assert!(unarmed.is_none());
         assert!(io_probe_start().is_none());
     }
@@ -2589,7 +2639,7 @@ mod tests {
         let io = |pages: u64| Some((IoSample { pageins: Some(0), page_size: Some(4096), ..IoSample::default() }, IoSample { pageins: Some(pages), page_size: Some(4096), ..IoSample::default() }));
         report.first_edit_diagnosis = Some(FirstEditDiagnosis {
             note: DIAGNOSIS_NOTE, settle_before_edit_ms: 2000,
-            cargo: vec![first_edit_run(1, 1, 2028.0, io(10))], frust_tuned: vec![first_edit_run(1, 1, 2354.0, io(9000))],
+            cargo: vec![first_edit_run(1, 1, 2028.0, io(10))], frust_tuned: vec![first_edit_run(1, 1, 2354.0, io(9000))], pagein_trace: None,
         });
         let json = serde_json::to_value(&report).unwrap();
         let d = &json["first_edit_diagnosis"];
@@ -2601,6 +2651,13 @@ mod tests {
         let markdown = repo_markdown(&report);
         assert!(markdown.contains("#### First-edit diagnosis (settle 2000 ms before the edits)"), "{markdown}");
         assert!(markdown.contains("| frust-tuned | 1 | 1 | 2354 | 9000 | 35.2 | n/a | n/a | n/a |"), "{markdown}");
+        assert!(json["first_edit_diagnosis"].get("pagein_trace").is_none() && !markdown.contains("Page-in trace"));
+        let summary = pageio::summarise(["0.1  PgIn[A]  D=0x1  B=0x1000  /dev/disk3s5  /usr/lib/dyld  0.0001 W rustc.7"], 40);
+        report.first_edit_diagnosis.as_mut().unwrap().pagein_trace = Some(pageio::PageinTrace { dir: "/t".into(), tools: vec![("cargo".into(), summary)] });
+        assert_eq!(serde_json::to_value(&report).unwrap()["first_edit_diagnosis"]["pagein_trace"]["tools"][0][1]["top_paths"][0]["count"], 1);
+        let markdown = repo_markdown(&report);
+        assert!(markdown.contains("full lists in `/t/pageio-summary.txt`") && markdown.contains("- cargo: 1 page-in lines in 1 trace files; by process: rustc 1"), "{markdown}");
+        assert!(markdown.contains("| cargo | 1 | /usr/lib/dyld |"), "{markdown}");
     }
 
     #[test]

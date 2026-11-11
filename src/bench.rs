@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 mod concurrent;
+mod pageio;
 mod repo;
 
 use crate::compact::{self, AutoOptions, Category, CompactOptions};
