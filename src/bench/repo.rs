@@ -1159,24 +1159,8 @@ fn vm_stat_pageins() -> (Option<u64>, Option<u64>) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn tree_io() -> (Option<u64>, Option<u64>) {
-    // SAFETY: rusage_info_v2 is plain data and proc_pid_rusage writes at most one V2 record to it.
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    let buffer = (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>();
-    // SAFETY: our own pid is valid and `buffer` points at a rusage_info_v2 as RUSAGE_INFO_V2 requires.
-    let pageins = (unsafe { libc::proc_pid_rusage(std::process::id() as libc::c_int, libc::RUSAGE_INFO_V2, buffer) } == 0)
-        .then_some(info.ri_child_pageins);
-    // SAFETY: rusage is plain data and getrusage only writes the out pointer.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: RUSAGE_CHILDREN is always valid and `usage` is a valid out pointer.
-    let inblock = (unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } == 0).then(|| u64::try_from(usage.ru_inblock).ok()).flatten();
-    (pageins, inblock)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn tree_io() -> (Option<u64>, Option<u64>) {
-    (None, None)
+    crate::sys::tree_io()
 }
 
 // The tree counters are read nearest the build on both sides, so the vm_stat child never lands inside the delta.

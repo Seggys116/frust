@@ -664,6 +664,10 @@ fn cluster_size(path: &Path) -> io::Result<u64> {
 
 pub fn prefetch(_path: &Path, _len: u64) {}
 
+pub fn tree_io() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
 pub fn prefetch_toolchain(_sysroot: &Path, _host: &str) {}
 
 pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {

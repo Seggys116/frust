@@ -578,6 +578,10 @@ pub fn prefetch(path: &Path, len: u64) {
     imp::prefetch(path, len)
 }
 
+pub fn tree_io() -> (Option<u64>, Option<u64>) {
+    imp::tree_io()
+}
+
 pub fn prefetch_toolchain(sysroot: &Path, host: &str) {
     imp::prefetch_toolchain(sysroot, host)
 }
