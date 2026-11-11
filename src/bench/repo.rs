@@ -1123,7 +1123,7 @@ fn parse_tuning(text: &str) -> Option<String> {
     })
 }
 
-const DIAGNOSIS_NOTE: &str = "Opt-in first-edit diagnosis (macOS): page-ins are vm_stat's system-wide Pageins delta across the build; tree page-ins and block reads are the page-ins (proc_pid_rusage ri_child_pageins) and block input operations (getrusage RUSAGE_CHILDREN ru_inblock) of the build's reaped process tree. Counters are read just before the spawn and right after cargo exits, so the deferred-store drain is excluded. Null means the counter was unavailable.";
+const DIAGNOSIS_NOTE: &str = "Opt-in first-edit diagnosis (macOS): page-ins are vm_stat's system-wide Pageins delta across the build; tree page-ins and block reads are the page-ins (proc_pid_rusage ri_child_pageins) and block input operations (getrusage RUSAGE_CHILDREN ru_inblock) of the build's reaped process tree. Counters are read just before the spawn and right after cargo exits, so the deferred-store drain is excluded. Null means the counter was unavailable. With a settle, only the even-numbered runs wait before their edits.";
 
 // I/O counters read around one build by the opt-in first-edit diagnosis.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -2204,8 +2204,9 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             }
             samples[tool.index()].noop.extend(median_of(&repeats));
         }
-        if opts.diagnose_first_edit && opts.settle_before_edit_ms > 0 {
-            eprintln!("frust bench: diagnosis: settling {} ms before the edits", opts.settle_before_edit_ms);
+        // Only the even-numbered runs settle, so one job compares settled and unsettled first edits on the same machine.
+        if opts.diagnose_first_edit && opts.settle_before_edit_ms > 0 && run % 2 == 1 {
+            eprintln!("frust bench: diagnosis: settling {} ms before the edits of run {}", opts.settle_before_edit_ms, run + 1);
             thread::sleep(Duration::from_millis(opts.settle_before_edit_ms));
         }
         let mut touched = HashSet::new();
