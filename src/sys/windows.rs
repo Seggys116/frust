@@ -668,8 +668,6 @@ pub fn tree_io() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
-pub fn prefetch_toolchain(_sysroot: &Path, _host: &str) {}
-
 pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     if fs::symlink_metadata(src)?.is_dir() {
         return Err(io::Error::from(io::ErrorKind::Unsupported));

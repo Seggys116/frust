@@ -691,41 +691,6 @@ pub fn prefetch(path: &Path, len: u64) {
 #[cfg(not(target_os = "macos"))]
 pub fn prefetch(_path: &Path, _len: u64) {}
 
-#[cfg(target_os = "macos")]
-pub fn prefetch_toolchain(sysroot: &Path, host: &str) {
-    let dirs = [sysroot.join("lib"), sysroot.join("lib").join("rustlib").join(host).join("lib")];
-    // A restored build never runs the system linker, so its binaries go cold between builds.
-    let developer = fs::read_link("/var/db/xcode_select_link").unwrap_or_else(|_| PathBuf::from("/Library/Developer/CommandLineTools"));
-    let linkers = ["clang", "ld", "ld-prime", "dsymutil"].map(|name| developer.join("usr").join("bin").join(name));
-    // The hints return quickly but a slow directory scan must not delay cargo.
-    std::thread::spawn(move || {
-        for path in linkers {
-            if let Ok(meta) = fs::metadata(&path)
-                && meta.is_file()
-                && meta.len() >= 16 * 1024
-            {
-                prefetch(&path, meta.len());
-            }
-        }
-        for dir in dirs {
-            let Ok(entries) = fs::read_dir(dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let wanted = path.extension().is_some_and(|ext| ext == "dylib" || ext == "rlib" || ext == "rmeta");
-                if let (true, Ok(meta)) = (wanted, entry.metadata())
-                    && meta.is_file()
-                    && meta.len() >= 16 * 1024
-                {
-                    prefetch(&path, meta.len());
-                }
-            }
-        }
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn prefetch_toolchain(_sysroot: &Path, _host: &str) {}
-
 #[cfg(target_os = "linux")]
 pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     if fs::symlink_metadata(src)?.is_dir() {

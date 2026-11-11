@@ -582,10 +582,6 @@ pub fn tree_io() -> (Option<u64>, Option<u64>) {
     imp::tree_io()
 }
 
-pub fn prefetch_toolchain(sysroot: &Path, host: &str) {
-    imp::prefetch_toolchain(sysroot, host)
-}
-
 pub fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     imp::copy_symlink(src, dst)
 }
