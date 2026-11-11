@@ -50,6 +50,7 @@ jobs:
           EXE=""
           if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
           args=(--runs 9 --untuned-runs 3 --shared-runs 3)
+          if [ "$RUNNER_OS" = "macOS" ]; then args+=(--diagnose-first-edit --settle-before-edit-ms 3000); fi
           if [ -n "$PACKAGE" ]; then args+=(--package "$PACKAGE"); fi
           if [ -n "$FEATURES" ]; then args+=(--features "$FEATURES"); fi
           status=0

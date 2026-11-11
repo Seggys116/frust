@@ -2891,6 +2891,7 @@ struct Captured {
 
 // The clock stops when the direct child exits; a grandchild still holding stderr only delays the read by DRAIN, outside the measurement.
 fn spawn_capture(cmd: &mut Command) -> Result<Captured, String> {
+    let io_before = repo::io_probe_start();
     let started = Instant::now();
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("failed to launch {}: {e}", cmd.get_program().to_string_lossy()))?;
@@ -2912,6 +2913,7 @@ fn spawn_capture(cmd: &mut Command) -> Result<Captured, String> {
     let status = child.wait().map_err(|e| e.to_string())?;
     let exited = Instant::now();
     let millis = exited.duration_since(started).as_millis() as u64;
+    repo::io_probe_finish(io_before);
     let _ = done_rx.recv_timeout(DRAIN);
     let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(Captured { started, exited, success: status.success(), stderr: String::from_utf8_lossy(&bytes).into_owned(), millis })

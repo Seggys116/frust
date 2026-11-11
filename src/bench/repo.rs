@@ -64,6 +64,8 @@ struct RepoOptions {
     disk_slack: f64,
     untuned_runs: Option<usize>,
     shared_runs: usize,
+    diagnose_first_edit: bool,
+    settle_before_edit_ms: u64,
 }
 
 fn positive(name: &str, value: &str) -> Result<usize, String> {
@@ -80,6 +82,7 @@ impl RepoOptions {
         let mut disk_slack = 0.0;
         let mut untuned_runs = None;
         let mut shared_runs = DEFAULT_SHARED_RUNS;
+        let (mut diagnose_first_edit, mut settle_before_edit_ms) = (false, 0);
         let (mut edits, mut runs) = (DEFAULT_EDITS, DEFAULT_REPO_RUNS);
         let (mut json, mut markdown, mut gate) = (false, false, false);
         let mut index = 0;
@@ -93,7 +96,9 @@ impl RepoOptions {
                 "--json" if inline.is_none() => json = true,
                 "--markdown" if inline.is_none() => markdown = true,
                 "--gate" if inline.is_none() => gate = true,
-                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" | "--shared-runs" => {
+                "--diagnose-first-edit" if inline.is_none() => diagnose_first_edit = true,
+                "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" | "--shared-runs"
+                | "--settle-before-edit-ms" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -112,6 +117,9 @@ impl RepoOptions {
                         "--shared-runs" => {
                             shared_runs = value.trim().parse::<usize>().map_err(|_| format!("{name} needs a non-negative integer, got `{value}`"))?;
                         }
+                        "--settle-before-edit-ms" => {
+                            settle_before_edit_ms = value.trim().parse::<u64>().map_err(|_| format!("{name} needs a non-negative integer, got `{value}`"))?;
+                        }
                         "--package" => package = Some(value.to_string()),
                         "--features" => features = Some(value.to_string()),
                         "--disk-slack" => {
@@ -126,7 +134,10 @@ impl RepoOptions {
             index += 1;
         }
         let repo = repo.ok_or("--repo PATH is required")?;
-        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs, shared_runs })
+        if settle_before_edit_ms > 0 && !diagnose_first_edit {
+            return Err("--settle-before-edit-ms only applies together with --diagnose-first-edit".into());
+        }
+        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs, shared_runs, diagnose_first_edit, settle_before_edit_ms })
     }
 
     // The untuned column is a reference, so it may run on fewer of the paired runs than the gated columns.
@@ -1093,6 +1104,7 @@ struct RepoReport {
     gate_untuned: Option<Vec<GateCheck>>,
     shared: Option<SharedReport>,
     gate_shared: Option<Vec<GateCheck>>,
+    first_edit_diagnosis: Option<FirstEditDiagnosis>,
 }
 
 // The effective tuning each frust column reported through `frust env`; absent when that build does not print it.
@@ -1109,6 +1121,150 @@ fn parse_tuning(text: &str) -> Option<String> {
         let value = value.trim().trim_matches(['\'', '"']).trim();
         (key.trim().to_ascii_lowercase().ends_with("tuning") && !value.is_empty()).then(|| value.to_string())
     })
+}
+
+const DIAGNOSIS_NOTE: &str = "Opt-in first-edit diagnosis (macOS): page-ins are vm_stat's system-wide Pageins delta across the build; tree page-ins and block reads are the page-ins (proc_pid_rusage ri_child_pageins) and block input operations (getrusage RUSAGE_CHILDREN ru_inblock) of the build's reaped process tree. Counters are read just before the spawn and right after cargo exits, so the deferred-store drain is excluded. Null means the counter was unavailable.";
+
+// I/O counters read around one build by the opt-in first-edit diagnosis.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct IoSample {
+    pageins: Option<u64>,
+    page_size: Option<u64>,
+    tree_pageins: Option<u64>,
+    tree_inblock: Option<u64>,
+}
+
+thread_local! {
+    static IO_PROBE_ARMED: Cell<bool> = const { Cell::new(false) };
+    static IO_PROBE_RESULT: Cell<Option<(IoSample, IoSample)>> = const { Cell::new(None) };
+}
+
+// Returns (Pageins, page size) from `vm_stat` output; either is None when its line is missing.
+fn parse_vm_stat(text: &str) -> (Option<u64>, Option<u64>) {
+    let page_size = text.lines().next().and_then(|line| {
+        let rest = &line[line.find("page size of ")? + "page size of ".len()..];
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    });
+    let pageins = text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("Pageins:")?;
+        value.trim().trim_end_matches('.').parse::<u64>().ok()
+    });
+    (pageins, page_size)
+}
+
+fn vm_stat_pageins() -> (Option<u64>, Option<u64>) {
+    match Command::new("vm_stat").stdin(Stdio::null()).stderr(Stdio::null()).output() {
+        Ok(output) if output.status.success() => parse_vm_stat(&String::from_utf8_lossy(&output.stdout)),
+        _ => (None, None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tree_io() -> (Option<u64>, Option<u64>) {
+    // SAFETY: rusage_info_v2 is plain data and proc_pid_rusage writes at most one V2 record to it.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let buffer = (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>();
+    // SAFETY: our own pid is valid and `buffer` points at a rusage_info_v2 as RUSAGE_INFO_V2 requires.
+    let pageins = (unsafe { libc::proc_pid_rusage(std::process::id() as libc::c_int, libc::RUSAGE_INFO_V2, buffer) } == 0)
+        .then_some(info.ri_child_pageins);
+    // SAFETY: rusage is plain data and getrusage only writes the out pointer.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_CHILDREN is always valid and `usage` is a valid out pointer.
+    let inblock = (unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } == 0).then(|| u64::try_from(usage.ru_inblock).ok()).flatten();
+    (pageins, inblock)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tree_io() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+// The tree counters are read nearest the build on both sides, so the vm_stat child never lands inside the delta.
+fn io_sample(tree_first: bool) -> IoSample {
+    let tree = if tree_first { Some(tree_io()) } else { None };
+    let (pageins, page_size) = vm_stat_pageins();
+    let (tree_pageins, tree_inblock) = tree.unwrap_or_else(tree_io);
+    IoSample { pageins, page_size, tree_pageins, tree_inblock }
+}
+
+// Called by spawn_capture before the timed spawn; samples only when a diagnosed build armed the probe, and disarms it.
+pub(super) fn io_probe_start() -> Option<IoSample> {
+    IO_PROBE_ARMED.with(|armed| armed.replace(false)).then(|| io_sample(false))
+}
+
+// Called by spawn_capture after the child exited and the clock stopped.
+pub(super) fn io_probe_finish(before: Option<IoSample>) {
+    if let Some(before) = before {
+        IO_PROBE_RESULT.with(|result| result.set(Some((before, io_sample(true)))));
+    }
+}
+
+fn probed<T>(build: impl FnOnce() -> T) -> (T, Option<(IoSample, IoSample)>) {
+    IO_PROBE_RESULT.with(|result| result.set(None));
+    IO_PROBE_ARMED.with(|armed| armed.set(true));
+    let value = build();
+    IO_PROBE_ARMED.with(|armed| armed.set(false));
+    (value, IO_PROBE_RESULT.with(Cell::take))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct FirstEditRun {
+    run: usize,
+    edit: usize,
+    ms: f64,
+    pageins: Option<u64>,
+    pagein_bytes: Option<u64>,
+    tree_pageins: Option<u64>,
+    tree_pagein_bytes: Option<u64>,
+    tree_block_reads: Option<u64>,
+}
+
+fn first_edit_run(run: usize, edit: usize, ms: f64, io: Option<(IoSample, IoSample)>) -> FirstEditRun {
+    let (before, after) = io.unwrap_or_default();
+    let delta = |a: Option<u64>, b: Option<u64>| Some(b?.saturating_sub(a?));
+    let page_size = after.page_size.or(before.page_size);
+    let bytes = |pages: Option<u64>| Some(pages? * page_size?);
+    let pageins = delta(before.pageins, after.pageins);
+    let tree_pageins = delta(before.tree_pageins, after.tree_pageins);
+    FirstEditRun {
+        run, edit, ms, pageins, pagein_bytes: bytes(pageins), tree_pageins, tree_pagein_bytes: bytes(tree_pageins),
+        tree_block_reads: delta(before.tree_inblock, after.tree_inblock),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FirstEditDiagnosis {
+    note: &'static str,
+    settle_before_edit_ms: u64,
+    cargo: Vec<FirstEditRun>,
+    frust_tuned: Vec<FirstEditRun>,
+}
+
+fn opt_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| v.to_string())
+}
+
+fn opt_mib(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| format!("{:.1}", v as f64 / (1024.0 * 1024.0)))
+}
+
+fn diagnosis_line(tool: Tool, r: &FirstEditRun) -> String {
+    format!(
+        "frust bench: diagnosis run {} edit {} {}: {:.0} ms, pageins {} ({} MiB), tree pageins {} ({} MiB), tree block reads {}",
+        r.run, r.edit, tool.label(), r.ms, opt_count(r.pageins), opt_mib(r.pagein_bytes), opt_count(r.tree_pageins), opt_mib(r.tree_pagein_bytes), opt_count(r.tree_block_reads)
+    )
+}
+
+fn diagnosis_rows(d: &FirstEditDiagnosis) -> Vec<Vec<String>> {
+    let header = ["tool", "run", "edit", "ms", "pageins", "pagein MiB", "tree pageins", "tree MiB", "tree block reads"];
+    let mut rows = vec![header.iter().map(|s| s.to_string()).collect::<Vec<_>>()];
+    for (tool, runs) in [(Tool::Cargo, &d.cargo), (Tool::FrustTuned, &d.frust_tuned)] {
+        rows.extend(runs.iter().map(|r| vec![
+            tool.label().to_string(), r.run.to_string(), r.edit.to_string(), format!("{:.0}", r.ms), opt_count(r.pageins),
+            opt_mib(r.pagein_bytes), opt_count(r.tree_pageins), opt_mib(r.tree_pagein_bytes), opt_count(r.tree_block_reads),
+        ]));
+    }
+    rows
 }
 
 fn median_of(values: &[f64]) -> Option<f64> {
@@ -1482,6 +1638,10 @@ fn repo_markdown(report: &RepoReport) -> String {
             out.push_str(&markdown_table(&shared_rows(shared, report.gate_shared.as_ref())));
         }
     }
+    if let Some(d) = &report.first_edit_diagnosis {
+        out.push_str(&format!("\n#### First-edit diagnosis (settle {} ms before the edits)\n\n{}\n\n", d.settle_before_edit_ms, d.note));
+        out.push_str(&markdown_table(&diagnosis_rows(d)));
+    }
     if let Some(message) = &report.disk_tuned.message {
         out.push_str(&format!("\n{message}\n"));
     }
@@ -1539,6 +1699,12 @@ fn print_repo(report: &RepoReport) {
                     println!("  {line}");
                 }
             }
+        }
+    }
+    if let Some(d) = &report.first_edit_diagnosis {
+        println!("First-edit diagnosis (settle {} ms before the edits):", d.settle_before_edit_ms);
+        for line in aligned(&diagnosis_rows(d)) {
+            println!("  {line}");
         }
     }
     if let Some(message) = &report.disk_tuned.message {
@@ -2003,11 +2169,18 @@ fn tool_order(flip: usize, untuned: bool, cargo_tuned: bool) -> Vec<Tool> {
 struct Measured {
     samples: [Samples; 4],
     untuned_disk: DiskSnapshot,
+    diagnosis: Option<FirstEditDiagnosis>,
 }
 
 fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions) -> Result<Measured, String> {
     let mut samples: [Samples; 4] = Default::default();
     let mut untuned_disk = DiskSnapshot::default();
+    let mut diagnosis = (opts.diagnose_first_edit && cfg!(target_os = "macos")).then(|| FirstEditDiagnosis {
+        note: DIAGNOSIS_NOTE, settle_before_edit_ms: opts.settle_before_edit_ms, cargo: Vec::new(), frust_tuned: Vec::new(),
+    });
+    if opts.diagnose_first_edit && diagnosis.is_none() {
+        eprintln!("frust bench: warning: --diagnose-first-edit records counters on macOS only; the settle still applies");
+    }
     for run in 0..opts.runs {
         eprintln!("frust bench: run {} of {}", run + 1, opts.runs);
         let untuned = run < opts.untuned_runs();
@@ -2031,13 +2204,27 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             }
             samples[tool.index()].noop.extend(median_of(&repeats));
         }
+        if opts.diagnose_first_edit && opts.settle_before_edit_ms > 0 {
+            eprintln!("frust bench: diagnosis: settling {} ms before the edits", opts.settle_before_edit_ms);
+            thread::sleep(Duration::from_millis(opts.settle_before_edit_ms));
+        }
         let mut touched = HashSet::new();
         for edit in 0..opts.edits {
             let slot = edit % owners.len();
             backup.apply(slot, edit + 1)?;
             let first = touched.insert(owners[slot]);
             for tool in tool_order(run + edit, untuned, last) {
-                let ms = rig.build(tool, if first { "edit_first" } else { "edit_warm" })?;
+                let row = if first { "edit_first" } else { "edit_warm" };
+                let ms = match diagnosis.as_mut().filter(|_| first && matches!(tool, Tool::Cargo | Tool::FrustTuned)) {
+                    Some(diagnosis) => {
+                        let (ms, io) = probed(|| rig.build(tool, row));
+                        let record = first_edit_run(run + 1, edit + 1, ms?, io);
+                        eprintln!("{}", diagnosis_line(tool, &record));
+                        if tool == Tool::Cargo { diagnosis.cargo.push(record.clone()) } else { diagnosis.frust_tuned.push(record.clone()) }
+                        record.ms
+                    }
+                    None => rig.build(tool, row)?,
+                };
                 // Cargo-tuned only replays the edits so its target matches the others when sized.
                 if tool == Tool::CargoTuned {
                     continue;
@@ -2053,7 +2240,7 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             clear(&rig.untuned.ctx.home)?;
         }
     }
-    Ok(Measured { samples, untuned_disk })
+    Ok(Measured { samples, untuned_disk, diagnosis })
 }
 
 fn fetch_dependencies(ctx: &Ctx, repo: &Path) -> Result<(), String> {
@@ -2138,7 +2325,7 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         sequence: Cell::new(0),
     };
     let tuning = Tuning { untuned: rig.reported_tuning(&exe, &rig.untuned), tuned: rig.reported_tuning(&exe, &rig.tuned) };
-    let Measured { samples, untuned_disk } = measure(&rig, &backup, &owners, opts)?;
+    let Measured { samples, untuned_disk, diagnosis } = measure(&rig, &backup, &owners, opts)?;
     let tuned_disk = rig.snapshot(&rig.tuned, &rig.cargo_tuned_target);
     let untuned_verdict = disk_verdict(untuned_disk.cargo_bytes, untuned_disk.frust_bytes, opts.disk_slack);
     let tuned_verdict = disk_verdict(tuned_disk.cargo_bytes, tuned_disk.frust_bytes, opts.disk_slack);
@@ -2201,6 +2388,7 @@ fn benchmark(scratch: &Path, opts: &RepoOptions) -> Result<RepoReport, String> {
         gate_untuned: opts.gate.then(|| evaluate_gate(&samples[Tool::Cargo.index()], &samples[Tool::Frust.index()])),
         shared,
         gate_shared,
+        first_edit_diagnosis: diagnosis,
     })
 }
 
@@ -2308,6 +2496,7 @@ mod tests {
             gate_untuned: gate.then(|| evaluate_gate_for(cargo, untuned, false)),
             shared: None,
             gate_shared: None,
+            first_edit_diagnosis: None,
         }
     }
 
@@ -2337,22 +2526,96 @@ mod tests {
         assert_eq!(parsed, RepoOptions {
             repo: PathBuf::from("/work/rg"), edits: 20, runs: 3, package: None,
             json: false, markdown: false, out: None, gate: false, features: None, disk_slack: 0.0,
-            untuned_runs: None, shared_runs: 1,
+            untuned_runs: None, shared_runs: 1, diagnose_first_edit: false, settle_before_edit_ms: 0,
         });
         assert_eq!(parsed.untuned_runs(), 3);
         let full = RepoOptions::parse(&flags(&[
             "--repo=/work/tokio", "--edits", "5", "--runs=2", "--package", "tokio",
             "--json", "--markdown", "--out", "r.json", "--gate", "--features", "full", "--disk-slack=2.5",
-            "--untuned-runs", "9", "--shared-runs", "4",
+            "--untuned-runs", "9", "--shared-runs", "4", "--diagnose-first-edit", "--settle-before-edit-ms=1500",
         ])).unwrap();
         assert_eq!(full, RepoOptions {
             repo: PathBuf::from("/work/tokio"), edits: 5, runs: 2, package: Some("tokio".into()),
             json: true, markdown: true, out: Some(PathBuf::from("r.json")), gate: true,
             features: Some("full".into()), disk_slack: 2.5, untuned_runs: Some(9), shared_runs: 4,
+            diagnose_first_edit: true, settle_before_edit_ms: 1500,
         });
         assert_eq!(full.untuned_runs(), 2);
         let fewer = RepoOptions::parse(&flags(&["--repo", "x", "--runs", "5", "--untuned-runs=3"])).unwrap();
         assert_eq!(fewer.untuned_runs(), 3);
+    }
+
+    #[test]
+    fn the_settle_needs_the_first_edit_diagnosis_and_a_non_negative_integer() {
+        let err = RepoOptions::parse(&flags(&["--repo", "x", "--settle-before-edit-ms", "500"])).unwrap_err();
+        assert!(err.contains("--diagnose-first-edit"), "{err}");
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--diagnose-first-edit", "--settle-before-edit-ms=-1"])).unwrap_err().contains("--settle-before-edit-ms"));
+        assert!(RepoOptions::parse(&flags(&["--repo", "x", "--diagnose-first-edit=yes"])).is_err());
+        let zero = RepoOptions::parse(&flags(&["--repo", "x", "--settle-before-edit-ms", "0"])).unwrap();
+        assert_eq!((zero.diagnose_first_edit, zero.settle_before_edit_ms), (false, 0));
+    }
+
+    const VM_STAT_SAMPLE: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                5873.\nPages active:                            404214.\n\"Translation faults\":                 2286543212.\nPageins:                                  2345288913.\nPageouts:                                     524383.\nSwapins:                                           0.\n";
+
+    #[test]
+    fn vm_stat_output_yields_pageins_and_the_page_size_from_the_header() {
+        assert_eq!(parse_vm_stat(VM_STAT_SAMPLE), (Some(2345288913), Some(16384)));
+        let intel = VM_STAT_SAMPLE.replace("16384", "4096");
+        assert_eq!(parse_vm_stat(&intel).1, Some(4096));
+        assert_eq!(parse_vm_stat("Pageins: 7.\n"), (Some(7), None));
+        assert_eq!(parse_vm_stat(""), (None, None));
+    }
+
+    #[test]
+    fn a_first_edit_run_takes_counter_deltas_and_keeps_missing_counters_null() {
+        let before = IoSample { pageins: Some(100), page_size: Some(16384), tree_pageins: Some(10), tree_inblock: Some(4) };
+        let after = IoSample { pageins: Some(164), page_size: Some(16384), tree_pageins: Some(42), tree_inblock: None };
+        let run = first_edit_run(2, 3, 2354.0, Some((before, after)));
+        assert_eq!(run, FirstEditRun {
+            run: 2, edit: 3, ms: 2354.0, pageins: Some(64), pagein_bytes: Some(64 * 16384),
+            tree_pageins: Some(32), tree_pagein_bytes: Some(32 * 16384), tree_block_reads: None,
+        });
+        let unprobed = first_edit_run(1, 1, 10.0, None);
+        assert_eq!((unprobed.pageins, unprobed.pagein_bytes, unprobed.tree_pageins), (None, None, None));
+        assert!(diagnosis_line(Tool::FrustTuned, &run).starts_with("frust bench: diagnosis run 2 edit 3 frust-tuned: 2354 ms, pageins 64 (1.0 MiB)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_armed_probe_reads_live_counters_around_one_spawn_only() {
+        let (captured, io) = probed(|| spawn_capture(&mut Command::new("true")));
+        assert!(captured.unwrap().success);
+        let (before, after) = io.expect("the armed spawn is sampled");
+        assert!(before.pageins.is_some() && after.page_size.is_some() && after.tree_pageins.is_some() && after.tree_inblock.is_some(), "{after:?}");
+        let run = first_edit_run(1, 1, 1.0, Some((before, after)));
+        assert!(run.pagein_bytes.is_some() && run.tree_pagein_bytes.is_some());
+        let (_, unarmed) = probed(|| ());
+        assert!(unarmed.is_none());
+        assert!(io_probe_start().is_none());
+    }
+
+    #[test]
+    fn the_first_edit_diagnosis_is_additive_in_json_and_markdown() {
+        let cargo = samples(1000.0, 1000.0, 20.0, 100.0);
+        let mut report = report_with(&cargo, &samples(900.0, 300.0, 5.0, 90.0), (100, 80), true);
+        let without = serde_json::to_value(&report).unwrap();
+        assert!(without["first_edit_diagnosis"].is_null());
+        assert!(!repo_markdown(&report).contains("First-edit diagnosis"));
+        let io = |pages: u64| Some((IoSample { pageins: Some(0), page_size: Some(4096), ..IoSample::default() }, IoSample { pageins: Some(pages), page_size: Some(4096), ..IoSample::default() }));
+        report.first_edit_diagnosis = Some(FirstEditDiagnosis {
+            note: DIAGNOSIS_NOTE, settle_before_edit_ms: 2000,
+            cargo: vec![first_edit_run(1, 1, 2028.0, io(10))], frust_tuned: vec![first_edit_run(1, 1, 2354.0, io(9000))],
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        let d = &json["first_edit_diagnosis"];
+        assert_eq!(d["settle_before_edit_ms"], 2000);
+        assert_eq!(d["cargo"][0]["pageins"], 10);
+        assert_eq!(d["frust_tuned"][0]["pagein_bytes"], 9000 * 4096);
+        assert!(d["frust_tuned"][0]["tree_block_reads"].is_null());
+        assert_eq!(json["schema_version"], 3);
+        let markdown = repo_markdown(&report);
+        assert!(markdown.contains("#### First-edit diagnosis (settle 2000 ms before the edits)"), "{markdown}");
+        assert!(markdown.contains("| frust-tuned | 1 | 1 | 2354 | 9000 | 35.2 | n/a | n/a | n/a |"), "{markdown}");
     }
 
     #[test]
