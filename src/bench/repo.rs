@@ -65,6 +65,7 @@ struct RepoOptions {
     untuned_runs: Option<usize>,
     shared_runs: usize,
     diagnose_first_edit: bool,
+    warm_cpu_before_edit_ms: u64,
     settle_before_edit_ms: u64,
 }
 
@@ -82,7 +83,7 @@ impl RepoOptions {
         let mut disk_slack = 0.0;
         let mut untuned_runs = None;
         let mut shared_runs = DEFAULT_SHARED_RUNS;
-        let (mut diagnose_first_edit, mut settle_before_edit_ms) = (false, 0);
+        let (mut diagnose_first_edit, mut settle_before_edit_ms, mut warm_cpu_before_edit_ms) = (false, 0, 0);
         let (mut edits, mut runs) = (DEFAULT_EDITS, DEFAULT_REPO_RUNS);
         let (mut json, mut markdown, mut gate) = (false, false, false);
         let mut index = 0;
@@ -98,7 +99,7 @@ impl RepoOptions {
                 "--gate" if inline.is_none() => gate = true,
                 "--diagnose-first-edit" if inline.is_none() => diagnose_first_edit = true,
                 "--repo" | "--edits" | "--runs" | "--package" | "--out" | "--features" | "--disk-slack" | "--untuned-runs" | "--shared-runs"
-                | "--settle-before-edit-ms" => {
+                | "--settle-before-edit-ms" | "--warm-cpu-before-edit-ms" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -120,6 +121,9 @@ impl RepoOptions {
                         "--settle-before-edit-ms" => {
                             settle_before_edit_ms = value.trim().parse::<u64>().map_err(|_| format!("{name} needs a non-negative integer, got `{value}`"))?;
                         }
+                        "--warm-cpu-before-edit-ms" => {
+                            warm_cpu_before_edit_ms = value.trim().parse::<u64>().map_err(|_| format!("{name} needs a non-negative integer, got `{value}`"))?;
+                        }
                         "--package" => package = Some(value.to_string()),
                         "--features" => features = Some(value.to_string()),
                         "--disk-slack" => {
@@ -137,7 +141,7 @@ impl RepoOptions {
         if settle_before_edit_ms > 0 && !diagnose_first_edit {
             return Err("--settle-before-edit-ms only applies together with --diagnose-first-edit".into());
         }
-        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs, shared_runs, diagnose_first_edit, settle_before_edit_ms })
+        Ok(Self { repo, edits, runs, package, json, markdown, out, gate, features, disk_slack, untuned_runs, shared_runs, diagnose_first_edit, warm_cpu_before_edit_ms, settle_before_edit_ms })
     }
 
     // The untuned column is a reference, so it may run on fewer of the paired runs than the gated columns.
@@ -1224,6 +1228,22 @@ struct FirstEditRun {
     tree_block_reads: Option<u64>,
 }
 
+// Keeps every core busy so the first edit does not start from an idle machine that a long compile would have warmed.
+fn warm_cpus(span: Duration) {
+    let until = Instant::now() + span;
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    let spinners: Vec<_> = (0..cores).map(|_| thread::spawn(move || {
+        let mut sink = 0u64;
+        while Instant::now() < until {
+            sink = sink.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            std::hint::black_box(sink);
+        }
+    })).collect();
+    for spinner in spinners {
+        let _ = spinner.join();
+    }
+}
+
 fn first_edit_run(run: usize, edit: usize, ms: f64, io: Option<(IoSample, IoSample)>) -> FirstEditRun {
     let (before, after) = io.unwrap_or_default();
     let delta = |a: Option<u64>, b: Option<u64>| Some(b?.saturating_sub(a?));
@@ -2235,6 +2255,9 @@ fn measure(rig: &Rig, backup: &EditBackup, owners: &[usize], opts: &RepoOptions)
             eprintln!("frust bench: diagnosis: settling {} ms before the edits of run {}", opts.settle_before_edit_ms, run + 1);
             thread::sleep(Duration::from_millis(opts.settle_before_edit_ms));
         }
+        if opts.warm_cpu_before_edit_ms > 0 {
+            warm_cpus(Duration::from_millis(opts.warm_cpu_before_edit_ms));
+        }
         let mut touched = HashSet::new();
         for edit in 0..opts.edits {
             let slot = edit % owners.len();
@@ -2561,19 +2584,19 @@ mod tests {
         assert_eq!(parsed, RepoOptions {
             repo: PathBuf::from("/work/rg"), edits: 20, runs: 3, package: None,
             json: false, markdown: false, out: None, gate: false, features: None, disk_slack: 0.0,
-            untuned_runs: None, shared_runs: 1, diagnose_first_edit: false, settle_before_edit_ms: 0,
+            untuned_runs: None, shared_runs: 1, diagnose_first_edit: false, warm_cpu_before_edit_ms: 0, settle_before_edit_ms: 0,
         });
         assert_eq!(parsed.untuned_runs(), 3);
         let full = RepoOptions::parse(&flags(&[
             "--repo=/work/tokio", "--edits", "5", "--runs=2", "--package", "tokio",
             "--json", "--markdown", "--out", "r.json", "--gate", "--features", "full", "--disk-slack=2.5",
-            "--untuned-runs", "9", "--shared-runs", "4", "--diagnose-first-edit", "--settle-before-edit-ms=1500",
+            "--untuned-runs", "9", "--shared-runs", "4", "--diagnose-first-edit", "--settle-before-edit-ms=1500", "--warm-cpu-before-edit-ms", "700",
         ])).unwrap();
         assert_eq!(full, RepoOptions {
             repo: PathBuf::from("/work/tokio"), edits: 5, runs: 2, package: Some("tokio".into()),
             json: true, markdown: true, out: Some(PathBuf::from("r.json")), gate: true,
             features: Some("full".into()), disk_slack: 2.5, untuned_runs: Some(9), shared_runs: 4,
-            diagnose_first_edit: true, settle_before_edit_ms: 1500,
+            diagnose_first_edit: true, warm_cpu_before_edit_ms: 700, settle_before_edit_ms: 1500,
         });
         assert_eq!(full.untuned_runs(), 2);
         let fewer = RepoOptions::parse(&flags(&["--repo", "x", "--runs", "5", "--untuned-runs=3"])).unwrap();
