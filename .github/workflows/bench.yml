@@ -50,11 +50,6 @@ jobs:
           EXE=""
           if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
           args=(--runs 9 --untuned-runs 3 --shared-runs 3)
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            args+=(--diagnose-first-edit --settle-before-edit-ms 3000)
-            export FRUST_BENCH_PAGEIN_TRACE="$RUNNER_TEMP/pagein"
-            mkdir -p "$FRUST_BENCH_PAGEIN_TRACE"
-          fi
           if [ -n "$PACKAGE" ]; then args+=(--package "$PACKAGE"); fi
           if [ -n "$FEATURES" ]; then args+=(--features "$FEATURES"); fi
           status=0
@@ -68,13 +63,6 @@ jobs:
         with:
           name: bench-${{ matrix.os }}-${{ matrix.repo.name }}
           path: ${{ runner.temp }}/bench-${{ matrix.os }}-${{ matrix.repo.name }}.json
-          if-no-files-found: ignore
-          retention-days: 30
-      - uses: actions/upload-artifact@v7
-        if: always() && runner.os == 'macOS'
-        with:
-          name: pagein-trace-${{ matrix.repo.name }}
-          path: ${{ runner.temp }}/pagein
           if-no-files-found: ignore
           retention-days: 30
       - name: clean up clone and scratch state
