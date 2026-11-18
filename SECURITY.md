@@ -1,5 +1,7 @@
 # Security policy
 
+The version support and scope below apply to the earlier fRust accelerator releases. The compiler rewrite is in planning.
+
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through GitHub's

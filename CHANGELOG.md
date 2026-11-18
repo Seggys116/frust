@@ -2,6 +2,10 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+* Started the fRust compiler rewrite and retired the previous build accelerator from the active branch. The entries below describe earlier releases.
+
 ## [0.3.0]
 
 ### Changed

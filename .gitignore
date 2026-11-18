@@ -2,3 +2,9 @@
 .DS_Store
 .claude/
 *.swp
+
+/goal.md
+/plan.md
+/plans.md
+/research.md
+/.research/

@@ -1,4 +1,4 @@
-name: CI
+name: Documentation
 
 on:
   push:
@@ -12,113 +12,21 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-
 jobs:
-  lint:
-    name: clippy
+  docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked
-      - name: platform primitives stay behind src/sys
+          fetch-depth: 2
+      - name: Check diff and SVG assets
         run: |
-          if grep -rn --include='*.rs' -E 'libc::|std::os::(unix|windows|fd)|OsStrExt|MetadataExt|PermissionsExt|CommandExt|ExitStatusExt' src \
-            | grep -v -e '^src/sys/' -e '^src/compact.rs'; then
-            echo "platform-specific calls belong in src/sys (the macOS apfs module in src/compact.rs is the one exception)"
-            exit 1
-          fi
+          git diff --check HEAD^ HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
 
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      # The toolchain tests select these; installing them here avoids concurrent rustup auto-installs, which corrupt a toolchain.
-      - run: rustup toolchain install 1.98.1 nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --all-targets
-      - run: cargo test --locked --no-fail-fast
-        env:
-          FRUST_TEST_FAILURE_DIR: ${{ runner.temp }}/frust-test-failures
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: frust-test-failures-${{ matrix.os }}
-          path: ${{ runner.temp }}/frust-test-failures/
-          if-no-files-found: ignore
-          retention-days: 3
-
-  # Every trusted stamp is compared with a fresh content hash, so a stamp that lies fails the suite.
-  test-audit:
-    name: test-audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      # The toolchain tests select these; installing them here avoids concurrent rustup auto-installs, which corrupt a toolchain.
-      - run: rustup toolchain install 1.98.1 nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --no-fail-fast
-        env:
-          FRUST_CACHE_TRUST_STAMPS: audit
-          FRUST_TEST_FAILURE_DIR: ${{ runner.temp }}/frust-test-failures-audit
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: frust-test-failures-audit
-          path: ${{ runner.temp }}/frust-test-failures-audit/
-          if-no-files-found: ignore
-          retention-days: 3
-
-  msrv:
-    name: msrv 1.89
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.89"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets
-
-  cross:
-    name: check (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc }
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --bins --target ${{ matrix.target }}
-
-  install-scripts:
-    name: install scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sh -n install.sh
-      - run: sudo apt-get install -y shellcheck >/dev/null && shellcheck install.sh
+          for asset in sorted(Path(".github/assets").glob("*.svg")):
+              if ElementTree.parse(asset).getroot().tag != "{http://www.w3.org/2000/svg}svg":
+                  raise SystemExit(f"Invalid SVG root in {asset}")
+          PY

@@ -13,4 +13,4 @@ body:
     id: idea
     attributes:
       label: Proposal
-      description: What would you like to happen? Note that frust keeps cargo's command line and output unchanged by design.
+      description: Describe the behavior you want and how it would affect existing Rust or Cargo workflows.
