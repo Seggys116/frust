@@ -193,6 +193,7 @@ def prepare_fd_inputs(output, runtime):
 def runtime_runs(args, output, directory, workload, profile, mode, round_number, order):
     _, binary, *_ = WORKLOADS[workload]
     expected = None
+    affinity = str(args.runtime_cpu) if args.runtime_cpu is not None else args.cpus
     env = {key: value for key, value in os.environ.items() if key in ("HOME", "LANG", "LC_ALL")}
     env["PATH"] = "/usr/bin:/bin"
     for index in range(args.runtime + 1):
@@ -211,7 +212,7 @@ def runtime_runs(args, output, directory, workload, profile, mode, round_number,
                 png_dir.mkdir(exist_ok=True)
                 command = [executable, "-o", "4", "--threads", "1", "--dir", png_dir,
                            *sorted((CORPUS / "pngs").glob("*.png"))]
-            row = timed(command, output, env, log, args.cpus)
+            row = timed(command, output, env, log, affinity)
             if workload == "oxipng":
                 products = sorted(png_dir.glob("*.png"))
                 assert len(products) == 8
@@ -268,8 +269,11 @@ def run_lane(args, output, workload, profile, bins_by_label, round_number):
                        if line.startswith('{')]
             compiled = sum(record.get("reason") == "compiler-artifact"
                            and record.get("fresh") is False for record in records)
-            if not kind.startswith("noop"):
-                assert compiled > 0, (label, kind, compiled)
+            if kind.startswith("noop"):
+                if compiled:
+                    raise RuntimeError(f"{label} {kind} compiled {compiled} units. See {log}")
+            elif not compiled:
+                raise RuntimeError(f"{label} {kind} reused every unit. See {log}")
             result["compiled"] = compiled
 
         result.update(toolchain=label, workload=workload, profile=profile, case=kind, revision=int(revision),
@@ -384,6 +388,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--cpus", default="0-5")
     parser.add_argument("--runtime", type=int, default=0)
+    parser.add_argument("--runtime-cpu", type=int, help="pin executable runtime to a single CPU")
     parser.add_argument("--runtime-all", action="store_true")
     parser.add_argument("--history-edits", type=int, default=0)
     parser.add_argument("--clean", action="store_true")
@@ -418,7 +423,7 @@ def main():
         }
     (output / "environment.json").write_text(json.dumps(dict(
         host=os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname()),
-        cpus=args.cpus, jobs=args.jobs, toolchains=identities,
+        cpus=args.cpus, jobs=args.jobs, runtime_cpu=args.runtime_cpu, toolchains=identities,
         frust_debug_compression=args.frust_debug_compression,
     ), indent=2) + "\n")
     if "fd" in args.workloads:
