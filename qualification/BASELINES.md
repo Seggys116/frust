@@ -1,6 +1,6 @@
 # Measured baselines
 
-These rows were recorded before the next candidate compiler sample. The profile is opt-level 3, fat LTO, one codegen unit, incremental on, debug 0, and no strip. No extra `target-cpu` is set. Progress animation is off. The host is Linux x86-64. Wall time is `/usr/bin/time -v`. Cargo's own "Finished" line is listed beside it. Every row exited 0.
+These rows were recorded before the next candidate compiler sample. The profile is opt-level 3, fat LTO, one codegen unit, incremental on, debug 0, and no strip. No extra `target-cpu` is set. Progress animation is off. The host is Linux x86-64. Wall time is `/usr/bin/time -v`. Cargo's own "Finished" line is listed beside it. Every row exited 0. The protocol was frozen on 2026-11-19. This file records no CPU model and no per-row timestamps.
 
 Stock for the paired budgets is the unpatched stage-2 built from the same recipe. Official Rust 1.100.0 is recorded separately because those binaries are PGO builds and this recipe is not.
 
@@ -183,6 +183,13 @@ Three holdouts. Median wall 14.20s.
 
 Post-revert: wall 14.14s, cargo 14.13s, max RSS 525960 kB. Up-to-date no-op: wall 0.03s, cargo 0.03s, max RSS 36288 kB.
 
-## Not measured yet
+## Runtime and stripped size
 
-Runtime and stripped size. Thresholds in `qualification/PROTOCOL.md` are unchanged.
+These are not baseline rows in this file. They were measured later, against the same unpatched stage-2 control, and are recorded in `qualification/CANDIDATE.md`. Qualifiers for reading those numbers:
+
+- Host Linux x86-64, sampled on 2026-11-19 according to the timestamps in `CANDIDATE.md`.
+- Control stripped sizes (`strip --strip-unneeded`): ripgrep 4024992 bytes, oxipng 1338440 bytes.
+- The ripgrep corpus command (`qualification/CORPUS.md`) runs in about 5 to 7 ms. The control median was 4.84 ms in one session and between about 5.8 and 6.2 ms in later sessions, so runtime ratios are only comparable within a session. The oxipng command ran about 0.20 to 0.21 s.
+- Locked rustfmt 1.9.0 has no control or candidate binary, so only two of the three required runtime and size workloads have been measured.
+
+Thresholds in `qualification/PROTOCOL.md` are unchanged.

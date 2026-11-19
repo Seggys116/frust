@@ -5,11 +5,13 @@ Frozen before any candidate runtime sample. The bytes are produced by `qualifica
 Regenerate into an empty directory and compare:
 
 ```
-python3 qualification/make_corpus.py DEST --manifest /tmp/corpus.sha256
-cmp /tmp/corpus.sha256 qualification/corpus.sha256
+python3 qualification/make_corpus.py DEST --manifest NEW_MANIFEST
+cmp NEW_MANIFEST qualification/corpus.sha256
 ```
 
-The copy used for measurement lives under the managed build directory `target/compiler-rewrite/corpus`. Timed outputs go outside that directory. Nothing here has been timed.
+The copy used for measurement lives under the managed build directory `target/compiler-rewrite/corpus`. Timed outputs go outside that directory.
+
+The corpus was frozen before any runtime sample. Runtime samples taken with it are in `qualification/CANDIDATE.md`, on Linux x86-64 on 2026-11-19. They cover the ripgrep command and the oxipng command only. The rustfmt command has not been timed, because locked rustfmt 1.9.0 does not build with the compilers tried. Those samples are single sessions, not a passing gate, and the control ripgrep median moved between sessions from 0.0048 s to about 0.0062 s.
 
 ## Commands
 

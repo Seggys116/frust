@@ -1,10 +1,83 @@
-# Configuration design
+# Configuration
 
-The patched Cargo defaults `fcargo` build outputs to per-user storage. Workspaces and toolchains get separate mutable output directories. Cross-workspace compiler artifact reuse remains experimental.
+fRust keeps build outputs in per-user central storage when Cargo is started through `fcargo`. The behavior below is implemented in the patched Cargo (`support/patches/0001-frust-central-target.patch`) and `fcargo`, and the Linux paths are covered by tests in this repository. The macOS paths are computed by the same code but have not been run on macOS.
 
-The user-level JSON file accepts separate paths for the target root and cache root. Either path can point to temporary storage. Cleanup on reboot depends on how the operating system manages the chosen directory. The default paths use each platform’s user cache location. The installer and toolchain files live separately from managed build data.
+## Central target directory
 
-Explicit Cargo directory controls take precedence. Tooling should discover final artifact paths through Cargo metadata or build messages. [Cargo build directories](https://doc.rust-lang.org/cargo/reference/build-cache.html) · [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)
+The patched Cargo uses a central target directory only when all of these hold:
+
+- Cargo was started by `fcargo` (which sets `FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`.
+- `FRUST_CENTRAL_TARGET` is not `off`.
+- No target directory or build directory was chosen another way, for example `CARGO_TARGET_DIR` or a Cargo configuration setting.
+- The workspace is not an ephemeral or embedded manifest.
+
+Plain `cargo` keeps the stock `target/` default. When the central default applies, Cargo fails with a message if `HOME` is not an absolute path, if `config.json` is invalid, or if the toolchain id is rejected.
+
+The directory is `<target_root>/targets/<xx>/<rest>`, where `xx<rest>` is the hex sha-256 of the toolchain id, a NUL byte and the canonical workspace path. Different workspaces and different toolchains therefore get separate directories, and a symlink to a workspace maps to the same directory as the workspace. The toolchain id is, in order, `FRUST_TOOLCHAIN_ID`, the trimmed contents of the `frust-toolchain-id` file in the toolchain root (the parent of `bin/`), or `frust-unidentified`. An id must be non-empty and must not contain `/`, `\` or a NUL byte.
+
+## User config file
+
+`config.json` is optional. A missing file means defaults. It is a JSON object with exactly these fields, and an unknown field is an error:
+
+```
+{"version": 1, "target_root": "/absolute/path", "cache_root": "/absolute/path"}
+```
+
+`version` is required and must be the integer 1. `target_root` and `cache_root` are optional and must be absolute paths. Either can point to temporary storage. Cleanup on reboot depends on how the operating system manages the chosen directory.
+
+| | Linux | macOS |
+| --- | --- | --- |
+| Config file | `$XDG_CONFIG_HOME/frust/config.json`, else `~/.config/frust/config.json` | `~/Library/Application Support/fRust/config.json` |
+| Default roots | `$XDG_CACHE_HOME/frust`, else `~/.cache/frust` | `~/Library/Caches/fRust` |
+
+An `XDG_*` value that is empty or not absolute is ignored. Targets go under `<target_root>/targets`. The target root and the cache root default to the same directory.
+
+## Artifact cache directory
+
+The patched Cargo creates `<cache_root>/artifacts` and a `MARKER` file containing `frust-cache-v1`. If the path is not a directory, cannot be written, or holds an unreadable or different marker, the check reports a fallback. The patched Cargo ignores that result for central targets. The unit artifact cache below stores in `units/v1` inside this directory and stays off when the check does not report the directory ready. The opt-in compiler object cache described in [how-it-works](how-it-works.md) is stored next to the compiler's output object, not here.
+
+## Unit artifact cache
+
+The patched Cargo (`support/patches/0007-frust-unit-cache.patch`) keeps a content-addressed store of finished rustc outputs for registry, git and directory-source dependencies, and of heavy build script runs of registry and git packages. It lives in `<cache_root>/artifacts/units/v1` (default `~/.cache/frust/artifacts/units/v1` on Linux). `HOME` must be an absolute path. [How it works](how-it-works.md#unit-artifact-cache) describes what is stored, the key and the fallbacks.
+
+The cache is on when Cargo was started by `fcargo` (`FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`. It is available on Linux and macOS only.
+
+| Variable | Effect |
+| --- | --- |
+| `FRUST_UNIT_CACHE` | `1` or `on` turns the cache on for any invocation. `0` or `off` turns it off. Unset or any other value: on under `fcargo`, off otherwise. |
+| `FRUST_UNIT_CACHE_MAX_BYTES` | Size budget of the store in bytes. A missing, zero or unparsable value means 8 GiB. |
+| `FRUST_UNIT_CACHE_SCRIPT_MIN_MS` | Shortest build script run, in milliseconds, that is stored. Default 3000. `0` stores every eligible run. An unparsable value means the default. |
+| `FRUST_UNIT_CACHE_DEBUG` | `1` prints one line per decision to stderr, prefixed `frust-unit-cache:`. Units log `hit`, `miss` with a reason, `store` and `skip` with a reason. Build scripts log `script-hit`, `script-miss`, `script-store` and `script-skip`. |
+
+After a store, a size scan runs at most once per process, and only when the size counter is missing, older than a day or over the budget. If the scan finds the total over the budget, entries are evicted least recently used first until the store is at 80 percent of it. The same scan removes temporary files and incomplete entries more than an hour old. The `FRUST_UNIT_CACHE*` variables are not part of the build script key.
+
+## Direct entry
+
+In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. On Linux, `fcargo` runs Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO` and, when `RUSTC` is unset and a sibling `frustc` exists, `RUSTC` set, unless one of these holds, in which case it executes `fcargo-ui` with the same arguments:
+
+- Progress is not plain. It is plain when `TERM=dumb`, when `FRUST_PROGRESS` is `plain` or `off`, or when `FRUST_PROGRESS` is not `static` or `interactive` and stderr is not a terminal.
+- `FRUST_CARGO` is set and not empty.
+- The first argument starts with `+`.
+
+If `FRUST_CARGO` names an `fcargo` that is the same file as this executable, it exits with an error naming the problem. On other hosts `fcargo` is still the patched Cargo, but the direct entry code is not compiled.
+
+## Environment variables
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `FRUST_PROGRESS` | `fcargo` | `plain` or `off`: hand over to Cargo with no progress output. `static`: print one final frame. `interactive`: repaint on a terminal, otherwise static. Unset or any other value: interactive on a terminal, plain otherwise. `TERM=dumb` forces plain. |
+| `FRUST_PROGRESS_COLOR` | `fcargo` | `always` or `never`. Otherwise color is on for a terminal whose `TERM` is not `dumb`. |
+| `FRUST_BUILD_REPORT` | `fcargo` | When set to any value, print a build report with rows for analysis, code generation, full LTO and native link. Each row currently reads `Unavailable` because `fcargo` does not observe those phases. Not printed in plain mode. |
+| `FRUST_CARGO` | `fcargo` | Path of the Cargo executable to run. Default: a `cargo` next to `fcargo`, else `cargo` on `PATH`. |
+| `FRUST_INVOCATION` | patched Cargo | Set to `fcargo` by `fcargo` for the Cargo it starts. |
+| `FRUST_CENTRAL_TARGET` | patched Cargo | `off` disables the central target default. |
+| `FRUST_TOOLCHAIN_ID` | patched Cargo | Overrides the toolchain id used in the central target path. |
+| `FRUST_EXPERIMENTAL_CODEGEN_CACHE` | `frustc` | `1` enables the post-LTO object cache. |
+| `FRUST_EXPERIMENTAL_RELR` | `frustc` | `1` enables packed relative relocations on eligible GNU links. |
+
+`fcargo` also sets `RUSTC` to a `frustc` next to the Cargo executable when `RUSTC` is unset and that file exists. It forwards Cargo's exit code. Plain mode, `--quiet`, `-q`, `--message-format` and `--json` pass straight through to Cargo.
+
+Explicit Cargo directory controls take precedence over the central default. Tooling should discover final artifact paths through Cargo metadata or build messages. [Cargo build directories](https://doc.rust-lang.org/cargo/reference/build-cache.html) · [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)
 
 ## Cooperative checks
 
