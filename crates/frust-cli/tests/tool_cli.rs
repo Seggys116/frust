@@ -12,13 +12,19 @@ fn gates_bin() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_frust-gates"))
 }
 
-fn cargo_110() -> PathBuf {
-    let output = Command::new("rustup")
-        .args(["which", "--toolchain", "1.100.0", "cargo"])
-        .output()
-        .expect("rustup which cargo");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim().to_string())
+/// The Rust 1.100.0 Cargo from rustup, or `None` (the test is skipped) when it is not installed.
+fn cargo_110() -> Option<PathBuf> {
+    let output = Command::new("rustup").args(["which", "--toolchain", "1.100.0", "cargo"]).output().ok()?;
+    if !output.status.success() {
+        eprintln!("skipped: rustup has no 1.100.0 toolchain");
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf8(output.stdout).ok()?.trim().to_string()))
+}
+
+/// PATH for spawned tools: the caller's own, so rustup shims resolve on any machine.
+fn tool_path() -> String {
+    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
 }
 
 fn write_project(root: &Path, source: &str) {
@@ -33,7 +39,7 @@ fn write_project(root: &Path, source: &str) {
 
 fn run(bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     let mut command = Command::new(bin);
-    command.args(args).env("PATH", "/home/seggy116/.cargo/bin:/usr/bin:/bin");
+    command.args(args).env("PATH", tool_path());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -42,7 +48,7 @@ fn run(bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output
 
 #[test]
 fn plain_and_dumb_match_cargo_and_static_keeps_diagnostics() {
-    let cargo = cargo_110();
+    let Some(cargo) = cargo_110() else { return };
     let root = std::env::temp_dir().join(format!("frust-fcargo-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let project = root.join("hello");
@@ -252,10 +258,17 @@ sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
     let _ = fs::remove_dir_all(&root);
 }
 
-fn patched_cargo() -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/compiler-rewrite/cargo-dev/debug/cargo");
-    assert!(path.is_file(), "patched cargo is missing at {}", path.display());
-    path
+/// The patched Cargo named by FRUST_TEST_PATCHED_CARGO, else the local development build.
+/// `None` (the test is skipped) when neither exists: CI does not build the patched Cargo.
+fn patched_cargo() -> Option<PathBuf> {
+    let path = std::env::var_os("FRUST_TEST_PATCHED_CARGO").map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/compiler-rewrite/cargo-dev/debug/cargo")
+    });
+    if !path.is_file() {
+        eprintln!("skipped: no patched cargo at {}", path.display());
+        return None;
+    }
+    Some(path)
 }
 
 fn target_directory(output: &std::process::Output) -> String {
@@ -294,7 +307,7 @@ fn cargo_metadata(cargo: &Path, manifest: &Path, envs: &[(&str, &str)], args: &[
 
 #[test]
 fn patched_cargo_namespaces_fcargo_and_preserves_overrides() {
-    let cargo = patched_cargo();
+    let Some(cargo) = patched_cargo() else { return };
     let root = std::env::temp_dir().join(format!("frust-central-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let project = root.join("app");
