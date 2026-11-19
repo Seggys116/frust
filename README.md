@@ -10,7 +10,7 @@
 
 </div>
 
-This branch packages a source-equivalent Rust 1.100.0 stage-2 toolchain (`frustc`, `fcargo`, and rustdoc). Two measured compiler changes missed the frozen release-build budgets. Those probes are recorded in `qualification/CANDIDATE.md`. No faster-rebuild claim is made from them.
+This branch packages a source-equivalent Rust 1.100.0 stage-2 toolchain (`frustc`, `fcargo`, and rustdoc). Two measured compiler changes missed the frozen release-build budgets. Those probes are recorded in `qualification/CANDIDATE.md`. No faster-rebuild claim is made from them. Host compatibility for this package is recorded in `qualification/COMPAT.md`.
 
 | Area | Design target |
 | --- | --- |
