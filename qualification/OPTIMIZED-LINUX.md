@@ -20,6 +20,10 @@ The local launcher was also built with fat LTO, one codegen unit and PGO from th
 
 The PGO-only diagnostic isolated no-op overhead on a one-crate target. Across 30 alternating rounds on one core, median CPU was 36.65 ms for official Cargo, 38.94 ms for PGO fRust Cargo invoked directly, and 41.18 ms through the PGO launcher. All 90 samples reused the existing compilation. The paired launcher/direct difference was 2.30 ms. A separate syscall trace recorded two executable loads through the launcher and one in either direct invocation. Direct fRust Cargo still used 5.8% more CPU by the paired median. Samples and traces are under `target/compiler-rewrite/optimized-dist/pgo-noop-*`.
 
+[The in-process Cargo entry trial](fast-cargo-entry.patch) hardlinks the patched Cargo as `fcargo` and places the existing launcher at `fcargo-ui`. Plain packaged invocations can enter Cargo directly. Static progress, explicit Cargo selection and rustup toolchain directives still go through the launcher. The prototype passed build-script Cargo identity, explicit compiler selection, rustup delegation, static rendering and recursion checks.
+
+On the source-built Cargo used in this trial, 100 paired no-ops took 42.09 ms median CPU through the launcher and 39.83 ms through the in-process entry. The paired ratio was 0.950 with a one-sided 95% bound of 0.955. Official Cargo used 35.72 ms median CPU in the same run. The forced-UI path adds another process launch and still needs its own performance and terminal qualification. The trial stays outside the default patch series. Raw data is in `target/compiler-rewrite/optimized-dist/cargo-fast-entry-noops-final.jsonl`.
+
 ## Automatic storage
 
 [The storage probe](automatic-storage.py) creates six feature variants per mode in isolated workspaces and then verifies that the last variant remains fresh. It exercises normal noninteractive output, explicit plain output, quiet output, JSON, static progress, disabled collection, and an explicit target override. The allocated byte count comes from the actual target filesystem.
