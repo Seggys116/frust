@@ -62,6 +62,8 @@ Edit classes, applied to a fixed file in each tree and then reverted:
 - No-op: rebuild with no source change.
 - Holdout: leaf edit of fd only. fd is not used to choose the compiler change.
 
+A leaf, wide, or holdout sample starts from an incremental target built from the unmodified tree. When an earlier application of the same patch would reuse that patched work product, copy the unmodified target and time the copy. A no-op is a later build of those same unmodified sources with no edit in between. Reversing a patch updates file mtimes, so the next build is a post-revert rebuild, not a no-op. Toolchains share the cohort trees, so one toolchain must not edit a tree between another toolchain's seed build and its sample.
+
 The 0.80 geometric mean is the leaf medians of at least two primary workloads, which is what `judge_edit` computes. Wide edits join the leaf edits in the tail gate. Cold, no-op, and holdout are their own gates.
 
 Budgets: edited geomean and its upper bound ≤ 0.80, holdout median ratio < 1, cold median ≤ 1.05, no-op median overhead ≤ max(5% of the stock median, 20 ms), leaf and wide p95 ≤ 1.05.
