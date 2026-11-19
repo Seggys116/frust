@@ -83,7 +83,7 @@ Stock-compiler characterizations on ripgrep, with oxipng added for the x86-64-v3
 
 ### Cargo unit cache and no-op overhead
 
-These results come from the Benchmark workflow (`clean` and `noop` series, control against fRust, both built by the Toolchains workflow). The table below is filled from a recorded workflow run and names the run and commit; it contains no local-host numbers. Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are not release claims. A first build with an empty store also pays for writing cache entries.
+These results come from the Benchmark workflow (`clean` and `noop` series, control against fRust, both built by the Toolchains workflow). No workflow run is recorded here yet; each recorded result will name its run and commit and contain no local-host numbers. Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are not release claims. A first build with an empty store also pays for writing cache entries.
 
 ## Rules for new measurements
 

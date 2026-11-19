@@ -12,7 +12,7 @@
 
 ## Status
 
-fRust packages Rust 1.100.0 (upstream commit `0ef1bc386`, pinned in `support/upstream.lock`) built from source with a patched Cargo, `fcargo`, `frustc` and rustdoc. Its compiler, standard library and LLVM come from the unmodified upstream sources; the changes are in Cargo, in the central target layout, and in how finished work is reused.
+fRust packages Rust 1.100.0 (upstream commit `0ef1bc386`, pinned in `support/upstream.lock`) built from source with a patched Cargo, `fcargo`, `frustc` and rustdoc. Its compiler, standard library and LLVM are the upstream sources apart from one experimental object-reuse patch that is off by default; the changes that matter are in Cargo, in the central target layout, and in how finished work is reused.
 
 Published performance numbers come from the [Benchmark workflow](.github/workflows/benchmark.yml) on GitHub-hosted runners and are recorded in [the benchmark page](docs/benchmarks.md). Dated development measurements from a local host are kept in [the qualification notes](qualification/OPTIMIZED-LINUX.md) and are not release claims.
 
