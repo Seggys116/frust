@@ -1,137 +1,46 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/hero.svg" alt="frust: animated clean rebuild from a warm cache on GitHub Actions, ripgrep on Linux, cargo 6.75 s versus frust 178 ms, 37.9x faster" width="880">
+<img src=".github/assets/hero.svg" alt="fRust, a Rust compiler toolchain." width="880">
 
-**A thin accelerator that sits on top of the Rust toolchain you already have.**
+**A Rust compiler and Cargo toolchain aimed at faster rebuilds.**
 
-[![CI](https://github.com/Seggys116/frust/actions/workflows/ci.yml/badge.svg)](https://github.com/Seggys116/frust/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-ce422b.svg)](https://github.com/Seggys116/frust/blob/main/LICENSE)
-[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-ffd23f.svg)](https://www.rust-lang.org)
-![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-30363d.svg)
+[Architecture](docs/how-it-works.md) · [Configuration](docs/configuration.md) · [Benchmarks](docs/benchmarks.md) · [Contributing](CONTRIBUTING.md)
 
-[Install](#install) · [How it works](#how-it-works) · [Use](#use) · [Builds that overlap](#builds-that-overlap) · [Results](#results) · [Docs](https://github.com/Seggys116/frust/blob/main/docs/how-it-works.md)
-
-<img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880">
+<img src=".github/assets/divider.svg" alt="" width="880">
 
 </div>
 
-<br>
+## Status
 
-> frust does not ship a compiler, patch cargo or re-implement its command line. It asks your installed `cargo` and
-> `rustc` what they are, then wraps them. Every argument, `+toolchain`, stdout, stderr and exit code passes through.
+This branch packages a Rust 1.100.0 stage-2 toolchain (upstream commit `0ef1bc386`, pinned in `support/upstream.lock`) with a patched Cargo, `fcargo`, and a `frustc` entry point. Only Linux x86-64 has been built and measured. No compiler change has passed the frozen performance budgets, and no faster-rebuild result is qualified. All performance samples below were taken on 2026-11-19. The host CPU model is not recorded in the qualification files.
 
-<table>
-<tr>
-<td width="25%" valign="top"><b>Compile cache</b><br><sub>Shared across projects and clean rebuilds. A hit restores the exact outputs without starting rustc, as a copy-on-write clone where the filesystem supports it.</sub></td>
-<td width="25%" valign="top"><b>Central targets</b><br><sub>One directory per workspace and toolchain. Projects stay clean and switching toolchains never invalidates the others.</sub></td>
-<td width="25%" valign="top"><b>Build locks</b><br><sub>A fair queue in front of cargo's own. Identical concurrent builds share one build, and waiters see who holds the lock.</sub></td>
-<td width="25%" valign="top"><b>Clean display</b><br><sub>Colour, live progress, cache counters and terminal integration. Plain cargo output when piped.</sub></td>
-</tr>
-</table>
+- **Packaged toolchain.** Its `rustc`, `frustc`, compiler driver, standard library and rustdoc match an unpatched stage-2 control byte for byte. Its `cargo` is patched: central target directories with a JSON config file, and content checksums for `frustc` builds (`support/patches/`). `qualification/COMPAT.md` records the upstream test suites and the ecosystem comparison. That file is a compatibility record, not a performance result.
+- **Kept compiler candidate, not qualified.** `frust-cg1` reuses the machine-code object after fat-LTO optimization when the optimized module is unchanged, and can pack relative relocations (RELR). Both are opt-in in the current patch (`support/patches/rustc/`). One ripgrep leaf sample ran at 0.655 of stock wall time. That edit leaves the optimized module unchanged, so it hits the cache. Single samples of the syn leaf (1.026), regex leaf (1.030) and fd holdout (1.014) were slower than stock. The three-leaf geometric mean is about 0.885 against a 0.80 budget, and the 30-pair gate was not run.
+- **Dropped candidates.** A pre-optimization fat-LTO cache passed the full paired Linux gate for the leaf, cold, no-op, tail, memory and disk budgets (the leaf geometric mean of 0.6885 came from one ripgrep cache hit, with syn at 0.98 and regex at 1.00) but failed the holdout, runtime and stripped-size budgets. A two-thread fat-LTO codegen split ran the fd holdout pair at 21.19s against 15.90s with 1.62 times the peak RSS, so the paired gate was not run. Both patches are under `support/patches/rustc/dropped/`, with other rejected candidates. `qualification/CANDIDATE.md` has the numbers and their qualifiers.
 
-## How it works
+| Area | Goal | State |
+| --- | --- | --- |
+| Compatibility | Build existing Rust projects with the language, standard library and Cargo behavior of a matched upstream release. | Compiler and rustdoc suites run on Linux x86-64. One run-make test failed, and `qualification/COMPAT.md` traces it to the unpatched control build. Cargo's upstream suite was not run. |
+| Incremental builds | Reuse unaffected work after a localized edit. | Stock rustc incremental compilation is unchanged. Post-LTO object reuse is the only added reuse, and it is unqualified. |
+| Release builds | Shorten release builds while keeping full LTO when requested. | Full LTO optimization still runs in the kept candidate. The leaf, runtime and stripped-size budgets are unmet. |
+| Central storage | Keep build outputs under user-configurable central directories by default. | `fcargo` with the patched Cargo places outputs under a per-user target root. The `artifacts` cache directory holds the Cargo unit artifact cache (see below). Its speedup is not measured yet. |
 
-You run `fcargo`. frust takes the build lock, points cargo at a central target directory and starts your own cargo, which
-runs `frust-wrap` in place of rustc for each crate. A cache hit restores the stored outputs without starting the compiler.
+## Toolchain
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/flow.svg" alt="cargo calls frust-wrap, which looks up a content-hashed key: a hit restores outputs without running rustc, a miss runs rustc and stores the result" width="880"></p>
+The toolchain ships `frustc` (a hardlink to `rustc`), `fcargo`, `fcargo-ui`, a patched `cargo` and rustdoc. `fcargo` is a hardlink to the patched `cargo`: it runs Cargo with the central target default directly, and hands over to `fcargo-ui` to draw build progress on a terminal, for static progress, for an explicit `FRUST_CARGO` and for `+toolchain`. That direct entry is compiled on Linux only. `frust-install` downloads and installs the latest published toolchain with its sha256 verified, updates it with `frust-install update`, and rolls back with `frust-install rollback`. It can also install a local archive. `frust-gates` recomputes the frozen budgets from raw paired samples.
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
+Get `frust-install` with `cargo install frust-rs`, then run `frust-install`. The release workflow builds a toolchain for Linux x86-64 and for macOS on Apple Silicon and on Intel, and on any other host the installer reports the missing target. Linux x86-64 is the only verified host. The macOS toolchains are unverified: no macOS toolchain build or measurement is recorded yet, and the workflow's launch check on each macOS runner is the first test they get. The only archive recorded is a local build (`qualification/COMPAT.md`).
 
-## Install
+<p align="center"><img src=".github/assets/flow.svg" alt="Planned build flow from fcargo through frustc and the native linker, with a central compiler cache. The cache is planned and not implemented." width="880"></p>
 
-**macOS and Linux**
+## Cargo unit artifact cache
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Seggys116/frust/main/install.sh | sh
-```
+Under `fcargo`, the patched Cargo stores finished rustc outputs of registry, git and directory-source library and proc-macro units, and the output of heavy build script runs of registry and git packages, in a content-addressed store under the artifact cache root. Cargo restores them after verifying checksums and any mismatch compiles normally. Path and workspace members, incremental units and wrapper builds are never cached. libgit2 now starts on first git use instead of on every Cargo invocation. The mechanism, key and limits are in [how it works](docs/how-it-works.md#unit-artifact-cache) and the controls are in [configuration](docs/configuration.md#unit-artifact-cache). The cache is covered by unit tests and a 23-case probe, `qualification/prove-unit-cache.py`, on Linux x86-64 only. The macOS code paths are compiled in and unverified. Build-time results are not recorded yet.
 
-**Windows (PowerShell)**
+## Native fat-LTO builds
 
-```powershell
-irm https://raw.githubusercontent.com/Seggys116/frust/main/install.ps1 | iex
-```
+On Linux x86-64, `fcargo build --release` automatically uses incremental compilation and 16 codegen units for eligible local projects that select fat LTO. Explicit profile settings take precedence. See [the configuration details](docs/configuration.md#native-fat-lto-defaults) and [the measured tradeoff](qualification/SEMANTIC-LTO.md#incremental-fat-lto-profile).
 
-**Anywhere with Rust**
+## Project history
 
-```sh
-cargo binstall frust-rs   # prebuilt binaries
-cargo install frust-rs    # from source
-```
-
-Binaries are checksummed and installed to `~/.local/bin` (`%LOCALAPPDATA%\frust\bin` on Windows). Run `frust doctor`
-afterwards to check your setup. The crates.io package is `frust-rs` because the name `frust` belongs to an unrelated crate.
-
-Windows support is new. The test suite runs on Windows in CI, but it has had far less real-world use than macOS and Linux.
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
-
-## Use
-
-Use `fcargo` wherever you would use `cargo`:
-
-```sh
-fcargo build --release
-fcargo +nightly test -p mycrate -- --nocapture
-fclippy --all-targets
-```
-
-| Command | Purpose |
-|---|---|
-| `frust stats` | Hit rate, time saved, cache and target sizes |
-| `frust doctor` | Check the environment frust relies on |
-| `frust locks` | Show running and queued builds |
-| `frust compact` / `frust gc` | Shrink target directories and prune the cache |
-| `frust env` | Print shell exports so IDEs and rust-analyzer share the cache |
-| `frust where` | Print the central target directory for this workspace (`frust where check` prints the one `check` and `clippy` use) |
-
-Anything frust does not recognise is passed straight to cargo. Set `FRUST_BYPASS=1` to run cargo completely untouched.
-
-On macOS, `FRUST_LINK=smart fcargo build` opts eligible dev binaries into the direct native-linker path. Measure actual edit builds with `frust bench --linking --runs 7`; see [configuration](docs/configuration.md) for eligibility and controls.
-
-## Builds that overlap
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/locks.svg" alt="Builds in different profiles run at once, builds in the same profile run in order, and identical builds share one build" width="880"></p>
-
-Builds in different profiles run in parallel. Builds in the same profile queue in order, and an identical build joins the
-one already running instead of waiting. A `--target` build also takes its profile's host slot, so it queues behind other
-builds of that profile.
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
-
-## Results
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-times.svg" alt="Build times on GitHub Actions for bat on Linux, macOS and Windows: clean rebuilds and no-op builds far faster, cold builds and edits within a few percent of cargo" width="760"></p>
-
-Measured by the Bench workflow on GitHub-hosted Linux, macOS and Windows runners against ripgrep, bat and tokio, nine runs per phase. Clean rebuilds from the cache were **2.1× to 37.9× faster** and no-op builds **3.0× to 19.5× faster**; the whole frust home was **56% to 71% smaller** than cargo's target on macOS and equal elsewhere. Cold builds and edits are bound by rustc, so they tie cargo within a few percent. [Method and results](docs/benchmarks.md#latest-ci-results).
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-speedup.svg" alt="Clean rebuild from a warm cache on GitHub Actions, cargo time divided by frust time: 2.1x to 37.9x across ripgrep, bat and tokio on Linux, macOS and Windows" width="760"></p>
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-disk.svg" alt="Disk after the benchmark on GitHub Actions: cargo's target against frust's whole home, equal on Linux and Windows and 56 to 71 percent smaller on macOS" width="760"></p>
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/ci-bench.svg" alt="CI benchmark ratios of frust against cargo on Linux, macOS and Windows for ripgrep, bat and tokio: clean rebuilds and no-ops far faster, cold builds and edits tied within a few percent" width="760"></p>
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
-
-## Updating
-
-After a successful build on an interactive terminal, frust prints a one-line notice when a newer release exists. Run
-`frust self-update` to install it; the command verifies the download's SHA-256 before replacing anything. It is not
-`frust update`, so `cargo update` keeps working. Set `FRUST_UPDATE_CHECK=off` (or run `frust self-update --disable`)
-to stop the daily check.
-
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/frust/main/.github/assets/divider.svg" alt="" width="880"></p>
-
-## Learn more
-
-[How it works](https://github.com/Seggys116/frust/blob/main/docs/how-it-works.md) &middot; [Configuration](https://github.com/Seggys116/frust/blob/main/docs/configuration.md) &middot; [Benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md) &middot; [Contributing](https://github.com/Seggys116/frust/blob/main/CONTRIBUTING.md) &middot; [Security](https://github.com/Seggys116/frust/blob/main/SECURITY.md) &middot; [Changelog](https://github.com/Seggys116/frust/blob/main/CHANGELOG.md)
-
-<br>
-
-<p align="center"><sub>MIT licensed &middot; &copy; 2026 Zak Noble-Clarke</sub></p>
-
-<div align="center">
-
-<a href="https://www.buymeacoffee.com/seggy116"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-violet.png" alt="Buy me a coffee" height="50" /></a>
-
-</div>
+The [changelog](CHANGELOG.md) records the earlier fRust build accelerator and the transition to the compiler project. See [reporting guidance](SECURITY.md) for security issues.

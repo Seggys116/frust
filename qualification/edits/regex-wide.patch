@@ -1,0 +1,9 @@
+--- a/src/regex/string.rs
++++ b/src/regex/string.rs
+@@ -227,6 +227,7 @@ impl Regex {
+     /// assert!(Regex::new(r"(?-u:\w){1000}").is_ok());
+     /// ```
+     pub fn new(re: &str) -> Result<Regex, Error> {
++        let _frust_wide = re.len();
+         RegexBuilder::new(re).build()
+     }

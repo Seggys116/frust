@@ -1,0 +1,56 @@
+name: Set up a benchmark runner
+description: Unpack the control and fRust toolchains, fetch the frozen workloads and record the host.
+
+inputs:
+  workloads:
+    description: Workloads to fetch, space separated.
+    default: ""
+
+outputs:
+  work:
+    description: Scratch directory on the large disk.
+    value: ${{ steps.disk.outputs.work }}
+
+runs:
+  using: composite
+  steps:
+    # Targets and seeded copies need more room than the system disk has; /mnt is the large one.
+    - id: disk
+      shell: bash
+      run: |
+        sudo mkdir -p /mnt/bench
+        sudo chown "$USER" /mnt/bench
+        echo "work=/mnt/bench" >> "$GITHUB_OUTPUT"
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: toolchain-*
+        path: ${{ runner.temp }}/toolchains
+        merge-multiple: true
+    - name: Unpack toolchains
+      shell: bash
+      run: |
+        dest=target/compiler-rewrite/toolchains
+        mkdir -p "$dest"
+        for pack in "$RUNNER_TEMP"/toolchains/*.tar.zst; do
+          tar --use-compress-program 'zstd -d' -xf "$pack" -C "$dest"
+        done
+        ls -l "$dest" "$dest"/*/bin
+    - name: Fetch workloads
+      shell: bash
+      env:
+        WORKLOADS: ${{ inputs.workloads }}
+      run: |
+        for workload in $WORKLOADS; do
+          qualification/fetch-cohort.sh "$workload" target/compiler-rewrite/cohorts "$PWD/target/compiler-rewrite/toolchains/control/bin/cargo"
+        done
+    - name: Record the host
+      shell: bash
+      run: |
+        {
+          echo "runner ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          uname -a
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz'
+          free -m | sed -n 2p
+          ld --version | head -n 1
+          cc --version | head -n 1
+        } | tee "$RUNNER_TEMP/environment.txt"

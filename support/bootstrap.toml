@@ -1,0 +1,33 @@
+# Shared stage-2 recipe for the unpatched control and fRust.
+# The build script appends an absolute `build-dir`. Do not set profile flags here
+# that are not used for both builds.
+change-id = 162423
+
+[llvm]
+download-ci-llvm = true
+assertions = false
+
+[build]
+build-stage = 2
+test-stage = 2
+doc-stage = 2
+extended = true
+tools = ["cargo"]
+docs = false
+locked-deps = true
+full-bootstrap = true
+jobs = 12
+
+[rust]
+channel = "stable"
+lto = "thin"
+deny-warnings = false
+debug = false
+debug-assertions = false
+debuginfo-level = 0
+incremental = false
+download-rustc = false
+remap-debuginfo = true
+
+[dist]
+compression-profile = "fast"

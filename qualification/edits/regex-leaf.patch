@@ -1,0 +1,10 @@
+--- a/src/regex/string.rs
++++ b/src/regex/string.rs
+@@ -251,6 +251,7 @@
+     /// ```
+     #[inline]
+     pub fn is_match(&self, haystack: &str) -> bool {
++        let _frust_leaf = haystack.len();
+         self.is_match_at(haystack, 0)
+     }
+ 

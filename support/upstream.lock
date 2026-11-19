@@ -1,0 +1,15 @@
+# Pinned inputs for the fRust toolchain. verify-pins.sh checks the gitlinks.
+rust_commit=0ef1bc386059596dada8fb65b50425aab2ea637a
+rust_release=1.100.0
+rust_commit_date=2026-11-09
+cargo_gitlink=3acc79c0c841844675bc53a605922dbfc441e750
+llvm_gitlink=0a5579eb649d3634a9c30ac873300cc2944fa070
+llvm_version=23.1.5
+stage0_compiler_version=1.99.0
+stage0_compiler_date=2026-10-01
+stage0_compiler_git_commit=b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+stage0_manifest_hash=ce6dddc886364f8d786514771212cebe9b731ba82d6b859951c6b0ccc516b6a2
+stage0_rustc_linux_xz=dist/2026-10-01/rustc-1.99.0-x86_64-unknown-linux-gnu.tar.xz
+stage0_rustc_linux_xz_sha256=77171ba2a0345fdf2abc4fedda55d6de078dae7a68527c28be8c77dcc9604bd5
+host=x86_64-unknown-linux-gnu
+channel=stable

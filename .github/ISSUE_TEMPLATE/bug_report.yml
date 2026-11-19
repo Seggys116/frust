@@ -1,5 +1,5 @@
 name: Bug report
-description: Something is wrong or slower than plain cargo
+description: Report a compatibility, correctness or performance issue
 labels: [bug]
 body:
   - type: textarea
@@ -13,18 +13,12 @@ body:
     id: repro
     attributes:
       label: Reproduction
-      description: Minimal steps or a small project that reproduces it. Try `FRUST_BYPASS=1` and `FRUST_CACHE=off` and say which one makes it go away.
-  - type: textarea
-    id: doctor
-    attributes:
-      label: Output of `frust doctor`
-      render: text
+      description: Include a small public reproducer or exact steps. If possible, repeat with the matching upstream Rust toolchain and include the result.
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: frust version and platform
-      placeholder: "frust 0.1.0, macOS 15 arm64, rustc 1.89"
+      label: fRust version or commit, host and target
     validations:
       required: true

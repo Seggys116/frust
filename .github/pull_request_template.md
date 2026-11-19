@@ -2,7 +2,6 @@
 
 ## Checks
 
-- [ ] `cargo clippy --all-targets` is clean
-- [ ] `cargo test` passes
-- [ ] Cache-key changes keep the "nothing is cached when it cannot be done safely" rule
-- [ ] Docs updated if behaviour or configuration changed
+- [ ] Relevant checks ran and the results are recorded
+- [ ] Compatibility and performance evidence is included for changes in those areas
+- [ ] Documentation is current for user-visible changes

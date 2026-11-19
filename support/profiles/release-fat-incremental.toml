@@ -1,0 +1,5 @@
+[profile.release-fat-incremental]
+inherits = "release"
+lto = "fat"
+incremental = true
+codegen-units = 16

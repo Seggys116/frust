@@ -1,0 +1,9 @@
+# workload  repository  tree-under-test commit  Cargo.lock origin  Cargo.lock sha256
+# Commits and hashes are frozen in PROTOCOL.md. Lock origin is "upstream" or a file under qualification/locks.
+ripgrep   https://github.com/BurntSushi/ripgrep.git  e89fff89ac9af12e8d4ce9d5fd07beb408ca730f  upstream                          7a7d39cda8a03930e578f1dbb724e055771901842eca239e03b01e19da946a64
+syn       https://github.com/dtolnay/syn.git         97ec37dda8a893a460066da694fd1eb7cb30538a  locks/syn.Cargo.lock              13af99611da1fe20cfcdd80a64aa7a99e251d0bf7cd6e4740c3cdb7a90c8f59c
+regex     https://github.com/rust-lang/regex.git     4226f214c56e584304520adb9080bcc4c792390e  locks/regex.Cargo.lock            6b742a7fb6c35c9f8f7c5de1e11a670cd8b1b51cafbd1415d26c0a41d65191a0
+fd        https://github.com/sharkdp/fd.git          b2a287b3993768e0ec52f0852916917f23fb2a38  upstream                          080f85e31279c422c5591ad7092ef93c7171711122c7de2b7aa32b84c5e72ed9
+rustfmt   https://github.com/rust-lang/rustfmt.git   cebab3e99259be82ff069e5ae89e91855d79e534  upstream                          ec81403a3f2c7fd2fe9ba56d3fbf5d9bc806c401554485a40e195030c86491b2
+oxipng    https://github.com/oxipng/oxipng.git       36f3ef8aac65ecf1761739ea2f2e530281f1312b  upstream                          22f3f5ee510e8af2e78194091197d1a223c171381aab9bb3479f32379033f6bb
+zstd-rs   https://github.com/gyscos/zstd-rs.git      1e52c7e44cfecdf4a5363fe84edf7819f4bc346a  locks/zstd-rs.Cargo.lock          8412f76d2ddbe8c6f7375be7788a932b0375d26b08104ddb02e948ffb808532f

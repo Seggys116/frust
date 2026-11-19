@@ -1,0 +1,96 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
+index deaa78fcd..ca9c9c550 100644
+--- a/compiler/rustc_codegen_llvm/src/back/write.rs
++++ b/compiler/rustc_codegen_llvm/src/back/write.rs
+@@ -859,6 +859,16 @@ fn handle_offload<'ll>(cx: &'ll SimpleCx<'_>, old_fn: &llvm::Value) {
+     result.into_result().unwrap_or_else(|()| llvm_err(dcx, LlvmError::RunLlvmPasses))
+ }
+ 
++fn invoked_as_frustc() -> bool {
++    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
+ // Unsafe due to LLVM calls.
+ pub(crate) fn optimize(
+     cgcx: &CodegenContext,
+@@ -882,13 +892,17 @@ pub(crate) fn optimize(
+ 
+     // FIXME(ZuseZ4): support SanitizeHWAddress and prevent illegal/unsupported opts
+ 
+-    if let Some(opt_level) = config.opt_level {
++    if let Some(mut opt_level) = config.opt_level {
+         let opt_stage = match cgcx.lto {
+             Lto::Fat => llvm::OptStage::PreLinkFatLTO,
+             Lto::Thin | Lto::ThinLocal => llvm::OptStage::PreLinkThinLTO,
+             _ if cgcx.use_linker_plugin_lto => llvm::OptStage::PreLinkThinLTO,
+             _ => llvm::OptStage::PreLinkNoLTO,
+         };
++        // Fat LTO repeats this pipeline. Skip the pre-link copy only for frustc.
++        if matches!(opt_stage, llvm::OptStage::PreLinkFatLTO) && invoked_as_frustc() {
++            opt_level = config::OptLevel::No;
++        }
+ 
+         // If we know that we will later run AD, then we disable vectorization and loop unrolling.
+         // Otherwise we pretend AD is already done and run the normal opt pipeline (=PostAD).
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+index beb63ad61..a6c71ebac 100644
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -31,7 +31,9 @@
+ #endif
+ #include "llvm/Passes/StandardInstrumentations.h"
+ #include "llvm/Support/CBindingWrapping.h"
++#include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/FileSystem.h"
++#include "llvm/Support/Path.h"
+ #include "llvm/Support/Program.h"
+ #include "llvm/Support/TimeProfiler.h"
+ #include "llvm/Support/VirtualFileSystem.h"
+@@ -58,6 +60,9 @@
+ #include <set>
+ #include <string>
+ #include <vector>
++#if defined(__linux__)
++#include <unistd.h>
++#endif
+ 
+ // Conditional includes prevent clang-format from fully sorting the list,
+ // so if any are needed, keep them separate down here.
+@@ -444,6 +449,31 @@ extern "C" LLVMTargetMachineRef LLVMRustCreateTargetMachine(
+     TM->setLargeDataThreshold(LargeDataThreshold);
+   }
+ 
++#if defined(__linux__)
++  // The frustc hardlink enables the x86 machine outliner. Invoking rustc does not.
++  if (TM != nullptr && OptLevel != CodeGenOptLevelEnum::None &&
++      (Trip.getArch() == Triple::x86 || Trip.getArch() == Triple::x86_64)) {
++    char exe_path[4096];
++    ssize_t len = ::readlink("/proc/self/exe", exe_path, sizeof(exe_path));
++    if (len > 0 && len < static_cast<ssize_t>(sizeof(exe_path))) {
++      StringRef base = llvm::sys::path::filename(StringRef(exe_path, static_cast<size_t>(len)));
++      if (base == "frustc") {
++        TM->setMachineOutliner(true);
++        TM->setSupportsDefaultOutlining(true);
++        // X86 leaves shouldOutlineFromFunctionByDefault false, so TargetDefault
++        // adds the pass and then skips every function. AlwaysOutline uses
++        // X86InstrInfo::isFunctionSafeToOutlineFrom.
++        llvm::cl::Option *OutlinerOpt =
++            llvm::cl::getRegisteredOptions().lookup("enable-machine-outliner");
++        if (OutlinerOpt == nullptr ||
++            OutlinerOpt->addOccurrence(0, "enable-machine-outliner", "always")) {
++          report_fatal_error("frustc could not enable the machine outliner");
++        }
++      }
++    }
++  }
++#endif
++
+   return wrap(TM);
+ }
+ 

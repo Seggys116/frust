@@ -1,0 +1,630 @@
+diff --git a/compiler/rustc_crate_store/src/cstore.rs b/compiler/rustc_crate_store/src/cstore.rs
+index c8fe5562b..66bf5116e 100644
+--- a/compiler/rustc_crate_store/src/cstore.rs
++++ b/compiler/rustc_crate_store/src/cstore.rs
+@@ -224,6 +224,8 @@ pub struct Untracked {
+     pub stable_crate_ids: FreezeLock<StableCrateIdMap>,
+     /// The hash of the local crate as computed in metadata encoding.
+     pub local_crate_hash: OnceLock<Svh>,
++    /// The interface hash computed beside it when the fRust interface hash mode is on.
++    pub local_interface_hash: OnceLock<Svh>,
+ }
+ 
+ impl Untracked {
+diff --git a/compiler/rustc_interface/src/passes.rs b/compiler/rustc_interface/src/passes.rs
+index da0ebce5b..94008ff5a 100644
+--- a/compiler/rustc_interface/src/passes.rs
++++ b/compiler/rustc_interface/src/passes.rs
+@@ -47,7 +47,7 @@
+ };
+ use rustc_structures::{CrateType, Limit};
+ use rustc_trait_selection::{solve, traits};
+-use tracing::{info, instrument};
++use tracing::{debug, info, instrument};
+ 
+ use crate::interface::Compiler;
+ use crate::{diagnostics, limits, util};
+@@ -580,6 +580,40 @@ fn escape_dep_env(symbol: Symbol) -> String {
+     escaped
+ }
+ 
++/// Appends the interface hash of this crate and of every dependency to the dep-info file.
++///
++/// Dep-info is written before metadata exists, so these lines are added once it has been
++/// encoded. A missing line only means that Cargo cannot skip a later rebuild.
++fn append_interface_dep_info(tcx: TyCtxt<'_>) {
++    if !rustc_session::frust::interface_hash_enabled()
++        || !tcx.sess.opts.output_types.contains_key(&OutputType::DepInfo)
++    {
++        return;
++    }
++    let Some(own) = tcx.untracked().local_interface_hash.get().copied() else { return };
++    let OutFileName::Real(path) = tcx.output_filenames(()).path(OutputType::DepInfo) else {
++        return;
++    };
++
++    // The text matches the 16 bytes that the metadata header stores for each crate.
++    let hex = |hash: rustc_data_structures::svh::Svh| -> String {
++        hash.as_fingerprint().to_le_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
++    };
++    let mut lines = format!("# frust-iface:v1:{}\n", hex(own));
++    let cstore = CStore::from_tcx(tcx);
++    for &cnum in tcx.crates(()) {
++        lines.push_str(&format!("# frust-iface-dep:{}\n", hex(cstore.crate_header_hash(cnum))));
++    }
++    drop(cstore);
++
++    let appended = fs::OpenOptions::new().append(true).open(&path).and_then(|mut file| {
++        file.write_all(lines.as_bytes())
++    });
++    if let Err(err) = appended {
++        debug!("could not append interface hashes to {}: {err}", path.display());
++    }
++}
++
+ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[PathBuf]) {
+     // Write out dependency rules to the dep-info file if requested
+     let sess = tcx.sess;
+@@ -966,6 +1000,7 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
+         definitions,
+         stable_crate_ids,
+         local_crate_hash: OnceLock::new(),
++        local_interface_hash: OnceLock::new(),
+     };
+ 
+     // We're constructing the HIR here; we don't care what we will
+@@ -1316,6 +1351,8 @@ pub(crate) fn start_codegen<'tcx>(
+         Err(guar) => guar.raise_fatal(),
+     };
+ 
++    append_interface_dep_info(tcx);
++
+     let is_host_metadata = tcx
+         .sess
+         .opts
+diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
+index aea843ac0..a63f02b27 100644
+--- a/compiler/rustc_metadata/src/creader.rs
++++ b/compiler/rustc_metadata/src/creader.rs
+@@ -234,6 +234,11 @@ pub fn has_crate_data(&self, cnum: CrateNum) -> bool {
+         self.metas[cnum].is_some()
+     }
+ 
++    /// The hash in the metadata header of a loaded crate, which is what dependents record.
++    pub fn crate_header_hash(&self, cnum: CrateNum) -> Svh {
++        self.get_crate_data(cnum).hash()
++    }
++
+     pub(crate) fn get_crate_data(&self, cnum: CrateNum) -> &CrateMetadata {
+         self.metas[cnum].as_ref().unwrap_or_else(|| panic!("Failed to get crate data for {cnum:?}"))
+     }
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
+index 27b36c23d..902ee293d 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
+@@ -2122,6 +2122,19 @@ pub(crate) fn hash(&self) -> Svh {
+         self.blob.get_crate_hash()
+     }
+ 
++    /// The hash that tracks this crate for incremental compilation of its consumers.
++    ///
++    /// A published interface hash ignores edits to bodies a consumer may have read, so such a
++    /// crate is tracked by a hash of the whole metadata instead.
++    pub(crate) fn tracking_hash(&self) -> Svh {
++        if !self.root.header.frust_interface_hash {
++            return self.hash();
++        }
++        let mut hasher = twox_hash::XxHash3_128::new();
++        hasher.write(&self.blob);
++        Svh::new(Fingerprint::from_le_bytes(hasher.finish_128().to_le_bytes()))
++    }
++
+     pub(crate) fn has_async_drops(&self) -> bool {
+         self.root.tables.adt_async_destructor.len > 0
+     }
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+index 154cf4f06..c06eb3828 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+@@ -376,7 +376,7 @@ fn into_args(self) -> (DefId, SimplifiedType) {
+     }
+     native_libraries => { cdata.get_native_libraries(tcx).collect() }
+     foreign_modules => { cdata.get_foreign_modules(tcx).map(|m| (m.def_id, m)).collect() }
+-    crate_hash => { cdata.hash() }
++    crate_hash => { cdata.tracking_hash() }
+     crate_host_hash => { cdata.host_hash }
+     crate_name => { cdata.root.header.name }
+     num_extern_def_ids => { cdata.num_def_ids() }
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
+index afa5646be..1a9a476db 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
+@@ -10,7 +10,7 @@
+ 
+ use rustc_attr_ir::{AttributeKind, EncodeCrossCrate, find_attr};
+ use rustc_data_structures::fingerprint::Fingerprint;
+-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
++use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
+ use rustc_data_structures::memmap::{Mmap, MmapMut};
+ use rustc_data_structures::owned_slice::slice_owned;
+ use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+@@ -24,6 +24,7 @@
+ use rustc_index::IndexVec;
+ use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+ use rustc_middle::hir::map::compute_hir_hash;
++use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+ use rustc_middle::middle::dependency_format::Linkage;
+ use rustc_middle::mir::interpret;
+ use rustc_middle::query::Providers;
+@@ -34,7 +35,7 @@
+ use rustc_serialize::opaque::FileEncoder;
+ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+ use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
+-use rustc_session::config::{OptLevel, OutputType, TargetModifier};
++use rustc_session::config::{DebugInfo, OptLevel, OutputType, TargetModifier};
+ use rustc_span::def_id::CRATE_MOD_ID;
+ use rustc_span::hygiene::HygieneEncodeContext;
+ use rustc_span::{
+@@ -78,6 +79,87 @@ pub(super) struct EncodeContext<'a, 'tcx> {
+     hygiene_ctxt: Rc<RefCell<HygieneEncodeContext>>,
+     // Used for both `Symbol`s and `ByteSymbol`s.
+     symbol_index_table: FxHashMap<u32, usize>,
++    // Set only for the second pass that computes the fRust interface hash.
++    iface: Option<InterfacePass>,
++}
++
++/// State of the pass that encodes the metadata a second time to hash its interface.
++///
++/// The pass produces the same tables as the real encoding, but a span contributes nothing unless
++/// the code generated for a dependent crate can observe it. Edits that only move or reshape
++/// source text then leave the hash unchanged.
++struct InterfacePass {
++    /// Debug info or coverage maps are on, so every span is observable.
++    keep_all: bool,
++    /// Spans observable through a `Location` or the call site of an inlined body.
++    keep: FxHashSet<Span>,
++}
++
++impl InterfacePass {
++    fn new(tcx: TyCtxt<'_>) -> Self {
++        let keep_all = tcx.sess.opts.debuginfo != DebugInfo::None || tcx.sess.instrument_coverage();
++        Self { keep_all, keep: FxHashSet::default() }
++    }
++
++    fn keeps(&self, span: Span) -> bool {
++        self.keep_all || self.keep.contains(&span)
++    }
++
++    /// Records the spans of `body` that a dependent can observe.
++    fn collect<'tcx>(&mut self, tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
++        if self.keep_all {
++            return;
++        }
++        for block in body.basic_blocks.iter() {
++            let terminator = block.terminator();
++            let observable = match &terminator.kind {
++                mir::TerminatorKind::Assert { .. } => true,
++                mir::TerminatorKind::Call { func, .. } => {
++                    call_may_observe_location(tcx, body, func)
++                }
++                _ => false,
++            };
++            if observable {
++                self.keep_span(terminator.source_info.span);
++            }
++        }
++        for scope in body.source_scopes.iter() {
++            if let Some((_, call_site)) = scope.inlined {
++                self.keep_span(call_site);
++            }
++        }
++    }
++
++    /// Keeps `span` and every macro call site above it, because a `Location` resolves through them.
++    fn keep_span(&mut self, span: Span) {
++        let mut current = span;
++        self.keep.insert(current);
++        // The bound only guards against a cyclic expansion table.
++        for _ in 0..256 {
++            if !current.from_expansion() {
++                break;
++            }
++            current = current.ctxt().outer_expn_data().call_site;
++            self.keep.insert(current);
++        }
++    }
++}
++
++/// Whether the source position of a call can reach a `Location` in a dependent crate.
++///
++/// A `#[track_caller]` callee reports the position of its call. A trait method may resolve to such
++/// a callee once the dependent chooses the implementation. Anything that is not a direct call of a
++/// known function is treated as observable.
++fn call_may_observe_location<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    body: &mir::Body<'tcx>,
++    func: &mir::Operand<'tcx>,
++) -> bool {
++    let ty::FnDef(def_id, _) = *func.ty(&body.local_decls, tcx).kind() else { return true };
++    if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::TRACK_CALLER) {
++        return true;
++    }
++    tcx.opt_associated_item(def_id).is_some_and(|item| matches!(item.container, AssocContainer::Trait))
+ }
+ 
+ /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
+@@ -182,6 +264,9 @@ fn encode_expn_id(&mut self, expn_id: ExpnId) {
+     }
+ 
+     fn encode_span(&mut self, span: Span) {
++        if self.iface.is_some() {
++            return self.encode_interface_span(span);
++        }
+         match self.span_shorthands.entry(span) {
+             Entry::Occupied(o) => {
+                 // If an offset is smaller than the absolute position, we encode with the offset.
+@@ -459,6 +544,32 @@ fn emit_lazy_distance(&mut self, position: NonZero<usize>) {
+         self.emit_usize(distance);
+     }
+ 
++    /// Span encoding of the interface pass: nothing for spans that cannot be observed, and a
++    /// position that does not depend on byte offsets for the ones that can.
++    fn encode_interface_span(&mut self, span: Span) {
++        let observable = self.iface.as_ref().is_some_and(|pass| pass.keeps(span));
++        if !observable {
++            self.emit_u8(0);
++            return;
++        }
++        let ctxt = if self.is_proc_macro { SyntaxContext::root() } else { span.ctxt() };
++        if span.is_dummy() {
++            self.emit_u8(1);
++            self.encode_syntax_context(ctxt);
++            return;
++        }
++        let source_map = self.tcx.sess.source_map();
++        let lo = source_map.lookup_char_pos(span.lo());
++        let hi = source_map.lookup_char_pos(span.hi());
++        self.emit_u8(2);
++        lo.file.stable_id.encode(self);
++        self.emit_u32(lo.line as u32);
++        self.emit_u32(lo.col.0 as u32);
++        self.emit_u32(hi.line as u32);
++        self.emit_u32(hi.col.0 as u32);
++        self.encode_syntax_context(ctxt);
++    }
++
+     fn lazy<T: ParameterizedOverTcx, B: Borrow<T::Value<'tcx>>>(&mut self, value: B) -> LazyValue<T>
+     where
+         T::Value<'tcx>: Encodable<EncodeContext<'a, 'tcx>>,
+@@ -744,6 +855,7 @@ macro_rules! stat {
+                     triple: tcx.sess.opts.target_triple.clone(),
+                     is_proc_macro_crate: proc_macro_data.is_some(),
+                     is_stub: false,
++                    frust_interface_hash: rustc_session::frust::interface_hash_enabled(),
+                 },
+ 
+                 stable_crate_id: tcx.stable_crate_id(LOCAL_CRATE),
+@@ -808,7 +920,14 @@ macro_rules! stat {
+         } else {
+             tcx.crate_hash(LOCAL_CRATE)
+         };
+-        tcx.untracked().local_crate_hash.set(hash).expect("local_crate_hash set twice");
++        if self.iface.is_some() {
++            tcx.untracked()
++                .local_interface_hash
++                .set(hash)
++                .expect("local_interface_hash set twice");
++        } else {
++            tcx.untracked().local_crate_hash.set(hash).expect("local_crate_hash set twice");
++        }
+ 
+         let unhashed = stat!("final", || {
+             // Indexed by dependency `CrateNum`, matching the numbering `encode_crate_deps` uses.
+@@ -1431,10 +1550,13 @@ fn encode_attrs(&mut self, def_id: LocalDefId) {
+             is_exported: tcx.effective_visibilities(()).is_exported(def_id),
+             is_doc_hidden: false,
+         };
++        // The interface pass leaves out doc text: only rustdoc reads it, never generated code.
++        let interface_pass = self.iface.is_some();
+         let attr_iter = tcx
+             .hir_attrs(tcx.local_def_id_to_hir_id(def_id))
+             .iter()
+-            .filter(|attr| analyze_attr(*attr, &mut state));
++            .filter(|attr| analyze_attr(*attr, &mut state))
++            .filter(|attr| !interface_pass || attr.doc_str().is_none());
+ 
+         record_array!(self.tables.attributes[def_id.to_def_id()] <- attr_iter);
+ 
+@@ -1876,6 +1998,9 @@ fn encode_mir(&mut self) {
+ 
+             debug!("EntryBuilder::encode_mir({:?})", def_id);
+             if encode_opt {
++                if let Some(pass) = self.iface.as_mut() {
++                    pass.collect(tcx, tcx.optimized_mir(def_id));
++                }
+                 record!(self.tables.optimized_mir[def_id.to_def_id()] <- tcx.optimized_mir(def_id));
+                 self.tables
+                     .cross_crate_inlinable
+@@ -1896,6 +2021,9 @@ fn encode_mir(&mut self) {
+                     record!(self.tables.trivial_const[def_id.to_def_id()] <- (val, ty));
+                 } else {
+                     is_trivial = false;
++                    if let Some(pass) = self.iface.as_mut() {
++                        pass.collect(tcx, tcx.mir_for_ctfe(def_id));
++                    }
+                     record!(self.tables.mir_for_ctfe[def_id.to_def_id()] <- tcx.mir_for_ctfe(def_id));
+                 }
+ 
+@@ -1916,6 +2044,11 @@ fn encode_mir(&mut self) {
+                 }
+             }
+             if !is_trivial {
++                if let Some(pass) = self.iface.as_mut() {
++                    for promoted in tcx.promoted_mir(def_id).iter() {
++                        pass.collect(tcx, promoted);
++                    }
++                }
+                 record!(self.tables.promoted_mir[def_id.to_def_id()] <- tcx.promoted_mir(def_id));
+             }
+ 
+@@ -2142,9 +2275,13 @@ fn encode_crate_deps(&mut self) -> LazyArray<CrateDep> {
+             .crates(())
+             .iter()
+             .map(|&cnum| {
++                // The query read registers the dependency on the upstream crate, so a changed
++                // upstream stops the saved metadata from being reused. The value recorded is the
++                // header hash, which is what the locator compares.
++                let _ = self.tcx.crate_hash(cnum);
+                 let dep = CrateDep {
+                     name: self.tcx.crate_name(cnum),
+-                    hash: self.tcx.crate_hash(cnum),
++                    hash: crate::creader::CStore::from_tcx(self.tcx).crate_header_hash(cnum),
+                     host_hash: self.tcx.crate_host_hash(cnum),
+                     kind: self.tcx.crate_dep_kind(cnum),
+                     is_private: self.tcx.is_private_dep(cnum),
+@@ -2510,8 +2647,24 @@ fn decode(d: &mut D) -> Self {
+     }
+ }
+ 
++/// Whether saved metadata was written in the same hash mode as the current compilation.
++fn saved_metadata_mode_matches(path: &Path) -> bool {
++    let Ok(file) = std::fs::File::open(path) else { return false };
++    let Ok(mmap) = (unsafe { Mmap::map(file) }) else { return false };
++    let owned = slice_owned(mmap, Deref::deref);
++    MetadataBlob::new(owned).is_ok_and(|blob| {
++        blob.get_header().frust_interface_hash == rustc_session::frust::interface_hash_enabled()
++    })
++}
++
+ #[instrument(level = "trace", skip(tcx))]
+ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
++    if rustc_session::frust::interface_hash_enabled()
++        && !tcx.sess.opts.unstable_opts.metadata_crate_hash
++    {
++        tcx.dcx().fatal("FRUST_INTERFACE_HASH needs -Z metadata-crate-hash to stay enabled");
++    }
++
+     // Since encoding metadata is not in a query, and nothing is cached,
+     // there's no need to do dep-graph tracking for any of it.
+     tcx.dep_graph.assert_ignored();
+@@ -2527,6 +2680,9 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+         && let work_product_id =
+             WorkProductId::from_cgu_name(WorkProduct::METADATA_WORKPRODUCT_CGU_NAME)
+         && let Some(work_product) = tcx.dep_graph.previous_work_product(&work_product_id)
++        && saved_metadata_mode_matches(&old_incr_comp_session_dir.join(
++            &work_product.saved_files[OutputType::Metadata.extension()],
++        ))
+         && tcx.dep_graph.try_mark_green(tcx, &dep_node).is_some()
+     {
+         let saved_path = &work_product.saved_files[OutputType::Metadata.extension()];
+@@ -2544,17 +2700,22 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+         let blob = MetadataBlob::new(owned);
+         let hash = blob.expect("file already created").get_crate_hash();
+         tcx.untracked().local_crate_hash.set(hash).expect("local_crate_hash set twice");
++        if rustc_session::frust::interface_hash_enabled() {
++            // The saved header already holds the interface hash of the unchanged crate.
++            tcx.untracked().local_interface_hash.set(hash).expect("local_interface_hash set twice");
++        }
+ 
+         // Generate the metadata stub manually, as that is a small file compared to full metadata.
+         if let Some(ref_path) = ref_path {
+             let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata_stub");
+ 
+-            with_encode_metadata_header(tcx, ref_path, |ecx| {
++            with_encode_metadata_header(tcx, ref_path, false, |ecx| {
+                 let header: LazyValue<CrateHeader> = ecx.lazy(CrateHeader {
+                     name: tcx.crate_name(LOCAL_CRATE),
+                     triple: tcx.sess.opts.target_triple.clone(),
+                     is_proc_macro_crate: false,
+                     is_stub: true,
++                    frust_interface_hash: rustc_session::frust::interface_hash_enabled(),
+                 });
+                 (header.position.get(), 0)
+             })
+@@ -2582,7 +2743,7 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+         dep_node,
+         tcx,
+         || {
+-            with_encode_metadata_header(tcx, path, |ecx| {
++            with_encode_metadata_header(tcx, path, false, |ecx| {
+                 // Encode all the entries and extra information in the crate,
+                 // culminating in the `CrateRoot` which points to all of it.
+                 let (root, unhashed) = ecx.encode_crate_root();
+@@ -2596,6 +2757,11 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+                     ecx.opaque.file().metadata().unwrap().len(),
+                 );
+ 
++                // The interface hash must exist before the header hash is written below.
++                if rustc_session::frust::interface_hash_enabled() {
++                    encode_interface_hash(tcx);
++                }
++
+                 (root.position.get(), unhashed.position.get())
+             })
+         },
+@@ -2606,21 +2772,36 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+     if let Some(ref_path) = ref_path {
+         let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata_stub");
+ 
+-        with_encode_metadata_header(tcx, ref_path, |ecx| {
++        with_encode_metadata_header(tcx, ref_path, false, |ecx| {
+             let header: LazyValue<CrateHeader> = ecx.lazy(CrateHeader {
+                 name: tcx.crate_name(LOCAL_CRATE),
+                 triple: tcx.sess.opts.target_triple.clone(),
+                 is_proc_macro_crate: false,
+                 is_stub: true,
++                frust_interface_hash: rustc_session::frust::interface_hash_enabled(),
+             });
+             (header.position.get(), 0)
+         })
+     }
+ }
+ 
++/// Encodes the metadata once more, discarding the bytes, to compute the fRust interface hash.
++fn encode_interface_hash(tcx: TyCtxt<'_>) {
++    let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_interface_hash");
++    // FRUST_INTERFACE_DUMP keeps the normalised bytes, so two compiles can be compared offline.
++    let dump = std::env::var_os("FRUST_INTERFACE_DUMP");
++    let sink = dump.as_deref().map_or(Path::new("/dev/null"), Path::new);
++    with_encode_metadata_header(tcx, sink, true, |ecx| {
++        let (root, unhashed) = ecx.encode_crate_root();
++        ecx.opaque.flush();
++        (root.position.get(), unhashed.position.get())
++    });
++}
++
+ fn with_encode_metadata_header(
+     tcx: TyCtxt<'_>,
+     path: &Path,
++    interface: bool,
+     f: impl FnOnce(&mut EncodeContext<'_, '_>) -> (usize, usize),
+ ) {
+     // By default the crate hash (SVH) is computed from the bytes of the encoded metadata,
+@@ -2635,13 +2816,16 @@ fn with_encode_metadata_header(
+     if metadata_crate_hash {
+         // Fold in inputs that are not part of the encoded metadata bytes, reduced to a single
+         // fingerprint via the stable hasher and then mixed into the byte digest.
+-        let hir_body_hash = compute_hir_hash(tcx);
++        // The interface pass leaves out the HIR hash: it covers every body and every span.
++        let hir_body_hash = (!interface).then(|| compute_hir_hash(tcx));
+         let supplement: Fingerprint = tcx.with_stable_hashing_context(|mut hcx| {
+             let mut hasher = StableHasher::new();
+             // Add dep_tracking_hash to ensure the SVH changes when any tracked flag changes.
+             tcx.sess.opts.dep_tracking_hash(true).stable_hash(&mut hcx, &mut hasher);
+             // Add HIR hash for untracked elements, e.g. DefKind::GlobalAsm.
+-            hir_body_hash.stable_hash(&mut hcx, &mut hasher);
++            if let Some(hir_body_hash) = hir_body_hash {
++                hir_body_hash.stable_hash(&mut hcx, &mut hasher);
++            }
+             hasher.finish()
+         });
+         metadata_hasher.lock().unwrap().write(&supplement.to_le_bytes());
+@@ -2691,6 +2875,7 @@ fn with_encode_metadata_header(
+         is_proc_macro: tcx.crate_types().contains(&CrateType::ProcMacro),
+         hygiene_ctxt: Default::default(),
+         symbol_index_table: Default::default(),
++        iface: interface.then(|| InterfacePass::new(tcx)),
+     };
+ 
+     // Encode the rustc version string in a predictable location.
+@@ -2705,6 +2890,11 @@ fn with_encode_metadata_header(
+         tcx.dcx().emit_fatal(FailWriteFile { path: &path, err });
+     }
+ 
++    // The interface pass only produces a hash, so there is no file header to patch.
++    if interface {
++        return;
++    }
++
+     let mut file = ecx.opaque.file();
+     // We will return to this position after writing the root position and crate hash.
+     let pos_before_seek = file.stream_position().unwrap();
+@@ -2717,12 +2907,14 @@ fn with_encode_metadata_header(
+         tcx.dcx().emit_fatal(FailWriteFile { path: ecx.opaque.path(), err });
+     }
+ 
+-    let hash = tcx
+-        .untracked()
+-        .local_crate_hash
+-        .get()
+-        .copied()
+-        .expect("local_crate_hash set during encoding");
++    // The header publishes the interface hash when that mode computed one.
++    let hash = tcx.untracked().local_interface_hash.get().copied().unwrap_or_else(|| {
++        tcx.untracked()
++            .local_crate_hash
++            .get()
++            .copied()
++            .expect("local_crate_hash set during encoding")
++    });
+     if let Err(err) = encode_crate_hash(file, hash) {
+         tcx.dcx().emit_fatal(FailWriteFile { path: ecx.opaque.path(), err });
+     }
+diff --git a/compiler/rustc_metadata/src/rmeta/mod.rs b/compiler/rustc_metadata/src/rmeta/mod.rs
+index e3f3257ac..75e8df514 100644
+--- a/compiler/rustc_metadata/src/rmeta/mod.rs
++++ b/compiler/rustc_metadata/src/rmeta/mod.rs
+@@ -62,7 +62,7 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
+ /// Metadata encoding version.
+ /// N.B., increment this if you change the format of metadata such that
+ /// the rustc version can't be found to compare with `rustc_version()`.
+-const METADATA_VERSION: u8 = 11;
++const METADATA_VERSION: u8 = 12;
+ 
+ /// Metadata header which includes `METADATA_VERSION`.
+ ///
+@@ -239,6 +239,11 @@ pub(crate) struct CrateHeader {
+     ///
+     /// This is used inside rlibs and dylibs when using `-Zembed-metadata=no`.
+     pub(crate) is_stub: bool,
++    /// Whether the hash in the metadata header is an fRust interface hash.
++    ///
++    /// An interface hash ignores edits that cannot be observed through this crate's metadata.
++    /// Consumers use the flag to decide how to track the crate for incremental compilation.
++    pub(crate) frust_interface_hash: bool,
+ }
+ 
+ /// Serialized `.rmeta` data for a crate.
+diff --git a/compiler/rustc_session/src/frust.rs b/compiler/rustc_session/src/frust.rs
+new file mode 100644
+index 000000000..52942ce57
+--- /dev/null
++++ b/compiler/rustc_session/src/frust.rs
+@@ -0,0 +1,25 @@
++//! Switches that only the fRust compiler (`frustc`) honours.
++
++use std::sync::OnceLock;
++
++fn invoked_as_frustc() -> bool {
++    static CACHED: OnceLock<bool> = OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
++/// Whether crate metadata publishes an interface hash instead of a body-sensitive one.
++///
++/// Only the exact value `1` enables it, and only for an executable named `frustc`, so a stock
++/// `rustc` never changes behaviour. Cargo sets the variable for every unit of one build.
++pub fn interface_hash_enabled() -> bool {
++    static CACHED: OnceLock<bool> = OnceLock::new();
++    *CACHED.get_or_init(|| {
++        invoked_as_frustc()
++            && std::env::var_os("FRUST_INTERFACE_HASH").as_deref() == Some(std::ffi::OsStr::new("1"))
++    })
++}
+diff --git a/compiler/rustc_session/src/lib.rs b/compiler/rustc_session/src/lib.rs
+index e3580d36e..30818830e 100644
+--- a/compiler/rustc_session/src/lib.rs
++++ b/compiler/rustc_session/src/lib.rs
+@@ -24,6 +24,7 @@
+ #[macro_use]
+ pub mod config;
+ pub mod filesearch;
++pub mod frust;
+ mod macros;
+ mod options;
+ pub mod output;

@@ -4,81 +4,50 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-11-11
+* Native Linux x86-64 fCargo builds now default to incremental compilation with 16 codegen units for local packages using fat LTO at opt level 3. Explicit Cargo profile and incremental settings take precedence.
+
+Compiler rewrite. No release of the compiler toolchain has been made, and no compiler change has passed the frozen performance budgets. Measurements are on Linux x86-64 and dated 2026-11-19. See `docs/benchmarks.md` and `qualification/CANDIDATE.md`.
 
 ### Added
 
-* `FRUST_TUNE` compiles incremental, unoptimised crates of the dev and test profiles with 64 codegen units instead of rustc's incremental default of 256 when no codegen-units value is set, which cuts the per-object file work rustc and the linker do on every edit; release, custom profiles, dependencies and explicit settings are unchanged, and `FRUST_TUNE=off` restores rustc's default.
-* An incremental unit's rustc session is stored with its cache entry and restored on a hit, so the first edit after a clean rebuild is incremental instead of a from-scratch compile (`FRUST_CACHE_SESSIONS=off` disables).
-* Edit-loop executor: repeated edits replay only the affected rustc calls itself and fall back to cargo whenever it cannot prove the result identical (`FRUST_EXEC=off|on|audit`).
-* `frust gc` and `frust compact` report progress on stderr: a live status line on a terminal (phase, items done of the total, bytes, workspace or profile, elapsed time and ETA) and a line per phase plus at most one every 5 seconds in logs. `--quiet` silences it and `--progress` forces it (including with `FRUST_RENDER=off`). The gc plan and the compaction report now break the whole home down by workspace, with the store and other state listed separately, and `frust compact --workspace NAME|PATH` limits a run to one workspace. Library callers get the same events through `gc::plan_with`, `gc::execute_with` and `compact::compact_with` with a `Progress` implementation.
-* `fcargo check` and `clippy` build in their own central directory, `<toolchain id>-check` beside the build target (`frust where check`), so they no longer wait on a build through cargo's per-profile lock; identical checks still join. `FRUST_CHECK_DIR=off` restores the shared directory. `fcargo clean` removes both directories (a partial clean applies to both), gc and compaction age the check directory like any target, and `frust doctor` reports the setting.
-* `FRUST_LINKER` (`auto` or `system`): on Windows (MSVC) hosts builds link with the toolchain's `rust-lld` unless a linker is configured or `FRUST_LINKER=system`. `frust doctor` reports the default linker and the effective tuning.
-* No-op fast path: when nothing changed since the last successful `fcargo build` or `check` of the same invocation, `fcargo` prints cargo's output (replayed warnings and the `Finished` line) without launching cargo. Inputs, outputs, fingerprints, config, environment and toolchain are stamped; any difference, an active build or an untrusted volume falls back to cargo. `FRUST_NOOP=off|on|audit` (default `on`) and `FRUST_NOOP_TRACE=<file>` control and trace it.
-* `frust bench --repo PATH` benchmarks a real checkout with paired cargo and frust builds, many edits, and a disk guard that fails when frust's total footprint exceeds cargo's by more than the block overhead of its own records (the larger of 2 MiB and 1.5% of cargo's target). `--gate` also fails when the shipped default (tuned) configuration is slower than cargo by more than a noise allowance (paired median of per-run ratios: cold and edits at most 1.03x plus 40-50 ms, edit p90 at most 1.08x plus 60 ms). The report carries cargo, cargo-tuned (cold and disk only), untuned frust and tuned frust columns (schema version 3), and the disk guard compares tuned frust against cargo built with the same dependency debuginfo setting. `--untuned-runs N` runs the untuned column on fewer runs.
-* `.github/workflows/bench.yml` runs the repo benchmark on Linux, macOS and Windows runners against ripgrep, bat and tokio.
-* `FRUST_TIMINGS=<file>` appends one JSON timing record per compiler invocation.
-* `FRUST_CACHE_SHARE_ROOTS=on` (off by default) lets eligible workspace crates, incremental ones included, share cache entries across git worktrees and clones; crates that embed a checkout path stay specific to their checkout.
-* `frust gc --max-age-days N` and `FRUST_CACHE_MAX_AGE_DAYS` (default 14) set how long an unused cache entry is kept.
-* Cache entries record whether they came from a registry, git or path source and which central-target workspaces used them (optional `source` and `workspaces` fields in `meta.json`; entries stored by earlier versions read as unattributed).
-* `fcargo clean` of a whole central target also retires the path-crate cache entries only that workspace used. Registry and git entries stay in the shared store; `--frust-evict-registry` also retires the ones only that workspace used.
-* Linked cache entries: on volumes without block cloning (ext4, NTFS), a large output is stored as a hard link to the target file, so the cache no longer keeps a second copy of it; a failed link falls back to a copy. A restore always copies, and publishes only bytes that hash to the entry's recorded content hash with the recorded mode; a file rewritten in place makes the entry a miss. `FRUST_CACHE_BACKED=off|auto|force` (default `auto`) controls it.
-* `frust gc` counts a linked file that another name still shares as zero bytes and drops older orphaned linked entries of a unit at once.
-* `FRUST_CACHE_UNIT_VERSIONS` (default 1, at most 4) sets how many entries of a path unit stay in the store; a newer state retires older ones immediately instead of keeping four, so edit loops no longer leave store-only copies of every rebuilt unit.
-* A restore of a linked entry whose store file has no other name now links instead of copying (after a full hash check, and only while the store file has exactly two names), so clean rebuilds write no data for those files; `adopt` retries brief Windows sharing violations.
-* A deferred store dropped because a newer compile replaced its outputs now retires the unit's earlier store-only entries, and gc sweeps unreferenced store-only path entries after ten minutes, so edit loops end without an orphaned version.
-* Linked outputs are no longer hashed before the wrapper returns to cargo; the store hashes them and checks the file's identity around the hash and before the link.
-* Manifest format 6 is written only for manifests that list a linked entry, and linked entries use their own key domain, so earlier versions treat them as misses. Formats 3, 4 and 5 stay readable.
-
-* `FRUST_STORE_SLOTS` (1 to 16) sets the number of concurrent background stores; the default is half the CPU count, 1 to 4, and 2 to 8 on Windows.
-* `FRUST_CACHE_TESTS=on` stores test and bench harness executables, which are no longer stored by default.
-
-* `FRUST_STORE_START=after-build` (default `eager`) queues every deferred store as a job file while cargo runs and lets the front end start the drains once cargo exits, so stores never compete with the compiles; concurrent builds sharing a dependency may then each compile it.
-* Store outcomes in `FRUST_TIMINGS` carry the store's wall time (`total_ms`) and the CPU time of the storing thread (`cpu_ms`).
-* Cargo's `rustc -vV` and `--version` queries, including those of build scripts, are answered from the front end's toolchain probe instead of launching rustc; the probe reads the sysroot from the toolchain's layout on Unix.
-* Manifest and entry logs are packed into append-only checksummed LZ4 record files (`manifests.pack`, `entries.pack`); the earlier per-file formats stay readable.
-* `frust compact` re-links raw store copies to identical target files on volumes without block cloning, so a hard-linked store and target share one copy.
-* On macOS, restored artifacts of 16 KiB or more get a read-ahead hint, because a cloned file starts with an empty page cache.
-* Bench: the shared-cache phases `cold-shared` and `cold-shared-roots` (limit `0.90x + 100 ms` of cargo's cold median, three runs in CI), a fixed disk allowance of the larger of 2 MiB and 1.5%, and opt-in first-edit diagnostics (`--diagnose-first-edit`, `--settle-before-edit-ms`, `--warm-cpu-before-edit-ms`, `FRUST_BENCH_PAGEIN_TRACE`).
+* Started the fRust compiler rewrite and retired the previous build accelerator from the active branch. The entries for 0.3.0 and earlier describe that accelerator.
+* `fcargo`, which runs Cargo and sets `RUSTC` to a sibling `frustc` when unset. `FRUST_PROGRESS` selects plain, static or interactive progress, and plain, dumb-terminal, quiet and explicit JSON invocations hand over to Cargo. `FRUST_PROGRESS_COLOR`, `FRUST_BUILD_REPORT` and `FRUST_CARGO` are also read.
+* `frust-install`, which installs, updates, stages, rolls back and uninstalls a toolchain. With no command it downloads the latest release for the host from GitHub, verifies the sha-256 and installs it, and `frust-install update` replaces it when the release id changes. It can also install a local archive and sha-256 file. The checksum is verified before extraction and the `current` symlink changes only after the tree is complete. The release workflow builds toolchains for Linux x86-64 and for macOS on Apple Silicon and Intel; the macOS ones are unverified until a release run passes on them.
+* `frust-gates`, which recomputes the frozen Linux budgets from raw paired samples.
+* Cargo patch for central target directories and a user JSON config file (`config.json` with `version`, `target_root` and `cache_root`), active under `fcargo`. Outputs go to a per-user directory named from the toolchain id and the workspace path. An `artifacts` cache directory with a marker file is created.
+* Cargo patch (`0002-frustc-content-fingerprint.patch`) that compares content checksums instead of timestamps when Cargo's compiler path is named `frustc`.
+* Eligible `fcargo check` invocations on x86-64 GNU/Linux share verified unit outputs by default. Independent work can run while a peer compiles a shared unit. A stalled check releases its reader locks and retries serially. Set `FRUST_UNIT_JOIN=off` to use ordinary scheduling.
+* 19 November 2026: Cargo patch `0006-frust-lazy-libgit2.patch`. libgit2, and the system CA bundle load that comes with its TLS setup, now initialize on first git use instead of at the start of every Cargo invocation. Git dependencies, `cargo new`, `cargo fix` and proxy detection through git config still initialize it first, and the owner-validation setting is applied before the first repository is opened.
+* 19 November 2026: Cargo patch `0008-frust-direct-entry.patch`. In the packaged toolchain `fcargo` is a hard link of the patched `cargo`, so plain non-terminal invocations skip one process launch. The terminal progress launcher is installed as `fcargo-ui`, and interactive terminals, static progress, an explicit `FRUST_CARGO` and a `+toolchain` argument still go through it. The direct entry is compiled on Linux only.
+* 19 November 2026: Cargo patch `0007-frust-unit-cache.patch`, a verified content-addressed unit artifact cache. Finished rustc outputs of registry, git and directory-source library and proc-macro units are stored under `units/v1` in the artifact cache root and restored in place of rustc on a verified hit. On by default under `fcargo`. Heavy build script runs of registry and git packages (3000 ms by default) are cached in the same store, keyed on their environment, tools and system directories and bound to the same target path. Controls are `FRUST_UNIT_CACHE`, `FRUST_UNIT_CACHE_MAX_BYTES`, `FRUST_UNIT_CACHE_SCRIPT_MIN_MS` and `FRUST_UNIT_CACHE_DEBUG`. Any mismatch or store problem compiles normally. Covered by 86 unit tests in the two cache modules and the 23-case `qualification/prove-unit-cache.py` probe, and exercised with the existing cooperative-build and managed-retention proof scripts. Linux x86-64 is the only verified host. The macOS code paths are compiled in and unverified. Measured results are not recorded yet. See `docs/how-it-works.md` for the key, limits and fallbacks.
+* Compiler patch for post-LTO object reuse and RELR packing, kept as the candidate `frust-cg1` and not qualified. One ripgrep leaf sample ran at 0.655 of stock wall time, and single samples of the syn leaf, regex leaf and fd holdout were slower than stock. Both pieces are opt-in through `FRUST_EXPERIMENTAL_CODEGEN_CACHE=1` and `FRUST_EXPERIMENTAL_RELR=1`. Default compilation and linking retain upstream behavior.
+* Continuous integration for the Rust workspace, the shell scripts, the runtime corpus and the pinned upstream patches, and manual `Toolchains` and `Benchmark` workflows that build the control and fRust stage-2 toolchains and run the paired qualification samples and release gates on GitHub's Linux x86-64 runners. The workload commits and the three generated `Cargo.lock` files are recorded in `qualification/cohorts.lock` and `qualification/locks/`.
+* Qualification protocol, frozen workload cohort, baselines, edit scripts, runtime corpus, a parity proof script and compatibility record under `qualification/`.
 
 ### Changed
 
-* Automatic compaction no longer runs inside a build. A due pass starts as a detached `frust compact --auto-background` process after the build has released its lock, and holds Cargo's profile locks only for slices of `FRUST_COMPACT_SLICE_MS` (100 ms by default), stopping as soon as a frust build queues; an interrupted pass is continued by the next. Previously a due pass ran under the build lock after Cargo exited and added seconds to some builds. `FRUST_COMPACT_SYNC=on` runs the pass in the invoking command instead, after its lock is released.
-* `frust compact` lists target directories without measuring them first and measures each root once, and `frust gc` no longer walks every target after collecting just to decide whether to suggest `frust compact`, so neither spends minutes in silent extra walks on a large home.
-* A linked store reads each output once: it links first and hashes through the new name, and the same read attests a library again under the stamp the link left, instead of hashing before the link and reading the library a second time after it.
-* A file under a build script's `build/<unit>/out` is remembered in the hash memo as soon as cargo's `output` file beside it has a later change time, instead of after the 2 second settle margin, so static archives rewritten during a clean rebuild are no longer read again on the first edit.
-* On Linux and Windows, `fcargo build` no longer reads a root library at freeze to attest it when cargo's uplift link will void that attestation at once, predicted from the uplifted name still sharing the inode the compile replaced.
-* `fcargo doc` locks its profile and a `doc@output` slot instead of the whole target directory, so it runs alongside builds of the other profile.
-* Dependency debuginfo tuning (`FRUST_TUNE`) is now on by default; `FRUST_TUNE=off` restores cargo's defaults. It is skipped only when your own configuration sets `debug`, `split-debuginfo` or `strip` for the profile in use; an unrelated `[profile.release]` or other profile settings no longer disable it, and release, bench, install and custom profiles are never tuned.
-* Cache entries, manifests, unit records and key lock files now live directly under `store/`, `manifests/`, `units/` and `keylocks/` instead of in two character shard directories, which cost a directory block each on ext4. Older layouts stay readable and `frust gc` moves them flat and removes the emptied shard directories.
-* New entries keep their dep-info text and diagnostics inside `meta.json` (`inline` on a file record, `stderr_inline` on the entry; each falls back to a separate file above 64 KiB), so an entry holds only its payload files besides `meta.json`. Manifests that list such entries use format 7 (backed: 8); formats 3 to 6 and the older entry layout stay readable, and older versions treat the new manifests as misses.
-* Unit version records are written as lines of one file, `units/pack` (`unit unix_seconds key...`), rewritten atomically under the same metadata lock, instead of one file per unit. A legacy per-unit file is still read until the pack lists its unit; a write folds it into the pack, and gc retires pack lines by their recorded write time.
-* Idle compile key lock files older than ten minutes are unlinked by `frust gc` while it holds them, and a process that locked a file gc retired takes the lock again on the replacement, so a key never has two holders.
-* `frust bench --repo` measures the final disk totals after one explicit gc and compaction pass on the frust home (the work the product runs on its own), gates on that figure, and reports the pre-maintenance total, the pass time and a per-tree split of `other` beside it.
-* Test and bench harness executables (`rustc --test`) are compiled but not stored unless `FRUST_CACHE_TESTS=on`, so a rebuild of many test targets no longer pays for storing each one.
-* A finished compile with no free store slot queues its store as a job file that any helper drains, instead of storing inline on the compile's critical path. `FRUST_TIMINGS` reports it as `queued:slots`; inline stores remain only where the outputs cannot be frozen.
-* Cache entries are evicted by age, not by size. `FRUST_CACHE_MAX_GIB` and `FRUST_TARGET_MAX_GIB` are unlimited unless set.
-* Deferred stores of primary incremental units no longer hold the unit key lock, so the next edit does not wait for the previous store.
-* Detached helpers on Windows are created without inheriting handles.
-* `cargo clean` of a central target now runs as a child of frust under the whole-target build lock, so no build can start between releasing cache entries and deleting the target. Its arguments, output and exit code are unchanged, and the empty workspace directory is removed afterwards.
-* Cache payloads are LZ4-compressed on Windows volumes without block cloning (such as NTFS), so the store no longer keeps a raw copy of each large artifact next to the target's copy.
-* A `-sys` package's compile records every file of the link directories its build script filled, small object files included, so the final link at the end of a cold build looks them up instead of reading them (bat's binary pre-key: about 20 ms to 5 ms).
+* The workspace packages are `frust-rs` (the installer binaries, replacing the 0.4.0 accelerator on crates.io) and `frust-rs-core`, version 0.5.0, licensed MIT to match `LICENSE`. `cargo install frust-rs` installs `frust-install`, `fcargo` and `frust-gates`. Pushing a `v*` tag runs the release workflow, which publishes the GitHub release and then the crates.
 
-### Fixed
-* The stores of build-script capability probes that emit only metadata are deferred from a hard-linked snapshot of their outputs instead of running inline, which took about 300 ms per build off the critical path of cold macOS builds.
-* The volume probe that decides whether clones are available no longer races with concurrent wrappers, which had left Windows stores uncompressed and unlinked.
-* The edit-loop executor handles Windows builds: proc-macro and cdylib import libraries, executables without an extra filename, separators in dep-info files and the `.pdb` uplift.
+* Cargo skips checksumming excluded dependencies and treats dependencies saved during compiler invocation as dirty on the next build. Upgrading invalidates the earlier dependency checksum records.
+* Qualification requires the complete frozen cohort and rejects missing tail series and invalid timings. The parity fixture now compiles and links a native archive and tests an edit between compiler completion and Cargo's fingerprint write.
 
-* `frust gc` no longer deletes a workspace directory under `targets/` recursively. It removed one that looked empty (or could not be read) with everything in it, so a build that created its target between the check and the removal lost its `deps` mid-build (`failed to write ... deps/lib*.rmeta: No such file or directory`). Now only a directory holding nothing but regular files is removed, without recursion, and its marker is restored when the removal fails.
-* A restore that links a store file into the target gives it a fresh modification time like every other restore, so cargo no longer finds a linked build script or binary older than its dependencies and rebuilds it on every no-op build (ext4, NTFS).
-* The no-op fast path records units cargo names without a hash (a path package's `cdylib` or `dylib`, and executables on windows-msvc, whose dep-info is `deps/<crate>.d`) and follows a symlinked directory in a package whose build script has no rerun directives, instead of declining every build of such workspaces; `frust bench --repo` reports the fast path's decisions for the no-op row (`noop_decisions`).
-* `frust env` and `frust doctor` look for `frust-wrap.exe` on Windows, so `frust env` prints its `RUSTC_WRAPPER` line and doctor finds the wrapper.
-* A bare explicit linker such as `rust-lld` (from `-C linker`, cargo config or `RUSTFLAGS`) is also resolved in the toolchain sysroot, so those units are cached instead of silently compiled uncached.
-* A cache bypass caused by an unresolved linker is now visible: one stderr line per reason, `skip:linker` in `FRUST_TIMINGS`, and a `frust doctor` warning that names the linker.
-* A pending deferred store no longer protects the rest of the cache from eviction once its scan budget is exhausted.
-* Edits no longer get slower the more of them there have been. With unpacked debuginfo (the macOS default) rustc links every incremental object into `deps/` under a new name on each compile and never removes the old names, so frust's output scans visited about 256 more entries per ripgrep edit (51,000 after 200 edits: a 124 ms scan beside rustc and 72 ms after it). The store (or an inline store) of each compile now removes the unit's objects that existed before rustc started, unless they were rewritten since or the unit's current artifacts still name them; automatic compaction also runs once a target gains 4096 files, not only 64 MiB; and a test harness that is not stored is no longer scanned.
+### Dropped
 
-## [0.3.0]
+* Pre-optimization fat-LTO cache. The full paired gate failed the holdout, runtime and stripped-size budgets, with the runtime and size gates also short of three workloads.
+* Two-thread fat-LTO machine codegen. One fd holdout pair ran at 21.19s against 15.90s with 1.62 times the peak RSS, so the paired gate was not run.
+* Fat-LTO pre-link at opt-level 1, and at opt-level 0 with an x86 machine outliner. Single samples did not reach the 0.80 leaf budget, and the opt-level 0 variant used about 2.11 times the control's peak RSS.
+* Safe identical-code folding (`--icf=safe`). The ripgrep output was byte-identical to stock.
+* Hot-cold splitting and scheduling retargets (`-Z tune-cpu`) were checked with the stock compiler and not adopted.
+
+### Hardening
+
+* Hardening fixes to the tools and documentation are in progress on this branch. The commit history has the specifics.
+
+## Earlier accelerator releases
+
+The sections for 0.3.0, 0.2.0, 0.1.1 and 0.1.0 describe the earlier fRust build accelerator, a compile-cache wrapper that is no longer in the active branch. They do not describe the compiler toolchain.
+
+## [0.3.0] (earlier accelerator)
 
 ### Changed
 
@@ -104,7 +73,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * macOS store transport validates inherited socket roles and closes every rejected transferred descriptor.
 * Target maintenance preserves files owned by pending stores and retries their cleanup after publication.
 
-## [0.2.0]
+## [0.2.0] (earlier accelerator)
 
 ### Added
 
@@ -172,7 +141,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
   distinguish declared Cargo-unit compilations from build-script capability probes, and unavailable audits remain
   unknown rather than being reported as zero. Runtime output checks cover every measured executable launch.
 
-## [0.1.1]
+## [0.1.1] (earlier accelerator)
 
 ### Fixed
 
@@ -182,7 +151,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * The live display is redrawn as a fine line bar with half-cell steps, percent, exact unit count, elapsed time and cache
   hits, and unit timers aligned at the right edge. The animated Pac-Man bar is gone.
 
-## [0.1.0]
+## [0.1.0] (earlier accelerator)
 
 ### Added
 

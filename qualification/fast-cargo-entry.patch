@@ -1,0 +1,84 @@
+diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
+index 77dd77c..ff2036e 100644
+--- a/src/bin/cargo/main.rs
++++ b/src/bin/cargo/main.rs
+@@ -15,6 +15,8 @@ mod commands;
+ use crate::command_prelude::*;
+
+ fn main() {
++    #[cfg(target_os = "linux")]
++    select_frust_entry();
+     let _guard = setup_logger();
+
+     let mut gctx = match GlobalContext::default() {
+@@ -59,5 +61,70 @@ fn main() {
+     }
+ }
+
++#[cfg(target_os = "linux")]
++fn select_frust_entry() {
++    use std::io::IsTerminal;
++    use std::os::unix::fs::MetadataExt;
++    use std::os::unix::process::CommandExt;
++    use std::process::Command;
++
++    let mut args = env::args_os();
++    if args.next().as_deref().and_then(|arg| Path::new(arg).file_name())
++        != Some(OsStr::new("fcargo"))
++    {
++        return;
++    }
++    let Ok(exe) = env::current_exe() else {
++        return;
++    };
++    let Some(bin) = exe.parent() else {
++        return;
++    };
++    let rustc = bin.join("frustc");
++    let cargo = bin.join("cargo");
++    let progress = env::var("FRUST_PROGRESS").ok();
++    let plain = env::var_os("TERM").as_deref() == Some(OsStr::new("dumb"))
++        || matches!(progress.as_deref(), Some("plain" | "off"))
++        || (!matches!(progress.as_deref(), Some("static" | "interactive"))
++            && !std::io::stderr().is_terminal());
++    let explicit = env::var_os("FRUST_CARGO").filter(|value| !value.is_empty());
++    if let Some(program) = explicit.as_deref().map(Path::new)
++        && program.file_name() == Some(OsStr::new("fcargo"))
++    {
++        let resolved = if program.components().count() > 1 {
++            Some(program.to_path_buf())
++        } else {
++            env::var_os("PATH").and_then(|path| {
++                env::split_paths(&path).map(|dir| dir.join(program)).find(|path| path.is_file())
++            })
++        };
++        if let (Some(target), Ok(source)) = (resolved.and_then(|path| fs::metadata(path).ok()),
++                                             fs::metadata(&exe))
++            && (target.dev(), target.ino()) == (source.dev(), source.ino())
++        {
++            eprintln!(
++                "fRust: {} resolves to this fcargo; set FRUST_CARGO to the real cargo or install cargo next to fcargo",
++                program.display()
++            );
++            std::process::exit(1);
++        }
++    }
++    let toolchain = args.next().is_some_and(|argument| argument.to_string_lossy().starts_with('+'));
++    if !plain || explicit.is_some() || toolchain {
++        let error = Command::new(bin.join("fcargo-ui")).args(env::args_os().skip(1)).exec();
++        eprintln!("fRust could not run its launcher: {error}");
++        std::process::exit(101);
++    }
++
++    // No application threads have started at the entry point.
++    unsafe {
++        env::set_var("FRUST_INVOCATION", "fcargo");
++        env::set_var("CARGO", cargo);
++        if env::var_os("RUSTC").is_none() && rustc.is_file() {
++            env::set_var("RUSTC", rustc);
++        }
++    }
++}
++
+ fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
+     use tracing_subscriber::prelude::*;

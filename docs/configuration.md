@@ -1,178 +1,98 @@
 # Configuration
 
-For switches shown as `on` or `off`, the values `off`, `0`, `false` and `no` turn them off, and `on`, `1`, `true` and `yes` turn them on. Anything else leaves the default.
+fRust keeps build outputs in per-user central storage when Cargo is started through `fcargo`. The behavior below is implemented in the patched Cargo (`support/patches/0001-frust-central-target.patch`) and `fcargo`, and the Linux paths are covered by tests in this repository. The macOS paths are computed by the same code but have not been run on macOS.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `FRUST_HOME` | platform cache dir + `/frust` | All state lives here |
-| `FRUST_CACHE` | `on` | Compile cache |
-| `FRUST_CACHE_COMPRESSION` | `auto` | New cache writes use LZ4 on Linux when a reflink probe fails; `off` writes raw payloads. Both settings can read existing raw and compressed entries. See [cache payload storage](how-it-works.md#cache-payload-storage) |
-| `FRUST_CACHE_BACKED` | `auto` | On volumes without block cloning (ext4, NTFS), large outputs are stored as a hard link to the target file, so the bytes exist once; any link failure falls back to a copy. `off` stores ordinary payloads; `force` links on any volume (for tests). Needs `FRUST_CACHE_COMPRESSION` not `off`. Existing entries of every kind stay readable. See [linked entries](how-it-works.md#linked-entries) |
-| `FRUST_CACHE_SESSIONS` | `on` | An incremental unit's rustc session is stored beside its cache entry and put back on a hit, so the first edit after a clean rebuild is incremental. `off` stores artifacts only. Sessions are kept only on volumes that can clone or link them |
-| `FRUST_CACHE_PRIMARY` | `on` | Cache workspace packages too (non-incremental builds only) |
-| `FRUST_CACHE_SHARE_ROOTS` | `off` | `on` lets eligible workspace crates, incremental ones included, share cache entries across git worktrees and clones of the same repository: the checkout root becomes a token in the key and stored paths, and the crate is compiled with `--remap-path-prefix=<root>=/frust-root`. Crates that embed a checkout path stay specific to their checkout. See [sharing across checkouts](how-it-works.md#sharing-across-checkouts-opt-in) |
-| `FRUST_CACHE_PRIMARY_INCREMENTAL` | `on` | Cache incrementally compiled workspace outputs. Clean builds and branch switches can restore matching outputs; the next edit may need to rebuild incremental state. Storing changed states adds cache work; see [benchmarks](benchmarks.md). |
-| `FRUST_COMPACT_INCREMENTAL_IDLE_DAYS` | `7` | Idle incremental reuse data retention. Metadata-only state with unknown ownership can expire without cache coverage; fresh, active and unreadable state is protected. See [cleanup rules](how-it-works.md#incremental-data-and-compaction) |
-| `FRUST_BENCH_MAX_SCRATCH_MIB` | `4096` | Stops `frust bench` when its scratch directory passes this physical size |
-| `FRUST_CACHE_INCREMENTAL` | `on` | Cache incremental compiles of non-primary path dependencies, including optimized profiles |
-| `FRUST_CACHE_TRUST_STAMPS` | `on` | How far recorded file stamps are believed on a lookup. `on` accepts an input whose stamp is unchanged without reading it and re-hashes some of those inputs on every hit (all of them when there are four or fewer, otherwise one chosen at random). `audit` re-hashes every such input. `off` (or `0`, `false`, `no`) always hashes content. Any other value means `on`. A stamp that matched while the content differed is a violation: it is logged under `stamp-trust/` in `FRUST_HOME`, the compile runs, and stamps are not trusted on that volume for 7 days. Stamps are never trusted on network, FAT or FUSE filesystems or ones of unknown type, and on Windows only on NTFS and ReFS. `frust doctor` reports the state. See [how it works](how-it-works.md#stamp-trust-and-audits) |
-| `FRUST_KEYLOCK_WAIT_SECS` | `300` | How long a compile waits for another process compiling the same unit before compiling anyway. A waiter that is released looks the entry up again and restores it. Whole seconds; `0` does not wait |
-| `FRUST_STORE_SYNC` | `off` | `on` stores each compile result inside the wrapper before it returns. By default bounded background workers finish storage after rustc exits; Linux and macOS use a broker for multiple misses, with helper and inline fallbacks |
-| `FRUST_GC_SYNC` | `off` | `on` runs the daily automatic gc inline, including draining eligible idle central targets, and can delay the invoking command. By default the daily collector runs detached |
-| `FRUST_STORE_START` | `eager` | `after-build` queues every deferred store as a job file while cargo runs and starts the drains once cargo exits, so no store competes with the compiles and the wrapper skips the broker hand-off; concurrent builds that share a dependency may then each compile it, since no store holds its key lock. Needs a supervising front end (a build lock or the display); otherwise stores start eagerly |
-| `FRUST_STORE_SLOTS` | half the CPU count, 1 to 4 (2 to 8 on Windows) | Background stores that may run at once across all processes; values from 1 to 16. With every slot busy a finished compile queues its store as a job file instead of storing inline |
-| `FRUST_CACHE_TESTS` | `off` | `on` also stores test and bench harness executables (`rustc --test`); by default they are compiled but not stored, since each edit rebuilds them. An entry stored earlier is still restored |
-| `FRUST_CACHE_MAX_AGE_DAYS` | `14` | Cache entries unused for longer than this are evicted by `frust gc` and the daily automatic gc; fractional days are allowed and `frust gc --max-age-days N` overrides it. Entries a pending store still owns are kept. Superseded incremental entries (all but the newest `FRUST_CACHE_UNIT_VERSIONS`, at most two, per unit) are always removed regardless of age |
-| `FRUST_CACHE_UNIT_VERSIONS` | `1` | Entries kept per path unit (a workspace crate). Recording a new state retires older ones beyond this at once, so edit loops never hold more than cargo's own target. Values from 1 to 4; raise it to keep older states restorable after reverts and branch switches |
-| `FRUST_CACHE_MAX_GIB` | unlimited | Opt-in cache-store allocation cap enforced by `frust gc` and the daily automatic gc, evicting oldest-used entries first; encoded payloads count at their stored allocation. Unset, negative or non-numeric means no cap, so the store is never trimmed for size alone; `0` evicts every unprotected entry |
-| `FRUST_AUTO_COMPACT` | `on` | Compact central targets after successful builds. A due pass starts as a detached background process once the build has released its lock, so neither that build nor the next waits for it; it holds Cargo's profile locks only for short slices and stops when a build queues. Completed passes are throttled for 10 minutes; incomplete or interrupted passes retry after 30 seconds and continue where the last one stopped |
-| `FRUST_COMPACT_SYNC` | `off` | `on` runs a due automatic compaction pass in the invoking command after its build lock is released, so the command exits only after the pass; for tests and scripts that inspect the target right after a build. By default the pass runs detached |
-| `FRUST_COMPACT_SLICE_MS` | `100` | How long one slice of a background compaction pass may hold Cargo's profile locks before it releases them, lets waiting builds in and continues. A step in progress (one file or directory) always finishes first. `0` holds the locks for the whole pass |
-| `FRUST_COMPACT_KEEP_DAYS` | `14` | How long an unused profile's artifacts are kept before auto-compaction removes them |
-| `FRUST_TARGET_MAX_GIB` | unlimited | Opt-in soft per-target-directory budget, separate from the cache store. Unset means no size pressure, only the age rules apply. When set, old superseded artifacts and safely aged reuse state are eviction candidates; necessary live outputs and protected state can exceed it |
-| `FRUST_TARGET` | `central` | `local` leaves `CARGO_TARGET_DIR` alone |
-| `FRUST_CHECK_DIR` | `on` | `fcargo check` and `clippy` build in `<toolchain id>-check` beside the central build target, so they run alongside builds instead of waiting on cargo's profile lock. `off` shares one directory again (and the wait). Ignored when you set a target directory or `FRUST_TARGET=local` |
-| `FRUST_TUNE` | `on` | Builds dependencies without debug info (`--config profile.dev.package."*".debug=0`) in the dev and test profiles; your own workspace crates keep full debug info. Applies only to dev-like builds (never `--release`, `bench`, `install` or custom profiles). Skipped when the project, a cargo config file, `--config` or a `CARGO_PROFILE_*` variable sets `debug`, `split-debuginfo` or `strip` for the profile in use (including under `package` or `build-override`); other profile settings, and `[profile.release]`, do not block it. Also compiles incremental, unoptimised crates of the `debug` profile directory with `-C codegen-units=64` instead of rustc's 256 unless a codegen-units value is set anywhere; release, bench, custom profiles and dependencies are unchanged. See [smaller build directories](how-it-works.md#smaller-build-directories). `off` keeps cargo's defaults |
-| `FRUST_LINKER` | `auto` | On Windows (MSVC) hosts frust links with the toolchain's `rust-lld` when it is present and you have not chosen a linker (no `linker` in cargo config, no `CARGO_TARGET_*_LINKER`, no `-C linker` in rustflags). `system` keeps `link.exe`. Linux and macOS are unchanged. `frust doctor` reports the active choice |
-| `FRUST_LINK` | `off` | `smart` invokes Apple’s native linker directly for eligible macOS host dev binaries, avoiding the default compiler-driver process. Keeps static Rust linkage and current incremental state. Explicit linker options, custom drivers, cross targets, tests and release builds keep their existing link path |
-| `FRUST_NOOP` | `on` | No-op fast path: an unchanged repeat of a recorded `fcargo build` or `check` prints cargo's output without launching cargo. `off` always runs cargo; `audit` runs cargo whenever the fast path would have answered and fails the build if cargo compiled anything or printed different output. See [no-op fast path](how-it-works.md#no-op-fast-path) |
-| `FRUST_NOOP_TRACE` | unset | A file that receives one JSON line per `build` or `check` with the fast-path decision, the recording outcome and what differed, plus the executor's decision (`exec`) and plan outcome (`plan`) |
-| `FRUST_EXEC` | `on` | Executor: when only workspace sources changed since a recorded `fcargo build` or `check`, the recorded rustc calls of the changed units and their dependents run through the wrapper without launching cargo. `off` always runs cargo; `audit` runs cargo instead, then requires cargo's rebuilt units to be within the predicted set, compiled with the recorded arguments and environment, and a cache-free replay to produce the same bytes and diagnostics. See [executor](how-it-works.md#executor) |
-| `FRUST_LOCK` | `on` | Queued build lock |
-| `FRUST_LOCK_TIMEOUT_SECS` | none | Give up waiting for the lock |
-| `FRUST_RENDER` | `auto` | `auto`, `ansi`, `plain`, `off` |
-| `FRUST_OSC` | `auto` | `auto`, `off`, `all`, or a list |
-| `FRUST_DEBUG` | `off` | Print diagnostics from the compile wrapper (cache decisions, timings) and from automatic compaction to stderr |
-| `FRUST_UPDATE_CHECK` | on | `off` (or `0`, `false`, `no`) stops the daily release check and the update notice. `frust self-update --disable` does the same with a marker file in `FRUST_HOME`, and `--enable` removes it |
-| `FRUST_UPDATE_API_URL` | GitHub's latest-release API for frust | Where `frust self-update` looks up the release tag. For mirrors and tests; setting either update URL variable also allows non-https and `file` URLs |
-| `FRUST_UPDATE_DOWNLOAD_BASE` | `https://github.com/Seggys116/frust/releases/download` | Base URL of the release archives and their `.sha256` files. For mirrors and tests |
-| `FRUST_CARGO`, `FRUST_RUSTC` | PATH lookup | Use a specific binary |
-| `FRUST_BYPASS` | unset | Run cargo completely untouched |
+## Central target directory
 
-An explicit `CARGO_TARGET_DIR`, `--target-dir`, or a `target-dir` in your cargo config is always respected.
+The patched Cargo uses a central target directory only when all of these hold:
 
-`--frust-evict-registry` is a flag of `fcargo clean`, not a variable. frust removes it before cargo sees the arguments, and
-it also retires registry and git cache entries that only the cleaned workspace used. Any other command receives the flag
-unchanged. See [cleaning a project](how-it-works.md#cleaning-a-project).
+- Cargo was started by `fcargo` (which sets `FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`.
+- `FRUST_CENTRAL_TARGET` is not `off`.
+- No target directory or build directory was chosen another way, for example `CARGO_TARGET_DIR` or a Cargo configuration setting.
+- The workspace is not an ephemeral or embedded manifest.
 
-Automatic target retirement applies to frust-managed central targets after 30 days of inactivity. It rechecks
-activity while holding the frust target guard and Cargo profile locks, removes eligible payloads and preserves
-the target/profile directories, `deps` and `.fingerprint` roots, and Cargo lock files. Unknown or user-managed layouts
-and fresh activity prevent retirement. Expired incremental reuse data is pruned in bounded batches first; a held
-compiler session keeps its own state and prevents program-output retirement, while other expired reuse data can
-still be reclaimed. Foreground fallback samples a bounded set of candidates; the daily
-background collector drains eligible targets, and `FRUST_GC_SYNC=on` requests that drain inline.
+Plain `cargo` keeps the stock `target/` default. When the central default applies, Cargo fails with a message if `HOME` is not an absolute path, if `config.json` is invalid, or if the toolchain id is rejected.
 
-Cleanup runs when frust is invoked; it is not a background service. Retention periods and soft budgets do not
-impose a universal hard disk cap. See [incremental data and compaction](how-it-works.md#incremental-data-and-compaction)
-for idle-state protection, cleanup retries and the effect of cache coverage.
+The directory is `<target_root>/targets/<xx>/<rest>`, where `xx<rest>` is the hex sha-256 of the toolchain id, a NUL byte and the canonical workspace path. Different workspaces and different toolchains therefore get separate directories, and a symlink to a workspace maps to the same directory as the workspace. The toolchain id is, in order, `FRUST_TOOLCHAIN_ID`, the trimmed contents of the `frust-toolchain-id` file in the toolchain root (the parent of `bin/`), or `frust-unidentified`. An id must be non-empty and must not contain `/`, `\` or a NUL byte.
 
-The update check runs only on an interactive terminal, never when `CI` is set or `FRUST_BYPASS` is set, and at most
-once a day. See [how it works](how-it-works.md#updates) for `frust self-update`.
+## User config file
 
+`config.json` is optional. A missing file means defaults. It is a JSON object with exactly these fields, and an unknown field is an error:
 
-`frust bench --store=deferred --quick --runs 3 --json` measures general cold builds, restores and real
-edits with the production store policy. Its nested release-profile comparison uses the same policy.
-`frust bench --profiles --store=sync --quick --runs 3 --json` runs only default release, ThinLTO and
-full/fat LTO comparisons with synchronous cache storage, which remains the benchmark default.
-Both modes accept `--store=sync|deferred`. `millis` measures foreground completion;
-`store_drain_millis` records the observed interval from foreground exit until no pending job files remain
-and every existing store-slot lock can be held exclusively together. `settled_millis` measures from build
-start through that proof. These fields do not count helpers or synchronous fallbacks, and are omitted
-for Cargo samples, synchronous storage and maintenance rows. Every deferred build drains before later
-state changes, maintenance or runtime checks. A drain that cannot complete within 120 seconds fails;
-any failed deferred benchmark retains its fixture to protect files a helper may still use.
+```
+{"version": 1, "target_root": "/absolute/path", "cache_root": "/absolute/path"}
+```
 
-`frust bench --concurrent --quick --runs=7 --json` compares paired groups of two concurrent
-cold builds with equivalent dev-inherited `coldone` and `coldtwo` profiles. This mode defaults to
-`--store=deferred`; explicit `--store=sync|deferred` is supported. Each group starts with empty separate
-targets and an empty shared cache, retaining only independently warmed Cargo compiler-info memos.
-The report retains raw role/compiler evidence, group-only cache events, spawn skew, nanosecond
-foreground/drain/settled clocks, observed unit multiplicities, verified peer-reuse identities, same-path
-binary/runtime hashes, machine/load/filesystem context and paired median/minimum/maximum differences.
-Both unchanged builds must execute zero compiler calls (including queries), notices and cache events.
-This measures intra-group cooperation; OS page and registry caches stay warm. Store settlement proves
-job/slot completion, without claiming that every descendant process exited. The Linux/macOS compiler audit
-backend is required; Windows and combinations with profiles, growth, churn, linking, latency or
-`--settle-edits` are rejected before fixture creation. The fixture uses two local libraries in quick mode
-and eight otherwise; registry dependencies are included only when available offline. Compiler verbose
-identity, probe ID and Cargo version identify the selected toolchain. Foreground groups have a 120-second
-watchdog; a timeout or spawn failure cancels their owned process groups, with a five-second reaping
-budget. Store draining has its own 120-second bound. All failed concurrent runs retain their scratch.
+`version` is required and must be the integer 1. `target_root` and `cache_root` are optional and must be absolute paths. Either can point to temporary storage. Cleanup on reboot depends on how the operating system manages the chosen directory.
 
-Select `--concurrent-profile=dev|release|thin|fat` (default `dev`) to give both roles the same settings.
-For example, `frust bench --concurrent --concurrent-profile=thin --quick --runs=7 --json` measures
-matching ThinLTO builds. Release uses `lto=false`, 16 codegen units and unwind; thin uses ThinLTO,
-16 units and unwind; fat uses fat LTO, one unit and abort. All three release selections default to
-nonincremental compilation and disable debug information. JSON records the selection and effective settings;
-executable bytes, runtime, native compilation, peer reuse and no-op checks remain mandatory.
-This option requires `--concurrent` and cannot be repeated.
-For release, thin or fat profiles, `--concurrent-incremental=on|off` explicitly overrides incremental
-compilation for both roles; for example, `frust bench --concurrent --concurrent-profile=thin
---concurrent-incremental=on --quick --runs=7 --json`. The override requires `--concurrent`, cannot
-be repeated, and is rejected for dev, whose existing incremental behavior is unchanged. JSON records
-the effective incremental setting; all native-argument, executable, peer-reuse and no-op checks remain.
+| | Linux | macOS |
+| --- | --- | --- |
+| Config file | `$XDG_CONFIG_HOME/frust/config.json`, else `~/.config/frust/config.json` | `~/Library/Application Support/fRust/config.json` |
+| Default roots | `$XDG_CACHE_HOME/frust`, else `~/.cache/frust` | `~/Library/Caches/fRust` |
 
-On macOS, the default `dev` profiles retain full debug information and incremental compilation,
-using `split-debuginfo = "packed"` and `strip = "debuginfo"`. Debug information lives in complete
-dSYM bundles, avoiding random incremental object suffixes in executable debug maps. Every dev role
-verifies DWARF structure, fixture source units, types, located local variables and matching
-executable/bundle UUIDs after its settled clock. Two additional untimed dev warmups prove clean cache
-restoration with zero declared-unit or unknown compilations, positive hits, no misses and identical
-executable/runtime hashes and bundle file paths, bytes and modes. Native inspection has a shared
-ten-second process-group watchdog and bounded output reads. Release selections report this inspection
-as not applicable because debug information is disabled; all profiles still compare every executable
-byte. macOS JSON includes `native_debug_policy`, optional role `native_debug` proofs and separate
-`native_debug_cache_restores`. Directory outputs retain the inline store fallback when deferred
-capture cannot freeze them.
+An `XDG_*` value that is empty or not absolute is ignored. Targets go under `<target_root>/targets`. The target root and the cache root default to the same directory.
 
-The general report preserves its separate churn and maintenance experiments with synchronous storage;
-the churn section reports its own `store_policy`. Explicit `--store` is incompatible with `--growth`,
-`--churn`, `--linking` and `--latency`.
+## Artifact cache directory
 
-Audited build samples retain compilation arguments in `rustc_invocations` and version/help or known
-inspection-only `--print` queries in `rustc_query_invocations`, including queries that also specify
-`--emit`. Compilation-bearing requests such as `link-args` and `native-static-libs`, unknown print kinds
-and ambiguous arguments remain in the compilation audit. `rustc_call_count`
-counts both lists; `rustc_compilation_counts.total` keeps its compilation-only meaning. These fields are
-null where compiler auditing is unavailable. No-op builds require zero backend calls of either kind.
-Warm restores require zero declared-unit and unknown compilations; queries and build-script capability
-probes remain visible separately and contribute to elapsed time.
+The patched Cargo creates `<cache_root>/artifacts` and a `MARKER` file containing `frust-cache-v1`. If the path is not a directory, cannot be written, or holds an unreadable or different marker, the check reports a fallback. The patched Cargo ignores that result for central targets. The unit artifact cache below stores in `units/v1` inside this directory and stays off when the check does not report the directory ready. The opt-in compiler object cache described in [how-it-works](how-it-works.md) is stored next to the compiler's output object, not here.
 
-Add `--keep-scratch` to retain completed or failed benchmark fixtures for inspection. The retained path is
-printed to stderr, leaving JSON stdout parseable. Select the filesystem with `TMPDIR` (`TMP`/`TEMP` on
-Windows), allow at least 12 GiB free initially, and budget for retained targets plus cache data after the
-command exits. Retained fixtures are excluded from automatic abandoned-benchmark cleanup; remove them
-when inspection is complete. See [benchmarks](benchmarks.md) for the measurement method.
+## Unit artifact cache
 
-`frust bench --growth --settle-edits --edits=200 --json` replays the growth script after waiting for
-unchanged source stamps to pass the compiler's file-age guard: 100 ms on fine timestamps or 2 seconds
-on coarse timestamps. Each wait is outside the build clock, recorded separately, and bounded to 15
-seconds; unsafe or unexpectedly changed inputs fail the run. Ordinary `--growth` and nested churn
-continue to build immediately after edits. Settled mode records observed entry keys after descriptor
-and backing-file presence checks, nonzero-byte versus zero-byte miss records, retained unit-key counts
-and retired payload counts. Miss bytes alone do not prove publication or a successful restore. Every
-edit's output is checked across variants, and the final unchanged build must have no compiler calls,
-cache events or Cargo compile notices. This workload does not demonstrate reclamation after the
-one-hour retired-payload grace period.
+The patched Cargo (`support/patches/0007-frust-unit-cache.patch`) keeps a content-addressed store of finished rustc outputs for registry, git and directory-source dependencies, and of heavy build script runs of registry and git packages. It lives in `<cache_root>/artifacts/units/v1` (default `~/.cache/frust/artifacts/units/v1` on Linux). `HOME` must be an absolute path. [How it works](how-it-works.md#unit-artifact-cache) describes what is stored, the key and the fallbacks.
 
-Managed allocation includes the selected target and entire isolated cache home in one checked union.
-`other_managed_bytes` is the remainder outside the selected target/store, including control files,
-temporary or retired payloads and other central targets. `retired_payload_bytes` separately measures
-`tmp/evicted`; sharing can overlap other roots, so this breakdown must not be added to the total.
-Cargo has no cache-home or retired-payload measurement. Unreadable or changing allocation inventories
-are reported as unavailable with a reason.
+The cache is on when Cargo was started by `fcargo` (`FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`. It is available on Linux and macOS only.
 
-`FRUST_LINK=smart fcargo build` enables the native-link policy. It applies when Cargo invokes rustc for an
-unoptimised incremental binary; otherwise fresh artifacts remain fresh. The policy also works with
-`FRUST_CACHE=off`, respects an existing foreign `RUSTC_WRAPPER`, and uses the current `xcrun` linker selection
-rather than persisting an Xcode selection. `FRUST_DEBUG=1` reports applied and skipped decisions.
+| Variable | Effect |
+| --- | --- |
+| `FRUST_UNIT_CACHE` | `1` or `on` turns the cache on for any invocation. `0` or `off` turns it off. Unset or any other value: on under `fcargo`, off otherwise. |
+| `FRUST_UNIT_CACHE_MAX_BYTES` | Size budget of the store in bytes. A missing, zero or unparsable value means 8 GiB. |
+| `FRUST_UNIT_CACHE_SCRIPT_MIN_MS` | Shortest build script run, in milliseconds, that is stored. Default 3000. `0` stores every eligible run. An unparsable value means the default. |
+| `FRUST_UNIT_CACHE_DEBUG` | `1` prints one line per decision to stderr, prefixed `frust-unit-cache:`. Units log `hit`, `miss` with a reason, `store` and `skip` with a reason. Build scripts log `script-hit`, `script-miss`, `script-store` and `script-skip`. |
 
-Measure actual function-body edits with `frust bench --linking --runs 7 --json`. The benchmark keeps both
-incremental targets warm, alternates order, verifies that the binary recompiled and ran with the changed output,
-and records native-link and total-build timing separately. It uses the same wrapper path in both arms to avoid
-invalidating Cargo’s compiler-information cache between samples.
+After a store, a size scan runs at most once per process, and only when the size counter is missing, older than a day or over the budget. If the scan finds the total over the budget, entries are evicted least recently used first until the store is at 80 percent of it. The same scan removes temporary files and incomplete entries more than an hour old. The `FRUST_UNIT_CACHE*` variables are not part of the build script key.
 
-On Linux, `--linking` profiles only `FRUST_LINK=off` with the configured linker. It verifies the same real edits,
-compiled-unit counts and changed runtime output, without reporting a smart-mode comparison. JSON reports
-`runtime_outputs_equal: null` when there is only one mode. Windows profiling is not yet supported.
+## Direct entry
+
+In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. On Linux, `fcargo` runs Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO` and, when `RUSTC` is unset and a sibling `frustc` exists, `RUSTC` set, unless one of these holds, in which case it executes `fcargo-ui` with the same arguments:
+
+- Progress is not plain. It is plain when `TERM=dumb`, when `FRUST_PROGRESS` is `plain` or `off`, or when `FRUST_PROGRESS` is not `static` or `interactive` and stderr is not a terminal.
+- `FRUST_CARGO` is set and not empty.
+- The first argument starts with `+`.
+
+If `FRUST_CARGO` names an `fcargo` that is the same file as this executable, it exits with an error naming the problem. On other hosts `fcargo` is still the patched Cargo, but the direct entry code is not compiled.
+
+## Environment variables
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `FRUST_PROGRESS` | `fcargo` | `plain` or `off`: hand over to Cargo with no progress output. `static`: print one final frame. `interactive`: repaint on a terminal, otherwise static. Unset or any other value: interactive on a terminal, plain otherwise. `TERM=dumb` forces plain. |
+| `FRUST_PROGRESS_COLOR` | `fcargo` | `always` or `never`. Otherwise color is on for a terminal whose `TERM` is not `dumb`. |
+| `FRUST_BUILD_REPORT` | `fcargo` | When set to any value, print a build report with rows for analysis, code generation, full LTO and native link. Each row currently reads `Unavailable` because `fcargo` does not observe those phases. Not printed in plain mode. |
+| `FRUST_CARGO` | `fcargo` | Path of the Cargo executable to run. Default: a `cargo` next to `fcargo`, else `cargo` on `PATH`. |
+| `FRUST_INVOCATION` | patched Cargo | Set to `fcargo` by `fcargo` for the Cargo it starts. |
+| `FRUST_CENTRAL_TARGET` | patched Cargo | `off` disables the central target default. |
+| `FRUST_TOOLCHAIN_ID` | patched Cargo | Overrides the toolchain id used in the central target path. |
+| `FRUST_EXPERIMENTAL_CODEGEN_CACHE` | `frustc` | `1` enables the post-LTO object cache. |
+| `FRUST_EXPERIMENTAL_RELR` | `frustc` | `1` enables packed relative relocations on eligible GNU links. |
+
+`fcargo` also sets `RUSTC` to a `frustc` next to the Cargo executable when `RUSTC` is unset and that file exists. It forwards Cargo's exit code. Plain mode, `--quiet`, `-q`, `--message-format` and `--json` pass straight through to Cargo.
+
+Explicit Cargo directory controls take precedence over the central default. Tooling should discover final artifact paths through Cargo metadata or build messages. [Cargo build directories](https://doc.rust-lang.org/cargo/reference/build-cache.html) · [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)
+
+## Cooperative checks
+
+On x86-64 GNU/Linux, eligible `fcargo check` invocations share check units by default when they use the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler checks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics. Set `FRUST_UNIT_JOIN=off` to use ordinary Cargo scheduling.
+
+Joining uses the current Cargo build-directory layout, local storage, and the invocation's own jobserver. Graphs with build scripts, proc macros or artifact dependencies use ordinary Cargo scheduling, as do checks with `--keep-going`, `--timings`, or Cargo's explicit fine-grained locking flag. Contended units defer before taking a job slot, so independent work can proceed even with `-j1`. If a check stalls while retaining reader locks, Cargo releases them and retries serially. That retry can repeat unit progress messages. Switching between modes can cause a rebuild because their fingerprint identities differ.
+
+Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks. The native qualification covers Linux x86-64. The legacy `FRUST_EXPERIMENTAL_UNIT_JOIN=1` opt-in remains available on macOS for qualification. [Concurrent check probe](../qualification/cooperative-builds.py)
+
+In the 19 November 2026 Linux check, all five regex metadata artifacts matched the ordinary Cargo path byte for byte. Twelve alternating warm checks per mode reported every artifact fresh. The syn workspace exercised ordinary scheduling for a graph with build-time dependencies and produced identical metadata with either setting.
+
+## Native fat-LTO defaults
+
+When `fcargo` selects `frustc` for a native x86-64 GNU Linux build, local packages in release-derived profiles using fat LTO at opt level 3 default to incremental compilation and 16 codegen units. Use the project's ordinary release or custom profile command. Cargo honors explicit profile, package, environment, and command-line settings as well as its existing CI incremental policy.
+
+The incremental default applies when both fields are unspecified. If incremental compilation is already enabled, fCargo supplies 16 codegen units only when the profile leaves that count unset. Build scripts, proc macros, registry dependencies, and cross-target units keep their usual defaults.
+
+In the 2026-11-19 Linux samples, 16 codegen units reduced edited build time by 23.4% for ripgrep and 4.7% for fd. Ripgrep's stripped executable grew by 3.2%. Both builds still ran full LTO. [Measurements](../qualification/SEMANTIC-LTO.md)

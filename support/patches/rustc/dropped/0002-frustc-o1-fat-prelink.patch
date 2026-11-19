@@ -1,0 +1,41 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
+index deaa78fcd..7b90b2531 100644
+--- a/compiler/rustc_codegen_llvm/src/back/write.rs
++++ b/compiler/rustc_codegen_llvm/src/back/write.rs
+@@ -859,6 +859,16 @@ fn handle_offload<'ll>(cx: &'ll SimpleCx<'_>, old_fn: &llvm::Value) {
+     result.into_result().unwrap_or_else(|()| llvm_err(dcx, LlvmError::RunLlvmPasses))
+ }
+ 
++fn invoked_as_frustc() -> bool {
++    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
+ // Unsafe due to LLVM calls.
+ pub(crate) fn optimize(
+     cgcx: &CodegenContext,
+@@ -882,13 +892,18 @@ pub(crate) fn optimize(
+ 
+     // FIXME(ZuseZ4): support SanitizeHWAddress and prevent illegal/unsupported opts
+ 
+-    if let Some(opt_level) = config.opt_level {
++    if let Some(mut opt_level) = config.opt_level {
+         let opt_stage = match cgcx.lto {
+             Lto::Fat => llvm::OptStage::PreLinkFatLTO,
+             Lto::Thin | Lto::ThinLocal => llvm::OptStage::PreLinkThinLTO,
+             _ if cgcx.use_linker_plugin_lto => llvm::OptStage::PreLinkThinLTO,
+             _ => llvm::OptStage::PreLinkNoLTO,
+         };
++        // Fat LTO still runs at the requested level. frustc keeps this pre-link
++        // copy at O1: O0 bitcode made the monolithic module much larger.
++        if matches!(opt_stage, llvm::OptStage::PreLinkFatLTO) && invoked_as_frustc() {
++            opt_level = config::OptLevel::Less;
++        }
+ 
+         // If we know that we will later run AD, then we disable vectorization and loop unrolling.
+         // Otherwise we pretend AD is already done and run the normal opt pipeline (=PostAD).

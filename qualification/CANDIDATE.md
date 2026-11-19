@@ -1,0 +1,392 @@
+# Candidate
+
+## Status after the 19 November performance review
+
+| Experiment | Disposition | Evidence |
+| --- | --- | --- |
+| Opt-level 0 pre-link and outliner | Archived | Higher RSS and larger artifact. |
+| Opt-level 1 pre-link | Archived | Leaf geometric mean 0.989 in single samples. |
+| Safe ICF | Archived | Equivalent output with negligible build-time change. |
+| Post-optimization whole-object cache | Opt-in research | Ripgrep's IR-neutral hit improved, and the fd miss regressed. The partial key prevents promotion. |
+| RELR | Separate opt-in research | Smaller Linux artifacts with additional loader and linker requirements. |
+| Pre-optimization fat-LTO cache | Archived | Required fd miss regressed and runtime and size evidence was incomplete. |
+| Two-thread fat-LTO codegen split | Archived | The fd miss took 1.33 times the wall time and 1.62 times peak RSS. |
+| Ordered fat-LTO stream cache | Archived | Full paired judge: holdout median 1.0239, tail over 1.05, runtime and size incomplete. Peak RSS 1.0531. |
+
+The source patch keeps ordinary compilation and linking on the upstream paths. This ledger supersedes retention language in the historical experiment entries. Retest historical patches against their original bases and switches. A meaningful change to fat-LTO input still runs the full pipeline. The next candidate protocol needs executable workloads with verifiable artifact changes, a fresh holdout, per-phase traces, and a runtime A/A check before timing.
+
+The qualification evaluator now reuses resampling storage and selects the median without sorting each sample. With three synthetic 60-pair groups and 2,000 resamples per evaluation, 20 alternating batches on Linux measured 11.91 ms before and 6.15 ms after. This measures the evaluator alone. The original pre-optimization sample file still fails the holdout, runtime and size gate rows.
+
+The Linux review package is `target/compiler-rewrite/toolchains/frust-0ef1bc386-review1`. Both stage-2 rebuilds and ambient-free launch passed. The revised proof passed nine warm/fresh cases, including the changed C archive, backend options with eight CGUs, and the edit after rustc returned. The original package reproduced stale warm output in that final case. The patched Cargo library suite passed 192 tests, including all 30 selected fingerprint tests. The project workspace passed 25 tests with 88.85% line and 85.45% region coverage. This is focused Linux correctness evidence. Native macOS and release performance qualification remain open.
+
+The stage-2 compiler in `target/compiler-rewrite/toolchains/frust-prelink2` (id `frust-0ef1bc386-prelink2`) contains the change below. `qualification/prove-codegen.sh` passed on that prefix before any candidate timing sample: `LLVM_fatlto` ran for both `frustc` (1.252s) and `rustc` (1.214s) on the codegen probe; fat LTO with `-C save-temps` wrote 1 pre-optimization bitcode file at `codegen-units=1` and 8 at `codegen-units=8` for both compilers; warm incremental and fresh release builds matched `.text` bytes and program output for a leaf body, its revert, a generic plus a trait method, a public function plus a macro, a native input, a linker-only `--defsym`, and a same-size edit whose timestamp was restored. This is a correctness result, not a budget ratio.
+
+The earlier prefix `frust-prelink1` has the compiler change and the previous Cargo. It does not have the content checksum below. `frust` (id `frust-0ef1bc386-central1`) remains the unpatched package.
+
+The change applies only when the running executable's filename is `frustc`. A `rustc` invocation, including the hardlink next to `frustc`, keeps the upstream pipeline. On Linux, `/proc/self/exe` keeps the hardlink name.
+
+Two parts:
+
+1. Fat-LTO pre-link. In `optimize`, a `PreLinkFatLTO` stage invoked as `frustc` passes opt-level 0 to the pre-link pipeline. `config.opt_level` is left alone. The later fat-LTO `run_pass_manager` still uses that requested level, so the `LLVM_fatlto` pipeline still runs. Thin LTO is unchanged. The control ripgrep time-passes row that motivated this split is in `BASELINES.md`: inside the 19.589s `ripgrep` invocation, `LLVM_fatlto` was 13.540s and one `LLVM_passes` row was 5.000s.
+
+2. x86 machine outliner. `LLVMRustCreateTargetMachine` sets `EnableMachineOutliner` and `SupportsDefaultOutlining` for `frustc` on x86 and x86_64 when the codegen opt level is not none. X86 already sets `EnableMachineOutliner` in its target constructor and does not implement `shouldOutlineFromFunctionByDefault` (the default returns false). `TargetDefault` therefore adds the pass and then skips every function. The `frustc` path sets the LLVM option `enable-machine-outliner` to `always`, which uses `X86InstrInfo::isFunctionSafeToOutlineFrom`. Functions that use a red zone are skipped by that check. This is not a `-C llvm-args` flag and it is not PGO, BOLT, or a ThinLTO cache.
+
+3. Content checksums. Cargo uses `FingerprintMethod::Content` only when its rustc path is named `frustc`. After each such compile it stores a Blake3 checksum and length for every dep-info input that rustc did not already checksum. The next build compares those checksums, so a same-size edit is rebuilt when its timestamp is restored. A `rustc` invocation keeps Cargo's mtime check. The diff is `support/patches/0002-frustc-content-fingerprint.patch`.
+
+A later read of the packaged binaries, not a timing sample, checked the fingerprint JSON of a one-file crate. `frust-prelink2` and `frust-o1` record `content` when `RUSTC` is named `frustc`, and `mtime` when it is named `rustc`. The unpatched stage-2 cargo records `mtime`. The central package originally shipped the older cargo (`sha256 68d30c1bb572553e783785f5aefe04a749a7969b9bf8852e598ef5e8e7cd7329`), which also recorded `mtime` for both names. That binary is preserved at `target/compiler-rewrite/preserved/cargo-mtime-68d30c1bb572553e`.
+
+The central `bin/cargo` is now the content-checksum binary already built for those dropped prefixes (`sha256 19da6cf49ae9f14389a0fb07382580c02e872172037edb13147eb9bdcad52507`). It records `content` when `RUSTC` is named `frustc` and `mtime` when it is named `rustc`. The control cargo was not replaced. With the new central cargo, a same-size edit of the parity fixture whose timestamp was restored recompiled, and its `.text` and stdout matched a fresh build (`STAMP_OK 2026-11-19T03:59:06+00:00`, stdout `22 2 4 22 44 37`). The earlier `prove-codegen.sh` run on the old central cargo passed leaf, revert, wide, api, native, and link, then failed only that stamp case: the second build finished in 0.00s without compiling. Fat LTO and the codegen-unit counts in that run had already passed for both `frustc` and `rustc`.
+
+The compiler diff for this dropped candidate is `support/patches/rustc/dropped/0001-frustc-fat-prelink-and-x86-outliner.patch`. `support/apply-rustc-patches.sh` does not apply `dropped/`. `qualification/time-build.sh` exports `RUSTC` to a sibling `frustc` only when that file exists. The control and official bin directories have no `frustc`, so their baselines stay on `rustc`.
+
+A control time-passes build of the syn library had no `LLVM_fatlto` row. Fat LTO of an rlib stops after the pre-link pipeline, and that pipeline was 1.430s of a 2.501s crate invocation. The skip changes that pre-link copy. A downstream fat-LTO binary still runs `run_pass_manager` at the requested opt level.
+
+## Probe, then dropped
+
+One cold build and one leaf incremental of ripgrep were timed with `qualification/time-build.sh` against `frust-prelink2`, after the correctness proof and before any 30-pair run. The target was `target/compiler-rewrite/baselines/candidate/ripgrep`. Both exited 0 and the cohort was clean afterward. The `rg` binary contains 4951 `OUTLINED_FUNCTION_` symbols; the unpatched control `rg` contains none. Unstripped size was 4912464 bytes versus the control binary's 4687944. Stripped size was not measured.
+
+| Run | Wall | Cargo finished | Max RSS | Exit |
+| --- | --- | --- | --- | --- |
+| cold | 24.70s | 24.69s | 1000896 kB | 0 |
+| leaf 1 | 16.74s | 16.73s | 1044428 kB | 0 |
+
+Against the recorded control medians (cold wall 27.27s and RSS 463216 kB; leaf wall 19.14s, the middle of 19.13/19.14/19.26, and leaf RSS 495216 kB, the middle of 484640/495216/517492):
+
+- Cold wall ratio 24.70/27.27 = 0.906, inside the 1.05 cap.
+- Leaf wall ratio 16.74/19.14 = 0.875, above the 0.80 geomean cap. The control leaf spread is 0.13s, and this sample is 1.40s slower than a 0.80 result (15.31s).
+- Cold RSS ratio 1000896/463216 = 2.16 and leaf RSS ratio 1044428/495216 = 2.11, both above the 1.10 cap.
+
+A 30-pair median cannot bring a 2× RSS result under 1.10, and this leaf ratio does not leave room for the 0.80 geomean. The full paired gate was not run. The candidate is dropped. Thresholds are unchanged. `frust-prelink2` stays on disk as the measured artifact. The source-equivalent package remains `target/compiler-rewrite/toolchains/frust`.
+
+## Second candidate, proved then dropped
+
+`target/compiler-rewrite/toolchains/frust-o1` (id `frust-0ef1bc386-o1`) is a different change. It does not include the outliner. When the executable name is `frustc` and the stage is `PreLinkFatLTO`, the pre-link pipeline runs at `OptLevel::Less` (pass-builder O1). `config.opt_level` is unchanged, so the fat-LTO `run_pass_manager` still uses the requested level. Thin LTO is unchanged. The diff is `support/patches/rustc/dropped/0002-frustc-o1-fat-prelink.patch`. The apply script does not apply `dropped/`.
+
+`qualification/prove-codegen.sh` passed on this prefix before the probe (`PROVE_OK 2026-11-19T02:00:18+00:00`). Fat LTO ran for `frustc` (1.201s) and `rustc` (1.202s). `-C save-temps` wrote 1 pre-optimization bitcode file at `codegen-units=1` and 8 at `codegen-units=8` for both compilers. Warm and fresh `.text` bytes matched for the leaf, its revert, the wide edit, the public API plus macro, the native input, the linker-only symbol, and the restored-timestamp edit.
+
+One cold build and one clean-target leaf per primary workload were then timed with `qualification/time-build.sh`. These are not 30-pair medians. Targets: `target/compiler-rewrite/baselines/o1/{ripgrep,syn,regex}`. All six exited 0 and the cohorts were clean afterward.
+
+| Workload | Run | Wall | Cargo finished | Max RSS |
+| --- | --- | --- | --- | --- |
+| ripgrep | cold | 26.12s | 26.12s | 459516 kB |
+| ripgrep | leaf | 18.20s | 18.20s | 517420 kB |
+| syn | cold | 3.07s | 3.06s | 293096 kB |
+| syn | leaf | 1.92s | 1.91s | 295652 kB |
+| regex | cold | 5.02s | 5.01s | 350112 kB |
+| regex | leaf | 0.33s | 0.32s | 200812 kB |
+
+Leaf ratios against the frozen control medians (ripgrep 19.14s / 495216 kB, syn 1.89s / 290560 kB, regex 0.33s / 195780 kB):
+
+- ripgrep 18.20/19.14 = 0.951. The 0.80 line is 15.31s. This sample is 2.89s short of it.
+- syn 1.92/1.89 = 1.016.
+- regex 0.33/0.33 = 1.000.
+- The three-ratio product is 0.966 and the geometric mean is 0.989. A 30-pair median of samples this close to 1 cannot reach 0.80.
+- Leaf RSS ratios are 1.045, 1.018, and 1.026, all inside 1.10. Cold ripgrep 26.12/27.27 = 0.958, inside 1.05.
+
+The pre-link level between O1 and O3 is the wrong lever. O0 remains the dropped RSS failure. No Os/O2/Oz ladder was run after these numbers.
+
+## Why no third compiler change was sampled
+
+A control ripgrep leaf was rebuilt with `-Z time-llvm-passes` (`RUSTC_BOOTSTRAP=1`) into `target/compiler-rewrite/baselines/control/ripgrep-llvm-passes`. The log is `target/compiler-rewrite/logs/control-ripgrep-llvm-passes-z.log`. This is a characterization, not a paired sample and not a rewrite of the frozen baseline. The largest LLVM pass report in that log, the `rg` invocation, totals 18.589s wall. That matches the earlier control split of `LLVM_passes` 5.000s plus `LLVM_fatlto` 13.540s (18.540s).
+
+Inside that report the largest pass is `X86 DAG->DAG Instruction Selection` at 2.490s (13.4%). Backend passes sum to 5.878s (31.6%). Middle-end passes sum to 12.709s (68.4%). The largest middle-end pass is `InlinerPass` at 0.869s (4.7%). Several names appear twice because the pre-link pipeline and the fat-LTO pipeline both run in the one invocation. No pass is as large as the 3.83s gap between the 19.14s control leaf and a 0.80 result.
+
+Closing that gap on ripgrep alone would still leave the three-primary geometric mean at about 0.933 if syn and regex stayed at the ratios above. Reaching 0.80 across all three primaries needs a ratio product of at most 0.512. With syn and regex near 1, ripgrep would have to fall to about 9.8s. That is larger than the whole backend (5.9s). It would require skipping the fat-LTO optimization pipeline. That pipeline is the requested full-LTO optimization, so it stays. A byte-identical reuse also cannot meet the separate 0.97 runtime and stripped-size gates. The 30-pair gate was not run. Thresholds are unchanged. `frust-o1` stays on disk. At that point the active compiler patch series was empty, and the pinned `write.rs` was restored.
+
+The leaf edits themselves sit in the inlining cone. `qualification/edits/regex-leaf.patch` adds a line to `Regex::is_match`, which is already `#[inline]`. `qualification/edits/ripgrep-leaf.patch` adds a line to the generic `search_path`. `qualification/edits/syn-leaf.patch` adds a line to the inner constructor called by public `Error::new`. A green mono-item can keep its pre-optimization IR, but the pre-link pipeline and, for a binary, fat LTO still re-optimize every caller that inlines the changed body. That is the bulk of the leaf time above. Caching unchanged IR does not remove it, and it does not change the emitted machine code, so it cannot move the 0.97 runtime or stripped-size aggregates off 1.
+
+## Flag checks that were not packaged
+
+Two stock-compiler flag checks, not patches and not paired samples, asked whether a code-quality switch could supply the 0.97 size budget without a new invalidation boundary. Both used the unpatched stage-2 `rustc` and the frozen release profile on unmodified ripgrep. The control binary is the differential `rg` (4687944 bytes). `strip --strip-unneeded` makes it 4024992 bytes. Its `.text` is 2538086 bytes. Logs and copies are under `target/compiler-rewrite/logs/char-outliner-rg.log` and `target/compiler-rewrite/char/`.
+
+`-C llvm-args=-enable-machine-outliner=always` at opt-level 3, fat LTO, one codegen unit. Cold wall 26.99s, `/usr/bin/time -v` max RSS 940412 kB, exit 0. The binary has 5228 `OUTLINED_FUNCTION_` symbols. Unstripped 4941920 bytes (1.054 versus the control binary). Stripped 4034368 bytes (1.002 versus 4024992). `.text` fell to 2384230 bytes (0.939). Section growth in `.eh_frame`, `.eh_frame_hdr`, and `.gcc_except_table` used more than the `.text` saving, so the stripped file grew. The size gate rejects growth. This is not the dropped O0 outliner candidate; that one was a compiler patch and was not retimed.
+
+`-C link-arg=-Wl,--icf=all` through `cc -fuse-ld=lld`. Cold wall 26.92s, max RSS 433648 kB, exit 0. Unstripped 4636536 bytes (0.989). Stripped 3973584 bytes (0.987 versus 4024992). `size` text 3752652 versus the control binary's 3804064 (0.986). The stripped ratio is above the 0.97 aggregate, and `--icf=all` may fold address-taken functions, so it was not enabled in the packaged compiler. Neither cold wall is a leaf edit ratio.
+
+On the frozen corpus command, the control `rg` median of 30 runs was 4.84ms. GNU `grep -F -a` on the same file was 0.52ms. The command is not a pure memory-bandwidth ceiling. No LLVM pass in the characterization was shown to turn that gap into a 3% smaller and 3% faster fat-LTO binary while also taking the three leaf ratios' product to 0.512. Nothing from these checks was packaged. Thresholds are unchanged. Checklist items for the measured reuse change and the Linux performance gates stay open.
+
+## Safe identical-code folding
+
+`support/patches/rustc/0001-frustc-safe-icf.patch` was the measured change. When the compiler was invoked as `frustc`, LLD was the linker, and the opt level was 2 or 3, `GccLinker::optimize` passed `--icf=safe` after the existing `-O1` linker flag. `--icf=safe` folds only functions whose address is not taken. The `rustc` hardlink did not pass it. Full LTO and the requested codegen-unit count were unchanged. This was not a cache of whole objects: the linker reused identical machine code after LTO, and a program could differ from stock when safe duplicates remained.
+
+The stage-2 compiler was rebuilt in `target/compiler-rewrite/build-icf` from a copy of the unpatched control, with `--keep-stage 0` and `--keep-stage-std` 0, 1, and 2. `build-control` was not rebuilt. Its driver is still sha256 `0d5e12331727ef3d4358356bc502e81393ec056aa943e97bd34bac82725dad3d`. The new driver is sha256 `901e3f9adf23a75ffdbbb8df422532c796d895c1c39d9eacc561ad9bf68297f0` (155098784 bytes) and contains the `--icf=safe` string. Recreating the stage-2 sysroot dropped the already-built standard library and `rustdoc`. Those files were copied back from the control stage-2. `libstd-c2e710ac05435005.so` and `rustdoc` match that control. The package is `target/compiler-rewrite/toolchains/frust-icf1`, id `frust-0ef1bc386-icf1`, with the content-checksum cargo (sha256 `19da6cf49ae9f14389a0fb07382580c02e872172037edb13147eb9bdcad52507`). `rustc` and `frustc` are one inode.
+
+A link trace of an opt-level 3 fat-LTO binary showed `frustc` passing `-Wl,--icf=safe` through `cc` to `rust-lld`. The `rustc` hardlink's `cc` argv had no `--icf=safe`. `qualification/prove-codegen.sh` on this prefix recorded `LLVM_FATLTO frustc 1.217000s`, `LLVM_FATLTO rustc 1.207000s`, codegen-unit counts 1 and 8 for both names, and warm/fresh `.text` and stdout parity for the leaf, revert, wide, api, native, linker-only, and restored-timestamp edits. The stamp stdout was `22 2 4 22 44 37`. `PROVE_OK 2026-11-19T04:32:09+00:00`.
+
+One clean-target ripgrep leaf was then timed with `qualification/time-build.sh`. The seed cold build, not a gate sample, was 26.90s wall and 451116 kB max RSS. The leaf was 19.12s wall and 507916 kB max RSS, exit 0. Logs: `target/compiler-rewrite/logs/icf1-ripgrep-cold.log` and `icf1-ripgrep-leaf.log`. Against the frozen leaf medians that is 19.12/19.14 = 0.999 wall and 507916/495216 = 1.026 RSS. A 0.80 leaf would be 15.31s. The `rg` binary is byte-identical to the control differential `rg`: sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`, 4687944 bytes unstripped, 4024992 bytes after `strip --strip-unneeded`, `size` text 3804064. The stripped ratio is 1, which misses 0.97. A separate opt-level 3 fat-LTO probe with two identical `#[inline(never)]` functions was also byte-identical between `frustc` and `rustc` (367032 bytes). LLVM already merges identical function bodies before the linker, so `--icf=safe` had nothing left to fold. The earlier unpackaged `--icf=all` check is what changed the ripgrep bytes, to 3973584 stripped (0.987), and it can fold address-taken functions, so it stays out of the compiler. The cohort was clean after the leaf. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open.
+
+The candidate is dropped. The patch was reversed on the stage-2 checkout and moved to `support/patches/rustc/dropped/0003-frustc-safe-icf.patch`. At that point `linker.rs` did not contain `invoked_as_frustc` or `--icf=safe`, and `support/apply-rustc-patches.sh` reported no rustc patches. `target/compiler-rewrite/toolchains/frust-icf1`, `parity/frust-0ef1bc386-icf1`, and `probes/icf1` stay on disk and were not retimed. `build-control` was not modified. `build-icf` was later reused for the successor below, which replaced that stage-2 driver.
+
+## Default unwind tables are not a 3% size cut
+
+A stock stage-2 cold build of unmodified ripgrep with `-C force-unwind-tables=no`, still at opt-level 3, fat LTO, and one codegen unit, asked whether Linux `default_uwtable` was the 0.97 size budget. It is a characterization, not a paired sample and not a candidate. Cold wall 26.96s, max RSS 438060 kB, exit 0. Log: `target/compiler-rewrite/logs/char-unwind-no-rg.log`. The binary is `target/compiler-rewrite/char/unwind-no2/release/rg` (4668920 bytes, sha256 `019abe07e12e124bc1b03356319776d7553dc2cc7ff0a7349d20424875a96d52`). `.text` stayed 2538086 bytes. `.eh_frame` fell from 210780 to 196836 and `.eh_frame_hdr` from 31876 to 26796. `strip --strip-unneeded` left 4005968 bytes, a 19024-byte saving against 4024992 (ratio 0.995). The 0.97 bar is 3904242 bytes, which needs a saving of at least 120750. LLVM still emits unwind information for functions that are not `nounwind`, so turning off the default `uwtable` attribute does not remove the bulk of `.eh_frame`. This flag was not added to the compiler.
+
+## Post-LTO codegen reuse and RELR
+
+`support/patches/rustc/0001-frustc-codegen-reuse.patch` is the active compiler change. `support/apply-rustc-patches.sh` reports it already applied. It is not `--icf=safe`, not a pre-link opt-level change, and not ThinLTO. Two `frustc`-only pieces:
+
+1. After fat-LTO optimization, and only when emitting one object file, hash the optimized module and reuse a previous object with the same hash. The hash is order-independent. `StructuralHash` does not cover global initializers, so those are hashed separately, along with linkage, function attributes, constant metadata such as `!range`, the data layout, the target triple, and module flags. Debug-info nodes are not in the hash. If the module has `llvm.dbg.cu`, the object is compiled and not stored. The cache file lives next to the object, under `frust-codegen-cache/`, so it survives the per-invocation temporary name. A miss compiles normally and then stores the object. Full LTO still runs: the hash is taken after `run_pass_manager`. Pre-optimization bitcode is still written, so the codegen-unit count is unchanged. The `rustc` hardlink does not hash or reuse.
+
+2. At opt-level 2 or 3, on a GNU ELF link that is not `crt-static` and not WebAssembly, pass `-z pack-relative-relocs`. `--pack-dyn-relocs=relr` packs the relocations but does not add the `GLIBC_ABI_DT_RELR` version, and the loader then rejects the file. The flag that loads is `-z pack-relative-relocs`.
+
+The stage-2 compiler was rebuilt in `target/compiler-rewrite/build-icf` with `--keep-stage 0` and `--keep-stage-std` 0, 1, and 2. `build-control` was not rebuilt. Recreating the stage-2 sysroot again dropped `rustdoc` and the standard library; those 54 files were copied back from the control stage-2. `libstd-c2e710ac05435005.so` and `rustdoc` match that control. The new driver is sha256 `15c710071f3babdba3ddf16a0e654fa5c9f8c43214e0f7ce0ea87825ebe8f1a4` (155149824 bytes). It contains `pack-relative-relocs` and `frust-codegen-cache`, and it does not contain `--icf=safe`. The package is `target/compiler-rewrite/toolchains/frust-cg1`, id `frust-0ef1bc386-cgcache1`, with the content-checksum cargo (sha256 `19da6cf49ae9f14389a0fb07382580c02e872172037edb13147eb9bdcad52507`). `rustc` and `frustc` are one inode. `toolchains/frust` and `toolchains/frust-icf1` were not overwritten.
+
+`qualification/prove-codegen.sh` recorded `LLVM_FATLTO frustc 1.232000s`, `LLVM_FATLTO rustc 1.212000s`, codegen-unit counts 1 and 8 for both names, and warm/fresh `.text` and stdout parity for the leaf, revert, wide, api, native, linker-only, and restored-timestamp edits. The stamp stdout was `22 2 4 22 44 37`. `PROVE_OK 2026-11-19T05:19:38+00:00`.
+
+The ripgrep leaf's optimized module does not change under the frozen edit. An order-sensitive module hash misses it, because 38 functions are permuted and a raw bitcode hash also misses, but every function body and every global initializer matches. An order-independent hash of those bodies and initializers matches, and it changes when an instruction constant or a global initializer changes. Printed instruction metadata does not match across that pair, so it is not part of the key. That is why codegen can be skipped for this leaf without skipping fat-LTO optimization. Parallel post-LTO codegen was not used: an 8-way split of the optimized bitcode saved about 3.2s after the split itself and pushed the summed resident set over the 1.10 cap.
+
+One clean target was seeded with an unmodified ripgrep release build, then one leaf was timed with `qualification/time-build.sh`. The seed is not a gate sample: 27.17s wall and 442592 kB max RSS, next to the frozen cold median of 27.27s. It left 61 files in `frust-codegen-cache`. The leaf did not add a cache file. Logs: `target/compiler-rewrite/logs/cgcache1-ripgrep-cold.log` and `cgcache1-ripgrep-leaf.log`. The target is `target/compiler-rewrite/probes/cgcache1/ripgrep`. The cohort was clean afterward.
+
+| Run | Wall | Max RSS | Exit |
+| --- | --- | --- | --- |
+| seed cold | 27.17s | 442592 kB | 0 |
+| leaf | 12.53s | 447136 kB | 0 |
+
+Against the frozen leaf medians (wall 19.14s, RSS 495216 kB):
+
+- Leaf wall 12.53/19.14 = 0.655, under the 0.80 bar of 15.31s.
+- Leaf RSS 447136/495216 = 0.903, under the 1.10 bar of about 544738 kB.
+- Unstripped `rg` is 4405552 bytes, sha256 `9af9ac5e16737ca1da64263aab4c718cae9b00b4cc6f3b3b4f7885ac1f8df866`. `strip --strip-unneeded` leaves 3742608 bytes, 3742608/4024992 = 0.930, under the 0.97 bar of 3904242 bytes. `readelf -V` shows `GLIBC_ABI_DT_RELR`. `rg --version` prints ripgrep 15.2.0.
+
+`.text` is still 2538086 bytes. It is not byte-identical to the control differential `rg`: 12146 bytes differ. The corpus command (`rg --no-config -j 1 -F frust_needle_7 search.txt`) produced the same stdout from both binaries (423040 bytes, exit 0). On 30 runs after 5 warmups, in the same session, the control median was 0.005820s and the candidate median was 0.005766s, a ratio of 0.991. That is not under 0.97. The frozen corpus median of 0.004839s is not the comparison, because the control binary on this session was 0.005820s. A 30-pair build gate would time this same binary. It cannot turn 0.991 into a runtime aggregate of 0.97. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open. Syn and regex were not sampled.
+
+## Arrow Lake scheduling is not a runtime win
+
+This was a characterization on the unpatched stage-2 compiler, not a patch and not a packaged candidate. `-Z tune-cpu=arrowlake` sets LLVM's scheduling model. It does not change `target-cpu`. A small probe compiled three ways at opt-level 3 with fat LTO: the default and the arrowlake tune both had no AVX or YMM instructions, while `target-cpu=native` had 1330. The same check on the ripgrep binaries below counted 1012 YMM lines in each, so the tune did not widen the ISA. `build-control` was not modified.
+
+Both ripgrep builds used the frozen release profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none) from an empty target. They ran together, so the wall times are not cold-gate samples: default 32.57s and 446940 kB, arrowlake 32.84s and 459544 kB, both exit 0. Logs: `target/compiler-rewrite/logs/tune1-rg-base.log` and `tune1-rg-arrow.log`. The default binary matches the control differential `rg` byte for byte, sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`, 4687944 bytes. The tuned binary is sha256 `8c57f5500d7108b66c3980c7d8bd8e0b53766510d9013ce57074f7fa5ad2a41a`, 4738152 bytes. `strip --strip-unneeded` leaves 4024992 and 4074944 bytes. 4074944/4024992 = 1.012, so this workload's stripped file grew. The size gate requires every workload to be no larger than stock.
+
+The corpus command was `rg --no-config -j 1 -F frust_needle_7 search.txt`. Stdout matched, 423040 bytes. A first 30-run pair was taken while the rustfmt attempt below was still compiling, and it is not the result: the medians were 0.007968s and 0.008276s. After that load ended, 30 interleaved runs with the order rotated gave:
+
+| Binary | Median | Mean | Population stdev |
+| --- | --- | --- | --- |
+| default | 0.006181s | 0.006182s | 0.000075s |
+| arrowlake | 0.006230s | 0.006223s | 0.000057s |
+| control `rg` | 0.006088s | 0.006094s | 0.000074s |
+
+The tuned median over the default median is 0.006230/0.006181 = 1.008. The default binary and `target/compiler-rewrite/char/rg-control` are the same bytes, and those two medians still differ by 1.015, so a ratio this close to 1 is inside the noise of a 6ms process start. It is not a 0.97 runtime win. One workload at about 1.0 cannot be pulled under a 0.97 aggregate by the other two unless those two average about 0.94, and this workload's stripped file already grew.
+
+The locked rustfmt tree (`cebab3e99259be82ff069e5ae89e91855d79e534`, the peel of tag `5eb206859397a1cb7a6ef91790d38591c0a36ac9`) does not compile with this stage-2 compiler. Cargo got past the missing `overload` crate once the network retry ran, then `rustfmt-nightly` failed with 43 errors against the current `rustc_ast` (`EXIT:101` in `tune1-rf-base.log` and `tune1-rf-arrow.log`). The compiler tree's own rustfmt is 1.11.0 (`d957b2ec4b0120979585316f2f342400ccafb16c`) and was not substituted. Oxipng was not built: the ripgrep size regression already fails the per-workload size rule. The tune was not added to `frustc`. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open.
+
+## Hot-cold split and v3 scheduling miss the runtime aggregate
+
+Both checks used the unpatched stage-2 compiler and the frozen release profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none). Neither flag was added to `frustc`. `build-control` was not modified. The 30-pair gate was not run.
+
+Hot-cold split was `-C llvm-args=-hot-cold-split` with `RUSTC_BOOTSTRAP=1` on unmodified ripgrep. The build log is `target/compiler-rewrite/logs/hcs1-ripgrep.log` (start `2026-11-19T05:42:31+00:00`, cargo finished in 28.23s, `/usr/bin/time` wall 28.24s, max RSS 452680 kB, `EXIT:0`). That wall time is not a cold-gate sample. The binary is sha256 `4bc5797ed45629e99b9f34da54bd8d80992d2b49cc2c24fae6d35feb2c5e38f4`, 4799592 bytes. `strip --strip-unneeded` leaves 4043784 bytes. 4043784/4024992 = 1.005, so the stripped file grew. `.text` is 2535200 bytes against 2538086 in the stock rebuild, so the pass shrank the text section and still grew the stripped file. All three binaries have 1012 YMM lines. Corpus stdout matched the stock rebuild and `target/compiler-rewrite/char/rg-control` (423040 bytes, exit 0). Thirty rotated runs after warmups:
+
+| Binary | Median | Mean | Population stdev |
+| --- | --- | --- | --- |
+| hot-cold split | 0.006210s | 0.006200s | 0.000083s |
+| stock rebuild | 0.006095s | 0.006101s | 0.000066s |
+| control `rg` | 0.006074s | 0.006096s | 0.000082s |
+
+0.006210/0.006095 = 1.019. The same-byte stock rebuild and control differ by 1.003 on this run, so the slowdown is outside that gap. The per-workload runtime bound is 1.01.
+
+The second check retargets scheduling at the psABI x86-64-v3 model without adding an instruction set. Rustc took `-Z tune-cpu=x86-64-v3`. GCC 15 rejects `-mtune=x86-64-v3` and accepts `-mtune=haswell`, which is the microarchitecture that level names. Ripgrep was built with the rustc tune only. Oxipng was built twice: stock, and rustc tune plus `CFLAGS=-mtune=haswell` so libdeflate was rescheduled too. The libdeflate archives differ (`b07366dee47d728924b022575a21f42cd003b0bebcaf1d4aa0fe8f6b0f334f94` and `79bcc60a9bce58e68be49b12b2bba8e63406f0b87c2d2060260974f57f72864f`). The three builds ran together, so their walls are not cold-gate samples. Logs: `target/compiler-rewrite/logs/v3-ripgrep.log` (cargo 33.34s, `EXIT:0`), `v3-ox-base.log` (20.56s, `EXIT:0`), `v3-ox-v3.log` (20.22s, `EXIT:0`).
+
+| Binary | Bytes | Stripped | YMM lines | sha256 |
+| --- | --- | --- | --- | --- |
+| ripgrep v3 | 4718152 | 4054944 | 1012 | `c62842b210ec37b1ed0bfd3830b7d409f9d3d126091880330afb1e21227d1c56` |
+| ripgrep stock rebuild | 4687944 | 4024992 | 1012 | `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4` |
+| oxipng stock | 1551704 | 1338440 | 482 | `943327577a41641a25c01a23d29c1c515c0abd20124d937e3b31ea75bc7e08d8` |
+| oxipng v3 | 1563256 | 1349992 | 514 | `2acb54d045173416826a16407b382d71a65f8f06f20ca1232a35ef57407d9688` |
+
+Stripped ripgrep grew by 4054944/4024992 = 1.007. Stripped oxipng grew by 1349992/1338440 = 1.009. Ripgrep's YMM count stayed 1012, so the rustc tune did not widen that binary's ISA. Oxipng's YMM count rose from 482 to 514 inside the retuned libdeflate archive. Thirty rotated ripgrep runs, and twenty rotated oxipng runs of `oxipng -o 4 --threads 1 --dir OUT pngs/*.png`:
+
+| Workload | Stock median | Tuned median | Ratio | Population stdev, stock / tuned |
+| --- | --- | --- | --- | --- |
+| ripgrep | 0.006228s | 0.006343s | 1.019 | 0.000151s / 0.000086s |
+| oxipng | 0.204504s | 0.203671s | 0.996 | 0.003138s / 0.004169s |
+
+The same-byte ripgrep stock rebuild and `char/rg-control` differed by 1.002 on this run (medians 0.006228s and 0.006216s). The oxipng outputs match, sha256 `e6e1003862ebc17db0cbbc22cbb87a7b927ffe835affb2fb9e821b379f55492d` over the eight files. A 0.4% oxipng move is inside a 1.5% standard deviation, and the ripgrep move is a slowdown past 1.01. In the stock libdeflate archive, `deflate_compress.o` has no YMM instructions. The AVX2 symbols are `adler32` and `crc32`. `matchfinder_init_avx2` is compiled only when `__AVX2__` is set, and `-mtune` does not set it. Rescheduling the scalar compressor did not produce a 0.97 aggregate.
+
+A separate oxipng build set `CFLAGS=-march=haswell` and left the Rust compiler stock. That does define `__AVX2__`. `deflate_compress.o` then has 1380 YMM lines, and the linked binary has 1917 against 482 in the stock binary. Log: `target/compiler-rewrite/logs/v3-ox-march.log` (cargo 12.87s, `EXIT:0`, run in parallel with nothing else, still not a cold-gate sample). The binary is sha256 `36601a5937530fe99f98c6d75eb31e10480308c7c6514801680d773846e70715`, 1526264 bytes, stripped 1313408. 1313408/1338440 = 0.981. The eight PNG outputs match the stock build. Twenty rotated runs gave a stock median of 0.209695s (mean 0.207146s, population stdev 0.005006s) and a haswell median of 0.204892s (mean 0.205442s, population stdev 0.004825s). The median ratio is 0.977 and the mean ratio is 0.992. The median gap is about one standard deviation of a single run, and the same stock binary's median moved from 0.204504s in the previous batch to 0.209695s here, so this is not a demonstrated runtime win. `-march=haswell` also makes the compressor require AVX2 with no runtime fallback, which is a hidden target change. It was not packaged.
+
+The locked rustfmt tree still does not compile (43 `rustc_ast` errors in `tune1-rf-base.log`). The in-tree 1.11.0 rustfmt was not substituted. With ripgrep near 1.0, the other two workloads have to average about 0.955 to pull a three-workload geomean to 0.97, and each stripped file has to stay at or under stock. Hot-cold split and the v3 tune grow the stripped files from those builds. The haswell march build is smaller (0.981) and its runtime move is inside the noise. None of the three produces the aggregate. Thresholds are unchanged. Those probes were not packaged.
+
+## Codegen reuse is the kept candidate
+
+`frust-0ef1bc386-cgcache1` is the change that stays. The on-disk artifacts match the proof and the leaf sample above. The parity log `target/compiler-rewrite/parity/frust-0ef1bc386-cgcache1/prove.log` ends `PROVE_OK 2026-11-19T05:19:38+00:00`: fat LTO ran for `frustc` (1.232s) and `rustc` (1.212s), both names wrote 1 and 8 pre-optimization bitcode files at the requested codegen-unit counts, and warm/fresh `.text` and stdout matched for the leaf, revert, wide, api, native, linker-only, and restored-timestamp edits. The packaged driver is `target/compiler-rewrite/toolchains/frust-cg1/lib/librustc_driver-c56a332a1933ca87.so`, sha256 `15c710071f3babdba3ddf16a0e654fa5c9f8c43214e0f7ce0ea87825ebe8f1a4`, 155149824 bytes. The leaf `rg` is still sha256 `9af9ac5e16737ca1da64263aab4c718cae9b00b4cc6f3b3b4f7885ac1f8df866`. `strip --strip-unneeded` still leaves 3742608 bytes, and `readelf -V` still shows `GLIBC_ABI_DT_RELR`. The ripgrep cohort has no `_frust_leaf` marker.
+
+The leaf log `target/compiler-rewrite/logs/cgcache1-ripgrep-leaf.log` used `toolchains/frust-cg1/bin` and recorded 12.53s and 447136 kB. 12.53/19.14 = 0.655, under the 0.80 bar. 3742608 is smaller than the stock 4024992, so stripped size did not grow. The same-session corpus median ratio was 0.005766/0.005820 = 0.991, under the 1.01 per-workload bound. The candidate is kept on that evidence. The 0.97 runtime aggregate is still unmet. The syn, regex, and fd samples are in the next section. The 30-pair gate was not run, so the full Linux budget remains open. `cargo +1.100.0 test --manifest-path crates/frust-core/Cargo.toml --offline` passed 16 tests. Thresholds are unchanged.
+
+## Packaged cg1 samples of syn, regex, and fd
+
+One frozen-protocol sample each, on `toolchains/frust-cg1/bin`, from `2026-11-19T06:03:52+00:00` through `2026-11-19T06:04:52+00:00`. The driver log is `target/compiler-rewrite/logs/cg1-sample-driver.log`. Every row exited 0. Syn and regex leaves were copied from their cold targets before the edit. The fd holdout reused the fd cold target. After the exit trap, the syn, regex, and fd cohorts contain no `_frust_leaf` marker. These are single samples, not the 30-pair gate, and the gate was not started.
+
+Stock walls and RSS values are the frozen control rows in `qualification/BASELINES.md`. Ratios use wall clock and max RSS.
+
+| Workload | Kind | Wall | Cargo | Max RSS | Stock wall | Stock RSS | Wall ratio | RSS ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| syn | cold | 3.06s | 3.05s | 293104 kB | 3.05s | 292820 kB | 1.003 | 1.001 |
+| syn | no-op | 0.04s | 0.03s | 58840 kB | 0.04s | 55520 kB | 1.000 | 1.060 |
+| syn | leaf | 1.94s | 1.94s | 295356 kB | 1.89s | 290560 kB | 1.026 | 1.017 |
+| regex | cold | 4.90s | 4.90s | 350380 kB | 5.05s | 347772 kB | 0.970 | 1.007 |
+| regex | no-op | 0.01s | 0.01s | 39748 kB | 0.01s | 36348 kB | 1.000 | 1.094 |
+| regex | leaf | 0.34s | 0.33s | 200312 kB | 0.33s | 195780 kB | 1.030 | 1.023 |
+| fd | cold | 32.98s | 32.97s | 490124 kB | 33.72s | 441532 kB | 0.978 | 1.110 |
+| fd | no-op | 0.03s | 0.02s | 49376 kB | 0.03s | 47308 kB | 1.000 | 1.044 |
+| fd | holdout | 16.12s | 16.11s | 466716 kB | 15.90s | 448916 kB | 1.014 | 1.040 |
+
+Logs: `target/compiler-rewrite/logs/cg1-syn-cold.log`, `cg1-syn-noop.log`, `cg1-syn-leaf.log`, `cg1-regex-cold.log`, `cg1-regex-noop.log`, `cg1-regex-leaf.log`, `cg1-fd-cold.log`, `cg1-fd-noop.log`, and `cg1-fd-holdout.log`. Regex cold against the clean-seed wall of 4.87s is 1.006, and its RSS against 346032 kB is 1.013. Cold wall ratios are at or under 1.05. No-op wall overhead is 0, inside max(5% of the stock wall, 20 ms). Syn and regex leaf RSS ratios are under 1.10. The fd holdout RSS ratio is under 1.10. The fd cold RSS ratio is 490124/441532 = 1.110, over 1.10, on this one sample. fd is a holdout and is not used to choose the compiler change.
+
+`du -sb` after the timings is in `target/compiler-rewrite/logs/cg1-disk.log` (`2026-11-19T06:04:52+00:00`). Candidate bytes: syn-cold 40122459, syn-leaf 40257059, regex-cold 102838741, regex-leaf 102914045, fd-cold 337238480. Control bytes: syn-seed 39706133, syn-miss-1 39840747, regex-seed 102830317, regex-miss-1 102905640, fd 308291554. Ratios: 1.010, 1.010, 1.000, 1.000, and 1.094. All are under 1.20. The traces are not the same length. Control seeds are cold only, the miss directories are one reversed leaf, and the control fd directory is the earlier full trace, while fd-cold here is cold plus a no-op plus one holdout. `probes/cg1` holds 162 `frust-codegen-cache` files, which are part of the candidate byte counts.
+
+The one-sample leaf wall ratios are ripgrep 0.655, syn 1.026, and regex 1.030. Their product is about 0.692 and the geometric mean is about 0.885, above 0.80. Syn and regex are libraries. Their builds have no fat-LTO row, and the edited crate's object changed, so the post-optimization cache did not remove that work. The fd holdout wall ratio is 1.014, which is not below 1. None of these rows is a gate result.
+
+These samples do not reach a 0.97 runtime aggregate or a per-workload stripped-size bar. They measure build time, not application runtime. The kept ripgrep corpus median ratio is still 0.991. Locked rustfmt 1.9.0 still does not compile, and oxipng was not rebuilt with `frust-cg1` for this sample. With ripgrep at 0.991, the other two runtime ratios have to multiply to at most 0.921 to pull a three-workload geometric mean to 0.97, and each stripped file has to stay at or under stock. That evidence is not here. Checklist item 6 stays unchecked. Thresholds are unchanged.
+
+## Fat-LTO pre-optimization cache
+
+`target/compiler-rewrite/toolchains/frust-preopt1` (id `frust-0ef1bc386-preopt1`) stores the fat-LTO object after the module merge and before `run_pass_manager`. The cache name is `preopt-v1-{opt}-{pipeline}-{irhash}.o`. A hit returns that object and skips the pass manager. A miss runs the requested fat-LTO pipeline and then stores the object. The post-optimization object cache and RELR packing from the codegen-reuse candidate stay. The diff is `support/patches/rustc/0002-frustc-fatlto-preopt-cache.patch`. The cache is used only when the executable name is `frustc`.
+
+`qualification/prove-codegen.sh` passed on this prefix before the paired samples. The parity log `target/compiler-rewrite/parity/frust-0ef1bc386-preopt1/prove.log` ends `PROVE_OK 2026-11-19T06:21:07+00:00`. `LLVM_fatlto` ran for `frustc` (1.278s) and `rustc` (1.211s). Both names wrote 1 pre-optimization bitcode file at codegen-units 1 and 8 files at codegen-units 8. Warm and fresh `.text` and stdout matched for the leaf (`22 2 4 22 44 37`), the revert (`21 2 4 22 44 37`), the wide edit, the public API plus macro, the native input, the linker-only symbol, and the restored-timestamp edit. The fresh leaf finished in 1.39s. A following build of those same leaf sources finished in 0.21s. The fresh revert finished in 1.39s. The 0.21s row is that repeated leaf build. The packaged driver is `toolchains/frust-preopt1/lib/librustc_driver-c56a332a1933ca87.so`, sha256 `18cb740482dca81597480b79d37b976f364570dda51aa5b6cb8aeebee8748cf3`, 155139416 bytes. The default package `toolchains/frust` still has the unpatched control driver, sha256 `0d5e12331727ef3d4358356bc502e81393ec056aa943e97bd34bac82725dad3d`.
+
+The paired gate compared `toolchains/frust-preopt1/bin` with the unpatched stage-2 through `qualification/time-build.sh`. The build-time driver finished `2026-11-19T09:16:35Z`. Counts from the per-pair logs, each with `EXIT:0` on both sides: 60 leaf and 60 wide for ripgrep, syn, and regex; 30 cold and 30 no-op for ripgrep, syn, regex, and fd; 30 fd holdout. The seven cohorts were clean afterward. `patch(1)` writes `patching file` to stdout, and the driver summary for every patched kind stored that text in place of the wall time. Wall clock and RSS for those kinds were read back from the `/usr/bin/time -v` logs. Cold and no-op summaries were already the time output.
+
+Median wall (even counts use the average of the two middle samples) and the median of the paired ratios:
+
+| Workload | Kind | Pairs | fRust wall | Stock wall | Median ratio |
+| --- | --- | --- | --- | --- | --- |
+| ripgrep | leaf | 60 | 6.29s | 19.02s | 0.3316 |
+| syn | leaf | 60 | 1.90s | 1.92s | 0.9844 |
+| regex | leaf | 60 | 0.33s | 0.33s | 1.0000 |
+| ripgrep | wide | 60 | 20.06s | 19.48s | 1.0296 |
+| fd | holdout | 30 | 16.25s | 15.77s | 1.0308 |
+
+The frozen ripgrep leaf edit adds an unused local. That local is removed before the fat-LTO merge, so the pre-optimization module matches the unmodified seed and the cache hits. The timed `rg` is sha256 `9af9ac5e16737ca1da64263aab4c718cae9b00b4cc6f3b3b4f7885ac1f8df866`, the same bytes as the frust seed. The stock leaf `rg` matches the stock seed, sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`. The wide edit changes the merged module. Ripgrep wide therefore runs the pass manager and the hash (median ratio 1.0296, p95 1.0387). Syn and regex are libraries. Their builds have no fat-LTO row, and their leaf ratios stay at 0.9844 and 1.0000. The leaf geometric mean is the ripgrep hit averaged with those two near-1 ratios.
+
+`cargo +1.100.0 test -p frust-core --offline` passed 16 tests. The shipped `crates/target/debug/frust-gates` then judged the paired file. Its report:
+
+| Gate | Status | Detail |
+| --- | --- | --- |
+| edited-release-build | passed | geomean 0.6885, upper 0.6889 |
+| holdout-build | failed | median ratio 1.0308 is not an improvement |
+| cold-build | passed | median ratio 1.0050 |
+| noop-overhead | passed | median overhead 0.0000s, allowance 0.0200s |
+| tail-latency | passed | primary and wider edit p95 are within 1.05 |
+| peak-memory | passed | max ratio 1.0844 |
+| disk-bytes | passed | max ratio 1.1445 |
+| runtime-workloads | failed | inconclusive: need three runnable workloads |
+| runtime-aggregate | failed | geomean 0.9891, upper 1.1369 exceeds 0.97 |
+| stripped-size | failed | inconclusive: need three stripped sizes |
+
+Tail p95 values from that report: regex leaf 1.0313, ripgrep leaf 0.3363, syn leaf 1.0052, regex wide 1.0303, ripgrep wide 1.0387, syn wide 0.9948. Cold median 1.0050. No-op median overhead is 0 against a 0.020s allowance. The worst leaf or holdout RSS ratio is 1.0844 (fd, 494636 kB / 456132 kB). The worst target-byte ratio is 1.1445 (fd holdout, 352838746 / 308288209).
+
+Runtime and stripped size used the unmodified ripgrep seeds and oxipng release binaries built with the same profile `time-build.sh` exports: opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none. Oxipng's manifest also sets `panic = "abort"`, and the harness does not override panic. The frust oxipng binary has a `preopt-v1-3-` object, so the fat-LTO pipeline ran at opt-level 3. A GNU `time` `%e` capture wrote 0.00s for all 60 ripgrep pairs and 0.01s steps for oxipng. That capture is discarded. The judged samples are 60 rotated pairs from a monotonic clock, after 3 untimed warmups. Both ripgrep binaries wrote 423040 bytes, sha256 `118c0e6684d6cc46308cdd44baaa594af0a5cc83d19aa282ef5fcfc48e2e925f`. The eight oxipng outputs match sha256 `e6e1003862ebc17db0cbbc22cbb87a7b927ffe835affb2fb9e821b379f55492d`. Series medians are ripgrep 0.007294s versus 0.007459s and oxipng 0.210778s versus 0.210533s. Pairs alternate which binary runs first. On the 7ms ripgrep command the first process in the pair is slower: the odd-pair ratio median is 1.335 and the even-pair median is 0.750. The paired-ratio median is 0.978, and the bootstrap upper is 1.1369 because that position effect is large beside the command. Oxipng's paired median is 0.9998.
+
+`strip --strip-unneeded` leaves ripgrep at 3742608 bytes versus 4024992, and oxipng at 1311416 versus 1338440. The two-file geometric mean is 0.9545. The binaries differ, so neither row is marked identical code. Locked rustfmt 1.9.0, package `rustfmt-nightly`, built with this `frustc` and exited 101. The log `target/compiler-rewrite/logs/preopt1-gate/rustfmt-frust.log` reports 10 `E0463` errors: the packaged sysroot has no `rustc_private` crates (`rustc_ast_pretty`, `rustc_data_structures`, `rustc_errors`, `rustc_expand`, `rustc_parse`, `rustc_session`, `rustc_span`, `thin_vec`, `rustc_driver`). An earlier invocation used `-p rustfmt` and failed before compilation because the package name is `rustfmt-nightly`; that log is `rustfmt-frust-bad-package.log`. Rustfmt 1.11.0 was not substituted. The rustfmt cohort was clean afterward.
+
+`frust-0ef1bc386-preopt1` is not a qualified candidate. Four budgets failed. Checklist items 6 and 7 stay open. Thresholds are unchanged. `build-control` was not modified. The pair logs, the sample file, and the judge report are under `target/compiler-rewrite/logs/preopt1-gate/`.
+
+The patch was removed from the compiler tree with `git apply --reverse` and moved to `support/patches/rustc/dropped/0004-frustc-fatlto-preopt-cache.patch`. `support/apply-rustc-patches.sh` does not apply `dropped/`. The live series is `0001-frustc-codegen-reuse.patch` only. `toolchains/frust-preopt1`, its parity log, and `logs/preopt1-gate/` stay as the record of this failed candidate and were not retimed.
+
+## Fat-LTO parallel machine codegen
+
+`target/compiler-rewrite/toolchains/frust-par1` (id `frust-0ef1bc386-par1`) kept the pre-optimization object cache, renamed `fatpar-v1-{opt}-{pipeline}-{irhash}.o`, and on a miss ran `buildLTODefaultPipeline` unchanged, then split the optimized module into two partitions (`SplitModule`, `PreserveLocals` false), code-generated those partitions on two threads, and combined them with `ld -r`. The thread count is part of the pipeline fingerprint. `rustc` does not take this path. A hit still skips the pass manager. The diff that was built is `support/patches/rustc/dropped/0005-frustc-fatlto-parallel-codegen.patch`. It applies on top of `0001-frustc-codegen-reuse.patch` and is not in the live series.
+
+`qualification/prove-codegen.sh` passed before the sample. `target/compiler-rewrite/parity/frust-0ef1bc386-par1/prove.log` ends `PROVE_OK 2026-11-19T09:59:06+00:00`. `LLVM_fatlto` ran for `frustc` (1.173s) and `rustc` (1.211s). Both names wrote 1 pre-optimization bitcode file at codegen-units 1 and 8 files at codegen-units 8. Warm and fresh `.text` and stdout matched for the leaf, the revert, the wide edit, the public API plus macro, the native input, the linker-only symbol, and the restored-timestamp edit. The packaged driver contains `fatpar-v1` and `pack-relative-relocs` and does not contain `--icf=safe`. `libstd` and `rustdoc` match the unpatched control. The stage-2 rebuild log is `target/compiler-rewrite/logs/par1-rebuild.log` (`BUILD_EXIT 0`, `PACKAGE_EXIT 0`, `PROVE_EXIT 0`).
+
+One paired sample, not a gate, is in `target/compiler-rewrite/logs/par1-probe/probe.txt`. Each side started from an unmodified incremental seed. Stock seeds are the unpatched stage-2 seeds. The frust seeds were built with this compiler. Both processes exited 0.
+
+| Workload | Kind | fRust wall | Stock wall | Wall ratio | fRust RSS | Stock RSS | RSS ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ripgrep | leaf | 6.37s | 19.37s | 0.3289 | 389264 kB | 499036 kB | 0.7800 |
+| fd | holdout | 21.19s | 15.90s | 1.3327 | 782868 kB | 483860 kB | 1.6180 |
+
+The ripgrep leaf is a cache hit. Its `rg` sha256 `dd7a5c417d7fe489851687d4d379ffedaab9bc6d74712c4e11271504be0f7b32` matches the frust seed, and both directories name the same object `fatpar-v1-3-7ebda51b53de8b03-07ecf3d6b77c970c.o`. Stripped size is 3742608 bytes versus 4024992. The fd holdout missed: the seed object is `fatpar-v1-3-7ebda51b53de8b03-831c79cf27018273.o` and the holdout added `fatpar-v1-3-7ebda51b53de8b03-5e31d54f152cfa63.o`. Target bytes are 354744742 versus 308288207 (1.1507). Stripped `fd` is 3921728 versus 4161616. The fd wall is slower than stock, and the RSS ratio is over 1.10.
+
+The holdout miss is required. Stock `rustc` emitted pre-LTO bitcode for the patched and unpatched fd crate (`logs/par1-probe/fd-ir.log` and `fd-ir-base.log`). The unused `let _frust_leaf = pattern.len()` does not survive as a live value, but the IR still differs: a `src/main.rs` location constant moves from line 375 (`0x0177`) to line 376 (`0x0178`), and that constant's content-hash symbol changes with it. SSA names downstream also shift (`.i82` versus `.i81`). Reusing the unmodified object would keep the old panic line. The two-thread split did not pay for itself on that miss. The full 30/60-pair gate was not run. Checklist items 6 and 7 stay open. Thresholds are unchanged.
+
+The parallel patch was removed from the compiler tree. `support/apply-rustc-patches.sh` reports `already applied 0001-frustc-codegen-reuse.patch` only. `toolchains/frust-par1`, its parity log, and `logs/par1-probe/` stay as the record and were not retimed. `build-control` was not modified. This is not a qualified candidate.
+
+## Ordered fat-LTO stream cache
+
+`target/compiler-rewrite/toolchains/frust-fatkey1` (id `frust-0ef1bc386-fatkey1`) hashes the merged fat-LTO module in module order and stores `frust-fatkey-cache/fatkey-v1-{opt}-{pipeline}-{hash}.o`. A hit copies that object and returns before `run_pass_manager`. A miss runs the requested fat-LTO pipeline, then stores the object. Pre-link stays on the upstream path. `rustc` does not consult this cache. RELR and the post-optimization object cache remain behind `FRUST_EXPERIMENTAL_RELR` and `FRUST_EXPERIMENTAL_CODEGEN_CACHE`. This gate set neither. The packaged driver sha256 is `aac10b0282025b6c9f82c8faf90f50c5ed69d479ebe4a51749446ecf72886a21`. The diff is `support/patches/rustc/dropped/0006-frustc-fatlto-stream-cache.patch`.
+
+The first `prove-codegen.sh` run failed `mid-build-edit` (`PROVE_EXIT 1` at `2026-11-19T10:45:17+00:00`, parity directory `target/compiler-rewrite/parity/frust-0ef1bc386-fatkey1`). The prefix still contained the earlier cargo binary, which recorded a checksum of a source file the proof edited after rustc returned, so the next build did not recompile. Cargo rebuilt from the content-fingerprint patch was installed into this prefix only. The second proof, label `frust-0ef1bc386-fatkey1b`, passed. `target/compiler-rewrite/parity/frust-0ef1bc386-fatkey1b/prove.log` ends `PROVE_OK 2026-11-19T10:54:19+00:00`. The mid-build edit recompiled and the warm `.text` matched a fresh build. `LLVM_fatlto` ran for `frustc` (1.246s) and `rustc` (1.205s). Both names wrote 1 pre-optimization bitcode file at codegen-units 1 and 8 files at codegen-units 8.
+
+One probe pair is in `target/compiler-rewrite/logs/fatkey1-probe/probe.txt`. Both sides exited 0.
+
+| Workload | Kind | fRust wall | Stock wall | Wall ratio | fRust RSS | Stock RSS | RSS ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ripgrep | leaf | 6.471880s | 19.544713s | 0.3311 | 388028 kB | 513900 kB | 0.7551 |
+| fd | holdout | 16.345641s | 16.177821s | 1.0104 | 465244 kB | 484048 kB | 0.9612 |
+
+The ripgrep leaf hit `fatkey-v1-3-2980a21d8ab4a4ff-0838c7afaf293d9a.o`. Its `rg` sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4` matches the unmodified frust seed and the stock leaf binary. The fd holdout missed and added `fatkey-v1-3-2980a21d8ab4a4ff-5232f6cd16fb734b.o`. Stripped ripgrep and fd matched stock, 4024992 and 4161616 bytes, because RELR was off.
+
+The shipped `crates/target/debug/frust-gates` judged `logs/fatkey1-gate/samples.txt`. The report is `logs/fatkey1-gate/gates.json` (sha256 `18da5cb3a5ecd9bdba02de609a221d33a8c539bb906e1231c9197441c74b53c8`). `JUDGE_EXIT 1` at `2026-11-19T15:58:49+00:00`. Counts, each with `EXIT:0` on both sides: 60 leaf and 60 wide for ripgrep, syn, and regex; 30 cold and 30 no-op for ripgrep, syn, regex, and fd; 30 fd holdout.
+
+| Workload | Kind | Pairs | Median fRust wall | Median stock wall | Median ratio |
+| --- | --- | --- | --- | --- | --- |
+| ripgrep | leaf | 60 | 6.3876s | 19.2228s | 0.3319 |
+| syn | leaf | 60 | 5.9656s | 5.9238s | 1.0038 |
+| regex | leaf | 60 | 0.6607s | 0.6669s | 0.9913 |
+| ripgrep | wide | 60 | 39.4067s | 38.7990s | 1.0129 |
+| fd | holdout | 30 | 27.9229s | 36.6752s | 1.0239 |
+
+The median ratio is the median of the paired ratios. It is not the ratio of the two median walls. Syn and fd absolute walls sit above the frozen baselines because the host load average reached 19 during the gate while other sessions compiled fd and oxipng. The samples were not retimed.
+
+| Gate | Status | Detail |
+| --- | --- | --- |
+| edited-release-build | passed | geomean 0.6912, upper 0.6946 |
+| holdout-build | failed | median ratio 1.0239 is not an improvement |
+| cold-build | passed | median ratio 1.0027 |
+| noop-overhead | passed | median overhead 0.0002s, allowance 0.0200s |
+| tail-latency | failed | regex/leaf p95 1.0556 exceeds 1.05 |
+| peak-memory | passed | max ratio 1.0531 |
+| disk-bytes | passed | max ratio 1.0506 |
+| runtime-workloads | failed | inconclusive: need three runnable workloads |
+| runtime-aggregate | failed | inconclusive: need all three runtime workloads |
+| stripped-size | failed | inconclusive: need three stripped sizes |
+
+Tail p95 values from that report: regex leaf 1.0556, ripgrep leaf 0.4124, syn leaf 1.0628, regex wide 1.1415, ripgrep wide 1.4116, syn wide 1.0315. The ripgrep leaf hit is the unused-local edit dying before the hash. Ripgrep no-op pair 1 was 8.394s against 25.847s: the probe had applied and reversed the leaf patch on the shared cohort, so the first no-op rebuilt. Pairs 2 through 30 were about 0.026s on both sides. The no-op median still passed. Peak RSS is the fd holdout pair 478552 kB / 454424 kB. The worst target-byte ratio is fd holdout 323892585 / 308288210.
+
+Runtime used the unmodified ripgrep seeds and oxipng release binaries. Each timed run followed an untimed run of that same binary. Both ripgrep binaries wrote the frozen corpus size, and the oxipng output digests matched. `strip --strip-unneeded` leaves ripgrep at 4024992 bytes on both sides (sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`) and oxipng at 1338440 bytes on both sides (sha256 `943327577a41641a25c01a23d29c1c515c0abd20124d937e3b31ea75bc7e08d8`). The judge marked both rows identical code. The two-workload runtime geomean is 0.9974 and its upper bound is 1.0020. Locked rustfmt 1.9.0, package `rustfmt-nightly`, exited 101. `logs/fatkey1-gate/rustfmt-frust.log` reports 10 `E0463` errors and no `rustc_private` crates. Rustfmt 1.11.0 was not substituted, and fd was not timed under the name rustfmt.
+
+`frust-0ef1bc386-fatkey1` is not a qualified candidate. Five budgets failed. Checklist items 6 and 7 stay open. Thresholds are unchanged. `build-control` was not modified.
+
+The stream-cache patch was removed from the compiler tree with `git apply --reverse` and moved to `support/patches/rustc/dropped/0006-frustc-fatlto-stream-cache.patch`. `0001-frustc-codegen-reuse.patch` still reverse-checks as applied. `0010-frustc-interface-hash.patch` is present, unapplied, and was left untouched. `support/apply-rustc-patches.sh` was not run, because that script would apply `0010`. `toolchains/frust-fatkey1`, both parity logs, and `logs/fatkey1-gate/` stay as the record of this failed candidate and were not retimed.
+
+## Fat-LTO location splice
+
+`target/compiler-rewrite/toolchains/frust-span1` (id `frust-0ef1bc386-span1`) classifies panic-location records in the merged fat-LTO module, zeroes the line field for the cache key, and on a later edit either copies the object or splices the new 16-byte payloads into it. A hit returns before `run_pass_manager`. A miss runs the requested fat-LTO pipeline and then stores the object. The cache directory is `frust-fatspan-cache/`, not `frust-codegen-cache/`. `rustc` does not consult it. RELR and the post-optimization object cache stay behind their experimental switches. This gate set neither. Both sides used `CARGO_BUILD_JOBS=8`, which `qualification/time-build.sh` does not set. The packaged driver sha256 is `adfe1ed94b425359f372c29be0c3f1c6093b91e664fd880045b93e0b45fb2ba6`. The diff is `support/patches/rustc/experimental/0007-frustc-fatlto-span-reuse.patch`.
+
+`qualification/prove-codegen.sh` passed as `frust-0ef1bc386-span1b`. `target/compiler-rewrite/parity/frust-0ef1bc386-span1b/prove.log` ends `PROVE_OK 2026-11-19T17:11:13+00:00`. `LLVM_fatlto` ran for `frustc` (1.253s) and `rustc` (1.204s). Warm and fresh `.text` matched for the leaf, the revert, the wide edit, the public API, the native input, the linker-only symbol, the restored timestamp, and the mid-build edit. An earlier label, `frust-0ef1bc386-span1`, died with `E0463` before the standard library was copied back into the compiler-only stage-2 sysroot. That directory was kept. The second proof used the repaired prefix.
+
+One fd holdout pair, before the gate, was 3.407608s against 15.764452s (0.2162) and 371432 kB against 456312 kB (0.8140). The allocated difference between the frust seed and holdout binaries was the build id and one `.data.rel.ro` byte, line 375 to 376. `.text` matched. That pair is not the gate.
+
+The shipped `frust-gates` judged `logs/span1-gate/span1-samples.txt`. The report is `logs/span1-gate/gates.json` (sha256 `65e867ef87a9b500828bc1375cdc9b65a9bf862896bc88c00cac6de66a8d7458`). `JUDGE_EXIT 1`. `gates.rs` sha256 `6aec6f5c1cb23205083380627db936f82ccd35425777dd4f91185eaef28ecacd` matches the hash recorded before the judge binary was built. Every raw `WALL_SECONDS` row matches the sample file. Counts, each with `EXIT:0` on both sides: 60 leaf and 60 wide for ripgrep, syn, and regex; 30 cold and 30 no-op for ripgrep, syn, regex, and fd; 30 fd holdout.
+
+| Workload | Kind | Pairs | Median fRust wall | Median stock wall | Median of paired ratios |
+| --- | --- | --- | --- | --- | --- |
+| ripgrep | leaf | 60 | 6.4508s | 19.7635s | 0.3327 |
+| syn | leaf | 60 | 3.4502s | 4.7273s | 0.9773 |
+| regex | leaf | 60 | 0.3526s | 0.3617s | 0.9740 |
+| ripgrep | wide | 60 | 21.2747s | 21.2261s | 1.0152 |
+| fd | holdout | 30 | 3.4888s | 15.9219s | 0.2182 |
+
+The gate ratio is the median of the paired ratios, not the ratio of the two median walls. Syn's unpaired medians would give 0.7298, and that number is not the gate. The two sides move in opposite directions across pairs.
+
+| Gate | Status | Detail |
+| --- | --- | --- |
+| edited-release-build | passed | geomean 0.6816, upper 0.6865 |
+| holdout-build | passed | median ratio 0.2182 |
+| cold-build | passed | median ratio 0.9967 |
+| noop-overhead | passed | median overhead 0.0009s, allowance 0.0200s |
+| tail-latency | failed | syn/leaf p95 1.6110 exceeds 1.05 |
+| peak-memory | passed | max ratio 1.0271 |
+| disk-bytes | passed | max ratio 1.0479 |
+| runtime-workloads | failed | inconclusive: need three runnable workloads |
+| runtime-aggregate | failed | inconclusive: need all three runtime workloads |
+| stripped-size | failed | inconclusive: need three stripped sizes |
+
+Tail p95 values from that report: regex leaf 1.0302, ripgrep leaf 0.3524, syn leaf 1.6110, regex wide 1.0716, ripgrep wide 1.0471, syn wide 1.0448. Regex wide is also above 1.05. The judge names the first series that exceeds the cap. Ripgrep no-op pair 1 was 0.029s against 19.464s: the copied stock seed rebuilt once. Later no-op pairs were about 0.025s. The no-op median still passed. Peak RSS is the regex leaf pair 201120 kB / 195804 kB. The worst target-byte ratio is ripgrep leaf 181723060 / 173417037.
+
+A bootstrap of the leaf geometric mean from the raw ratios, 2000 replicates, seed `0xF00571006A7E`, nearest-rank 95%, produced 0.68653026. The judge reports 0.68653029. The same recomputation reproduced the cold median, the holdout median, the no-op overhead, and the RSS maximum.
+
+Runtime used the unmodified ripgrep seeds and oxipng release binaries. Both ripgrep binaries wrote 423040 bytes, sha256 `118c0e6684d6cc46308cdd44baaa594af0a5cc83d19aa282ef5fcfc48e2e925f`. The eight oxipng outputs match sha256 `e6e1003862ebc17db0cbbc22cbb87a7b927ffe835affb2fb9e821b379f55492d`. `strip --strip-unneeded` leaves ripgrep at 4024992 bytes on both sides (sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`) and oxipng at 1338440 bytes on both sides (sha256 `943327577a41641a25c01a23d29c1c515c0abd20124d937e3b31ea75bc7e08d8`). The judge marked both rows identical code. On those identical binaries the ripgrep paired-ratio median was 0.9697 with standard deviation 0.097, and oxipng was 0.9995 with standard deviation 0.029. The two-workload geomean is 0.9845 and its upper bound is 1.0364. Identical code does not meet 0.97.
+
+Locked rustfmt 1.9.0, package `rustfmt-nightly`, exited 101. `logs/span1-gate/rustfmt-frust.log` reports 44 errors and no `E0463`. The toolchain file in that tree asks for nightly-2026-02-19. Rust 1.100.0's `rustc_ast::Block` has no `tokens` field. A two-line probe of that field fails with `E0609` under this `frustc` and under the unpatched stage-2 `rustc` when both use the same `librustc_ast-0cab878d2b7c71c4.rlib` (sha256 `264a550ceaca66a83555e5da15adbf7c98727e4b940cca2a166d53ee3fa5cbd3`). Stock cannot build the locked rustfmt either. Rustfmt 1.11.0 was not substituted, and fd was not timed under the name rustfmt.
+
+`frust-0ef1bc386-span1` is not a qualified candidate. Four budgets failed. The leaf geomean is a line-number hit on one binary workload, not a general leaf speedup. Checklist items 6 and 7 stay open. Thresholds are unchanged. `build-control` was not modified. The patch stays applied. `toolchains/frust-span1`, the parity logs, and `logs/span1-gate/` were not deleted and were not retimed.

@@ -1,0 +1,5 @@
+# Runner labels newer than the pinned actionlint knows about.
+self-hosted-runner:
+  labels:
+    - macos-15-intel
+    - macos-26-intel

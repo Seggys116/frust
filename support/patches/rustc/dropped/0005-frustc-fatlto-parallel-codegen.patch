@@ -1,0 +1,522 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
+--- a/compiler/rustc_codegen_llvm/src/back/write.rs
++++ b/compiler/rustc_codegen_llvm/src/back/write.rs
+@@ -23,7 +23,10 @@
+ use rustc_session::Session;
+ use rustc_session::config::{self, Lto, OutputType, Passes, SplitDwarfKind, SwitchWithOptPath};
+ use rustc_span::{BytePos, InnerSpan, Pos, RemapPathScopeComponents, SpanData, SyntaxContext};
+-use rustc_target::spec::{CodeModel, FloatAbi, RelocModel, SanitizerSet, SplitDebuginfo, TlsModel};
++use rustc_target::spec::{
++    CodeModel, FloatAbi, FramePointer, PanicStrategy, RelocModel, SanitizerSet, SplitDebuginfo,
++    TlsModel,
++};
+ use tracing::{debug, trace};
+ 
+ use crate::back::lto::{Buffer, ModuleBuffer};
+@@ -101,6 +104,33 @@
+     result.into_result().unwrap_or_else(|()| llvm_err(dcx, LlvmError::WriteOutput { path: output }))
+ }
+ 
++/// Parallel machine codegen for one fat-LTO object. The optimization pipeline
++/// has already finished. `false` means the caller must emit the object itself.
++fn write_parallel_fat_object<'ll>(
++    cgcx: &CodegenContext,
++    target: &'ll llvm::TargetMachine,
++    no_builtins: bool,
++    m: &'ll llvm::Module,
++    output: &Path,
++    verify_llvm_ir: bool,
++) -> bool {
++    if !invoked_as_frustc() || cgcx.lto != Lto::Fat || FRUST_FAT_CODEGEN_THREADS < 2 {
++        return false;
++    }
++    let output_c = path_to_c_string(output);
++    let result = unsafe {
++        llvm::LLVMRustWriteParallelObject(
++            target,
++            m,
++            output_c.as_ptr(),
++            FRUST_FAT_CODEGEN_THREADS,
++            no_builtins,
++            verify_llvm_ir,
++        )
++    };
++    result == llvm::LLVMRustResult::Success
++}
++
+ pub(crate) fn create_informational_target_machine(sess: &Session) -> OwnedTargetMachine {
+     let config = TargetMachineFactoryConfig { split_dwarf_file: None, output_obj_file: None };
+     target_machine_factory(sess, config::OptLevel::No)(sess.dcx(), config)
+@@ -1019,6 +1049,224 @@
+     }
+ }
+ 
++/// Partitions used when `frustc` emits a fat-LTO object. Two keeps the
++/// resident set near the serial pipeline. The cache key includes this count.
++const FRUST_FAT_CODEGEN_THREADS: u32 = 2;
++
++fn split_dwarf_object(cgcx: &CodegenContext) -> bool {
++    cgcx.target_can_use_split_dwarf
++        && cgcx.split_debuginfo != SplitDebuginfo::Off
++        && cgcx.split_dwarf_kind == SplitDwarfKind::Split
++}
++
++/// Extra LLVM flags, profiles, and sanitizers change the object without a
++/// complete encoding in the key. Missing the cache is safe.
++fn fat_reuse_refused(sess: &Session, config: &ModuleConfig) -> bool {
++    config.passes.iter().any(|pass| !pass.is_empty())
++        || config.pgo_gen.enabled()
++        || config.pgo_use.is_some()
++        || config.pgo_sample_use.is_some()
++        || config.sanitizer != SanitizerSet::empty()
++        || config.sanitizer_cfi_diag.is_some()
++        || config.sanitizer_cfi_recover.is_some()
++        || config.sanitizer_recover != SanitizerSet::empty()
++        || config.sanitizer_memory_track_origins != 0
++        || !config.sanitizer_dataflow_abilist.is_empty()
++        || config.instrument_coverage
++        || config.debug_info_for_profiling
++        || config.no_prepopulate_passes
++        || !config.llvm_plugins.is_empty()
++        || !config.offload.is_empty()
++        || config.autodiff.contains(&config::AutoDiff::Enable)
++        || !sess.opts.cg.llvm_args.is_empty()
++}
++
++fn bit_flag(value: bool) -> u8 {
++    u8::from(value)
++}
++
++fn fnv1a64(bytes: &[u8]) -> u64 {
++    let mut hash = 0xcbf29ce484222325u64;
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++fn reloc_tag(model: RelocModel) -> &'static str {
++    match model {
++        RelocModel::Static => "static",
++        RelocModel::Pic => "pic",
++        RelocModel::Pie => "pie",
++        RelocModel::DynamicNoPic => "dynamic-no-pic",
++        RelocModel::Ropi => "ropi",
++        RelocModel::Rwpi => "rwpi",
++        RelocModel::RopiRwpi => "ropi-rwpi",
++    }
++}
++
++fn code_model_tag(model: Option<CodeModel>) -> &'static str {
++    match model {
++        None => "default",
++        Some(CodeModel::Tiny) => "tiny",
++        Some(CodeModel::Small) => "small",
++        Some(CodeModel::Kernel) => "kernel",
++        Some(CodeModel::Medium) => "medium",
++        Some(CodeModel::Large) => "large",
++    }
++}
++
++fn tls_tag(model: TlsModel) -> &'static str {
++    match model {
++        TlsModel::GeneralDynamic => "global-dynamic",
++        TlsModel::LocalDynamic => "local-dynamic",
++        TlsModel::InitialExec => "initial-exec",
++        TlsModel::LocalExec => "local-exec",
++        TlsModel::Emulated => "emulated",
++    }
++}
++
++fn float_abi_tag(abi: Option<FloatAbi>) -> &'static str {
++    match abi {
++        None => "default",
++        Some(FloatAbi::Soft) => "soft",
++        Some(FloatAbi::Hard) => "hard",
++    }
++}
++
++fn panic_tag(strategy: PanicStrategy) -> &'static str {
++    match strategy {
++        PanicStrategy::Unwind => "unwind",
++        PanicStrategy::Abort => "abort",
++        PanicStrategy::ImmediateAbort => "immediate-abort",
++    }
++}
++
++fn frame_pointer_tag(kind: FramePointer) -> &'static str {
++    match kind {
++        FramePointer::Always => "always",
++        FramePointer::NonLeaf => "non-leaf",
++        FramePointer::MayOmit => "may-omit",
++    }
++}
++
++/// Target-machine options are not all present in the pre-optimization IR.
++/// The fingerprint is part of the cache name so a CPU or relocation change misses.
++fn fat_pipeline_fingerprint(sess: &Session, cgcx: &CodegenContext, bitcode: BitcodeSection) -> u64 {
++    let config = &cgcx.module_config;
++    let function_sections =
++        sess.opts.unstable_opts.function_sections.unwrap_or(sess.target.function_sections);
++    let trap_unreachable =
++        sess.opts.unstable_opts.trap_unreachable.unwrap_or(sess.target.trap_unreachable);
++    let relax_elf =
++        sess.opts.unstable_opts.relax_elf_relocations.unwrap_or(sess.target.relax_elf_relocations);
++    let use_ctors =
++        sess.opts.unstable_opts.use_ctors_section.unwrap_or(sess.target.use_ctors_section);
++    let large = sess.opts.unstable_opts.large_data_threshold.unwrap_or(0);
++    let bitcode_tag = match bitcode {
++        BitcodeSection::None => "none",
++        BitcodeSection::Full => "full",
++    };
++    let text = format!(
++        "bitcode={bitcode_tag}\nbuiltins={}\nvec_loop={}\nvec_slp={}\nmerge={}\nlifetime={}\ncpu={}\ntune={}\nfeatures={}\ntriple={}\nreloc={}\ncode={}\ntls={}\npanic={}\nframe={}\nfunc_sections={}\ntrap={}\nrelax={}\nctors={}\nfloat={}\nsingle={}\nunique={}\nlarge={large}\nmsvc={}\narch={}\nprefer_dynamic={}\nthreads={FRUST_FAT_CODEGEN_THREADS}\n",
++        bit_flag(config.no_builtins),
++        bit_flag(config.vectorize_loop),
++        bit_flag(config.vectorize_slp),
++        bit_flag(config.merge_functions),
++        bit_flag(config.emit_lifetime_markers),
++        llvm_util::target_cpu(sess),
++        llvm_util::tune_cpu(sess).unwrap_or(""),
++        sess.global_backend_features.join(","),
++        versioned_llvm_target(sess),
++        reloc_tag(sess.relocation_model()),
++        code_model_tag(sess.code_model()),
++        tls_tag(sess.tls_model()),
++        panic_tag(sess.panic_strategy()),
++        frame_pointer_tag(sess.opts.cg.force_frame_pointers),
++        bit_flag(function_sections),
++        bit_flag(trap_unreachable),
++        bit_flag(relax_elf),
++        bit_flag(use_ctors),
++        float_abi_tag(sess.target.llvm_floatabi),
++        bit_flag(sess.target.singlethread(&sess.internal_target_features)),
++        bit_flag(!sess.opts.unstable_opts.no_unique_section_names),
++        bit_flag(cgcx.msvc_imps_needed),
++        cgcx.target_arch,
++        bit_flag(cgcx.prefer_dynamic),
++    );
++    fnv1a64(text.as_bytes())
++}
++
++/// Object reused when the merged pre-optimization module and the fat-LTO
++/// pipeline match a previous `frustc` compile. A miss still runs the pass
++/// manager. `rustc` does not consult this cache.
++pub(crate) fn preopt_fat_cache_path(
++    sess: &Session,
++    cgcx: &CodegenContext,
++    module: &ModuleCodegen<ModuleLlvm>,
++) -> Option<PathBuf> {
++    if !invoked_as_frustc() || cgcx.lto != Lto::Fat {
++        return None;
++    }
++    let config = &cgcx.module_config;
++    let EmitObj::ObjectCode(bitcode) = config.emit_obj else {
++        return None;
++    };
++    if cgcx.save_temps
++        || config.emit_asm
++        || config.emit_ir
++        || config.emit_bc
++        || config.emit_thin_lto_summary
++        || split_dwarf_object(cgcx)
++        || fat_reuse_refused(sess, config)
++    {
++        return None;
++    }
++    let mut has_debug = 0u8;
++    let hash = unsafe { llvm::LLVMRustModuleCodegenHash(module.module_llvm.llmod(), &mut has_debug) };
++    if has_debug != 0 {
++        return None;
++    }
++    let obj_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &module.name);
++    let parent = obj_out.parent()?;
++    let opt = opt_level_tag(cgcx.opt_level);
++    let pipeline = fat_pipeline_fingerprint(sess, cgcx, bitcode);
++    let name = format!("fatpar-v1-{opt}-{pipeline:016x}-{hash:016x}.o");
++    Some(parent.join("frust-codegen-cache").join(name))
++}
++
++pub(crate) fn load_preopt_fat_object(
++    cgcx: &CodegenContext,
++    module: &ModuleCodegen<ModuleLlvm>,
++    cache: &Path,
++) -> Option<CompiledModule> {
++    let obj_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &module.name);
++    if let Some(parent) = obj_out.parent() {
++        fs::create_dir_all(parent).ok()?;
++    }
++    if !copy_cached_object(cache, &obj_out) {
++        return None;
++    }
++    Some(CompiledModule {
++        name: module.name.clone(),
++        kind: module.kind,
++        object: Some(obj_out),
++        global_asm_object: None,
++        dwarf_object: None,
++        bytecode: None,
++        assembly: None,
++        llvm_ir: None,
++    })
++}
++
++pub(crate) fn store_preopt_fat_object(cache: &Path, compiled: &CompiledModule) {
++    let Some(object) = compiled.object.as_deref() else {
++        return;
++    };
++    store_cached_object(cache, object);
++}
++
+ pub(crate) fn codegen(
+     cgcx: &CodegenContext,
+     prof: &SelfProfilerRef,
+@@ -1190,17 +1438,30 @@
+                     None => false,
+                 };
+                 if !reused {
+-                    write_output_file(
+-                        dcx,
+-                        tm.raw(),
+-                        config.no_builtins,
+-                        llmod,
+-                        &obj_out,
+-                        dwo_out,
+-                        llvm::FileType::ObjectFile,
+-                        prof,
+-                        config.verify_llvm_ir,
+-                    );
++                    let parallel = dwo_out.is_none()
++                        && write_parallel_fat_object(
++                            cgcx,
++                            tm.raw(),
++                            config.no_builtins,
++                            llmod,
++                            &obj_out,
++                            config.verify_llvm_ir,
++                        );
++                    if parallel {
++                        record_artifact_size(prof, "object_file", &obj_out);
++                    } else {
++                        write_output_file(
++                            dcx,
++                            tm.raw(),
++                            config.no_builtins,
++                            llmod,
++                            &obj_out,
++                            dwo_out,
++                            llvm::FileType::ObjectFile,
++                            prof,
++                            config.verify_llvm_ir,
++                        );
++                    }
+                     if let Some(path) = cache.as_deref() {
+                         store_cached_object(path, &obj_out);
+                     }
+diff --git a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+--- a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
++++ b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+@@ -111,11 +111,26 @@
+             modules,
+         );
+ 
++        // The merged module is the fat-LTO input. A hit copies the object from
++        // an identical previous pipeline and skips that pipeline. A miss runs
++        // the requested pipeline below, including parallel machine codegen.
++        let preopt_cache = back::write::preopt_fat_cache_path(sess, cgcx, &module);
++        if let Some(cache) = preopt_cache.as_deref()
++            && let Some(compiled) = back::write::load_preopt_fat_object(cgcx, &module, cache)
++        {
++            return compiled;
++        }
++
+         let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
+         let dcx = dcx.handle();
+         back::lto::run_pass_manager(cgcx, &sess.prof, dcx, &mut module, false);
+ 
+-        back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config)
++        let compiled =
++            back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config);
++        if let Some(cache) = preopt_cache.as_deref() {
++            back::write::store_preopt_fat_object(cache, &compiled);
++        }
++        compiled
+     }
+     fn run_thin_lto(
+         cgcx: &CodegenContext,
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -2445,6 +2445,17 @@
+         FileType: FileType,
+         VerifyIR: bool,
+     ) -> LLVMRustResult;
++    /// Split a fat-LTO module into `Threads` partitions, codegen them in
++    /// parallel, and `ld -r` the parts into `Output`. Failure leaves the
++    /// module unchanged so the caller can emit one object serially.
++    pub(crate) fn LLVMRustWriteParallelObject<'a>(
++        T: &'a TargetMachine,
++        M: &'a Module,
++        Output: *const c_char,
++        Threads: u32,
++        NoBuiltins: bool,
++        VerifyIR: bool,
++    ) -> LLVMRustResult;
+     /// Order-independent hash of the module for object reuse. `HasDebugCompileUnit`
+     /// is set when `llvm.dbg.cu` is present; callers must not reuse those objects.
+     pub(crate) fn LLVMRustModuleCodegenHash<'a>(
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -4,6 +4,7 @@
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallString.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StableHashing.h"
+ #include "llvm/Analysis/Lint.h"
+@@ -11,6 +12,7 @@
+ #if LLVM_VERSION_GE(22, 0)
+ #include "llvm/Analysis/RuntimeLibcallInfo.h"
+ #endif
++#include "llvm/Bitcode/BitcodeReader.h"
+ #include "llvm/Bitcode/BitcodeWriter.h"
+ #include "llvm/Bitcode/BitcodeWriterPass.h"
+ #include "llvm/CodeGen/CommandFlags.h"
+@@ -38,6 +40,9 @@
+ #include "llvm/Support/CBindingWrapping.h"
+ #include "llvm/Support/FileSystem.h"
+ #include "llvm/Support/Program.h"
++#include "llvm/Support/ThreadPool.h"
++#include "llvm/Transforms/Utils/SplitModule.h"
++#include <atomic>
+ #include "llvm/Support/TimeProfiler.h"
+ #include "llvm/Support/VirtualFileSystem.h"
+ #include "llvm/Target/TargetMachine.h"
+@@ -756,6 +761,124 @@
+   return LLVMRustResult::Success;
+ }
+ 
++// Codegen one split partition into Path. Returns true on failure.
++// The bitcode is independent of the caller's LLVMContext, so this can run
++// on a worker thread.
++static bool frust_codegen_partition(const TargetMachine *OrigTM,
++                                    StringRef BC, StringRef Path,
++                                    bool NoBuiltins, bool VerifyIR) {
++  LLVMContext Ctx;
++  Expected<std::unique_ptr<Module>> Parsed = parseBitcodeFile(
++      MemoryBufferRef(BC, "frust-fat-part.bc"), Ctx);
++  if (!Parsed)
++    return true;
++  std::unique_ptr<Module> Part = std::move(*Parsed);
++  std::unique_ptr<TargetMachine> TM(OrigTM->getTarget().createTargetMachine(
++      OrigTM->getTargetTriple(), OrigTM->getTargetCPU(),
++      OrigTM->getTargetFeatureString(), OrigTM->Options,
++      OrigTM->getRelocationModel(), OrigTM->getCodeModel(),
++      OrigTM->getOptLevel()));
++  if (!TM)
++    return true;
++
++  std::error_code EC;
++  raw_fd_ostream OS(Path, EC, sys::fs::OF_None);
++  if (EC)
++    return true;
++
++  LLVMPassManagerRef PMR = LLVMCreatePassManager();
++  LLVMRustAddLibraryInfo(wrap(TM.get()), PMR, wrap(Part.get()), NoBuiltins);
++  legacy::PassManager *PM = unwrap<legacy::PassManager>(PMR);
++  bool EmitFailed = TM->addPassesToEmitFile(
++      *PM, OS, nullptr, CodeGenFileType::ObjectFile, !VerifyIR);
++  if (!EmitFailed)
++    PM->run(*Part);
++  OS.flush();
++  LLVMDisposePassManager(PMR);
++  return EmitFailed;
++}
++
++// Split a finished fat-LTO module and codegen the partitions in parallel,
++// then `ld -r` them into one object. The IR pipeline has already run.
++// The original module is left intact. Returns Failure without writing Output
++// when the split cannot be completed, so the caller can emit serially.
++extern "C" LLVMRustResult
++LLVMRustWriteParallelObject(LLVMTargetMachineRef TMRef, LLVMModuleRef MRef,
++                            const char *Output, unsigned Threads,
++                            bool NoBuiltins, bool VerifyIR) {
++  if (!TMRef || !MRef || !Output || Threads < 2)
++    return LLVMRustResult::Failure;
++  TargetMachine *OrigTM = unwrap(TMRef);
++  Module *Mod = unwrap(MRef);
++  unsigned Defined = 0;
++  for (const Function &F : *Mod)
++    if (!F.isDeclaration())
++      ++Defined;
++  if (Defined < 2)
++    return LLVMRustResult::Failure;
++
++  std::vector<SmallString<0>> Parts;
++  Parts.reserve(Threads);
++  SplitModule(
++      *Mod, Threads,
++      [&](std::unique_ptr<Module> Part) {
++        SmallString<0> BC;
++        raw_svector_ostream BCOS(BC);
++        WriteBitcodeToFile(*Part, BCOS);
++        Parts.push_back(std::move(BC));
++      },
++      /*PreserveLocals=*/false, /*RoundRobin=*/false);
++  if (Parts.size() < 2)
++    return LLVMRustResult::Failure;
++
++  std::vector<std::string> ObjPaths;
++  ObjPaths.reserve(Parts.size());
++  for (unsigned I = 0; I < Parts.size(); ++I)
++    ObjPaths.push_back(std::string(Output) + ".part" + std::to_string(I) + ".o");
++
++  std::atomic<int> Failed(0);
++  {
++    DefaultThreadPool Pool(hardware_concurrency(static_cast<unsigned>(Parts.size())));
++    for (unsigned I = 0; I < Parts.size(); ++I) {
++      Pool.async([&, I]() {
++        if (frust_codegen_partition(OrigTM, Parts[I], ObjPaths[I], NoBuiltins,
++                                    VerifyIR))
++          Failed.store(1, std::memory_order_relaxed);
++      });
++    }
++    Pool.wait();
++  }
++  if (Failed.load(std::memory_order_relaxed)) {
++    for (const std::string &PartPath : ObjPaths)
++      sys::fs::remove(PartPath);
++    return LLVMRustResult::Failure;
++  }
++
++  auto LdOrErr = sys::findProgramByName("ld");
++  if (!LdOrErr) {
++    for (const std::string &PartPath : ObjPaths)
++      sys::fs::remove(PartPath);
++    return LLVMRustResult::Failure;
++  }
++  std::string Ld = std::move(*LdOrErr);
++  std::vector<StringRef> Args;
++  Args.push_back(Ld);
++  Args.push_back("-r");
++  Args.push_back("-o");
++  Args.push_back(Output);
++  for (const std::string &PartPath : ObjPaths)
++    Args.push_back(PartPath);
++  std::string ErrMsg;
++  int RC = sys::ExecuteAndWait(Ld, Args, std::nullopt, {}, 0, 0, &ErrMsg);
++  for (const std::string &PartPath : ObjPaths)
++    sys::fs::remove(PartPath);
++  if (RC != 0) {
++    sys::fs::remove(Output);
++    return LLVMRustResult::Failure;
++  }
++  return LLVMRustResult::Success;
++}
++
+ extern "C" typedef void (*LLVMRustSelfProfileBeforePassCallback)(
+     void *,        // LlvmSelfProfiler
+     const char *,  // pass name

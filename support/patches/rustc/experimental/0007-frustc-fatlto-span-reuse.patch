@@ -1,0 +1,793 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+index 3f89777bb..3a22fcd56 100644
+--- a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
++++ b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+@@ -111,11 +111,32 @@ fn optimize_and_codegen_fat_lto(
+             modules,
+         );
+ 
++        let span = back::fat_span::FatSpan::prepare(sess, cgcx, module.module_llvm.llmod());
++        if let Some(span) = &span
++            && span.install_reuse(cgcx, &module.name)
++        {
++            // The cached object already is the full-LTO result. Debug, assembly,
++            // and bitcode emission are refused before a hit is possible.
++            return module.into_compiled_module(
++                true,
++                false,
++                false,
++                false,
++                false,
++                &cgcx.output_filenames,
++            );
++        }
++
+         let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
+         let dcx = dcx.handle();
+         back::lto::run_pass_manager(cgcx, &sess.prof, dcx, &mut module, false);
+ 
+-        back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config)
++        let compiled =
++            back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config);
++        if let Some(span) = span {
++            span.store_produced(cgcx, &compiled);
++        }
++        compiled
+     }
+     fn run_thin_lto(
+         cgcx: &CodegenContext,
+diff --git a/compiler/rustc_codegen_llvm/src/back/mod.rs b/compiler/rustc_codegen_llvm/src/back/mod.rs
+index 3ecd7dd89..802f70c67 100644
+--- a/compiler/rustc_codegen_llvm/src/back/mod.rs
++++ b/compiler/rustc_codegen_llvm/src/back/mod.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod archive;
++pub(crate) mod fat_span;
+ pub(crate) mod llvm_backend;
+ pub(crate) mod lto;
+ pub(crate) mod owned_mc_subtarget_info;
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+index a4e677d..ada8b09 100644
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -2489,6 +2489,17 @@ pub(crate) fn LLVMRustOptimize<'a>(
+         LLVMPlugins: *const c_char,
+         LLVMPluginsLen: size_t,
+     ) -> LLVMRustResult;
++    /// Hash of the merged fat-LTO module after panic-location line numbers are
++    /// normalized. `Payloads` receives `Count` 16-byte location records in
++    /// module order. Any non-zero `HasDebugCompileUnit` forbids reuse. `Count`
++    /// greater than `Capacity` means the buffer was too small and nothing was written.
++    pub(crate) fn LLVMRustFatSpanHash<'a>(
++        M: &'a Module,
++        HasDebugCompileUnit: &mut u8,
++        Payloads: *mut u8,
++        Capacity: u32,
++        Count: &mut u32,
++    ) -> u64;
+     pub(crate) fn LLVMRustPrintModule(
+         M: &Module,
+         Output: *const c_char,
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+index 2bf85ae..0a7c207 100644
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -1863,3 +1863,162 @@ extern "C" void LLVMRustComputeLTOCacheKey(RustStringRef KeyOut,
+   OS << Key.str();
+ }
+ 
++// Hash the merged fat-LTO module after panic-location lines are normalized.
++// Included here so this stays outside the earlier object-reuse patch.
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/GlobalVariable.h"
++#include <array>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++
++static uint64_t frust_read_le_or_be(StringRef Bytes, unsigned Off, unsigned Width,
++                                    bool LittleEndian) {
++  uint64_t Value = 0;
++  for (unsigned I = 0; I < Width; ++I) {
++    unsigned Shift = LittleEndian ? I * 8 : (Width - 1 - I) * 8;
++    Value |= uint64_t(uint8_t(Bytes[Off + I])) << Shift;
++  }
++  return Value;
++}
++
++static const GlobalVariable *frust_global_from_constant(const Constant *C, unsigned Depth) {
++  if (!C || Depth > 4)
++    return nullptr;
++  if (const auto *GV = dyn_cast<GlobalVariable>(C))
++    return GV;
++  if (const auto *GA = dyn_cast<GlobalAlias>(C))
++    return frust_global_from_constant(GA->getAliasee(), Depth + 1);
++  if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
++    if (CE->getNumOperands() == 0)
++      return nullptr;
++    return frust_global_from_constant(cast<Constant>(CE->getOperand(0)), Depth + 1);
++  }
++  return nullptr;
++}
++
++// core::panic::Location on a 64-bit target is a packed { ptr, [16 x i8] }:
++// the pointer addresses a NUL-terminated path, and the 16 bytes are
++// file length, line, and column. Anything else stays in the hash unchanged.
++static bool frust_is_panic_location(const GlobalVariable &GV, bool LittleEndian,
++                                    uint8_t Out[16]) {
++  if (!GV.isConstant() || !GV.hasPrivateLinkage() || !GV.hasInitializer())
++    return false;
++  if (GV.getUnnamedAddr() != GlobalValue::UnnamedAddr::Global)
++    return false;
++  const auto *Init = dyn_cast<ConstantStruct>(GV.getInitializer());
++  if (!Init || Init->getNumOperands() != 2)
++    return false;
++  StructType *ST = Init->getType();
++  if (!ST->isPacked() || ST->getNumElements() != 2 || !ST->getElementType(0)->isPointerTy())
++    return false;
++  const auto *ArrayTy = dyn_cast<ArrayType>(ST->getElementType(1));
++  if (!ArrayTy || ArrayTy->getNumElements() != 16 || !ArrayTy->getElementType()->isIntegerTy(8))
++    return false;
++  const auto *Payload = dyn_cast<ConstantDataArray>(Init->getOperand(1));
++  if (!Payload)
++    return false;
++  StringRef Raw = Payload->getRawDataValues();
++  if (Raw.size() != 16)
++    return false;
++  uint64_t FileLen = frust_read_le_or_be(Raw, 0, 8, LittleEndian);
++  uint64_t Line = frust_read_le_or_be(Raw, 8, 4, LittleEndian);
++  uint64_t Column = frust_read_le_or_be(Raw, 12, 4, LittleEndian);
++  if (FileLen == 0 || FileLen > 4096 || Line == 0 || Line > 10000000 || Column == 0 ||
++      Column > 1000000)
++    return false;
++  const auto *File = frust_global_from_constant(dyn_cast<Constant>(Init->getOperand(0)), 0);
++  if (!File || !File->hasInitializer())
++    return false;
++  const auto *FileBytes = dyn_cast<ConstantDataArray>(File->getInitializer());
++  if (!FileBytes || !FileBytes->getElementType()->isIntegerTy(8))
++    return false;
++  StringRef Path = FileBytes->getRawDataValues();
++  if (Path.size() != FileLen + 1 || Path.back() != 0 || !Path.drop_back().contains(".rs"))
++    return false;
++  memcpy(Out, Raw.data(), 16);
++  return true;
++}
++
++struct FrustSpanRestore {
++  struct Item {
++    GlobalVariable *GV;
++    std::string Name;
++    Constant *Init;
++  };
++  SmallVector<Item, 32> Items;
++  ~FrustSpanRestore() {
++    for (auto It = Items.rbegin(); It != Items.rend(); ++It) {
++      It->GV->setInitializer(It->Init);
++      It->GV->setName(It->Name);
++    }
++  }
++};
++
++extern "C" uint64_t LLVMRustFatSpanHash(LLVMModuleRef M, uint8_t *HasDebugCompileUnit,
++                                        uint8_t *Payloads, uint32_t Capacity, uint32_t *Count) {
++  *HasDebugCompileUnit = 0;
++  *Count = 0;
++  if (!Payloads)
++    Capacity = 0;
++  Module *Mod = unwrap(M);
++  if (Mod->getNamedMetadata("llvm.dbg.cu")) {
++    *HasDebugCompileUnit = 1;
++    return 0;
++  }
++
++  bool LittleEndian = Mod->getDataLayout().isLittleEndian();
++  SmallVector<GlobalVariable *, 64> Locs;
++  SmallVector<std::array<uint8_t, 16>, 64> PayloadStore;
++  for (GlobalVariable &GV : Mod->globals()) {
++    uint8_t Tmp[16];
++    if (!frust_is_panic_location(GV, LittleEndian, Tmp))
++      continue;
++    std::array<uint8_t, 16> Bytes{};
++    memcpy(Bytes.data(), Tmp, 16);
++    PayloadStore.push_back(Bytes);
++    Locs.push_back(&GV);
++  }
++  if (PayloadStore.size() > std::numeric_limits<uint32_t>::max()) {
++    *Count = std::numeric_limits<uint32_t>::max();
++    *HasDebugCompileUnit = 1;
++    return 0;
++  }
++  *Count = static_cast<uint32_t>(PayloadStore.size());
++  if (PayloadStore.size() > Capacity)
++    return 0;
++
++  for (size_t I = 0; I < PayloadStore.size(); ++I)
++    memcpy(Payloads + I * 16, PayloadStore[I].data(), 16);
++
++  FrustSpanRestore Restore;
++  LLVMContext &Ctx = Mod->getContext();
++  for (size_t I = 0; I < Locs.size(); ++I) {
++    GlobalVariable *GV = Locs[I];
++    auto *Init = cast<ConstantStruct>(GV->getInitializer());
++    uint8_t Zeroed[16];
++    memcpy(Zeroed, PayloadStore[I].data(), 16);
++    Zeroed[8] = 0;
++    Zeroed[9] = 0;
++    Zeroed[10] = 0;
++    Zeroed[11] = 0;
++    Constant *NewPayload = ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(Zeroed, 16));
++    Constant *Fields[2] = {cast<Constant>(Init->getOperand(0)), NewPayload};
++    Constant *NewInit = ConstantStruct::get(Init->getType(), ArrayRef<Constant *>(Fields, 2));
++    char Name[32];
++    snprintf(Name, sizeof(Name), "frust.span.%08u", static_cast<unsigned>(I));
++    Restore.Items.push_back(FrustSpanRestore::Item{GV, GV->getName().str(), GV->getInitializer()});
++    GV->setInitializer(NewInit);
++    GV->setName(Name);
++    if (GV->getName() != Name) {
++      // Non-zero tells the caller to ignore the hash. The destructor restores
++      // the module before this return completes.
++      *HasDebugCompileUnit = 1;
++      *Count = 0;
++      return 0;
++    }
++  }
++  // The hash runs while the normalized names and zeroed lines are in place.
++  // FrustSpanRestore then puts the caller's module back before we return.
++  return frust_sorted_codegen_hash(*Mod);
++}
+diff --git a/compiler/rustc_codegen_llvm/src/back/fat_span.rs b/compiler/rustc_codegen_llvm/src/back/fat_span.rs
+new file mode 100644
+index 0000000..84f467c
+--- /dev/null
++++ b/compiler/rustc_codegen_llvm/src/back/fat_span.rs
+@@ -0,0 +1,282 @@
++//! Fat-LTO object reuse for a panic-location line change.
++//!
++//! The merged module is hashed after location symbol names are canonicalized and
++//! the line `u32` is zeroed. An exact payload match copies the cached object.
++//! A mapping that changes only those line bytes splices them into the cached
++//! object. Either hit skips the fat-LTO pipeline and instruction selection.
++//! Anything else, including a backend flag this key does not name, runs full LTO.
++//!
++//! The `rustc` hardlink never enters this path. Incremental pre-LTO bitcode is
++//! already on disk before `optimize_and_codegen_fat_lto`, so that flag does not
++//! disable reuse. The cache directory is `frust-fatspan-cache`, not the
++//! experimental post-opt cache.
++
++mod splice;
++
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::sync::OnceLock;
++
++use rustc_codegen_ssa::CompiledModule;
++use rustc_codegen_ssa::back::write::{BitcodeSection, CodegenContext, EmitObj};
++use rustc_session::Session;
++use rustc_session::config::{OptLevel, OutputType};
++use rustc_target::spec::SplitDebuginfo;
++use splice::{decode_span_entry, encode_span_entry, fnv1a64, splice_span_payloads};
++
++use crate::llvm;
++
++const CACHE_DIR: &str = "frust-fatspan-cache";
++const FIRST_CAPACITY: u32 = 16384;
++const MAX_LOCATIONS: u32 = 1 << 20;
++
++pub(crate) struct FatSpan {
++    hash: u64,
++    payloads: Vec<[u8; 16]>,
++}
++
++fn invoked_as_frustc() -> bool {
++    static CACHED: OnceLock<bool> = OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
++fn opt_level_tag(level: OptLevel) -> &'static str {
++    match level {
++        OptLevel::No => "0",
++        OptLevel::Less => "1",
++        OptLevel::More => "2",
++        OptLevel::Aggressive => "3",
++        OptLevel::Size => "s",
++        OptLevel::SizeMin => "z",
++    }
++}
++
++fn reuse_allowed(sess: &Session, cgcx: &CodegenContext) -> bool {
++    if !invoked_as_frustc() || cgcx.save_temps || !sess.opts.cg.llvm_args.is_empty() {
++        return false;
++    }
++    let config = &*cgcx.module_config;
++    if config.emit_ir
++        || config.emit_asm
++        || config.emit_bc
++        || config.emit_thin_lto_summary
++        || config.no_prepopulate_passes
++        || config.instrument_coverage
++        || config.debug_info_for_profiling
++        || !config.passes.is_empty()
++        || !config.llvm_plugins.is_empty()
++        || !config.autodiff.is_empty()
++        || !config.offload.is_empty()
++        || !config.sanitizer.is_empty()
++        || !config.sanitizer_recover.is_empty()
++        || !config.sanitizer_dataflow_abilist.is_empty()
++        || config.pgo_gen.enabled()
++        || config.pgo_use.is_some()
++        || config.pgo_sample_use.is_some()
++        || cgcx.split_debuginfo != SplitDebuginfo::Off
++    {
++        return false;
++    }
++    matches!(&config.emit_obj, EmitObj::ObjectCode(_))
++}
++
++fn payloads_of(bytes: &[u8], count: u32) -> Option<Vec<[u8; 16]>> {
++    let need = usize::try_from(count).ok()?.checked_mul(16)?;
++    if bytes.len() < need {
++        return None;
++    }
++    let mut payloads = Vec::with_capacity(count as usize);
++    for chunk in bytes[..need].chunks_exact(16) {
++        let mut payload = [0u8; 16];
++        payload.copy_from_slice(chunk);
++        payloads.push(payload);
++    }
++    Some(payloads)
++}
++
++fn hash_module(module: &llvm::Module) -> Option<(u64, Vec<[u8; 16]>)> {
++    let mut has_debug = 0u8;
++    let mut count = 0u32;
++    let mut buffer = vec![0u8; FIRST_CAPACITY as usize * 16];
++    let hash = unsafe {
++        llvm::LLVMRustFatSpanHash(
++            module,
++            &mut has_debug,
++            buffer.as_mut_ptr(),
++            FIRST_CAPACITY,
++            &mut count,
++        )
++    };
++    if has_debug != 0 || count > MAX_LOCATIONS {
++        return None;
++    }
++    let (hash, count) = if count <= FIRST_CAPACITY {
++        (hash, count)
++    } else {
++        buffer.resize(count as usize * 16, 0);
++        let mut retry_count = 0u32;
++        let hash = unsafe {
++            llvm::LLVMRustFatSpanHash(
++                module,
++                &mut has_debug,
++                buffer.as_mut_ptr(),
++                count,
++                &mut retry_count,
++            )
++        };
++        if has_debug != 0 || retry_count != count {
++            return None;
++        }
++        (hash, retry_count)
++    };
++    Some((hash, payloads_of(&buffer, count)?))
++}
++
++impl FatSpan {
++    pub(crate) fn prepare(
++        sess: &Session,
++        cgcx: &CodegenContext,
++        module: &llvm::Module,
++    ) -> Option<Self> {
++        if !reuse_allowed(sess, cgcx) {
++            return None;
++        }
++        let (hash, payloads) = hash_module(module)?;
++        Some(FatSpan { hash, payloads })
++    }
++
++    pub(crate) fn install_reuse(&self, cgcx: &CodegenContext, module_name: &str) -> bool {
++        let Some((object_path, sidecar_path)) = cache_paths(cgcx, module_name, self.hash) else {
++            return false;
++        };
++        let Ok(sidecar) = fs::read(&sidecar_path) else {
++            return false;
++        };
++        let Ok(object) = fs::read(&object_path) else {
++            return false;
++        };
++        if object.is_empty() {
++            return false;
++        }
++        let Some((cached, checksum, object_len)) = decode_span_entry(&sidecar) else {
++            return false;
++        };
++        if checksum != fnv1a64(&object) || object_len != object.len() as u64 {
++            return false;
++        }
++        let produced = if cached == self.payloads {
++            object
++        } else {
++            match splice_span_payloads(&object, &cached, &self.payloads) {
++                Some(bytes) => bytes,
++                None => return false,
++            }
++        };
++        write_exclusive(&object_dest(cgcx, module_name), &produced)
++    }
++
++    pub(crate) fn store_produced(&self, cgcx: &CodegenContext, compiled: &CompiledModule) {
++        let Some(produced) = compiled.object.as_deref() else {
++            return;
++        };
++        let Ok(object) = fs::read(produced) else {
++            return;
++        };
++        // Dead locations are absent from the object. Exact reuse still copies the
++        // whole file. A later line change fails closed inside the splice when the
++        // new bytes are missing or ambiguous, so publish either way.
++        if object.is_empty() {
++            return;
++        }
++        let Some((object_path, sidecar_path)) = cache_paths(cgcx, &compiled.name, self.hash) else {
++            return;
++        };
++        let Some(parent) = object_path.parent() else {
++            return;
++        };
++        if fs::create_dir_all(parent).is_err() {
++            return;
++        }
++        let Some(sidecar) =
++            encode_span_entry(&self.payloads, fnv1a64(&object), object.len() as u64)
++        else {
++            return;
++        };
++        let token = std::process::id();
++        let object_tmp = tmp_path(&object_path, token, "otmp");
++        let sidecar_tmp = tmp_path(&sidecar_path, token, "stmp");
++        if fs::write(&object_tmp, &object).is_err() {
++            let _ = fs::remove_file(&object_tmp);
++            return;
++        }
++        if fs::write(&sidecar_tmp, &sidecar).is_err() {
++            let _ = fs::remove_file(&object_tmp);
++            let _ = fs::remove_file(&sidecar_tmp);
++            return;
++        }
++        // The object is renamed first. A torn pair fails the checksum and misses.
++        if fs::rename(&object_tmp, &object_path).is_err() {
++            let _ = fs::remove_file(&object_tmp);
++            let _ = fs::remove_file(&sidecar_tmp);
++            return;
++        }
++        if fs::rename(&sidecar_tmp, &sidecar_path).is_err() {
++            let _ = fs::remove_file(&sidecar_tmp);
++        }
++    }
++}
++
++fn object_dest(cgcx: &CodegenContext, module_name: &str) -> PathBuf {
++    cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, module_name)
++}
++
++fn cache_paths(cgcx: &CodegenContext, module_name: &str, hash: u64) -> Option<(PathBuf, PathBuf)> {
++    let config = &*cgcx.module_config;
++    let object_tag = match &config.emit_obj {
++        EmitObj::ObjectCode(BitcodeSection::None) => "n",
++        EmitObj::ObjectCode(BitcodeSection::Full) => "f",
++        EmitObj::Bitcode | EmitObj::None => return None,
++    };
++    let level = opt_level_tag(config.opt_level.unwrap_or(OptLevel::No));
++    let name = format!(
++        "span-v1-{}-{level}-{}{}{}{}{}{object_tag}-{:016x}",
++        cgcx.target_arch,
++        u8::from(config.vectorize_loop),
++        u8::from(config.vectorize_slp),
++        u8::from(config.merge_functions),
++        u8::from(config.emit_lifetime_markers),
++        u8::from(config.no_builtins),
++        hash,
++    );
++    let parent = object_dest(cgcx, module_name).parent()?.join(CACHE_DIR);
++    Some((parent.join(format!("{name}.o")), parent.join(format!("{name}.spans"))))
++}
++
++fn tmp_path(path: &Path, token: u32, suffix: &str) -> PathBuf {
++    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("span");
++    path.with_file_name(format!("{name}.{token}.{suffix}"))
++}
++
++fn write_exclusive(dest: &Path, bytes: &[u8]) -> bool {
++    let Some(parent) = dest.parent() else {
++        return false;
++    };
++    if fs::create_dir_all(parent).is_err() {
++        return false;
++    }
++    let tmp = tmp_path(dest, std::process::id(), "span-tmp");
++    if fs::write(&tmp, bytes).is_err() {
++        let _ = fs::remove_file(&tmp);
++        return false;
++    }
++    if fs::rename(&tmp, dest).is_err() {
++        let _ = fs::remove_file(&tmp);
++        return false;
++    }
++    true
++}
+diff --git a/compiler/rustc_codegen_llvm/src/back/fat_span/splice.rs b/compiler/rustc_codegen_llvm/src/back/fat_span/splice.rs
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/compiler/rustc_codegen_llvm/src/back/fat_span/splice.rs
+@@ -0,0 +1,262 @@
++//! Byte splice for `core::panic::Location` payloads inside a fat-LTO object.
++//!
++//! The record in the object is a pointer plus 16 bytes: file length, line, and
++//! column. A reuse hit may change only the line `u32` (bytes 8..12). Every
++//! other difference, an ambiguous mapping, or a payload that does not occur
++//! exactly as many times as the group says, refuses the splice.
++
++pub(super) const SPAN_MAGIC: &[u8; 11] = b"FRUSTSPAN1\0";
++
++pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
++    let mut hash = 0xcbf29ce484222325u64;
++    for &byte in bytes {
++        hash ^= u64::from(byte);
++        hash = hash.wrapping_mul(0x100000001b3);
++    }
++    hash
++}
++
++pub(super) fn encode_span_entry(
++    payloads: &[[u8; 16]],
++    checksum: u64,
++    object_len: u64,
++) -> Option<Vec<u8>> {
++    let count = u32::try_from(payloads.len()).ok()?;
++    let mut out = Vec::with_capacity(11 + 4 + 8 + 8 + payloads.len() * 16);
++    out.extend_from_slice(SPAN_MAGIC);
++    out.extend_from_slice(&count.to_le_bytes());
++    out.extend_from_slice(&checksum.to_le_bytes());
++    out.extend_from_slice(&object_len.to_le_bytes());
++    for payload in payloads {
++        out.extend_from_slice(payload);
++    }
++    Some(out)
++}
++
++pub(super) fn decode_span_entry(bytes: &[u8]) -> Option<(Vec<[u8; 16]>, u64, u64)> {
++    const HEADER: usize = 11 + 4 + 8 + 8;
++    if bytes.len() < HEADER || bytes[..11] != SPAN_MAGIC[..] {
++        return None;
++    }
++    let count = u32::from_le_bytes(bytes[11..15].try_into().ok()?);
++    let checksum = u64::from_le_bytes(bytes[15..23].try_into().ok()?);
++    let object_len = u64::from_le_bytes(bytes[23..31].try_into().ok()?);
++    let rest = &bytes[HEADER..];
++    let need = usize::try_from(count).ok()?.checked_mul(16)?;
++    if rest.len() != need {
++        return None;
++    }
++    let mut payloads = Vec::with_capacity(count as usize);
++    for chunk in rest.chunks_exact(16) {
++        let mut payload = [0u8; 16];
++        payload.copy_from_slice(chunk);
++        payloads.push(payload);
++    }
++    Some((payloads, checksum, object_len))
++}
++
++fn line_only(old: &[u8; 16], new: &[u8; 16]) -> bool {
++    old[..8] == new[..8] && old[12..] == new[12..]
++}
++
++fn find_matches(haystack: &[u8], needle: &[u8; 16]) -> Option<Vec<usize>> {
++    if haystack.len() < 16 {
++        return Some(Vec::new());
++    }
++    let mut hits = Vec::new();
++    for index in 0..=haystack.len() - 16 {
++        if &haystack[index..index + 16] == needle {
++            if hits.last().is_some_and(|prev| index < prev + 16) {
++                return None;
++            }
++            hits.push(index);
++        }
++    }
++    Some(hits)
++}
++
++/// Returns the spliced object, or `None` when the mapping is not a pure line change.
++/// `cached` is the payload list stored with the object. `current` is the list from
++/// the module being compiled. The input slice is left unchanged.
++pub(super) fn splice_span_payloads(
++    object: &[u8],
++    cached: &[[u8; 16]],
++    current: &[[u8; 16]],
++) -> Option<Vec<u8>> {
++    if cached.len() != current.len() {
++        return None;
++    }
++    let mut groups: Vec<([u8; 16], [u8; 16], usize)> = Vec::new();
++    for (old, new) in cached.iter().zip(current.iter()) {
++        if !line_only(old, new) {
++            return None;
++        }
++        if let Some(slot) = groups.iter_mut().find(|slot| slot.0 == *old) {
++            if slot.1 != *new {
++                return None;
++            }
++            slot.2 += 1;
++        } else {
++            groups.push((*old, *new, 1));
++        }
++    }
++
++    let mut edits: Vec<(usize, [u8; 16])> = Vec::new();
++    for (old, new, count) in &groups {
++        if old == new {
++            continue;
++        }
++        let hits = find_matches(object, old)?;
++        if hits.len() != *count {
++            return None;
++        }
++        for position in hits {
++            edits.push((position, *new));
++        }
++    }
++    edits.sort_by_key(|edit| edit.0);
++    for pair in edits.windows(2) {
++        if pair[1].0 < pair[0].0 + 16 {
++            return None;
++        }
++    }
++
++    let mut out = object.to_vec();
++    for (position, bytes) in edits {
++        out[position..position + 16].copy_from_slice(&bytes);
++    }
++    Some(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn payload(line: u32, column: u32) -> [u8; 16] {
++        let mut bytes = [0u8; 16];
++        bytes[0] = 0x0b;
++        bytes[8..12].copy_from_slice(&line.to_le_bytes());
++        bytes[12..16].copy_from_slice(&column.to_le_bytes());
++        bytes
++    }
++
++    #[test]
++    fn line_delta_replaces_only_those_bytes() {
++        let old = payload(0x11, 0x09);
++        let new = payload(0x12, 0x09);
++        let mut object = b"HEAD".to_vec();
++        object.extend_from_slice(&old);
++        object.extend_from_slice(b"TAIL");
++        let spliced = splice_span_payloads(&object, &[old], &[new]).unwrap();
++        assert_eq!(&spliced[..4], b"HEAD");
++        assert_eq!(&spliced[4..20], &new);
++        assert_eq!(&spliced[20..], b"TAIL");
++    }
++
++    #[test]
++    fn every_line_value_round_trips() {
++        let old = payload(7, 13);
++        for line in [1u32, 8, 17, 375, 376, 0x0100, 0x00ff_ffff] {
++            let new = payload(line, 13);
++            let mut object = b"....".to_vec();
++            object.extend_from_slice(&old);
++            object.extend_from_slice(b"....");
++            let spliced = splice_span_payloads(&object, &[old], &[new]).unwrap();
++            assert_eq!(&spliced[4..20], &new);
++            assert_eq!(&spliced[..4], b"....");
++            assert_eq!(&spliced[20..], b"....");
++        }
++    }
++
++    #[test]
++    fn identical_payloads_copy_without_a_match() {
++        let old = payload(17, 9);
++        let object = b"no location bytes here!!!!".to_vec();
++        let spliced = splice_span_payloads(&object, &[old], &[old]).unwrap();
++        assert_eq!(spliced, object);
++    }
++
++    #[test]
++    fn duplicate_locations_share_one_mapping() {
++        let old = payload(17, 9);
++        let new = payload(18, 9);
++        let mut object = Vec::new();
++        object.extend_from_slice(&old);
++        object.extend_from_slice(&[0, 1, 2, 3]);
++        object.extend_from_slice(&old);
++        let spliced = splice_span_payloads(&object, &[old, old], &[new, new]).unwrap();
++        assert_eq!(&spliced[..16], &new);
++        assert_eq!(&spliced[16..20], &[0, 1, 2, 3]);
++        assert_eq!(&spliced[20..36], &new);
++    }
++
++    #[test]
++    fn ambiguous_mapping_refuses() {
++        let old = payload(17, 9);
++        let object = old.to_vec();
++        assert!(
++            splice_span_payloads(&object, &[old, old], &[payload(18, 9), payload(19, 9)]).is_none()
++        );
++    }
++
++    #[test]
++    fn extra_occurrence_refuses() {
++        let old = payload(17, 9);
++        let mut object = old.to_vec();
++        object.extend_from_slice(&old);
++        assert!(splice_span_payloads(&object, &[old], &[payload(18, 9)]).is_none());
++    }
++
++    #[test]
++    fn missing_occurrence_refuses() {
++        let old = payload(17, 9);
++        assert!(splice_span_payloads(b"nothing useful!!", &[old], &[payload(18, 9)]).is_none());
++    }
++
++    #[test]
++    fn column_or_length_change_refuses() {
++        let old = payload(17, 9);
++        let mut column = old;
++        column[12] = column[12].wrapping_add(1);
++        let mut length = old;
++        length[0] = length[0].wrapping_add(1);
++        assert!(splice_span_payloads(&old, &[old], &[column]).is_none());
++        assert!(splice_span_payloads(&old, &[old], &[length]).is_none());
++    }
++
++    #[test]
++    fn overlapping_match_refuses() {
++        let mut needle = [0u8; 16];
++        needle.fill(0xab);
++        let mut object = needle.to_vec();
++        object.extend_from_slice(&needle[..8]);
++        // The pattern overlaps itself at offset 8.
++        object[8..24].copy_from_slice(&needle);
++        let mut changed = needle;
++        changed[8] = 1;
++        assert!(splice_span_payloads(&object, &[needle], &[changed]).is_none());
++    }
++
++    #[test]
++    fn sidecar_round_trip_rejects_a_torn_tail() {
++        let payloads = [payload(375, 57), payload(8, 13)];
++        let object = b"object-bytes";
++        let encoded = encode_span_entry(&payloads, fnv1a64(object), object.len() as u64).unwrap();
++        let (decoded, checksum, len) = decode_span_entry(&encoded).unwrap();
++        assert_eq!(decoded, payloads);
++        assert_eq!(checksum, fnv1a64(object));
++        assert_eq!(len, object.len() as u64);
++        assert!(decode_span_entry(&encoded[..encoded.len() - 1]).is_none());
++        let mut extra = encoded.clone();
++        extra.push(0);
++        assert!(decode_span_entry(&extra).is_none());
++        let mut bad = encoded.clone();
++        bad[0] = b'X';
++        assert!(decode_span_entry(&bad).is_none());
++    }
++
++    #[test]
++    fn checksum_tracks_a_single_byte() {
++        assert_ne!(fnv1a64(b"77010000"), fnv1a64(b"78010000"));
++    }
++}

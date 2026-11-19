@@ -1,0 +1,247 @@
+diff --git a/src/compiler/build_runner/frust_retention.rs b/src/compiler/build_runner/frust_retention.rs
+new file mode 100644
+index 0000000..1181459
+--- /dev/null
++++ b/src/compiler/build_runner/frust_retention.rs
+@@ -0,0 +1,106 @@
++use super::BuildRunner;
++use crate::compiler::CompileMode;
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs;
++use std::io;
++use std::path::Path;
++
++const KEEP_INACTIVE: usize = 3;
++const MARKER_PREFIX: &str = ".frust-published-bin-v2-";
++
++pub(super) fn collect(build: &BuildRunner<'_, '_>) {
++    let Some(layout) = build.frust_locked_unit_layout() else {
++        return;
++    };
++    if build
++        .bcx
++        .gctx
++        .get_env_os("FRUST_GC")
++        .is_some_and(|value| value == "0")
++    {
++        return;
++    }
++    let result = prune(build, layout.build());
++    if let Err(error) = result {
++        tracing::debug!(%error, "fRust managed build retention skipped");
++    }
++}
++
++fn prune(build: &BuildRunner<'_, '_>, build_dir: &Path) -> io::Result<()> {
++    let roots: Vec<_> = build
++        .compilation
++        .binaries
++        .iter()
++        .filter_map(|binary| {
++            let unit = &binary.unit;
++            if unit.mode != CompileMode::Build || !unit.target.is_bin() || unit.artifact.is_true() {
++                return None;
++            }
++            let output = build.files().out_dir_new_layout(unit);
++            // Only reclaim units whose executable Cargo publishes outside the unit directory.
++            (!binary.path.starts_with(&output))
++                .then(|| output.with_file_name(format!("{MARKER_PREFIX}{}", unit.target.name())))
++        })
++        .collect();
++    if roots.iter().all(|marker| marker.is_file()) {
++        return Ok(());
++    }
++    if !is_real_dir(build_dir) || !build_dir.parent().is_some_and(is_real_dir) {
++        return Ok(());
++    }
++
++    let mut packages = BTreeMap::new();
++    for marker in &roots {
++        if let Some(unit_dir) = marker.parent()
++            && let Some(package) = unit_dir.parent()
++            && package.parent() == Some(build_dir)
++            && let Some(hash) = unit_dir.file_name()
++            && let Some(name) = marker.file_name()
++        {
++            packages
++                .entry((package.to_path_buf(), name.to_owned()))
++                .or_insert_with(BTreeSet::new)
++                .insert(hash.to_owned());
++        }
++    }
++    for ((path, marker), live) in packages {
++        if !is_real_dir(&path) {
++            continue;
++        }
++        let mut inactive = Vec::new();
++        for entry in fs::read_dir(path)? {
++            let entry = entry?;
++            let name = entry.file_name();
++            let valid_hash = name.to_str().is_some_and(|text| {
++                text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
++            });
++            if !valid_hash || live.contains(&name) || !entry.file_type()?.is_dir() {
++                continue;
++            }
++            let unit = entry.path();
++            if unit.join(&marker).is_file() && is_real_dir(&unit.join("fingerprint")) {
++                inactive.push((entry.metadata()?.modified()?, unit));
++            }
++        }
++        inactive.sort_unstable_by(|left, right| right.cmp(left));
++        for (_, unit) in inactive.into_iter().skip(KEEP_INACTIVE) {
++            fs::remove_dir_all(unit)?;
++        }
++    }
++
++    for marker in roots {
++        if marker.parent().is_some_and(is_real_dir) && !marker.exists() {
++            drop(
++                fs::OpenOptions::new()
++                    .write(true)
++                    .create_new(true)
++                    .open(marker)?,
++            );
++        }
++    }
++    Ok(())
++}
++
++fn is_real_dir(path: &Path) -> bool {
++    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
++}
+diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
+index b8b9905..68c6efa 100644
+--- a/src/compiler/build_runner/mod.rs
++++ b/src/compiler/build_runner/mod.rs
+@@ -21,13 +21,14 @@ use super::RustdocFingerprint;
+ use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
+ use super::fingerprint::{Checksum, Fingerprint};
+ use super::job_queue::JobQueue;
+-use super::layout::Layout;
++use super::layout::{BuildDirLayout, Layout};
+ use super::lto::Lto;
+ use super::unit_graph::UnitDep;
+ use super::unused_deps::UnusedDepState;
+ use super::{BuildContext, Compilation, CompileKind, CompileMode, Executor, FileFlavor};
+
+ mod compilation_files;
++mod frust_retention;
+ use self::compilation_files::CompilationFiles;
+ pub use self::compilation_files::{Metadata, OutputFile, UnitHash};
+
+@@ -318,6 +319,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+                     .insert(dir.clone().into_path_buf());
+             }
+         }
++        frust_retention::collect(&self);
+         Ok(self.compilation)
+     }
+
+@@ -528,6 +530,17 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+         self.files.as_ref().unwrap()
+     }
+
++    pub(super) fn frust_locked_unit_layout(&self) -> Option<&BuildDirLayout> {
++        if !cfg!(target_os = "linux")
++            || !self.bcx.ws.frust_manages_target()
++            || self.bcx.all_kinds.iter().any(|kind| *kind != CompileKind::Host)
++        {
++            return None;
++        }
++        let layout = self.files().layout(CompileKind::Host).build_dir();
++        layout.frust_locked_unit_layout().then_some(layout)
++    }
++
+     /// Returns the filenames that the given unit will generate.
+     pub fn outputs(&self, unit: &Unit) -> CargoResult<Arc<Vec<OutputFile>>> {
+         self.files.as_ref().unwrap().outputs(unit, self.bcx)
+diff --git a/src/compiler/layout.rs b/src/compiler/layout.rs
+index 9425546..93d1bb1 100644
+--- a/src/compiler/layout.rs
++++ b/src/compiler/layout.rs
+@@ -328,6 +328,7 @@ impl Layout {
+                 tmp: build_root.join("tmp"),
+                 _lock: build_dir_lock,
+                 is_new_layout,
++                shared_build_dir,
+             },
+             _lock: lock,
+         })
+@@ -416,9 +417,14 @@ pub struct BuildDirLayout {
+     /// lock the same path twice.
+     _lock: Option<FileLock>,
+     is_new_layout: bool,
++    shared_build_dir: bool,
+ }
+
+ impl BuildDirLayout {
++    pub(super) fn frust_locked_unit_layout(&self) -> bool {
++        self.is_new_layout && !self.shared_build_dir && self._lock.is_some()
++    }
++
+     /// Makes sure all directories stored in the Layout exist on the filesystem.
+     pub fn prepare(&mut self) -> CargoResult<()> {
+         if !self.is_new_layout {
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 6832bb5..8c95473 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -2047,7 +2047,17 @@ fn add_codegen_incremental(
+     build_runner: &BuildRunner<'_, '_>,
+     unit: &Unit,
+ ) {
+-    let dir = build_runner.files().incremental_dir(&unit);
++    let managed_dir;
++    let dir = if unit.mode == CompileMode::Build
++        && unit.target.is_bin()
++        && !unit.artifact.is_true()
++        && build_runner.frust_locked_unit_layout().is_some()
++    {
++        managed_dir = build_runner.files().out_dir_new_layout(unit).with_file_name("incremental");
++        managed_dir.as_path()
++    } else {
++        build_runner.files().incremental_dir(unit)
++    };
+     let mut arg = OsString::from("incremental=");
+     arg.push(dir.as_os_str());
+     cmd.arg("-C").arg(arg);
+diff --git a/src/workspace/workspace.rs b/src/workspace/workspace.rs
+index 9254b67..7da618c 100644
+--- a/src/workspace/workspace.rs
++++ b/src/workspace/workspace.rs
+@@ -110,6 +110,7 @@ pub struct Workspace<'gctx> {
+     /// Shared target directory for all the packages of this workspace.
+     /// `None` if the default path of `root/target` should be used.
+     target_dir: Option<Filesystem>,
++    frust_managed_target: bool,
+
+     /// Shared build directory for intermediate build artifacts.
+     /// This directory may be shared between multiple workspaces.
+@@ -320,6 +321,7 @@ impl<'gctx> Workspace<'gctx> {
+             self.root(),
+         );
+         self.set_target_dir(Filesystem::new(namespaced));
++        self.frust_managed_target = true;
+         Ok(())
+     }
+
+@@ -333,6 +335,7 @@ impl<'gctx> Workspace<'gctx> {
+             },
+             root_manifest: None,
+             target_dir: None,
++            frust_managed_target: false,
+             build_dir: None,
+             members: IndexSet::default(),
+             member_ids: HashSet::default(),
+@@ -562,6 +565,10 @@ impl<'gctx> Workspace<'gctx> {
+             .unwrap_or_else(|| self.default_target_dir())
+     }
+
++    pub(crate) fn frust_manages_target(&self) -> bool {
++        self.frust_managed_target
++    }
++
+     pub fn build_dir(&self) -> Filesystem {
+         self.build_dir
+             .clone()

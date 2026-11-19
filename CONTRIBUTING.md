@@ -1,59 +1,34 @@
 # Contributing
 
-Thanks for helping. frust is a thin layer over the user's own cargo and rustc, so the main rule is: arguments,
-output and exit codes pass through unchanged unless a documented feature says otherwise.
+This branch is preparing the fRust compiler rewrite. The [README](README.md) describes its status and links to the design documentation. Repository working conventions are in [AGENTS.md](AGENTS.md).
 
-## Set up
+## Changes and verification
 
-```sh
-git clone https://github.com/Seggys116/frust
-cd frust
-cargo build
-cargo test
-```
+- Keep each commit scoped and describe its purpose. Update the user-facing docs when a command, configuration option or supported platform changes.
+- Record the exact upstream compiler, Cargo, LLVM, linker, SDK, host and target whenever reporting compatibility or performance results.
+- For compiler changes, show which upstream and project tests ran. For performance changes, include the workload, build state, options and before-and-after measurements. See the [benchmark methodology](docs/benchmarks.md).
+- Keep architecture plans, implementation briefs, working research and private benchmark material local. Use public fixtures for shareable reproductions.
 
-Rust 1.89 or newer is required (edition 2024).
+## Continuous integration
 
-## Before opening a pull request
+`.github/workflows/ci.yml` runs on every pull request and push to `main`. Its jobs are independent and run in parallel. The final `ci` job is the single required check.
 
-```sh
-cargo clippy --all-targets
-cargo test
-```
+Two workflows are manual and run only from the Actions tab or `gh workflow run`:
 
-CI runs the same checks on Linux, macOS and Windows, plus an MSRV build and cross-target checks.
+- `Toolchains` builds the unpatched control and the patched fRust stage-2 toolchains from the pinned sources and checks that the fRust package launches and passes the parity proof. Built toolchains are cached by recipe and patch hash.
+- `Benchmark` builds both toolchains, then runs the paired build samples, runtime and stripped-size measurements and the release gates from the [qualification protocol](qualification/PROTOCOL.md), one runner per series. Use few pairs with `enforce` off for a smoke run. A full run needs 30 pairs for the median series and 60 for leaf and wide edits, and takes several hours.
 
-## Guidelines
+GitHub's shared runners are noisy and their hardware is not recorded per job, so a Benchmark result checks the pipeline. A performance claim still needs the dated host evidence the [benchmark methodology](docs/benchmarks.md) requires.
 
-* A cache hit must be byte-for-byte what rustc would have produced. If correctness is in doubt, do not cache.
-* Platform-specific code goes behind `cfg` gates with an equivalent on every supported platform, or a graceful fallback.
-* Integration tests use an offline vendored registry and an isolated `FRUST_HOME`. Do not make tests touch the network or the real cache.
-* Add a regression test for every bug fix.
+## Releasing
 
-## Platform code
+A release is a `v*` tag on a commit that is on `main` and has a passing CI run. Before tagging, set the version in `crates/Cargo.toml` (both `workspace.package.version` and the `=` pin in `workspace.dependencies`), move the changelog entries out of Unreleased, and merge to `main`. Pushing the tag then runs `.github/workflows/release.yml`:
 
-Everything that differs between Unix and Windows lives in `src/sys/`, which has a `unix.rs` and a `windows.rs` backend
-behind `src/sys/mod.rs`. CI fails the lint job if platform calls appear elsewhere.
+1. It checks the tag against the crate version and the CI result for the commit.
+2. It builds the fRust toolchain natively for Linux x86-64, macOS Apple Silicon and macOS Intel (cached by recipe and patch hash), launches each, and runs the parity proof on Linux.
+3. On each platform it packages `frust-toolchain-<target>.tar.gz`, its `.sha256` and its `.id` file, installs them with `frust-install` into a scratch prefix and builds a project with the result.
+4. It publishes the GitHub release, which is what `frust-install` and `frust-install update` read, and then publishes `frust-rs-core` and `frust-rs` to crates.io. The crates job needs a `CARGO_REGISTRY_TOKEN` repository secret.
 
-* No `libc::`, `std::os::unix` or `std::os::windows` outside `src/sys/`. The one exception is the macOS-only `apfs`
-  module in `src/compact.rs`.
-* Take file identity (device, inode, link count, times) from `sys::stat`, `sys::lstat` or `sys::fstat`. Never build a
-  `Meta` with `Meta::from(std::fs::Metadata)`: it works only on Unix, because Windows cannot read file identity from a
-  bare `std::fs::Metadata`.
-* Turn paths and `OsStr` values into bytes with `OsStr::as_encoded_bytes`, not `OsStrExt`.
-* Tests that need Unix-only behaviour get `#[cfg(unix)]`.
-* A new platform primitive goes in `src/sys/mod.rs` with an implementation in both backends.
+Run the workflow by hand from a branch to do steps 1 to 3 without publishing anything. Publishing is irreversible, so tag only with explicit authorization.
 
-## Releases
-
-1. Update the package version in `Cargo.toml` and the root package in `Cargo.lock`, and add the release's factual
-   changes to `CHANGELOG.md`. Review `cargo package --locked --list` and run `cargo publish --locked --dry-run`.
-2. Commit the complete release contents and push them to `main`. Wait for the latest push-triggered CI run for that
-   exact commit SHA to finish successfully, including the platform tests, stamp audits, MSRV and cross-target checks.
-3. Create `vX.Y.Z` at that same tested commit, matching the package version exactly, and push the tag. Do not add or
-   amend release changes after CI passes without running CI on the resulting commit again.
-
-The release workflow rejects a mismatched version, missing CI run, unfinished CI run or unsuccessful latest CI run
-before building archives. It builds all eight binaries for Linux, macOS and Windows, publishes archives with SHA-256
-checksums, and the install scripts and `cargo binstall` pick them up. Publishing the crate also requires the
-`CARGO_REGISTRY_TOKEN` repository secret; without it, the workflow skips crates.io publication.
+Follow the [code of conduct](CODE_OF_CONDUCT.md) and use the private reporting channel for [security issues](SECURITY.md).
