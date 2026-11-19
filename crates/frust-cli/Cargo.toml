@@ -1,19 +1,24 @@
 [package]
-name = "frust-cli"
-version = "0.1.0"
+name = "frust-rs"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+authors.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-description = "fcargo entry point, toolchain installer, and release-gate reporter."
-
-[[bin]]
-name = "fcargo"
-path = "src/bin/fcargo.rs"
+description = "Installs and updates the fRust Rust toolchain: downloads the latest release, verifies its sha-256 and switches versions atomically. Also ships fcargo and frust-gates."
+readme = "../../README.md"
+keywords = ["rust", "toolchain", "installer", "cargo", "compiler"]
+categories = ["development-tools", "command-line-utilities"]
+default-run = "frust-install"
 
 [[bin]]
 name = "frust-install"
 path = "src/bin/frust-install.rs"
+
+[[bin]]
+name = "fcargo"
+path = "src/bin/fcargo.rs"
 
 [[bin]]
 name = "frust-gates"
@@ -24,4 +29,4 @@ name = "frust_cli"
 path = "src/lib.rs"
 
 [dependencies]
-frust-core = { path = "../frust-core" }
+frust-core.workspace = true

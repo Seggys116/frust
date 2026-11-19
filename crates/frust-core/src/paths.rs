@@ -5,8 +5,20 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CACHE_MARKER: &str = "frust-cache-v1";
+
+/// Accepted range for the optional `cache_max_bytes` budget: 1 GiB up to 2^53 (exact in a double).
+pub const MIN_CACHE_MAX_BYTES: u64 = 1 << 30;
+pub const MAX_CACHE_MAX_BYTES: u64 = 1 << 53;
+
+/// How long a reader waits for a concurrent writer before calling a partial marker corrupt.
+const MARKER_SETTLE: Duration = Duration::from_millis(100);
+
+/// Deepest object/array nesting the config parser accepts; it recurses on the native stack.
+const MAX_JSON_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostOs {
@@ -18,6 +30,7 @@ pub enum HostOs {
 pub struct UserConfig {
     pub target_root: Option<PathBuf>,
     pub cache_root: Option<PathBuf>,
+    pub cache_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,8 +43,9 @@ impl ConfigError {
     pub fn diagnostic(&self) -> String {
         format!(
             "fRust rejected {}: {}. \
-             Write {{\"version\":1}} and, if set, absolute \"target_root\" and \"cache_root\" strings.",
-            self.path, self.reason
+             Write {{\"version\":1}} and, if set, absolute \"target_root\" and \"cache_root\" strings \
+             and an integer \"cache_max_bytes\" from {} to {}.",
+            self.path, self.reason, MIN_CACHE_MAX_BYTES, MAX_CACHE_MAX_BYTES
         )
     }
 }
@@ -43,6 +57,7 @@ pub struct ResolvedRoots {
     pub cache_root: PathBuf,
     pub targets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
+    pub cache_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +107,7 @@ fn xdg_dir(raw: Option<&str>, home: &Path, default_child: &str) -> PathBuf {
 
 pub fn parse_user_config(path: &Path, bytes: &[u8]) -> Result<UserConfig, ConfigError> {
     let text = std::str::from_utf8(bytes).map_err(|_| error(path, "file is not UTF-8"))?;
-    let value = parse_json(text).map_err(|reason| error(path, reason))?;
+    let value = parse_json(text).map_err(|reason| error(path, &reason))?;
     let pairs = match value {
         Json::Object(pairs) => pairs,
         _ => return Err(error(path, "top-level value must be an object")),
@@ -100,11 +115,13 @@ pub fn parse_user_config(path: &Path, bytes: &[u8]) -> Result<UserConfig, Config
     let mut version = None;
     let mut target_root = None;
     let mut cache_root = None;
+    let mut cache_max_bytes = None;
     for (key, item) in pairs {
         match key.as_str() {
             "version" => version = Some(item),
             "target_root" => target_root = Some(item),
             "cache_root" => cache_root = Some(item),
+            "cache_max_bytes" => cache_max_bytes = Some(item),
             other => {
                 return Err(error(path, &format!("unknown field `{other}`")));
             }
@@ -112,13 +129,41 @@ pub fn parse_user_config(path: &Path, bytes: &[u8]) -> Result<UserConfig, Config
     }
     match version {
         Some(Json::Number(raw)) if raw == "1" => {}
-        Some(_) => return Err(error(path, "`version` must be the integer 1")),
+        Some(other) => {
+            let found = other.describe();
+            return Err(error(path, &format!("`version` must be the integer 1, found {found}")));
+        }
         None => return Err(error(path, "missing `version`")),
     }
     Ok(UserConfig {
         target_root: optional_absolute(path, "target_root", target_root)?,
         cache_root: optional_absolute(path, "cache_root", cache_root)?,
+        cache_max_bytes: optional_budget(path, cache_max_bytes)?,
     })
+}
+
+/// A plain non-negative integer literal inside the accepted budget range.
+fn optional_budget(path: &Path, value: Option<Json>) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let reject = |found: String| {
+        error(
+            path,
+            &format!(
+                "`cache_max_bytes` must be an integer number of bytes from {MIN_CACHE_MAX_BYTES} \
+                 (1 GiB) to {MAX_CACHE_MAX_BYTES} (2^53), found {found}"
+            ),
+        )
+    };
+    let Json::Number(raw) = &value else {
+        return Err(reject(value.describe()));
+    };
+    let parsed = if raw.bytes().all(|byte| byte.is_ascii_digit()) { raw.parse::<u64>().ok() } else { None };
+    match parsed {
+        Some(bytes) if (MIN_CACHE_MAX_BYTES..=MAX_CACHE_MAX_BYTES).contains(&bytes) => Ok(Some(bytes)),
+        _ => Err(reject(value.describe())),
+    }
 }
 
 fn optional_absolute(
@@ -129,9 +174,16 @@ fn optional_absolute(
     let Some(value) = value else {
         return Ok(None);
     };
-    let Json::String(text) = value else {
-        return Err(error(path, &format!("`{field}` must be a string")));
+    let text = match value {
+        Json::String(text) => text,
+        other => {
+            let found = other.describe();
+            return Err(error(path, &format!("`{field}` must be a string, found {found}")));
+        }
     };
+    if text.contains('\0') {
+        return Err(error(path, &format!("`{field}` must not contain a NUL character")));
+    }
     let candidate = PathBuf::from(&text);
     if text.is_empty() || !candidate.is_absolute() {
         return Err(error(
@@ -149,7 +201,7 @@ pub fn resolve_roots(
     xdg_cache_home: Option<&str>,
     config_bytes: Option<&[u8]>,
 ) -> Result<ResolvedRoots, ConfigError> {
-    let config_path = config_path(os, home, xdg_config_home);
+    let config_path = absolute_config_path(os, home, xdg_config_home)?;
     let config = match config_bytes {
         None => None,
         Some(bytes) => Some(parse_user_config(&config_path, bytes)?),
@@ -162,13 +214,43 @@ pub fn resolve_roots(
         .as_ref()
         .and_then(|cfg| cfg.cache_root.clone())
         .unwrap_or_else(|| default_cache_root(os, home, xdg_cache_home));
+    for root in [&target_root, &cache_root] {
+        require_absolute_root(&config_path, root, home)?;
+    }
     Ok(ResolvedRoots {
         config_path,
         targets_dir: target_root.join("targets"),
         artifacts_dir: cache_root.join("artifacts"),
+        cache_max_bytes: config.as_ref().and_then(|cfg| cfg.cache_max_bytes),
         target_root,
         cache_root,
     })
+}
+
+/// A relative home would make every derived root depend on the working directory.
+fn absolute_config_path(
+    os: HostOs,
+    home: &Path,
+    xdg_config_home: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
+    let path = config_path(os, home, xdg_config_home);
+    require_absolute_root(&path, &path, home)?;
+    Ok(path)
+}
+
+fn require_absolute_root(config_path: &Path, root: &Path, home: &Path) -> Result<(), ConfigError> {
+    if root.is_absolute() {
+        return Ok(());
+    }
+    Err(error(
+        config_path,
+        &format!(
+            "home directory `{}` is not absolute, so `{}` would depend on the working directory; \
+             set HOME or the XDG variables to absolute paths",
+            home.display(),
+            root.display()
+        ),
+    ))
 }
 
 /// Load `config.json` from the host location. A missing file uses defaults.
@@ -178,7 +260,7 @@ pub fn load_roots_from_host(
     xdg_config_home: Option<&str>,
     xdg_cache_home: Option<&str>,
 ) -> Result<ResolvedRoots, ConfigError> {
-    let path = config_path(os, home, xdg_config_home);
+    let path = absolute_config_path(os, home, xdg_config_home)?;
     match read_file(&path) {
         Ok(bytes) => resolve_roots(os, home, xdg_config_home, xdg_cache_home, Some(&bytes)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -212,36 +294,99 @@ pub fn namespaced_target_dir(targets_dir: &Path, toolchain_id: &str, workspace: 
     targets_dir.join(&hex[..2]).join(&hex[2..])
 }
 
+/// Never fails the build: any problem with the cache directory reports `Fallback`.
 pub fn open_artifact_cache(dir: &Path) -> CacheOpen {
+    open_artifact_cache_with(dir, &|| std::thread::sleep(MARKER_SETTLE))
+}
+
+fn open_artifact_cache_with(dir: &Path, settle: &dyn Fn()) -> CacheOpen {
     if dir.exists() && !dir.is_dir() {
         return CacheOpen::Fallback { reason: "cache path is not a directory" };
     }
-    if let Err(err) = fs::create_dir_all(dir) {
-        let _ = err;
+    if fs::create_dir_all(dir).is_err() {
         return CacheOpen::Fallback { reason: "cache directory is unwritable" };
     }
     let marker = dir.join("MARKER");
-    match fs::read_to_string(&marker) {
-        Ok(text) if text == CACHE_MARKER => CacheOpen::Ready,
-        Ok(_) => CacheOpen::Fallback { reason: "cache marker is corrupt" },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => match write_new_marker(&marker) {
-            Ok(()) => CacheOpen::Ready,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match fs::read_to_string(&marker) {
-                Ok(text) if text == CACHE_MARKER => CacheOpen::Ready,
-                Ok(_) => CacheOpen::Fallback { reason: "cache marker is corrupt" },
-                Err(_) => CacheOpen::Fallback { reason: "cache marker is unreadable" },
-            },
-            Err(_) => CacheOpen::Fallback { reason: "cache directory is unwritable" },
-        },
-        Err(_) => CacheOpen::Fallback { reason: "cache marker is unreadable" },
+    let mut state = read_marker(&marker);
+    if state == MarkerState::Missing {
+        match publish_marker(dir, &marker) {
+            Ok(true) => return CacheOpen::Ready,
+            // Another process published first, so judge its marker instead.
+            Ok(false) => state = read_marker(&marker),
+            Err(_) => return CacheOpen::Fallback { reason: "cache directory is unwritable" },
+        }
+    }
+    if state == MarkerState::Unfinished {
+        // Markers from older builds were created empty before being filled.
+        settle();
+        state = read_marker(&marker);
+    }
+    match state {
+        MarkerState::Valid => CacheOpen::Ready,
+        MarkerState::Unfinished | MarkerState::Corrupt => {
+            CacheOpen::Fallback { reason: "cache marker is corrupt" }
+        }
+        MarkerState::Missing | MarkerState::Unreadable => {
+            CacheOpen::Fallback { reason: "cache marker is unreadable" }
+        }
     }
 }
 
-fn write_new_marker(path: &Path) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerState {
+    Valid,
+    Missing,
+    /// Empty or a strict prefix of the marker: a writer may still be filling it.
+    Unfinished,
+    Corrupt,
+    Unreadable,
+}
+
+fn read_marker(path: &Path) -> MarkerState {
+    match fs::read(path) {
+        Ok(bytes) => classify_marker(&bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => MarkerState::Missing,
+        Err(_) => MarkerState::Unreadable,
+    }
+}
+
+fn classify_marker(bytes: &[u8]) -> MarkerState {
+    let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let expected = CACHE_MARKER.as_bytes();
+    if line == expected {
+        MarkerState::Valid
+    } else if expected.starts_with(bytes) {
+        MarkerState::Unfinished
+    } else {
+        MarkerState::Corrupt
+    }
+}
+
+/// Publish the marker atomically so readers never see an empty or partial file.
+/// Returns false when another process already published one.
+fn publish_marker(dir: &Path, marker: &Path) -> io::Result<bool> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".MARKER.{}.{id}.{nanos}.tmp", std::process::id()));
+    let result = write_temp_marker(&temp).and_then(|()| match fs::hard_link(&temp, marker) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        // Filesystems without hard links still get an atomic rename.
+        Err(_) => fs::rename(&temp, marker).map(|()| true),
+    });
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+fn write_temp_marker(path: &Path) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(CACHE_MARKER.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    file.sync_all()
 }
 
 fn error(path: &Path, reason: &str) -> ConfigError {
@@ -358,18 +503,40 @@ enum Json {
     Number(String),
     String(String),
     Object(Vec<(String, Json)>),
-    Other,
+    // Config validation never reads array items or literal values, only their kind.
+    Array,
+    Bool,
+    Null,
 }
 
-fn parse_json(input: &str) -> Result<Json, &'static str> {
+impl Json {
+    /// Name the kind of value for diagnostics, quoting numbers because they are short.
+    fn describe(&self) -> String {
+        match self {
+            Json::Number(raw) if raw.len() > 40 => format!("number `{}...`", &raw[..40]),
+            Json::Number(raw) => format!("number `{raw}`"),
+            Json::String(_) => "string".to_string(),
+            Json::Object(_) => "object".to_string(),
+            Json::Array => "array".to_string(),
+            Json::Bool => "boolean".to_string(),
+            Json::Null => "null".to_string(),
+        }
+    }
+}
+
+/// Strict RFC 8259 parsing: no trailing commas, leading zeros, comments or bare words.
+fn parse_json(input: &str) -> Result<Json, String> {
     let mut parser = Parser { bytes: input.as_bytes(), index: 0 };
     parser.skip();
-    let value = parser.value()?;
-    parser.skip();
-    if parser.index != parser.bytes.len() {
-        return Err("trailing data after the JSON value");
-    }
-    Ok(value)
+    let parsed = parser.value(0).and_then(|value| {
+        parser.skip();
+        if parser.index == parser.bytes.len() {
+            Ok(value)
+        } else {
+            Err("trailing data after the JSON value")
+        }
+    });
+    parsed.map_err(|reason| format!("{reason} at byte {}", parser.index))
 }
 
 struct Parser<'a> {
@@ -384,54 +551,104 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, &'static str> {
+    /// `depth` is the number of containers already open around this value.
+    fn value(&mut self, depth: usize) -> Result<Json, &'static str> {
         self.skip();
         match self.bytes.get(self.index).copied() {
-            Some(b'{') => self.object(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Json::String(self.string()?)),
             Some(b'-' | b'0'..=b'9') => Ok(Json::Number(self.number()?)),
-            Some(_) => {
-                self.skip_other()?;
-                Ok(Json::Other)
-            }
+            Some(b't') => self.literal(b"true", Json::Bool),
+            Some(b'f') => self.literal(b"false", Json::Bool),
+            Some(b'n') => self.literal(b"null", Json::Null),
+            Some(_) => Err("invalid JSON value"),
             None => Err("unexpected end of JSON"),
         }
     }
 
-    fn object(&mut self) -> Result<Json, &'static str> {
+    fn object(&mut self, depth: usize) -> Result<Json, &'static str> {
+        let depth = open_container(depth)?;
         self.index += 1;
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, Json)> = Vec::new();
+        self.skip();
+        if self.bytes.get(self.index) == Some(&b'}') {
+            self.index += 1;
+            return Ok(Json::Object(pairs));
+        }
         loop {
             self.skip();
-            if self.bytes.get(self.index) == Some(&b'}') {
-                self.index += 1;
-                break;
-            }
-            if !pairs.is_empty() {
-                match self.bytes.get(self.index) {
-                    Some(&b',') => {
-                        self.index += 1;
-                        self.skip();
-                    }
-                    None => return Err("unexpected end of JSON"),
-                    _ => return Err("expected a comma between object fields"),
-                }
-            }
-            if self.bytes.get(self.index) != Some(&b'"') {
-                return Err("object field name must be a string");
+            match self.bytes.get(self.index) {
+                Some(b'"') => {}
+                Some(b'}') => return Err("trailing comma in object"),
+                Some(_) => return Err("object field name must be a string"),
+                None => return Err("unexpected end of JSON"),
             }
             let key = self.string()?;
             if pairs.iter().any(|(existing, _)| existing == &key) {
                 return Err("duplicate object field");
             }
             self.skip();
-            if self.bytes.get(self.index) != Some(&b':') {
-                return Err("expected ':' after an object field");
+            self.expect(b':', "expected ':' after an object field")?;
+            let item = self.value(depth)?;
+            pairs.push((key, item));
+            self.skip();
+            match self.bytes.get(self.index) {
+                Some(b',') => self.index += 1,
+                Some(b'}') => {
+                    self.index += 1;
+                    return Ok(Json::Object(pairs));
+                }
+                Some(_) => return Err("expected a comma between object fields"),
+                None => return Err("unexpected end of JSON"),
             }
-            self.index += 1;
-            pairs.push((key, self.value()?));
         }
-        Ok(Json::Object(pairs))
+    }
+
+    fn array(&mut self, depth: usize) -> Result<Json, &'static str> {
+        let depth = open_container(depth)?;
+        self.index += 1;
+        self.skip();
+        if self.bytes.get(self.index) == Some(&b']') {
+            self.index += 1;
+            return Ok(Json::Array);
+        }
+        loop {
+            self.value(depth)?;
+            self.skip();
+            match self.bytes.get(self.index) {
+                Some(b',') => self.index += 1,
+                Some(b']') => {
+                    self.index += 1;
+                    return Ok(Json::Array);
+                }
+                Some(_) => return Err("expected a comma between array items"),
+                None => return Err("unexpected end of JSON"),
+            }
+            self.skip();
+            if self.bytes.get(self.index) == Some(&b']') {
+                return Err("trailing comma in array");
+            }
+        }
+    }
+
+    fn expect(&mut self, byte: u8, message: &'static str) -> Result<(), &'static str> {
+        match self.bytes.get(self.index) {
+            Some(&found) if found == byte => {
+                self.index += 1;
+                Ok(())
+            }
+            Some(_) => Err(message),
+            None => Err("unexpected end of JSON"),
+        }
+    }
+
+    fn literal(&mut self, word: &[u8], value: Json) -> Result<Json, &'static str> {
+        if !self.bytes[self.index..].starts_with(word) {
+            return Err("invalid JSON value");
+        }
+        self.index += word.len();
+        Ok(value)
     }
 
     fn string(&mut self) -> Result<String, &'static str> {
@@ -441,55 +658,61 @@ impl<'a> Parser<'a> {
         Ok(text)
     }
 
+    /// Accepts exactly `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+    /// Which fields may hold a number is the config layer's decision, not the parser's.
     fn number(&mut self) -> Result<String, &'static str> {
         let start = self.index;
         if self.bytes.get(self.index) == Some(&b'-') {
             self.index += 1;
         }
-        let digits = self.index;
+        match self.bytes.get(self.index) {
+            Some(b'0') => {
+                self.index += 1;
+                if matches!(self.bytes.get(self.index), Some(b'0'..=b'9')) {
+                    return Err("invalid number: leading zeros are not allowed");
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.digits();
+            }
+            _ => return Err("invalid number"),
+        }
+        if self.bytes.get(self.index) == Some(&b'.') {
+            self.index += 1;
+            if !self.digits() {
+                return Err("invalid number: digits are required after '.'");
+            }
+        }
+        if matches!(self.bytes.get(self.index), Some(b'e' | b'E')) {
+            self.index += 1;
+            if matches!(self.bytes.get(self.index), Some(b'+' | b'-')) {
+                self.index += 1;
+            }
+            if !self.digits() {
+                return Err("invalid number: digits are required in the exponent");
+            }
+        }
+        std::str::from_utf8(&self.bytes[start..self.index])
+            .map(str::to_owned)
+            .map_err(|_| "invalid number")
+    }
+
+    /// Consume ASCII digits and report whether there was at least one.
+    fn digits(&mut self) -> bool {
+        let start = self.index;
         while matches!(self.bytes.get(self.index), Some(b'0'..=b'9')) {
             self.index += 1;
         }
-        if self.index == digits {
-            return Err("invalid number");
-        }
-        if matches!(self.bytes.get(self.index), Some(b'.' | b'e' | b'E')) {
-            return Err("`version` must be an integer");
-        }
-        Ok(std::str::from_utf8(&self.bytes[start..self.index]).unwrap().to_string())
+        self.index > start
     }
+}
 
-    fn skip_other(&mut self) -> Result<(), &'static str> {
-        let rest = &self.bytes[self.index..];
-        for literal in [b"true".as_slice(), b"false".as_slice(), b"null".as_slice()] {
-            if rest.starts_with(literal) {
-                self.index += literal.len();
-                return Ok(());
-            }
-        }
-        if rest.first() == Some(&b'[') {
-            self.index += 1;
-            loop {
-                self.skip();
-                if self.bytes.get(self.index) == Some(&b']') {
-                    self.index += 1;
-                    return Ok(());
-                }
-                let _ = self.value()?;
-                self.skip();
-                if self.bytes.get(self.index) == Some(&b',') {
-                    self.index += 1;
-                    continue;
-                }
-                if self.bytes.get(self.index) == Some(&b']') {
-                    self.index += 1;
-                    return Ok(());
-                }
-                return Err("invalid array");
-            }
-        }
-        Err("invalid JSON value")
+/// Returns the depth inside a container opened at `depth`, or an error past the cap.
+fn open_container(depth: usize) -> Result<usize, &'static str> {
+    if depth >= MAX_JSON_DEPTH {
+        return Err("JSON is nested deeper than 64 levels");
     }
+    Ok(depth + 1)
 }
 
 /// Read a file's bytes for tests and the Cargo patch without buffering the whole disk on error.
@@ -503,16 +726,55 @@ pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
 
     fn scratch() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("frust-paths-{nanos}-{n}"));
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("frust-paths-{pid}-{nanos}-{n}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// Fixed-seed xorshift64 so generated cases are identical on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    fn config_path_of(root: &Path) -> PathBuf {
+        let path = root.join(".config").join("frust").join("config.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Permission tests are meaningless when the user bypasses mode bits.
+    fn running_as_root(probe_dir: &Path) -> bool {
+        set_mode(probe_dir, 0o555);
+        let writable = fs::write(probe_dir.join("probe"), b"x").is_ok();
+        set_mode(probe_dir, 0o755);
+        let _ = fs::remove_file(probe_dir.join("probe"));
+        writable
     }
 
     #[test]
@@ -627,5 +889,584 @@ mod tests {
             CacheOpen::Fallback { reason: "cache path is not a directory" }
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    const VALID_DOC: &[u8] = br#"{"version":1,"target_root":"/tmp/a b","cache_root":"/tmp/caf\u00e9"}"#;
+
+    fn config_file() -> &'static Path {
+        Path::new("/home/builder/.config/frust/config.json")
+    }
+
+    fn rejection(bytes: &[u8]) -> String {
+        parse_user_config(config_file(), bytes).unwrap_err().diagnostic()
+    }
+
+    fn nested_arrays(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn nested_objects(depth: usize) -> String {
+        format!("{}1{}", "{\"a\":".repeat(depth), "}".repeat(depth))
+    }
+
+    #[test]
+    fn sha256_handles_the_padding_boundary() {
+        let two_blocks = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(
+            hex32(&sha256(two_blocks)),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn number_errors_name_the_offending_field() {
+        let text = rejection(br#"{"version":1,"target_root":1.5}"#);
+        assert!(text.contains("`target_root` must be a string, found number `1.5`"), "{text}");
+        assert!(!text.contains("`version` must be an integer"), "{text}");
+        let cases = [
+            (br#"{"version":1.0}"#.as_slice(), "`version` must be the integer 1, found number `1.0`"),
+            (br#"{"version":-1}"#, "found number `-1`"),
+            (br#"{"version":1e0}"#, "found number `1e0`"),
+            (br#"{"version":"1"}"#, "found string"),
+            (br#"{"version":true}"#, "found boolean"),
+            (br#"{"version":null}"#, "found null"),
+            (br#"{"version":[1]}"#, "found array"),
+            (br#"{"version":{}}"#, "found object"),
+            (br#"{"version":1,"cache_root":null}"#, "`cache_root` must be a string, found null"),
+            (br#"{"version":1,"cache_root":7}"#, "`cache_root` must be a string, found number `7`"),
+        ];
+        for (doc, needle) in cases {
+            let text = rejection(doc);
+            assert!(text.contains(needle), "{text}");
+        }
+        let long = format!(r#"{{"version":{}}}"#, "1".repeat(50));
+        let text = rejection(long.as_bytes());
+        assert!(text.contains(&format!("found number `{}...`", "1".repeat(40))), "{text}");
+    }
+
+    #[test]
+    fn roots_reject_nul_and_empty_paths() {
+        let text = rejection(br#"{"version":1,"target_root":"/tmp/a\u0000b"}"#);
+        assert!(text.contains("`target_root` must not contain a NUL"), "{text}");
+        let text = rejection(br#"{"version":1,"cache_root":""}"#);
+        assert!(text.contains("`cache_root` must be an absolute path"), "{text}");
+        let text = rejection(br#"{"cache_root":"/tmp/x"}"#);
+        assert!(text.contains("missing `version`"), "{text}");
+        let text = rejection(br#"{"version":1,"version":1}"#);
+        assert!(text.contains("duplicate object field"), "{text}");
+    }
+
+    #[test]
+    fn parser_accepts_only_strict_json() {
+        let good = [
+            "0",
+            "-0",
+            "0.5",
+            "-1.5e+10",
+            "1E5",
+            "1e-2",
+            "[]",
+            "[ ]",
+            "{}",
+            "{ }",
+            "\"s\"",
+            "[1,[2,{\"a\":[]}],\"x\",true,false,null]",
+            " \t\r\n{\"a\" : \"\\u00e9\" ,\"b\":[ 1 , 2 ]}\n",
+        ];
+        for text in good {
+            assert!(parse_json(text).is_ok(), "{text:?}");
+        }
+        let bad = [
+            "", "[", "{", "[1,]", "[,]", "[,1]", "[1 2]", "{\"a\":1,}", "{,}", "{\"a\" 1}",
+            "{\"a\":}", "{\"a\"", "{\"a\":", "{a:1}", "{1:1}", "{\"a\":1 \"b\":2}", "01", "-01",
+            "00", "1.", ".5", "-.5", "1e", "1e+", "1.e5", "-", "+1", "1.5.2", "0x10", "tru",
+            "truee", "True", "nul", "NaN", "Infinity", "'a'", "\"a\" \"b\"", "{\"a\":1}x",
+            "// c\n{}", "{\"a\":1} // c", "/* c */ {}", "\"a\nb\"", "\"\\x\"", "\u{b}1", "\u{c}1",
+            "\u{a0}1", "\u{feff}{}",
+        ];
+        for text in bad {
+            assert!(parse_json(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn syntax_errors_say_what_and_where() {
+        assert_eq!(parse_json("[1,]").unwrap_err(), "trailing comma in array at byte 3");
+        let text = rejection(br#"{"version":1,}"#);
+        assert!(text.contains("trailing comma in object"), "{text}");
+        let text = rejection(br#"{"version":01}"#);
+        assert!(text.contains("leading zeros"), "{text}");
+        let text = rejection(br#"{"version":1"#);
+        assert!(text.contains("unexpected end of JSON at byte 12"), "{text}");
+        let text = rejection(b"");
+        assert!(text.contains("unexpected end of JSON at byte 0"), "{text}");
+        let text = rejection(br#"1"#);
+        assert!(text.contains("top-level value must be an object"), "{text}");
+    }
+
+    #[test]
+    fn nesting_is_capped_instead_of_overflowing_the_stack() {
+        assert!(parse_json(&nested_arrays(MAX_JSON_DEPTH)).is_ok());
+        assert!(parse_json(&nested_objects(MAX_JSON_DEPTH)).is_ok());
+        for text in [nested_arrays(MAX_JSON_DEPTH + 1), nested_objects(MAX_JSON_DEPTH + 1)] {
+            let reason = parse_json(&text).unwrap_err();
+            assert!(reason.contains("nested deeper than 64 levels"), "{reason}");
+        }
+        let mixed = format!("{}1{}", "[{\"a\":".repeat(40), "}]".repeat(40));
+        assert!(parse_json(&mixed).unwrap_err().contains("nested deeper"));
+        // The config object is level one, so the field value may nest 63 more.
+        let fits = format!(r#"{{"version":1,"cache_root":{}}}"#, nested_arrays(MAX_JSON_DEPTH - 1));
+        assert!(rejection(fits.as_bytes()).contains("found array"));
+        let over = format!(r#"{{"version":1,"cache_root":{}}}"#, nested_arrays(MAX_JSON_DEPTH));
+        assert!(rejection(over.as_bytes()).contains("nested deeper"));
+        let huge = format!(r#"{{"version":1,"cache_root":{}1}}"#, "[".repeat(200_000));
+        assert!(rejection(huge.as_bytes()).contains("nested deeper"));
+    }
+
+    #[test]
+    fn every_strict_prefix_of_a_valid_document_is_rejected() {
+        let config = parse_user_config(config_file(), VALID_DOC).unwrap();
+        assert_eq!(config.target_root, Some(PathBuf::from("/tmp/a b")));
+        assert_eq!(config.cache_root, Some(PathBuf::from("/tmp/caf\u{e9}")));
+        for end in 0..VALID_DOC.len() {
+            assert!(parse_user_config(config_file(), &VALID_DOC[..end]).is_err(), "prefix {end}");
+        }
+    }
+
+    #[test]
+    fn parser_survives_mutated_documents_and_byte_soup() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let insertions = b"{}[],:\"\\-+.eE0123456789tfnul \t\n\x00\xff";
+        let mut accepted = 0;
+        for round in 0..4000 {
+            let bytes: Vec<u8> = if round % 4 == 0 {
+                (0..rng.below(64)).map(|_| rng.next_u64() as u8).collect()
+            } else {
+                let mut bytes = VALID_DOC.to_vec();
+                for _ in 0..=rng.below(4) {
+                    match rng.below(4) {
+                        0 if !bytes.is_empty() => {
+                            let at = rng.below(bytes.len());
+                            bytes[at] = rng.next_u64() as u8;
+                        }
+                        1 if !bytes.is_empty() => {
+                            bytes.remove(rng.below(bytes.len()));
+                        }
+                        2 => {
+                            let at = rng.below(bytes.len() + 1);
+                            bytes.insert(at, insertions[rng.below(insertions.len())]);
+                        }
+                        _ => bytes.truncate(rng.below(bytes.len() + 1)),
+                    }
+                }
+                bytes
+            };
+            if let Ok(config) = parse_user_config(config_file(), &bytes) {
+                accepted += 1;
+                for root in [&config.target_root, &config.cache_root].into_iter().flatten() {
+                    assert!(root.is_absolute(), "{root:?} from {bytes:?}");
+                }
+            }
+        }
+        assert!(accepted > 0, "mutations never produced a valid document");
+
+        let tokens = [
+            "{", "}", "[", "]", ",", ":", "\"", "\\", "\\u", "version", "\"version\"", "1", "0",
+            "-", ".", "e", "true", "null", " ", "\u{e9}",
+        ];
+        for _ in 0..4000 {
+            let doc: String = (0..rng.below(16)).map(|_| tokens[rng.below(tokens.len())]).collect();
+            let _ = parse_json(&doc);
+        }
+    }
+
+    #[test]
+    fn escaped_generated_paths_round_trip_through_the_config() {
+        let mut rng = Rng(0xC0FF_EE12_3456_789B);
+        let pool = ['a', 'Z', '0', ' ', '/', '"', '\\', '\u{1}', '\u{1f}', '\n', '\u{e9}', '\u{2603}', '\u{1F600}'];
+        for _ in 0..1000 {
+            let tail: String = (0..rng.below(12)).map(|_| pool[rng.below(pool.len())]).collect();
+            let path = format!("/{tail}");
+            let escaped = crate::json_text::escape_json_string(&path);
+            let doc = format!(r#"{{"version":1,"target_root":"{escaped}"}}"#);
+            let config = parse_user_config(config_file(), doc.as_bytes()).unwrap();
+            assert_eq!(config.target_root, Some(PathBuf::from(&path)), "{doc}");
+        }
+    }
+
+    #[test]
+    fn resolved_roots_are_absolute_for_generated_environments() {
+        let mut rng = Rng(0xA5A5_1234_9876_5432);
+        let homes = ["/home/u", "/home/with space", "/", "/home/u/", "/home//double"];
+        let pool = ["", "relative", "./x", "../x", " ", "/", "/abs/with space", "/abs", "~", "$HOME"];
+        let alphabet = ['/', ' ', 'a', '.', 'b', '~', '\\', '\u{e9}'];
+        let random_xdg = |rng: &mut Rng| -> Option<String> {
+            match rng.below(4) {
+                0 => None,
+                1 => Some(pool[rng.below(pool.len())].to_string()),
+                _ => Some((0..rng.below(8)).map(|_| alphabet[rng.below(alphabet.len())]).collect()),
+            }
+        };
+        for _ in 0..500 {
+            let home = Path::new(homes[rng.below(homes.len())]);
+            let config_xdg = random_xdg(&mut rng);
+            let cache_xdg = random_xdg(&mut rng);
+            for os in [HostOs::Linux, HostOs::Macos] {
+                let roots =
+                    resolve_roots(os, home, config_xdg.as_deref(), cache_xdg.as_deref(), None).unwrap();
+                for path in [
+                    &roots.config_path,
+                    &roots.target_root,
+                    &roots.cache_root,
+                    &roots.targets_dir,
+                    &roots.artifacts_dir,
+                ] {
+                    assert!(path.is_absolute(), "{path:?} for {home:?} {config_xdg:?} {cache_xdg:?}");
+                }
+                if os == HostOs::Linux {
+                    let absolute = |value: &Option<String>| {
+                        value.as_deref().filter(|raw| Path::new(raw).is_absolute()).map(PathBuf::from)
+                    };
+                    let want_cache = absolute(&cache_xdg).unwrap_or_else(|| home.join(".cache"));
+                    let want_config = absolute(&config_xdg).unwrap_or_else(|| home.join(".config"));
+                    assert_eq!(roots.cache_root, want_cache.join("frust"));
+                    assert_eq!(roots.config_path, want_config.join("frust").join("config.json"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relative_home_is_rejected_unless_every_path_is_otherwise_absolute() {
+        for home in ["", "rel", ".", "../up"] {
+            let home = Path::new(home);
+            for os in [HostOs::Linux, HostOs::Macos] {
+                let err = resolve_roots(os, home, None, None, None).unwrap_err();
+                assert!(err.diagnostic().contains("not absolute"), "{}", err.diagnostic());
+                let err = load_roots_from_host(os, home, None, None).unwrap_err();
+                assert!(err.diagnostic().contains("not absolute"), "{}", err.diagnostic());
+            }
+            let covered = resolve_roots(HostOs::Linux, home, Some("/c"), Some("/k"), None).unwrap();
+            assert_eq!(covered.cache_root, PathBuf::from("/k/frust"));
+            let doc = br#"{"version":1,"target_root":"/t","cache_root":"/k"}"#;
+            let explicit = resolve_roots(HostOs::Linux, home, Some("/c"), None, Some(doc)).unwrap();
+            assert_eq!(explicit.target_root, PathBuf::from("/t"));
+        }
+    }
+
+    #[test]
+    fn symlinked_and_spaced_xdg_roots_are_kept_verbatim() {
+        let root = scratch();
+        let real = root.join("real cache");
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("link cache");
+        symlink(&real, &link).unwrap();
+        let link_text = link.to_str().unwrap();
+        let roots = resolve_roots(HostOs::Linux, &root, None, Some(link_text), None).unwrap();
+        assert_eq!(roots.target_root, link.join("frust"));
+        assert_eq!(roots.artifacts_dir, link.join("frust").join("artifacts"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_loading_reads_defaults_files_and_reports_unreadable_config() {
+        let root = scratch();
+        let home = root.join("home with space");
+        fs::create_dir_all(&home).unwrap();
+
+        let missing = load_roots_from_host(HostOs::Linux, &home, None, None).unwrap();
+        assert_eq!(missing.target_root, home.join(".cache").join("frust"));
+
+        let config = config_path_of(&home);
+        fs::create_dir(&config).unwrap();
+        let err = load_roots_from_host(HostOs::Linux, &home, None, None).unwrap_err();
+        assert!(err.reason.contains("could not read file"), "{}", err.diagnostic());
+        assert!(err.diagnostic().contains(&config.display().to_string()));
+        fs::remove_dir(&config).unwrap();
+
+        fs::write(&config, b"{\"version\":1,\"target_root\":\"/t\xff\"}").unwrap();
+        let err = load_roots_from_host(HostOs::Linux, &home, None, None).unwrap_err();
+        assert!(err.reason.contains("not UTF-8"), "{}", err.diagnostic());
+
+        fs::write(&config, b"").unwrap();
+        let err = load_roots_from_host(HostOs::Linux, &home, None, None).unwrap_err();
+        assert!(err.reason.contains("unexpected end of JSON"), "{}", err.diagnostic());
+
+        fs::write(&config, br#"{"version":1,"target_root":"/srv/t","cache_root":"/srv/c"}"#).unwrap();
+        let loaded = load_roots_from_host(HostOs::Linux, &home, None, None).unwrap();
+        assert_eq!(loaded.targets_dir, PathBuf::from("/srv/t/targets"));
+        assert_eq!(loaded.artifacts_dir, PathBuf::from("/srv/c/artifacts"));
+
+        let link = root.join("home link");
+        symlink(&home, &link).unwrap();
+        let via_link = load_roots_from_host(HostOs::Linux, &link, None, None).unwrap();
+        assert_eq!(via_link.config_path, link.join(".config").join("frust").join("config.json"));
+        assert_eq!(via_link.cache_root, PathBuf::from("/srv/c"));
+
+        let xdg = root.join("xdg");
+        let xdg_config = xdg.join("frust").join("config.json");
+        fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
+        fs::write(&xdg_config, br#"{"version":1}"#).unwrap();
+        let xdg_text = xdg.to_str().unwrap();
+        let from_xdg = load_roots_from_host(HostOs::Linux, &home, Some(xdg_text), None).unwrap();
+        assert_eq!(from_xdg.config_path, xdg_config);
+        assert_eq!(from_xdg.target_root, home.join(".cache").join("frust"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_config_file_is_reported() {
+        let root = scratch();
+        if running_as_root(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let config = config_path_of(&root);
+        fs::write(&config, br#"{"version":1}"#).unwrap();
+        set_mode(&config, 0o000);
+        let err = load_roots_from_host(HostOs::Linux, &root, None, None).unwrap_err();
+        assert!(err.reason.contains("could not read file"), "{}", err.diagnostic());
+        set_mode(&config, 0o644);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_workspace_resolves_dotdot_symlinks_and_spaces() {
+        let root = scratch();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let project = root.join("my project");
+        fs::create_dir_all(project.join("sub dir")).unwrap();
+        let link = root.join("link to project");
+        symlink(&project, &link).unwrap();
+        let expected = canonical_root.join("my project");
+        assert_eq!(canonical_workspace(&link), expected);
+        assert_eq!(canonical_workspace(&project.join("sub dir").join("..")), expected);
+
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(canonical_workspace(Path::new(".")), fs::canonicalize(&cwd).unwrap());
+        // Paths that cannot be canonicalized still become absolute and are otherwise untouched.
+        let missing = Path::new("frust-no-such-workspace/child");
+        assert_eq!(canonical_workspace(missing), cwd.join(missing));
+        let absent = root.join("absent dir");
+        assert_eq!(canonical_workspace(&absent), absent);
+        let dangling = root.join("dangling");
+        symlink(root.join("nowhere"), &dangling).unwrap();
+        assert_eq!(canonical_workspace(&dangling), dangling);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn namespaced_dirs_are_stable_distinct_and_shaped() {
+        let root = scratch();
+        let targets = root.join("targets");
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..50 {
+            let workspace = root.join(format!("worktree {index}"));
+            fs::create_dir_all(&workspace).unwrap();
+            let first = namespaced_target_dir(&targets, "toolchain", &workspace);
+            assert_eq!(first, namespaced_target_dir(&targets, "toolchain", &workspace));
+            let parts: Vec<_> = first.strip_prefix(&targets).unwrap().iter().collect();
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0].len(), 2);
+            assert_eq!(parts[1].len(), 62);
+            let hex = first.strip_prefix(&targets).unwrap().to_str().unwrap().replace('/', "");
+            assert!(hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+            assert!(seen.insert(first), "worktree {index} collided");
+        }
+        let workspace = root.join("worktree 0");
+        let mut by_toolchain = std::collections::BTreeSet::new();
+        for id in ["a", "ab", "a\0b", "", "a b", "a/b"] {
+            assert!(by_toolchain.insert(namespaced_target_dir(&targets, id, &workspace)), "{id:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marker_with_trailing_newline_is_accepted_and_left_alone() {
+        let root = scratch();
+        let marker = root.join("MARKER");
+        let cases = [
+            (b"frust-cache-v1\n".as_slice(), true),
+            (b"frust-cache-v1\r\n", true),
+            (b"frust-cache-v1", true),
+            (b"frust-cache-v1\n\n", false),
+            (b"frust-cache-v1 ", false),
+            (b" frust-cache-v1", false),
+            (b"frust-cache-v10", false),
+            (b"FRUST-CACHE-V1", false),
+            (b"frust-cache-v1\0", false),
+            (b"\xff\xfe\x00", false),
+        ];
+        for (bytes, valid) in cases {
+            fs::write(&marker, bytes).unwrap();
+            let settles = AtomicUsize::new(0);
+            let outcome = open_artifact_cache_with(&root, &|| {
+                settles.fetch_add(1, Ordering::Relaxed);
+            });
+            let expected = if valid {
+                CacheOpen::Ready
+            } else {
+                CacheOpen::Fallback { reason: "cache marker is corrupt" }
+            };
+            assert_eq!(outcome, expected, "{bytes:?}");
+            // Definite verdicts never wait for a writer, and the file is never rewritten.
+            assert_eq!(settles.load(Ordering::Relaxed), 0, "{bytes:?}");
+            assert_eq!(fs::read(&marker).unwrap(), bytes);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn partial_markers_get_one_settle_retry_before_counting_as_corrupt() {
+        let root = scratch();
+        let marker = root.join("MARKER");
+        for partial in ["", "f", "frust-cache", "frust-cache-v"] {
+            fs::write(&marker, partial).unwrap();
+            let settles = AtomicUsize::new(0);
+            let outcome = open_artifact_cache_with(&root, &|| {
+                settles.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(outcome, CacheOpen::Fallback { reason: "cache marker is corrupt" });
+            assert_eq!(settles.load(Ordering::Relaxed), 1, "{partial:?}");
+        }
+        // A writer that finishes during the wait is not reported as corruption.
+        fs::write(&marker, "").unwrap();
+        let outcome = open_artifact_cache_with(&root, &|| fs::write(&marker, CACHE_MARKER).unwrap());
+        assert_eq!(outcome, CacheOpen::Ready);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marker_that_is_a_directory_or_unreadable_falls_back() {
+        let root = scratch();
+        fs::create_dir(root.join("MARKER")).unwrap();
+        assert_eq!(
+            open_artifact_cache(&root),
+            CacheOpen::Fallback { reason: "cache marker is unreadable" }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crashed_writer_leftovers_do_not_block_the_cache() {
+        let root = scratch();
+        let dir = root.join("cache");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".MARKER.1.2.3.tmp"), b"").unwrap();
+        assert_eq!(open_artifact_cache(&dir), CacheOpen::Ready);
+        assert_eq!(open_artifact_cache(&dir), CacheOpen::Ready);
+        assert_eq!(fs::read(dir.join("MARKER")).unwrap(), CACHE_MARKER.as_bytes());
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".MARKER.1.2.3.tmp", "MARKER"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_openers_all_see_one_valid_marker() {
+        const THREADS: usize = 16;
+        let root = scratch();
+        for round in 0..20 {
+            let dir = root.join(format!("cache {round}"));
+            let barrier = Barrier::new(THREADS);
+            let settles = AtomicUsize::new(0);
+            let outcomes: Vec<CacheOpen> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..THREADS {
+                    handles.push(scope.spawn(|| {
+                        barrier.wait();
+                        open_artifact_cache_with(&dir, &|| {
+                            settles.fetch_add(1, Ordering::Relaxed);
+                        })
+                    }));
+                }
+                handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+            });
+            assert!(outcomes.iter().all(|outcome| *outcome == CacheOpen::Ready), "{outcomes:?}");
+            // Atomic publication means no reader ever observes an unfinished marker.
+            assert_eq!(settles.load(Ordering::Relaxed), 0);
+            assert_eq!(fs::read(dir.join("MARKER")).unwrap(), CACHE_MARKER.as_bytes());
+            let names: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(names, ["MARKER"]);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwritable_cache_directory_falls_back_without_side_effects() {
+        let root = scratch();
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        if running_as_root(&locked) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        set_mode(&locked, 0o555);
+        let unwritable = CacheOpen::Fallback { reason: "cache directory is unwritable" };
+        assert_eq!(open_artifact_cache(&locked), unwritable);
+        assert_eq!(open_artifact_cache(&locked.join("child")), unwritable);
+        assert!(fs::read_dir(&locked).unwrap().next().is_none());
+        set_mode(&locked, 0o755);
+        assert_eq!(open_artifact_cache(&locked), CacheOpen::Ready);
+
+        let marker = locked.join("MARKER");
+        set_mode(&marker, 0o000);
+        assert_eq!(
+            open_artifact_cache(&locked),
+            CacheOpen::Fallback { reason: "cache marker is unreadable" }
+        );
+        set_mode(&marker, 0o644);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_max_bytes_accepts_the_documented_range() {
+        let parse = |doc: &str| parse_user_config(config_file(), doc.as_bytes()).unwrap().cache_max_bytes;
+        assert_eq!(parse(r#"{"version":1}"#), None);
+        assert_eq!(parse(r#"{"version":1,"cache_max_bytes":1073741824}"#), Some(1 << 30));
+        assert_eq!(parse(r#"{"version":1,"cache_max_bytes":9007199254740992}"#), Some(1 << 53));
+        assert_eq!(parse(r#"{"cache_max_bytes":21474836480,"version":1}"#), Some(20 << 30));
+        let roots = resolve_roots(
+            HostOs::Linux,
+            Path::new("/home/builder"),
+            None,
+            None,
+            Some(br#"{"version":1,"cache_max_bytes":5368709120}"#),
+        )
+        .unwrap();
+        assert_eq!(roots.cache_max_bytes, Some(5 << 30));
+        let unset = resolve_roots(HostOs::Linux, Path::new("/home/builder"), None, None, None).unwrap();
+        assert_eq!(unset.cache_max_bytes, None);
+    }
+
+    #[test]
+    fn cache_max_bytes_rejections_say_how_to_fix_the_value() {
+        let cases = [
+            (r#"{"version":1,"cache_max_bytes":1073741823}"#, "found number `1073741823`"),
+            (r#"{"version":1,"cache_max_bytes":9007199254740993}"#, "found number `9007199254740993`"),
+            (r#"{"version":1,"cache_max_bytes":0}"#, "found number `0`"),
+            (r#"{"version":1,"cache_max_bytes":-5}"#, "found number `-5`"),
+            (r#"{"version":1,"cache_max_bytes":2147483648.5}"#, "found number `2147483648.5`"),
+            (r#"{"version":1,"cache_max_bytes":2e10}"#, "found number `2e10`"),
+            (r#"{"version":1,"cache_max_bytes":99999999999999999999999}"#, "found number"),
+            (r#"{"version":1,"cache_max_bytes":"5368709120"}"#, "found string"),
+            (r#"{"version":1,"cache_max_bytes":null}"#, "found null"),
+            (r#"{"version":1,"cache_max_bytes":true}"#, "found boolean"),
+            (r#"{"version":1,"cache_max_bytes":[1]}"#, "found array"),
+        ];
+        for (doc, found) in cases {
+            let text = rejection(doc.as_bytes());
+            assert!(text.contains("`cache_max_bytes` must be an integer number of bytes"), "{text}");
+            assert!(text.contains("1073741824 (1 GiB) to 9007199254740992 (2^53)"), "{text}");
+            assert!(text.contains(found), "{text}");
+        }
+        let text = rejection(br#"{"version":1,"cache_max_bytes":1,"cache_max_bytes":1}"#);
+        assert!(text.contains("duplicate object field"), "{text}");
     }
 }

@@ -1,0 +1,31 @@
+name: Set up Rust
+description: Install the toolchain pinned in crates/rust-toolchain.toml and restore the Cargo cache.
+
+inputs:
+  components:
+    description: Extra toolchain components, comma separated.
+    default: ""
+  targets:
+    description: Extra target triples, comma separated.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Installing up front stops the tests and rustup from racing to auto-install the same toolchain.
+    - name: Install toolchain
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/rust-toolchain.toml)
+        args=(--profile minimal --no-self-update)
+        [[ -n "$COMPONENTS" ]] && args+=(--component "$COMPONENTS")
+        [[ -n "$TARGETS" ]] && args+=(--target "$TARGETS")
+        rustup toolchain install "$channel" "${args[@]}"
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: crates
+        # Pull requests restore the main cache without writing their own.
+        save-if: ${{ github.ref == 'refs/heads/main' }}

@@ -1,0 +1,226 @@
+name: Benchmark
+
+# Manual. Runs the frozen qualification protocol on GitHub's shared Linux x86-64 runners:
+# paired control and fRust builds, runtime and stripped size, then the release gates.
+# Shared runners are noisy and unrecorded hardware varies per job, so a result here is a
+# reproducible check of the pipeline. It does not replace the dated host evidence in qualification/.
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Pairs per median series (cold, no-op, holdout). The gates need 30.
+        default: "30"
+      tail-pairs:
+        description: Pairs per leaf and wide series. The tail gate needs 60.
+        default: "60"
+      runtime-runs:
+        description: Paired runs per runtime workload. The gates need 30.
+        default: "30"
+      codegen-cache:
+        description: FRUST_EXPERIMENTAL_CODEGEN_CACHE for the fRust toolchain
+        type: boolean
+        default: true
+      relr:
+        description: FRUST_EXPERIMENTAL_RELR for the fRust toolchain
+        type: boolean
+        default: true
+      rebuild-toolchains:
+        description: Ignore cached toolchains and build them again
+        type: boolean
+        default: false
+      enforce:
+        description: Fail the run when a gate fails (turn off for smoke runs with few pairs)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FRUST_ENV: >-
+    --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=${{ inputs.codegen-cache && '1' || '0' }}
+    --frust-env FRUST_EXPERIMENTAL_RELR=${{ inputs.relr && '1' || '0' }}
+
+jobs:
+  toolchains:
+    uses: ./.github/workflows/toolchains.yml
+    with:
+      rebuild: ${{ inputs.rebuild-toolchains }}
+      codegen-cache: ${{ inputs.codegen-cache }}
+      relr: ${{ inputs.relr }}
+
+  # One runner per series. Both toolchains of a pair run on the same runner, so the ratio is
+  # not affected by differences between runners.
+  build-time:
+    name: ${{ matrix.workload }} ${{ matrix.name }}
+    needs: toolchains
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workload: ripgrep, name: leaf, kinds: "leaf:tail" }
+          - { workload: ripgrep, name: wide, kinds: "wide:tail" }
+          - { workload: ripgrep, name: cold, kinds: "cold:main" }
+          - { workload: ripgrep, name: no-op and resources, kinds: "noop:main trace:main" }
+          - { workload: syn, name: leaf, kinds: "leaf:tail" }
+          - { workload: syn, name: wide, kinds: "wide:tail" }
+          - { workload: syn, name: cold, kinds: "cold:main" }
+          - { workload: syn, name: no-op and resources, kinds: "noop:main trace:main" }
+          - { workload: regex, name: leaf, kinds: "leaf:tail" }
+          - { workload: regex, name: wide, kinds: "wide:tail" }
+          - { workload: regex, name: cold, kinds: "cold:main" }
+          - { workload: regex, name: no-op and resources, kinds: "noop:main trace:main" }
+          - { workload: fd, name: holdout, kinds: "holdout:main" }
+          - { workload: fd, name: cold, kinds: "cold:main" }
+          - { workload: fd, name: no-op and resources, kinds: "noop:main trace:main" }
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup
+        uses: ./.github/actions/bench-setup
+        with:
+          workloads: ${{ matrix.workload }}
+      - name: Collect paired samples
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+          KINDS: ${{ matrix.kinds }}
+          PAIRS_MAIN: ${{ inputs.pairs }}
+          PAIRS_TAIL: ${{ inputs.tail-pairs }}
+          WORK: ${{ steps.setup.outputs.work }}
+        run: |
+          toolchains=$PWD/target/compiler-rewrite/toolchains
+          for entry in $KINDS; do
+            kind=${entry%%:*}
+            pairs=$PAIRS_MAIN
+            [[ ${entry##*:} == tail ]] && pairs=$PAIRS_TAIL
+            # shellcheck disable=SC2086
+            python3 -I qualification/run-pairs.py --control "$toolchains/control/bin" --frust "$toolchains/frust/bin" \
+              --workload "$WORKLOAD" --kind "$kind" --pairs "$pairs" --work "$WORK/$kind" \
+              --samples "$WORK/samples.txt" $FRUST_ENV
+          done
+      - name: Stage results
+        if: always()
+        env:
+          WORK: ${{ steps.setup.outputs.work }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/logs"
+          cp "$WORK/samples.txt" "$RUNNER_TEMP/out/" || true
+          cp "$RUNNER_TEMP/environment.txt" "$RUNNER_TEMP/out/"
+          for dir in "$WORK"/*/logs; do
+            [[ -d $dir ]] || continue
+            kind=$(basename "$(dirname "$dir")")
+            mkdir -p "$RUNNER_TEMP/out/logs/$kind"
+            cp -r "$dir/." "$RUNNER_TEMP/out/logs/$kind/"
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: samples-${{ matrix.workload }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+
+  runtime:
+    name: runtime and size (${{ matrix.workload }})
+    needs: toolchains
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [ripgrep, rustfmt, oxipng]
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup
+        uses: ./.github/actions/bench-setup
+        with:
+          workloads: ${{ matrix.workload }}
+      - name: Write and check the frozen corpus
+        env:
+          WORK: ${{ steps.setup.outputs.work }}
+        run: |
+          python3 -I qualification/make_corpus.py "$WORK/corpus" --manifest "$WORK/corpus.sha256"
+          cmp "$WORK/corpus.sha256" qualification/corpus.sha256
+      - name: Build both toolchains' binaries and time them
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+          RUNS: ${{ inputs.runtime-runs }}
+          WORK: ${{ steps.setup.outputs.work }}
+        run: |
+          toolchains=$PWD/target/compiler-rewrite/toolchains
+          # shellcheck disable=SC2086
+          python3 -I qualification/run-runtime.py --control "$toolchains/control/bin" --frust "$toolchains/frust/bin" \
+            --workload "$WORKLOAD" --corpus "$WORK/corpus" --work "$WORK/run" --samples "$WORK/samples.txt" \
+            --runs "$RUNS" $FRUST_ENV
+      - name: Stage results
+        if: always()
+        env:
+          WORK: ${{ steps.setup.outputs.work }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$WORK/samples.txt" "$RUNNER_TEMP/out/" || true
+          cp "$RUNNER_TEMP/environment.txt" "$RUNNER_TEMP/out/"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: samples-runtime-${{ matrix.workload }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+
+  gates:
+    name: release gates
+    needs: [build-time, runtime]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: samples-*
+          path: ${{ runner.temp }}/samples
+      - name: Judge the combined samples
+        env:
+          ENFORCE: ${{ inputs.enforce }}
+        run: |
+          (cd crates && cargo build --release --locked -p frust-rs --bin frust-gates)
+          find "$RUNNER_TEMP/samples" -name samples.txt -exec cat {} + > "$RUNNER_TEMP/all-samples.txt"
+          wc -l "$RUNNER_TEMP/all-samples.txt"
+          status=0
+          crates/target/release/frust-gates --samples "$RUNNER_TEMP/all-samples.txt" --output "$RUNNER_TEMP/gates.json" > /dev/null || status=$?
+          python3 -I - "$RUNNER_TEMP/gates.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          print("## Release gates")
+          print()
+          print("Shared GitHub runner, advisory. See the workflow header for what this does and does not show.")
+          print()
+          print("| Gate | Status | Detail |")
+          print("| --- | --- | --- |")
+          for gate in report["gates"]:
+              print(f"| {gate['name']} | {gate['status']} | {gate['detail']} |")
+          print()
+          for key, value in report.items():
+              if key not in ("gates", "tail_p95"):
+                  print(f"- {key}: {value}")
+          for tail in report.get("tail_p95", []):
+              print(f"- tail p95 {tail['name']}: {tail['p95']}")
+          PY
+          if [[ $ENFORCE == true ]]; then exit "$status"; fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gates
+          path: |
+            ${{ runner.temp }}/gates.json
+            ${{ runner.temp }}/all-samples.txt
+          if-no-files-found: ignore
+          retention-days: 90

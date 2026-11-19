@@ -1,0 +1,341 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+--- a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
++++ b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+@@ -111,11 +111,26 @@
+             modules,
+         );
+ 
++        // The merged module is the fat-LTO input. A hit copies the object from
++        // the same ordered module and pipeline. A miss runs that pipeline on
++        // this module, serially, and then stores the object.
++        let fatkey_cache = back::write::fatkey_cache_path(sess, cgcx, &module);
++        if let Some(cache) = fatkey_cache.as_deref()
++            && let Some(compiled) = back::write::load_fatkey_object(cgcx, &module, cache)
++        {
++            return compiled;
++        }
++
+         let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
+         let dcx = dcx.handle();
+         back::lto::run_pass_manager(cgcx, &sess.prof, dcx, &mut module, false);
+ 
+-        back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config)
++        let compiled =
++            back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config);
++        if let Some(cache) = fatkey_cache.as_deref() {
++            back::write::store_fatkey_object(cache, &compiled);
++        }
++        compiled
+     }
+     fn run_thin_lto(
+         cgcx: &CodegenContext,
+diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
+--- a/compiler/rustc_codegen_llvm/src/back/write.rs
++++ b/compiler/rustc_codegen_llvm/src/back/write.rs
+@@ -23,7 +23,10 @@
+ use rustc_session::Session;
+ use rustc_session::config::{self, Lto, OutputType, Passes, SplitDwarfKind, SwitchWithOptPath};
+ use rustc_span::{BytePos, InnerSpan, Pos, RemapPathScopeComponents, SpanData, SyntaxContext};
+-use rustc_target::spec::{CodeModel, FloatAbi, RelocModel, SanitizerSet, SplitDebuginfo, TlsModel};
++use rustc_target::spec::{
++    CodeModel, FloatAbi, FramePointer, PanicStrategy, RelocModel, SanitizerSet, SplitDebuginfo,
++    TlsModel,
++};
+ use tracing::{debug, trace};
+ 
+ use crate::back::lto::{Buffer, ModuleBuffer};
+@@ -1443,3 +1446,219 @@
+     let total = unsafe { llvm::LLVMRustModuleInstructionStats(llmod) };
+     prof.artifact_size("cgu_instructions", name, total);
+ }
++
++fn split_dwarf_object(cgcx: &CodegenContext) -> bool {
++    cgcx.target_can_use_split_dwarf
++        && cgcx.split_debuginfo != SplitDebuginfo::Off
++        && cgcx.split_dwarf_kind == SplitDwarfKind::Split
++}
++
++/// Profiles, sanitizers, plugins, and extra passes are not in the key.
++/// Missing the cache is safe.
++fn fatkey_refused(sess: &Session, config: &ModuleConfig) -> bool {
++    config.passes.iter().any(|pass| !pass.is_empty())
++        || config.pgo_gen.enabled()
++        || config.pgo_use.is_some()
++        || config.pgo_sample_use.is_some()
++        || config.sanitizer != SanitizerSet::empty()
++        || config.sanitizer_cfi_diag.is_some()
++        || config.sanitizer_cfi_recover.is_some()
++        || config.sanitizer_recover != SanitizerSet::empty()
++        || config.sanitizer_memory_track_origins != 0
++        || !config.sanitizer_dataflow_abilist.is_empty()
++        || config.instrument_coverage
++        || config.debug_info_for_profiling
++        || config.no_prepopulate_passes
++        || !config.llvm_plugins.is_empty()
++        || !config.offload.is_empty()
++        || config.autodiff.contains(&config::AutoDiff::Enable)
++        || !sess.opts.cg.llvm_args.is_empty()
++}
++
++fn bit_flag(value: bool) -> u8 {
++    u8::from(value)
++}
++
++fn fnv1a64(bytes: &[u8]) -> u64 {
++    let mut hash = 0xcbf29ce484222325u64;
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++fn reloc_tag(model: RelocModel) -> &'static str {
++    match model {
++        RelocModel::Static => "static",
++        RelocModel::Pic => "pic",
++        RelocModel::Pie => "pie",
++        RelocModel::DynamicNoPic => "dynamic-no-pic",
++        RelocModel::Ropi => "ropi",
++        RelocModel::Rwpi => "rwpi",
++        RelocModel::RopiRwpi => "ropi-rwpi",
++    }
++}
++
++fn code_model_tag(model: Option<CodeModel>) -> &'static str {
++    match model {
++        None => "default",
++        Some(CodeModel::Tiny) => "tiny",
++        Some(CodeModel::Small) => "small",
++        Some(CodeModel::Kernel) => "kernel",
++        Some(CodeModel::Medium) => "medium",
++        Some(CodeModel::Large) => "large",
++    }
++}
++
++fn tls_tag(model: TlsModel) -> &'static str {
++    match model {
++        TlsModel::GeneralDynamic => "global-dynamic",
++        TlsModel::LocalDynamic => "local-dynamic",
++        TlsModel::InitialExec => "initial-exec",
++        TlsModel::LocalExec => "local-exec",
++        TlsModel::Emulated => "emulated",
++    }
++}
++
++fn float_abi_tag(abi: Option<FloatAbi>) -> &'static str {
++    match abi {
++        None => "default",
++        Some(FloatAbi::Soft) => "soft",
++        Some(FloatAbi::Hard) => "hard",
++    }
++}
++
++fn panic_tag(strategy: PanicStrategy) -> &'static str {
++    match strategy {
++        PanicStrategy::Unwind => "unwind",
++        PanicStrategy::Abort => "abort",
++        PanicStrategy::ImmediateAbort => "immediate-abort",
++    }
++}
++
++fn frame_pointer_tag(kind: FramePointer) -> &'static str {
++    match kind {
++        FramePointer::Always => "always",
++        FramePointer::NonLeaf => "non-leaf",
++        FramePointer::MayOmit => "may-omit",
++    }
++}
++
++/// Target-machine options are not all present in the pre-optimization IR.
++fn fatkey_pipeline_fingerprint(sess: &Session, cgcx: &CodegenContext, bitcode: BitcodeSection) -> u64 {
++    let config = &cgcx.module_config;
++    let function_sections =
++        sess.opts.unstable_opts.function_sections.unwrap_or(sess.target.function_sections);
++    let trap_unreachable =
++        sess.opts.unstable_opts.trap_unreachable.unwrap_or(sess.target.trap_unreachable);
++    let relax_elf =
++        sess.opts.unstable_opts.relax_elf_relocations.unwrap_or(sess.target.relax_elf_relocations);
++    let use_ctors =
++        sess.opts.unstable_opts.use_ctors_section.unwrap_or(sess.target.use_ctors_section);
++    let large = sess.opts.unstable_opts.large_data_threshold.unwrap_or(0);
++    let bitcode_tag = match bitcode {
++        BitcodeSection::None => "none",
++        BitcodeSection::Full => "full",
++    };
++    let text = format!(
++        "bitcode={}\nbuiltins={}\nvec_loop={}\nvec_slp={}\nmerge={}\nlifetime={}\ncpu={}\ntune={}\nfeatures={}\ntriple={}\nreloc={}\ncode={}\ntls={}\npanic={}\nframe={}\nfunc_sections={}\ntrap={}\nrelax={}\nctors={}\nfloat={}\nsingle={}\nunique={}\nlarge={}\nmsvc={}\narch={}\nprefer_dynamic={}\n",
++        bitcode_tag,
++        bit_flag(config.no_builtins),
++        bit_flag(config.vectorize_loop),
++        bit_flag(config.vectorize_slp),
++        bit_flag(config.merge_functions),
++        bit_flag(config.emit_lifetime_markers),
++        llvm_util::target_cpu(sess),
++        llvm_util::tune_cpu(sess).unwrap_or(""),
++        sess.global_backend_features.join(","),
++        versioned_llvm_target(sess),
++        reloc_tag(sess.relocation_model()),
++        code_model_tag(sess.code_model()),
++        tls_tag(sess.tls_model()),
++        panic_tag(sess.panic_strategy()),
++        frame_pointer_tag(sess.opts.cg.force_frame_pointers),
++        bit_flag(function_sections),
++        bit_flag(trap_unreachable),
++        bit_flag(relax_elf),
++        bit_flag(use_ctors),
++        float_abi_tag(sess.target.llvm_floatabi),
++        bit_flag(sess.target.singlethread(&sess.internal_target_features)),
++        bit_flag(!sess.opts.unstable_opts.no_unique_section_names),
++        large,
++        bit_flag(cgcx.msvc_imps_needed),
++        cgcx.target_arch,
++        bit_flag(cgcx.prefer_dynamic),
++    );
++    fnv1a64(text.as_bytes())
++}
++
++/// Object reused when the merged pre-optimization module and the fat-LTO
++/// pipeline match a previous `frustc` compile. The stored object was produced
++/// by the normal serial pipeline. `rustc` does not consult this cache.
++pub(crate) fn fatkey_cache_path(
++    sess: &Session,
++    cgcx: &CodegenContext,
++    module: &ModuleCodegen<ModuleLlvm>,
++) -> Option<PathBuf> {
++    if !invoked_as_frustc() || cgcx.lto != Lto::Fat {
++        return None;
++    }
++    let config = &cgcx.module_config;
++    let EmitObj::ObjectCode(bitcode) = config.emit_obj else {
++        return None;
++    };
++    if cgcx.save_temps
++        || config.emit_asm
++        || config.emit_ir
++        || config.emit_bc
++        || config.emit_thin_lto_summary
++        || split_dwarf_object(cgcx)
++        || fatkey_refused(sess, config)
++    {
++        return None;
++    }
++    let mut has_debug = 0u8;
++    let hash =
++        unsafe { llvm::LLVMRustModuleStreamHash(module.module_llvm.llmod(), &mut has_debug) };
++    if has_debug != 0 {
++        return None;
++    }
++    let obj_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &module.name);
++    let parent = obj_out.parent()?;
++    let opt = opt_level_tag(cgcx.opt_level);
++    let pipeline = fatkey_pipeline_fingerprint(sess, cgcx, bitcode);
++    let name = format!("fatkey-v1-{opt}-{pipeline:016x}-{hash:016x}.o");
++    Some(parent.join("frust-fatkey-cache").join(name))
++}
++
++pub(crate) fn load_fatkey_object(
++    cgcx: &CodegenContext,
++    module: &ModuleCodegen<ModuleLlvm>,
++    cache: &Path,
++) -> Option<CompiledModule> {
++    let obj_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &module.name);
++    if let Some(parent) = obj_out.parent() {
++        fs::create_dir_all(parent).ok()?;
++    }
++    if !copy_cached_object(cache, &obj_out) {
++        return None;
++    }
++    Some(CompiledModule {
++        name: module.name.clone(),
++        kind: module.kind,
++        object: Some(obj_out),
++        global_asm_object: None,
++        dwarf_object: None,
++        bytecode: None,
++        assembly: None,
++        llvm_ir: None,
++    })
++}
++
++pub(crate) fn store_fatkey_object(cache: &Path, compiled: &CompiledModule) {
++    let Some(object) = compiled.object.as_deref() else {
++        return;
++    };
++    store_cached_object(cache, object);
++}
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -2489,6 +2489,12 @@
+         LLVMPlugins: *const c_char,
+         LLVMPluginsLen: size_t,
+     ) -> LLVMRustResult;
++    /// Order-sensitive hash of a merged fat-LTO module. `HasDebugCompileUnit`
++    /// is set when `llvm.dbg.cu` is present; callers must not reuse those objects.
++    pub(crate) fn LLVMRustModuleStreamHash<'a>(
++        M: &'a Module,
++        HasDebugCompileUnit: &mut u8,
++    ) -> u64;
+     pub(crate) fn LLVMRustPrintModule(
+         M: &Module,
+         Output: *const c_char,
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -1862,3 +1862,55 @@
+   auto OS = RawRustStringOstream(KeyOut);
+   OS << Key.str();
+ }
++
++// Order-sensitive key for the fat-LTO object cache. A hit requires the merged
++// module's list order, not a sorted name list. Walking in place avoids the
++// name vector on the miss path. Callers still run the normal fat-LTO pipeline
++// when this key misses.
++static stable_hash frust_stream_codegen_hash(const Module &M) {
++  stable_hash H = xxh3_64bits(M.getDataLayoutStr());
++  H = stable_hash_combine(H, xxh3_64bits(M.getTargetTriple().str()));
++  SmallVector<Module::ModuleFlagEntry, 8> Flags;
++  M.getModuleFlagsMetadata(Flags);
++  for (const Module::ModuleFlagEntry &Flag : Flags) {
++    H = stable_hash_combine(H, xxh3_64bits(Flag.Key->getString()),
++                            static_cast<stable_hash>(Flag.Behavior),
++                            frust_hash_md(Flag.Val, 0));
++  }
++  for (const Module::GlobalAsmFragment &Frag : M.getModuleInlineAsm()) {
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Asm));
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Props.TargetCPU));
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Props.TargetFeatures));
++  }
++  for (const GlobalVariable &GV : M.globals())
++    H = stable_hash_combine(H, xxh3_64bits(GV.getName()), frust_global_extra(GV));
++  for (const GlobalAlias &A : M.aliases()) {
++    DenseSet<const GlobalValue *> Stack;
++    H = stable_hash_combine(H, xxh3_64bits(A.getName()), frust_hash_constant(&A, Stack));
++  }
++  for (const GlobalIFunc &I : M.ifuncs()) {
++    DenseSet<const GlobalValue *> Stack;
++    stable_hash IH = 0;
++    if (const Constant *Resolver = I.getResolver())
++      IH = frust_hash_constant(Resolver, Stack);
++    H = stable_hash_combine(H, xxh3_64bits(I.getName()), IH);
++  }
++  for (const Function &F : M)
++    H = stable_hash_combine(H, xxh3_64bits(F.getName()), frust_function_extra(F));
++  for (const NamedMDNode &NMD : M.named_metadata()) {
++    H = stable_hash_combine(H, xxh3_64bits(NMD.getName()));
++    for (unsigned I = 0; I < NMD.getNumOperands(); ++I)
++      H = stable_hash_combine(H, frust_hash_md(NMD.getOperand(I), 0));
++  }
++  return H;
++}
++
++extern "C" uint64_t LLVMRustModuleStreamHash(LLVMModuleRef M,
++                                             uint8_t *HasDebugCompileUnit) {
++  Module *Mod = unwrap(M);
++  bool HasDebug = Mod->getNamedMetadata("llvm.dbg.cu") != nullptr;
++  *HasDebugCompileUnit = HasDebug;
++  if (HasDebug)
++    return 0;
++  return frust_stream_codegen_hash(*Mod);
++}

@@ -1,0 +1,142 @@
+name: Toolchains
+
+# Manual, and called by Benchmark and Release. Builds the stage-2 toolchains from the pinned sources:
+# the unpatched control and the patched fRust one. Each fRust toolchain is then launched with no
+# ambient state, and on Linux it also passes the fat-LTO, codegen-unit and warm-fresh parity proof.
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Ignore cached toolchains and build them again
+        type: boolean
+        default: false
+      codegen-cache:
+        description: FRUST_EXPERIMENTAL_CODEGEN_CACHE for the parity check
+        type: boolean
+        default: true
+      relr:
+        description: FRUST_EXPERIMENTAL_RELR for the parity check
+        type: boolean
+        default: true
+      builds:
+        description: JSON list of {variant, target, os} to build
+        default: '[{"variant":"control","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"}]'
+  workflow_call:
+    inputs:
+      rebuild:
+        type: boolean
+        default: false
+      codegen-cache:
+        type: boolean
+        default: true
+      relr:
+        type: boolean
+        default: true
+      builds:
+        type: string
+        default: '[{"variant":"control","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"}]'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.variant }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.builds) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Name the archive
+        run: echo "ARCHIVE=$RUNNER_TEMP/${{ matrix.variant }}-${{ matrix.target }}.tar.zst" >> "$GITHUB_ENV"
+      # A toolchain is rebuilt only when its recipe, patches or packaging inputs change.
+      - id: key
+        env:
+          NAME: ${{ matrix.variant }}-${{ matrix.target }}
+          VARIANT: ${{ matrix.variant }}
+          RECIPE: ${{ hashFiles('support/upstream.lock', 'support/bootstrap.toml', '.github/scripts/build-toolchain.sh') }}
+          PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
+        run: |
+          if [[ $VARIANT == frust ]]; then
+            echo "value=toolchain-$NAME-$RECIPE-$PATCHES" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=toolchain-$NAME-$RECIPE" >> "$GITHUB_OUTPUT"
+          fi
+      - id: cache
+        if: ${{ !inputs.rebuild }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.ARCHIVE }}
+          key: ${{ steps.key.outputs.value }}
+      - name: Make room on Linux
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/build
+          sudo chown "$USER" /mnt/build
+          echo "BUILD_DIR=/mnt/build" >> "$GITHUB_ENV"
+          df -h / /mnt
+      # The macOS runner disk is small. Keep the selected Xcode and drop the rest.
+      - name: Make room on macOS
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: |
+          selected=$(xcode-select -p | sed 's|/Contents/Developer$||')
+          for app in /Applications/Xcode*.app; do
+            [[ $app == "$selected" ]] || sudo rm -rf "$app"
+          done
+          sudo rm -rf "$HOME/Library/Android" "$HOME/Library/Developer/CoreSimulator"
+          mkdir -p "$RUNNER_TEMP/build"
+          echo "BUILD_DIR=$RUNNER_TEMP/build" >> "$GITHUB_ENV"
+          command -v zstd > /dev/null || brew install zstd
+          df -h /
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+      - uses: ./.github/actions/setup-rust
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.variant == 'frust'
+      - name: Build and pack
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: .github/scripts/build-toolchain.sh "${{ matrix.variant }}" "$BUILD_DIR" "$ARCHIVE" "${{ matrix.target }}"
+      - uses: actions/cache/save@v6
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.ARCHIVE }}
+          key: ${{ steps.key.outputs.value }}
+      - name: Unpack the toolchain
+        if: matrix.variant == 'frust'
+        run: |
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$RUNNER_TEMP/unpacked"
+      - name: Launch the packaged toolchain with no ambient state
+        if: matrix.variant == 'frust'
+        run: |
+          mkdir -p "$RUNNER_TEMP/launch"
+          support/launch-check.sh "$RUNNER_TEMP/unpacked/frust" "$RUNNER_TEMP/launch" "$RUNNER_TEMP/launch/launch.log"
+          cat "$RUNNER_TEMP/launch/launch.log"
+      - name: Prove fat LTO, codegen units and warm-fresh parity
+        if: matrix.variant == 'frust' && runner.os == 'Linux'
+        env:
+          FRUST_EXPERIMENTAL_CODEGEN_CACHE: ${{ inputs.codegen-cache && '1' || '0' }}
+          FRUST_EXPERIMENTAL_RELR: ${{ inputs.relr && '1' || '0' }}
+        run: qualification/prove-codegen.sh "$RUNNER_TEMP/unpacked/frust" ci
+      - uses: actions/upload-artifact@v7
+        if: always() && matrix.variant == 'frust'
+        with:
+          name: verify-logs-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/launch/launch.log
+            target/compiler-rewrite/parity/ci/prove.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain-${{ matrix.variant }}-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          compression-level: 0
+          retention-days: 7

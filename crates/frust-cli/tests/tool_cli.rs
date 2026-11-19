@@ -224,7 +224,7 @@ if pid == 0:
     os.environ["TERM"] = "xterm"
     os.environ["COLUMNS"] = "80"
     os.environ["PATH"] = "/usr/bin:/bin"
-    os.execv(sys.argv[1], [sys.argv[1], "--version"])
+    os.execv(sys.argv[1], [sys.argv[1], "build"])
 data = b""
 while True:
     ready, _, _ = select.select([fd], [], [], 3)
