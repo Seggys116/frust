@@ -25,6 +25,10 @@ fRust is designed to ship its own `frustc` compiler, matching standard library a
 
 <p align="center"><img src=".github/assets/flow.svg" alt="Planned build flow from fcargo through frustc and the native linker. Compiler analysis and code generation can reuse validated state from central storage." width="880"></p>
 
+## Native fat-LTO builds
+
+On Linux x86-64, `fcargo build --release` automatically uses incremental compilation and 16 codegen units for eligible local projects that select fat LTO. Explicit profile settings take precedence. See [the configuration details](docs/configuration.md#native-fat-lto-defaults) and [the measured tradeoff](qualification/SEMANTIC-LTO.md#incremental-fat-lto-profile).
+
 ## Project history
 
 The [changelog](CHANGELOG.md) records the earlier fRust build accelerator and the transition to the compiler project. See [reporting guidance](SECURITY.md) for security issues.

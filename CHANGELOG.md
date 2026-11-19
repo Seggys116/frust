@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+* Native Linux x86-64 fCargo builds now default to incremental compilation with 16 codegen units for local packages using fat LTO at opt level 3. Explicit Cargo profile and incremental settings take precedence.
+
 * Started the fRust compiler rewrite and retired the previous build accelerator from the active branch. The entries below describe earlier releases.
 * Made post-optimization object reuse and RELR opt-in research flags. Default compilation and linking retain upstream behavior.
 * Cargo skips checksumming excluded dependencies and treats dependencies saved during compiler invocation as dirty on the next build. Upgrading invalidates the earlier dependency checksum records.

@@ -43,14 +43,9 @@ This series built a separate clean seed for each configuration and used the same
 | One CGU, retain LLVM analyses | 43.00 s | 30.77 s | 20.55 s | 745,576 KiB |
 | Sixteen CGUs | 42.18 s | 24.39 s | 22.16 s | 568,248 KiB |
 
-Sixteen CGUs took 23.4% less wall time on this edited rebuild. The stripped binary was 4,153,280 bytes versus 4,025,168 bytes for one CGU, a 3.2% increase. The edit's reported match count and the corpus command output matched. It remains an explicit profile because executable size grew and the measurements are exploratory.
+Sixteen CGUs took 23.4% less wall time on this edited rebuild. The stripped binary was 4,153,280 bytes versus 4,025,168 bytes for one CGU, a 3.2% increase. The edit's reported match count and the corpus command output matched. These samples establish a build-time and executable-size tradeoff on the measured workloads.
 
-From the application workspace, pass the shipped config file to Cargo. The profile inherits the project's release settings for optimization level, debug info, strip and panic.
-
-```sh
-fcargo --config /path/to/frust/support/profiles/release-fat-incremental.toml \
-  build --profile release-fat-incremental
-```
+The measured configuration is now fCargo's default for eligible native fat-LTO builds. Cargo uses the ordinary release profile settings and keeps explicit codegen-unit and incremental settings. The named profile below the `support/profiles` directory records the configuration used during the experiment.
 
 A second code-changing edit used the locked fd tree. The edit also treats colon as a path separator, which changes a search in a fixture containing `with:colon` from success to the existing diagnostic. Both sides used the named profile through packaged fCargo. The reference overrides just the CGU count to one.
 
@@ -64,6 +59,17 @@ The edited fd wall time decreased by 4.7%. The wide gap between the two workload
 The packaged fCargo selected frustc and passed `-C lto=fat`, `-C codegen-units=16` and `-C incremental` on the native archive fixture. LLVM fat LTO ran on the seed, edited and fresh builds. Edited and fresh builds matched executable `.text` and stdout.
 
 The runtime check made 12 alternating pairs per literal and regex command. Each process searched 16 repetitions of the 32 MiB file with one thread. All stdout digests matched. Sixteen CGUs had paired median runtime ratios of 1.001 and 1.000. Lowering the inlining threshold shrank the stripped binary by 6.7%, with ratios of 0.996 and 1.024. That regex regression rules out adopting the smaller threshold based on these samples.
+
+## Automatic default versus prior default
+
+A follow-up Linux comparison used packaged fCargo, the ordinary release profile with fat LTO, and the same ripgrep source and semantic edit. The control applied Cargo's prior release incremental setting of false. Both builds confirmed the edited match count and recorded a positive full-LTO phase.
+
+| Native release settings | Cold seed | Edited wall time | Edited stripped bytes |
+| --- | ---: | ---: | ---: |
+| Prior defaults | 42.76 s | 27.60 s | 4,438,248 |
+| Automatic incremental fat LTO | 38.71 s | 25.92 s | 4,152,432 |
+
+The edit took 6.1% less wall time and produced a 6.4% smaller stripped executable in this one comparison. The earlier 23.4% result uses a one-CGU incremental reference. These comparisons answer different questions.
 
 ## Post-LTO object partition feasibility
 
