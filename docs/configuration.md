@@ -8,11 +8,13 @@ Explicit Cargo directory controls take precedence. Tooling should discover final
 
 ## Cooperative checks
 
-Run `FRUST_EXPERIMENTAL_UNIT_JOIN=1 fcargo check` in each terminal to share eligible check units in the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler rechecks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics.
+On x86-64 GNU/Linux, eligible `fcargo check` invocations share check units by default when they use the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler checks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics. Set `FRUST_UNIT_JOIN=off` to use ordinary Cargo scheduling.
 
-The experiment uses the current Cargo build-directory layout and the invocation's own jobserver. Graphs with build scripts, proc macros or artifact dependencies use ordinary Cargo scheduling. Cargo defers contended units before assigning a job slot, so independent work can proceed even with `-j1`. Switching the experiment on or off can cause a rebuild because the fingerprint identities differ. Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks.
+Joining uses the current Cargo build-directory layout, local storage, and the invocation's own jobserver. Graphs with build scripts, proc macros or artifact dependencies use ordinary Cargo scheduling, as do checks with `--keep-going`, `--timings`, or Cargo's explicit fine-grained locking flag. Contended units defer before taking a job slot, so independent work can proceed even with `-j1`. If a check stalls while retaining reader locks, Cargo releases them and retries serially. That retry can repeat unit progress messages. Switching between modes can cause a rebuild because their fingerprint identities differ.
 
-The qualification probe covers local Linux x86-64 builds. [Concurrent check probe](../qualification/cooperative-builds.py)
+Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks. The native qualification covers Linux x86-64. The legacy `FRUST_EXPERIMENTAL_UNIT_JOIN=1` opt-in remains available on macOS for qualification. [Concurrent check probe](../qualification/cooperative-builds.py)
+
+In the 19 November 2026 Linux check, all five regex metadata artifacts matched the ordinary Cargo path byte for byte. Twelve alternating warm checks per mode reported every artifact fresh. The syn workspace exercised ordinary scheduling for a graph with build-time dependencies and produced identical metadata with either setting.
 
 ## Native fat-LTO defaults
 

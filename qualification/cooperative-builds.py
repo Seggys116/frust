@@ -2,6 +2,7 @@
 """Check shared compilation and independent progress with overlapping Cargo checks."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -37,7 +38,7 @@ previous=
 for arg do
     if [ "$previous" = --crate-name ] && [ "$arg" != ___ ]; then
         : > "$PROBE_DIR/$PROBE_REQUEST.$arg.$$"
-        if [ "$PROBE_REQUEST:$arg" = first:shared ]; then
+        if [ "$PROBE_CASE" = conflict ] || [ "$PROBE_REQUEST:$arg" = first:shared ]; then
             if [ "$PROBE_CASE" = edit ]; then
                 "$@"
                 : > "$PROBE_DIR/compiled"
@@ -75,6 +76,12 @@ def stop(process):
 def check_pair(root, args, cargo_options, second_packages):
     root.mkdir()
     create_workspace(root)
+    first_packages = ("left",)
+    if root.name == "conflict":
+        first_packages = ("shared", "independent")
+        for member in first_packages:
+            with (root / member / "src" / "lib.rs").open("a") as source:
+                source.write('pub const CONFIG: &str = env!("PROBE_REQUEST");\n')
     cargo_home = root / "cargo-home"
     cargo_home.mkdir()
     compiler_env = {
@@ -96,6 +103,8 @@ def check_pair(root, args, cargo_options, second_packages):
     def start(request, packages):
         command = [str(args.cargo), *cargo_options, "check", "--offline", "-j", str(args.jobs)]
         command.extend(["--target-dir", str(root / "target")])
+        if root.name == "conflict":
+            command.append("--message-format=json")
         for package in packages:
             command.extend(["-p", package])
         env = dict(compiler_env, PROBE_REQUEST=request)
@@ -106,8 +115,10 @@ def check_pair(root, args, cargo_options, second_packages):
         return process
 
     try:
-        first = start("first", ("left",))
+        first = start("first", first_packages)
         marker = "compiled" if root.name == "edit" else "first.shared.*"
+        if root.name == "conflict":
+            marker = "first.*.*"
         if not wait_for_marker(root, marker, first, args.timeout):
             raise RuntimeError("first request did not reach the shared compilation")
         if root.name == "edit":
@@ -119,7 +130,9 @@ def check_pair(root, args, cargo_options, second_packages):
             os.utime(replacement, ns=(times.st_atime_ns, times.st_mtime_ns))
             replacement.replace(source)
         second = start("second", second_packages)
-        if "independent" in second_packages:
+        if root.name == "conflict":
+            overlapped = wait_for_marker(root, "second.*.*", second, args.timeout)
+        elif "independent" in second_packages:
             overlapped = wait_for_marker(root, "second.independent.*", second, args.timeout)
         else:
             # Leave the first request in the compiler while the follower starts.
@@ -134,6 +147,17 @@ def check_pair(root, args, cargo_options, second_packages):
                 continue
             if process.wait(timeout=args.timeout):
                 raise RuntimeError(f"{request} Cargo check failed")
+        if root.name == "conflict":
+            for request in processes:
+                messages = (root / f"{request}.log").read_text().splitlines()
+                events = [json.loads(line) for line in messages if line.startswith("{")]
+                if [event["success"] for event in events if event["reason"] == "build-finished"] != [True]:
+                    raise RuntimeError(f"{request} did not emit one successful build-finished event")
+            print(f"conflict: both checks finished, overlapping first units {overlapped}", flush=True)
+            return overlapped and all(
+                any(root.glob(f"{request}.{member}.*"))
+                for request in processes for member in first_packages
+            )
         warm_is_fresh = True
         if root.name == "identical":
             if start("warm", ("left",)).wait(timeout=args.timeout):
@@ -167,7 +191,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=2,
                         metavar="N", help="Cargo job limit per request")
     parser.add_argument("--recovery", action="store_true",
-                        help="also check interruption and replacement with restored mtime")
+                        help="also check interruption, replacement with restored mtime, and conflicts")
     parser.add_argument("cargo_options", nargs=argparse.REMAINDER,
                         help="global Cargo options after --")
     args = parser.parse_args()
@@ -190,6 +214,7 @@ def main():
             results.extend([
                 check_pair(root / "interrupted", args, options, ("right", "independent")),
                 check_pair(root / "edit", args, options, ("right", "independent")),
+                check_pair(root / "conflict", args, options, ("shared", "independent")),
             ])
     return 0 if all(results) else 1
 

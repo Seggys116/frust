@@ -1,5 +1,5 @@
 diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
-index 4bf69f6..7494979 100644
+index 4bf69f6..b8b9905 100644
 --- a/src/compiler/build_runner/mod.rs
 +++ b/src/compiler/build_runner/mod.rs
 @@ -94,6 +94,7 @@ pub struct BuildRunner<'a, 'gctx> {
@@ -10,7 +10,7 @@ index 4bf69f6..7494979 100644
  }
  
  impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
-@@ -135,6 +136,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+@@ -135,9 +136,14 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
              failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
              unused_dep_state: UnusedDepState::new(bcx),
              lock_manager: Arc::new(LockManager::new()),
@@ -18,7 +18,22 @@ index 4bf69f6..7494979 100644
          })
      }
  
-@@ -432,8 +434,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
++    pub(crate) fn disable_cooperative_check(&mut self) {
++        self.cooperative_check = false;
++    }
++
+     /// Dry-run the compilation without actually running it.
+     ///
+     /// This is expected to collect information like the location of output artifacts.
+@@ -167,6 +173,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+     /// [`ops::cargo_compile`]: crate::ops::cargo_compile
+     #[tracing::instrument(skip_all)]
+     pub fn compile(mut self, exec: &Arc<dyn Executor>) -> CargoResult<Compilation<'gctx>> {
++        self.cooperative_check &= exec.allows_joined_checks();
+         // A shared lock is held during the duration of the build since rustc
+         // needs to read from the `src` cache, and we don't want other
+         // commands modifying the `src` cache while it is running.
+@@ -432,8 +439,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
              | UserIntent::Doctest
              | UserIntent::Bench => true,
          };
@@ -36,7 +51,7 @@ index 4bf69f6..7494979 100644
          let mut targets = HashMap::default();
          for kind in self.bcx.all_kinds.iter() {
              if let CompileKind::Target(target) = *kind {
-@@ -442,7 +451,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+@@ -442,7 +456,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                      Some(target),
                      &dest,
                      must_take_artifact_dir_lock,
@@ -47,7 +62,7 @@ index 4bf69f6..7494979 100644
              }
 diff --git a/src/compiler/fingerprint/join.rs b/src/compiler/fingerprint/join.rs
 new file mode 100644
-index 0000000..8be0bc2
+index 0000000..43fb09c
 --- /dev/null
 +++ b/src/compiler/fingerprint/join.rs
 @@ -0,0 +1,211 @@
@@ -205,12 +220,12 @@ index 0000000..8be0bc2
 +                // ctime also changes when a save restores the previous mtime.
 +                let invocation = paths::mtime(&dep_info)?;
 +                for input in info.files.keys() {
++                    let is_new = |meta: std::fs::Metadata| {
++                        FileTime::from_unix_time(meta.ctime(), meta.ctime_nsec() as u32) >= invocation
++                    };
 +                    let link = std::fs::symlink_metadata(input)?;
-+                    let target = std::fs::metadata(input)?;
-+                    if [&link, &target].into_iter().any(|meta| {
-+                        FileTime::from_unix_time(meta.ctime(), meta.ctime_nsec() as u32)
-+                            >= invocation
-+                    }) {
++                    let symlink = link.is_symlink();
++                    if is_new(link) || (symlink && is_new(std::fs::metadata(input)?)) {
 +                        return Ok(false);
 +                    }
 +                }
@@ -263,7 +278,7 @@ index 0000000..8be0bc2
 +    }
 +}
 diff --git a/src/compiler/fingerprint/mod.rs b/src/compiler/fingerprint/mod.rs
-index d388e63..8fd11e9 100644
+index d388e63..18f1276 100644
 --- a/src/compiler/fingerprint/mod.rs
 +++ b/src/compiler/fingerprint/mod.rs
 @@ -378,6 +378,7 @@
@@ -339,7 +354,7 @@ index d388e63..8fd11e9 100644
  
      let fingerprint = Arc::new(fingerprint);
      build_runner
-@@ -1674,6 +1682,12 @@ fn calculate_normal(
+@@ -1674,6 +1682,15 @@ fn calculate_normal(
          },
      ));
      let mut config = StableHasher::new();
@@ -347,12 +362,15 @@ index d388e63..8fd11e9 100644
 +        // The record is valid only for checks of this workspace and compiler.
 +        "frust-cooperative-check-v1".hash(&mut config);
 +        build_runner.bcx.ws.root().hash(&mut config);
-+        build_runner.bcx.rustc().path.hash(&mut config);
++        let rustc = build_runner.bcx.rustc();
++        rustc.path.hash(&mut config);
++        rustc.wrapper.hash(&mut config);
++        rustc.workspace_wrapper.hash(&mut config);
 +    }
      let linker = if unit.target.for_host() && !build_runner.bcx.gctx.target_applies_to_host()? {
          build_runner.compilation.host_linker()
      } else {
-@@ -1974,6 +1988,17 @@ fn local_fingerprints_deps(
+@@ -1974,6 +1991,17 @@ fn local_fingerprints_deps(
      local
  }
  
@@ -439,9 +457,18 @@ index 0c9d302..bf104c9 100644
  
  impl fmt::Debug for Job {
 diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
-index a581e11..ca934d9 100644
+index a581e11..0686c9c 100644
 --- a/src/compiler/job_queue/mod.rs
 +++ b/src/compiler/job_queue/mod.rs
+@@ -119,7 +119,7 @@ use std::fmt::Write as _;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ use std::thread::{self, Scope};
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ use std::{env, io};
+ 
+ use anyhow::{Context as _, format_err};
 @@ -588,8 +588,13 @@ impl<'gctx> DrainState<'gctx> {
          // The `pending_queue` is sorted in ascending priority order, and we
          // remove items from its end to schedule the highest priority items
@@ -484,7 +511,15 @@ index a581e11..ca934d9 100644
                      None => continue,
                  }
              }
-@@ -828,9 +835,10 @@ impl<'gctx> DrainState<'gctx> {
+@@ -818,6 +825,7 @@ impl<'gctx> DrainState<'gctx> {
+         // and then immediately return (or keep going, if requested by the build
+         // config).
+         let mut errors = ErrorsDuringDrain { count: 0 };
++        let mut stalled_since = None;
+         // CAUTION! Do not use `?` or break out of the loop early. Every error
+         // must be handled in such a way that the loop is still allowed to
+         // drain event messages.
+@@ -828,18 +836,29 @@ impl<'gctx> DrainState<'gctx> {
                  }
              }
  
@@ -497,8 +532,19 @@ index a581e11..ca934d9 100644
 +            if self.active.is_empty() && !retry_units {
                  break;
              }
++            // An idle check with completed units can hold a reader lock a peer
++            // needs to rebuild. Drop this runner before retrying exclusively.
++            if retry_units && errors.count == 0 && self.active.is_empty() && self.finished > 0 {
++                if stalled_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(2) {
++                    self.progress.clear();
++                    return (Err(crate::compiler::unit_join::RetrySerial.into()),);
++                }
++            } else {
++                stalled_since = None;
++            }
  
-@@ -839,7 +847,7 @@ impl<'gctx> DrainState<'gctx> {
+             // And finally, before we block waiting for the next event, drop any
+             // excess tokens we may have accidentally acquired. Due to how our
              // jobserver interface is architected we may acquire a token that we
              // don't actually use, and if this happens just relinquish it back
              // to the jobserver itself.
@@ -598,7 +644,7 @@ index 531aa63..e77c6d7 100644
      #[instrument(skip(self))]
      pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
 diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
-index d38634f..e35b9f6 100644
+index d38634f..6832bb5 100644
 --- a/src/compiler/mod.rs
 +++ b/src/compiler/mod.rs
 @@ -52,6 +52,7 @@ pub(crate) mod trim_paths;
@@ -617,7 +663,30 @@ index d38634f..e35b9f6 100644
  use crate::compiler::future_incompat::FutureIncompatReport;
  use crate::compiler::locking::LockKey;
  use crate::compiler::timings::SectionTiming;
-@@ -195,7 +197,10 @@ fn compile<'gctx>(
+@@ -146,6 +148,11 @@ pub trait Executor: Send + Sync + 'static {
+         on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
+     ) -> CargoResult<()>;
+ 
++    /// Whether another invocation may fulfill this executor's compilation work.
++    fn allows_joined_checks(&self) -> bool {
++        false
++    }
++
+     /// Queried when queuing each unit of work. If it returns true, then the
+     /// unit will always be rebuilt, independent of whether it needs to be.
+     fn force_rebuild(&self, _unit: &Unit) -> bool {
+@@ -159,6 +166,10 @@ pub trait Executor: Send + Sync + 'static {
+ pub struct DefaultExecutor;
+ 
+ impl Executor for DefaultExecutor {
++    fn allows_joined_checks(&self) -> bool {
++        true
++    }
++
+     #[instrument(name = "rustc", skip_all, fields(package = id.name().as_str(), process = cmd.to_string()))]
+     fn exec(
+         &self,
+@@ -195,7 +206,10 @@ fn compile<'gctx>(
          return Ok(());
      }
  
@@ -629,7 +698,7 @@ index d38634f..e35b9f6 100644
          Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
      } else {
          None
-@@ -242,23 +247,11 @@ fn compile<'gctx>(
+@@ -242,23 +256,11 @@ fn compile<'gctx>(
                  };
                  work.then(link_targets(build_runner, unit, false)?)
              } else {
@@ -656,7 +725,7 @@ index d38634f..e35b9f6 100644
                  if let Some(lock) = lock {
                      // Here we unlock the current shared lock to avoid deadlocking with other cargo
                      // processes. Then we configure our compile job to take an exclusive lock
-@@ -266,8 +259,26 @@ fn compile<'gctx>(
+@@ -266,8 +268,26 @@ fn compile<'gctx>(
                      // we downgrade to a shared lock to allow other cargo's to read the build unit.
                      // We will hold this shared lock for the remainder of compilation to prevent
                      // other cargo from re-compiling while we are still using the unit.
@@ -685,7 +754,7 @@ index d38634f..e35b9f6 100644
                      job.after(downgrade_lock_to_shared(lock));
                  }
              }
-@@ -286,6 +297,35 @@ fn compile<'gctx>(
+@@ -286,6 +306,35 @@ fn compile<'gctx>(
      Ok(())
  }
  
@@ -723,15 +792,14 @@ index d38634f..e35b9f6 100644
  fn make_failed_scrape_diagnostic(
 diff --git a/src/compiler/unit_join.rs b/src/compiler/unit_join.rs
 new file mode 100644
-index 0000000..a08419d
+index 0000000..7b517b3
 --- /dev/null
 +++ b/src/compiler/unit_join.rs
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,77 @@
 +//! Opt-in joining of equivalent units between Cargo processes sharing a build directory.
 +//!
-+//! With `FRUST_EXPERIMENTAL_UNIT_JOIN=1`, a dirty `cargo check` unit waits for
-+//! any process compiling it and, when that process left a record that is fresh
-+//! for this invocation, replays it instead of running the compiler again.
++//! An eligible `cargo check` defers contended units and replays the producer's
++//! outputs when its completed fingerprint is fresh for this invocation.
 +//!
 +//! Checks with build scripts use the normal path.
 +
@@ -741,16 +809,31 @@ index 0000000..a08419d
 +use crate::compiler::fingerprint::JoinProbe;
 +use crate::util::errors::CargoResult;
 +
-+/// Environment variable that enables joining when set to `1`.
-+const ENV: &str = "FRUST_EXPERIMENTAL_UNIT_JOIN";
++/// A cooperative check must release its reader locks before making progress.
++#[derive(Debug, thiserror::Error)]
++#[error("cooperative check stalled while retaining unit locks")]
++pub(crate) struct RetrySerial;
 +
 +/// Whether this process may join units built by another Cargo process.
-+#[allow(clippy::disallowed_methods)]
 +pub(super) fn supports(bcx: &BuildContext<'_, '_>) -> bool {
-+    cfg!(unix)
-+        && std::env::var(ENV).as_deref() == Ok("1")
++    let gctx = bcx.gctx;
++    let enabled = match gctx.get_env("FRUST_UNIT_JOIN").as_deref() {
++        Ok("off") => false,
++        _ => match gctx.get_env("FRUST_EXPERIMENTAL_UNIT_JOIN").as_deref() {
++            Ok("0") => false,
++            Ok("1") => cfg!(unix),
++            _ => cfg!(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
++                && gctx.get_env("FRUST_INVOCATION").ok() == Some("fcargo"),
++        },
++    };
++    enabled
++        && !bcx.ws.build_dir().as_path_unlocked().ancestors()
++            .any(crate::util::flock::is_on_nfs_mount)
 +        && matches!(bcx.build_config.intent, UserIntent::Check { .. })
 +        && !bcx.build_config.timing_report
++        && !bcx.build_config.keep_going
++        && !bcx.build_config.force_rebuild
++        && !bcx.gctx.cli_unstable().fine_grain_locking
 +        && bcx.gctx.cli_unstable().build_dir_new_layout
 +        && bcx.gctx.jobserver_from_env().is_none()
 +        && bcx.unit_graph.keys().all(|unit| {
@@ -810,6 +893,26 @@ index fa33bb2..1938a29 100644
                      Ok(layout) => Some(Ok((kind, layout))),
                      Err(e) => Some(Err(e)),
                  }
+diff --git a/src/ops/cargo_compile/mod.rs b/src/ops/cargo_compile/mod.rs
+index bf55ba1..efc773a 100644
+--- a/src/ops/cargo_compile/mod.rs
++++ b/src/ops/cargo_compile/mod.rs
+@@ -206,7 +206,14 @@ fn compile_ws<'a>(
+     if options.build_config.dry_run {
+         build_runner.dry_run()
+     } else {
+-        build_runner.compile(exec)
++        match build_runner.compile(exec) {
++            Err(error) if error.is::<crate::compiler::unit_join::RetrySerial>() => {
++                let mut serial = BuildRunner::new(&bcx)?;
++                serial.disable_cooperative_check();
++                serial.compile(exec)
++            }
++            result => result,
++        }
+     }
+ }
+ 
 diff --git a/src/util/flock.rs b/src/util/flock.rs
 index 14a2fde..563d5c3 100644
 --- a/src/util/flock.rs
