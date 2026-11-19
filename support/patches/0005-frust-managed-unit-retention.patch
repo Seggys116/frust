@@ -1,17 +1,18 @@
 diff --git a/src/compiler/build_runner/frust_retention.rs b/src/compiler/build_runner/frust_retention.rs
 new file mode 100644
-index 0000000..207ee6d
+index 0000000..1181459
 --- /dev/null
 +++ b/src/compiler/build_runner/frust_retention.rs
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,106 @@
 +use super::BuildRunner;
++use crate::compiler::CompileMode;
 +use std::collections::{BTreeMap, BTreeSet};
 +use std::fs;
 +use std::io;
 +use std::path::Path;
 +
 +const KEEP_INACTIVE: usize = 3;
-+const SEEN: &str = ".frust-retention-v1";
++const MARKER_PREFIX: &str = ".frust-published-bin-v2-";
 +
 +pub(super) fn collect(build: &BuildRunner<'_, '_>) {
 +    let Some(layout) = build.frust_locked_unit_layout() else {
@@ -33,10 +34,19 @@ index 0000000..207ee6d
 +
 +fn prune(build: &BuildRunner<'_, '_>, build_dir: &Path) -> io::Result<()> {
 +    let roots: Vec<_> = build
-+        .bcx
-+        .roots
++        .compilation
++        .binaries
 +        .iter()
-+        .map(|unit| build.files().out_dir_new_layout(unit).with_file_name(SEEN))
++        .filter_map(|binary| {
++            let unit = &binary.unit;
++            if unit.mode != CompileMode::Build || !unit.target.is_bin() || unit.artifact.is_true() {
++                return None;
++            }
++            let output = build.files().out_dir_new_layout(unit);
++            // Only reclaim units whose executable Cargo publishes outside the unit directory.
++            (!binary.path.starts_with(&output))
++                .then(|| output.with_file_name(format!("{MARKER_PREFIX}{}", unit.target.name())))
++        })
 +        .collect();
 +    if roots.iter().all(|marker| marker.is_file()) {
 +        return Ok(());
@@ -46,20 +56,20 @@ index 0000000..207ee6d
 +    }
 +
 +    let mut packages = BTreeMap::new();
-+    for unit in build.bcx.unit_graph.keys().chain(build.bcx.roots.iter()) {
-+        let output = build.files().out_dir_new_layout(unit);
-+        if let Some(unit_dir) = output.parent()
++    for marker in &roots {
++        if let Some(unit_dir) = marker.parent()
 +            && let Some(package) = unit_dir.parent()
 +            && package.parent() == Some(build_dir)
 +            && let Some(hash) = unit_dir.file_name()
++            && let Some(name) = marker.file_name()
 +        {
 +            packages
-+                .entry(package.to_path_buf())
++                .entry((package.to_path_buf(), name.to_owned()))
 +                .or_insert_with(BTreeSet::new)
 +                .insert(hash.to_owned());
 +        }
 +    }
-+    for (path, live) in packages {
++    for ((path, marker), live) in packages {
 +        if !is_real_dir(&path) {
 +            continue;
 +        }
@@ -74,7 +84,7 @@ index 0000000..207ee6d
 +                continue;
 +            }
 +            let unit = entry.path();
-+            if is_real_dir(&unit.join("fingerprint")) {
++            if unit.join(&marker).is_file() && is_real_dir(&unit.join("fingerprint")) {
 +                inactive.push((entry.metadata()?.modified()?, unit));
 +            }
 +        }
@@ -174,16 +184,20 @@ index 9425546..93d1bb1 100644
      pub fn prepare(&mut self) -> CargoResult<()> {
          if !self.is_new_layout {
 diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
-index 6832bb5..c3958f0 100644
+index 6832bb5..8c95473 100644
 --- a/src/compiler/mod.rs
 +++ b/src/compiler/mod.rs
-@@ -2047,7 +2047,13 @@ fn add_codegen_incremental(
+@@ -2047,7 +2047,17 @@ fn add_codegen_incremental(
      build_runner: &BuildRunner<'_, '_>,
      unit: &Unit,
  ) {
 -    let dir = build_runner.files().incremental_dir(&unit);
 +    let managed_dir;
-+    let dir = if build_runner.frust_locked_unit_layout().is_some() {
++    let dir = if unit.mode == CompileMode::Build
++        && unit.target.is_bin()
++        && !unit.artifact.is_true()
++        && build_runner.frust_locked_unit_layout().is_some()
++    {
 +        managed_dir = build_runner.files().out_dir_new_layout(unit).with_file_name("incremental");
 +        managed_dir.as_path()
 +    } else {
