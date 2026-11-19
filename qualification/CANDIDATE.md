@@ -148,3 +148,39 @@ The corpus command was `rg --no-config -j 1 -F frust_needle_7 search.txt`. Stdou
 The tuned median over the default median is 0.006230/0.006181 = 1.008. The default binary and `target/compiler-rewrite/char/rg-control` are the same bytes, and those two medians still differ by 1.015, so a ratio this close to 1 is inside the noise of a 6ms process start. It is not a 0.97 runtime win. One workload at about 1.0 cannot be pulled under a 0.97 aggregate by the other two unless those two average about 0.94, and this workload's stripped file already grew.
 
 The locked rustfmt tree (`cebab3e99259be82ff069e5ae89e91855d79e534`, the peel of tag `5eb206859397a1cb7a6ef91790d38591c0a36ac9`) does not compile with this stage-2 compiler. Cargo got past the missing `overload` crate once the network retry ran, then `rustfmt-nightly` failed with 43 errors against the current `rustc_ast` (`EXIT:101` in `tune1-rf-base.log` and `tune1-rf-arrow.log`). The compiler tree's own rustfmt is 1.11.0 (`d957b2ec4b0120979585316f2f342400ccafb16c`) and was not substituted. Oxipng was not built: the ripgrep size regression already fails the per-workload size rule. The tune was not added to `frustc`. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open.
+
+## Hot-cold split and v3 scheduling miss the runtime aggregate
+
+Both checks used the unpatched stage-2 compiler and the frozen release profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none). Neither flag was added to `frustc`. `build-control` was not modified. The 30-pair gate was not run.
+
+Hot-cold split was `-C llvm-args=-hot-cold-split` with `RUSTC_BOOTSTRAP=1` on unmodified ripgrep. The build log is `target/compiler-rewrite/logs/hcs1-ripgrep.log` (start `2026-11-19T05:42:31+00:00`, cargo finished in 28.23s, `/usr/bin/time` wall 28.24s, max RSS 452680 kB, `EXIT:0`). That wall time is not a cold-gate sample. The binary is sha256 `4bc5797ed45629e99b9f34da54bd8d80992d2b49cc2c24fae6d35feb2c5e38f4`, 4799592 bytes. `strip --strip-unneeded` leaves 4043784 bytes. 4043784/4024992 = 1.005, so the stripped file grew. `.text` is 2535200 bytes against 2538086 in the stock rebuild, so the pass shrank the text section and still grew the stripped file. All three binaries have 1012 YMM lines. Corpus stdout matched the stock rebuild and `target/compiler-rewrite/char/rg-control` (423040 bytes, exit 0). Thirty rotated runs after warmups:
+
+| Binary | Median | Mean | Population stdev |
+| --- | --- | --- | --- |
+| hot-cold split | 0.006210s | 0.006200s | 0.000083s |
+| stock rebuild | 0.006095s | 0.006101s | 0.000066s |
+| control `rg` | 0.006074s | 0.006096s | 0.000082s |
+
+0.006210/0.006095 = 1.019. The same-byte stock rebuild and control differ by 1.003 on this run, so the slowdown is outside that gap. The per-workload runtime bound is 1.01.
+
+The second check retargets scheduling at the psABI x86-64-v3 model without adding an instruction set. Rustc took `-Z tune-cpu=x86-64-v3`. GCC 15 rejects `-mtune=x86-64-v3` and accepts `-mtune=haswell`, which is the microarchitecture that level names. Ripgrep was built with the rustc tune only. Oxipng was built twice: stock, and rustc tune plus `CFLAGS=-mtune=haswell` so libdeflate was rescheduled too. The libdeflate archives differ (`b07366dee47d728924b022575a21f42cd003b0bebcaf1d4aa0fe8f6b0f334f94` and `79bcc60a9bce58e68be49b12b2bba8e63406f0b87c2d2060260974f57f72864f`). The three builds ran together, so their walls are not cold-gate samples. Logs: `target/compiler-rewrite/logs/v3-ripgrep.log` (cargo 33.34s, `EXIT:0`), `v3-ox-base.log` (20.56s, `EXIT:0`), `v3-ox-v3.log` (20.22s, `EXIT:0`).
+
+| Binary | Bytes | Stripped | YMM lines | sha256 |
+| --- | --- | --- | --- | --- |
+| ripgrep v3 | 4718152 | 4054944 | 1012 | `c62842b210ec37b1ed0bfd3830b7d409f9d3d126091880330afb1e21227d1c56` |
+| ripgrep stock rebuild | 4687944 | 4024992 | 1012 | `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4` |
+| oxipng stock | 1551704 | 1338440 | 482 | `943327577a41641a25c01a23d29c1c515c0abd20124d937e3b31ea75bc7e08d8` |
+| oxipng v3 | 1563256 | 1349992 | 514 | `2acb54d045173416826a16407b382d71a65f8f06f20ca1232a35ef57407d9688` |
+
+Stripped ripgrep grew by 4054944/4024992 = 1.007. Stripped oxipng grew by 1349992/1338440 = 1.009. Ripgrep's YMM count stayed 1012, so the rustc tune did not widen that binary's ISA. Oxipng's YMM count rose from 482 to 514 inside the retuned libdeflate archive. Thirty rotated ripgrep runs, and twenty rotated oxipng runs of `oxipng -o 4 --threads 1 --dir OUT pngs/*.png`:
+
+| Workload | Stock median | Tuned median | Ratio | Population stdev, stock / tuned |
+| --- | --- | --- | --- | --- |
+| ripgrep | 0.006228s | 0.006343s | 1.019 | 0.000151s / 0.000086s |
+| oxipng | 0.204504s | 0.203671s | 0.996 | 0.003138s / 0.004169s |
+
+The same-byte ripgrep stock rebuild and `char/rg-control` differed by 1.002 on this run (medians 0.006228s and 0.006216s). The oxipng outputs match, sha256 `e6e1003862ebc17db0cbbc22cbb87a7b927ffe835affb2fb9e821b379f55492d` over the eight files. A 0.4% oxipng move is inside a 1.5% standard deviation, and the ripgrep move is a slowdown past 1.01. In the stock libdeflate archive, `deflate_compress.o` has no YMM instructions. The AVX2 symbols are `adler32` and `crc32`. `matchfinder_init_avx2` is compiled only when `__AVX2__` is set, and `-mtune` does not set it. Rescheduling the scalar compressor did not produce a 0.97 aggregate.
+
+A separate oxipng build set `CFLAGS=-march=haswell` and left the Rust compiler stock. That does define `__AVX2__`. `deflate_compress.o` then has 1380 YMM lines, and the linked binary has 1917 against 482 in the stock binary. Log: `target/compiler-rewrite/logs/v3-ox-march.log` (cargo 12.87s, `EXIT:0`, run in parallel with nothing else, still not a cold-gate sample). The binary is sha256 `36601a5937530fe99f98c6d75eb31e10480308c7c6514801680d773846e70715`, 1526264 bytes, stripped 1313408. 1313408/1338440 = 0.981. The eight PNG outputs match the stock build. Twenty rotated runs gave a stock median of 0.209695s (mean 0.207146s, population stdev 0.005006s) and a haswell median of 0.204892s (mean 0.205442s, population stdev 0.004825s). The median ratio is 0.977 and the mean ratio is 0.992. The median gap is about one standard deviation of a single run, and the same stock binary's median moved from 0.204504s in the previous batch to 0.209695s here, so this is not a demonstrated runtime win. `-march=haswell` also makes the compressor require AVX2 with no runtime fallback, which is a hidden target change. It was not packaged.
+
+The locked rustfmt tree still does not compile (43 `rustc_ast` errors in `tune1-rf-base.log`). The in-tree 1.11.0 rustfmt was not substituted. With ripgrep near 1.0, the other two workloads have to average about 0.955 to pull a three-workload geomean to 0.97, and each stripped file has to stay at or under stock. These two passes grow every stripped file that was built and do not produce that runtime. Thresholds are unchanged. Checklist items 5-7 stay open.
