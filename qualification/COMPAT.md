@@ -35,7 +35,7 @@ Cargo's upstream suite was not started. `x.py test src/tools/cargo` with the con
 
 ## Locked cohorts
 
-Release builds used the frozen profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none), `--locked --offline`, and separate target directories under `target/compiler-rewrite/diff-central`. The cohort trees were clean. This was not a timing sample.
+Release builds used the frozen profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none), `--locked --offline`, and separate target directories under `target/compiler-rewrite/diff-central`. The cohort trees were clean. This was not a timing sample. It ran before the cargo replacement recorded above, so the fRust side still used the mtime cargo `sha256 68d30c1bb572553e783785f5aefe04a749a7969b9bf8852e598ef5e8e7cd7329` with packaged `frustc`. The control side used stage-2 `rustc` and the unpatched stage-2 cargo.
 
 | Artifact | Comparison |
 | --- | --- |
