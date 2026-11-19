@@ -61,7 +61,17 @@ def disk_usage(root):
         profile_dir = root / profile
         if not profile_dir.is_dir():
             continue
-        for name in ("incremental", "deps", "build", ".fingerprint"):
+        incremental = [
+            path for path in (profile_dir / "incremental",
+                              *(profile_dir / "build").glob("*/*/incremental"))
+            if path.is_dir()
+        ]
+        if incremental:
+            usage = [walk(path) for path in incremental]
+            size, blocks, entries = map(sum, zip(*usage))
+            counters[f"{profile}/incremental"] = dict(logical=size, allocated=blocks,
+                                                       entries=entries)
+        for name in ("deps", "build", ".fingerprint"):
             directory = profile_dir / name
             if directory.is_dir():
                 size, blocks, entries = walk(directory)

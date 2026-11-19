@@ -49,9 +49,26 @@ Path(destination).write_text(config)
 PY
 export RUST_BOOTSTRAP_CONFIG="$config"
 export TMPDIR="$work/tmp"
+bootstrap_python="$work/bootstrap-python"
+cat > "$bootstrap_python" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+args=("$@")
+# The profiling workloads also need proc_macro and test in the training sysroot.
+if [[ ${args[1]:-} == build ]]; then
+    for i in "${!args[@]}"; do
+        if [[ ${args[i]} == library/std ]]; then
+            args[i]=library
+        fi
+    done
+fi
+exec python3 "${args[@]}"
+BASH
+chmod +x "$bootstrap_python"
 cd "$source_dir"
 python3 x.py build --stage 1 opt-dist
 "$work/build/$host/stage1-tools-bin/opt-dist" local \
     --target-triple "$host" --checkout-dir "$source_dir" \
     --llvm-dir "$llvm" --artifact-dir "$work/profiles" --build-dir "$work/build" \
-    --build-llvm=false --use-bolt -- python3 x.py dist rustc rust-std cargo
+    --python "$bootstrap_python" --build-llvm=false --use-bolt \
+    -- python3 x.py dist rustc rust-std cargo

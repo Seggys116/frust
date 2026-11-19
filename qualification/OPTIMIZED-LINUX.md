@@ -12,9 +12,11 @@ Use an isolated checkout of the Rust pin with the intended Cargo and rustc patch
 bash support/optimize-linux.sh "$rust_source" "$work_directory" "$host_llvm_directory"
 ```
 
-The pipeline builds instrumented tools, trains them on the pinned rustc-perf suite, merges the profiles, rebuilds with PGO, then instruments and optimizes the rustc driver with BOLT. It reuses the already optimized shared LLVM and produces distribution archives. Check the final archive binaries and training logs before using the result in a benchmark.
+The pipeline builds instrumented tools, trains them on the pinned rustc-perf suite, merges the profiles, rebuilds with PGO, then instruments and optimizes the rustc driver with BOLT. It requests the full host library during opt-dist's bootstrap builds so training can compile proc macros and test binaries. It reuses the already optimized shared LLVM and produces distribution archives. Check the final archive binaries and training logs before using the result in a benchmark.
 
-Use the [build and disk collector](cpu-benchmark.py) with official Rust and the optimized package on the same core set. The [report's strict screen](report-cpu-disk.py) checks each measured build case against official Rust. It requires a median paired CPU ratio below one, target allocation at or below official Rust, and a paired runtime CPU upper bound at or below 1.01. A pass describes the measured cases and host.
+Use the [build and disk collector](cpu-benchmark.py) with official Rust and the optimized package on the same core set. Incremental allocation includes Cargo's flat and per-unit layouts and counts each inode once. The [report's strict screen](report-cpu-disk.py) checks each measured build case against official Rust. It requires a median paired CPU ratio below one, target allocation at or below official Rust, and a paired runtime CPU upper bound at or below 1.01. A pass describes the measured cases and host.
+
+The local launcher was also built with fat LTO, one codegen unit and PGO from the storage probe. It occupied 845,496 bytes compared with 1,007,000 for the release launcher. Thirty paired no-ops in each mode gave CPU ratios of 0.997 in both plain and static modes. This experiment establishes a smaller launcher and near-parity CPU for the measured no-ops. Its samples are in `target/compiler-rewrite/optimized-dist/launcher-noops.jsonl`.
 
 ## Automatic storage
 
@@ -31,5 +33,7 @@ The pinned Cargo stores units under `debug/build/<package>/<unit>/`. The existin
 | Explicit target directory | 6 / 3.69 MiB | 6 / 3.69 MiB |
 
 The active executable produced the expected output on each revision and remained fresh on the final invocation. The managed target used 32.6% fewer allocated bytes in the six-variant probe. This is a per-package retention result. Cross-workspace budget eviction and the concurrent-check patch combination need separate qualification. Raw samples are in `target/compiler-rewrite/optimized-dist/storage-verified-*.jsonl`.
+
+A second probe compiled an application with a build script and a feature-sensitive path dependency. The current and previous retained configurations reused all three Cargo artifacts without compiling again. The executable verified both the build-script value and the selected dependency feature. Its log is `target/compiler-rewrite/optimized-dist/storage-dependency-proof.log`.
 
 The local optimized retry uses the first three committed Cargo patches, the committed rustc patch, and the retention trial. Its compiler tools are isolated from the shared checkout. The first instrumented build reached Cargo and hit the host's missing OpenSSL development files. The retry uses the upstream Linux distribution's static Cargo dependency setting.

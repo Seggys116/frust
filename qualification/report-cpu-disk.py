@@ -307,6 +307,9 @@ def screen(groups, candidate):
                 if disk > 0:
                     failures += 1
                     print(f"FAIL {label} retained {disk / MIB:.3f} MiB more than official Rust")
+    if not checks:
+        print("FAIL no paired build or runtime checks")
+        return 1
     print(f"{failures} failures in {checks} measured checks")
     return int(failures > 0)
 
