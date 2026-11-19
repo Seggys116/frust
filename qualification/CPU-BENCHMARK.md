@@ -1,5 +1,7 @@
 # CPU build and executable benchmarks
 
+The [expanded CPU and disk matrix](CPU-DISK-BENCHMARK.md) measures additional LTO modes, incremental history, clean rebuilds, and the compiler allocator candidate.
+
 Measured on 19 November 2026 on Linux x86-64 with an Intel Core Ultra 7 255H. The three toolchains use Rust 1.100.0. **Official** is the unwrapped rustup-installed compiler and Cargo. **Control** is the unpatched source-built stage-2 package. **fRust** is the patched compiler package with an optimized build of its patched Cargo. The first pilot used debug Cargo by mistake. It is preserved separately and excluded from these tables.
 
 The official and control commands use their own `cargo` and `rustc`. fRust uses `fcargo` and its sibling `frustc` with the experimental object cache and RELR flags unset. Each run uses the same source snapshot, locked dependencies, and six Cargo jobs. Ripgrep builds use logical CPUs 0–5. fd and oxipng use CPUs 6–13. Compare toolchains within each workload and profile. The host was shared with other work.
