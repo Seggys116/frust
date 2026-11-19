@@ -1,0 +1,40 @@
+diff --git a/compiler/rustc_codegen_ssa/src/back/linker.rs b/compiler/rustc_codegen_ssa/src/back/linker.rs
+index 2b9ed32f2..c9ff88b84 100644
+--- a/compiler/rustc_codegen_ssa/src/back/linker.rs
++++ b/compiler/rustc_codegen_ssa/src/back/linker.rs
+@@ -28,6 +28,16 @@
+ use crate::base::needs_allocator_shim_for_linking;
+ use crate::{SymbolExport, diagnostics};
+ 
++fn invoked_as_frustc() -> bool {
++    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
+ #[cfg(test)]
+ mod tests;
+ 
+@@ -703,6 +713,18 @@ fn optimize(&mut self) {
+         {
+             self.link_arg("-O1");
+         }
++
++        // Reuse identical machine code after full LTO. `--icf=safe` folds only
++        // functions whose address is not taken, so function-pointer identity
++        // stays intact. `--icf=all` does not. The rustc hardlink keeps upstream
++        // linking. LLD is the linker that accepts this flag here.
++        if self.uses_lld
++            && (self.sess.opts.optimize == config::OptLevel::More
++                || self.sess.opts.optimize == config::OptLevel::Aggressive)
++            && invoked_as_frustc()
++        {
++            self.link_arg("--icf=safe");
++        }
+     }
+ 
+     fn pgo_gen(&mut self) {
