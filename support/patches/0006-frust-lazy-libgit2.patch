@@ -1,0 +1,234 @@
+diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
+index 77dd77c..3121f95 100644
+--- a/src/bin/cargo/main.rs
++++ b/src/bin/cargo/main.rs
+@@ -386,8 +386,9 @@ fn init_git() {
+     // validation in their code. This is inconvenient, but won't accidentally open consuming
+     // applications up to security issues if they use git2 to open repositories elsewhere in their
+     // code.
+-    unsafe {
+-        git2::opts::set_verify_owner_validation(false)
+-            .expect("set_verify_owner_validation should never fail");
+-    }
++    //
++    // The option is applied lazily by the first libgit2 entry point, because
++    // initializing libgit2 loads the TLS trust store and most invocations never
++    // touch git.
++    util::defer_git_init();
+ }
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index 146bf1d..3696ced 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -2529,15 +2529,16 @@ fn disables_multiplexing_for_bad_curl(
+ ) {
+     use crate::util::network;
+ 
+-    if network::proxy::http_proxy_exists(http, gctx) && http.multiplexing.is_none() {
+-        let bad_curl_versions = ["7.87.0", "7.88.0", "7.88.1"];
+-        if bad_curl_versions
+-            .iter()
+-            .any(|v| curl_version.starts_with(v))
+-        {
+-            tracing::info!("disabling multiplexing with proxy, curl version is {curl_version}");
+-            http.multiplexing = Some(false);
+-        }
++    let bad_curl_versions = ["7.87.0", "7.88.0", "7.88.1"];
++    // Test the version first so the proxy lookup only runs for affected libcurl.
++    if bad_curl_versions
++        .iter()
++        .any(|v| curl_version.starts_with(v))
++        && http.multiplexing.is_none()
++        && network::proxy::http_proxy_exists(http, gctx)
++    {
++        tracing::info!("disabling multiplexing with proxy, curl version is {curl_version}");
++        http.multiplexing = Some(false);
+     }
+ }
+ 
+diff --git a/src/ops/cargo_fix/mod.rs b/src/ops/cargo_fix/mod.rs
+index 90aeb7a..ad1dbc4 100644
+--- a/src/ops/cargo_fix/mod.rs
++++ b/src/ops/cargo_fix/mod.rs
+@@ -238,6 +238,7 @@ fn check_version_control(gctx: &GlobalContext, opts: &FixOptions) -> CargoResult
+ 
+     let mut dirty_files = Vec::new();
+     let mut staged_files = Vec::new();
++    crate::util::ensure_git_init();
+     if let Ok(repo) = git2::Repository::discover(gctx.cwd()) {
+         let mut repo_opts = git2::StatusOptions::new();
+         repo_opts.include_ignored(false);
+diff --git a/src/sources/git/oxide.rs b/src/sources/git/oxide.rs
+index 2bc4abf..ada6ce7 100644
+--- a/src/sources/git/oxide.rs
++++ b/src/sources/git/oxide.rs
+@@ -371,6 +371,7 @@ pub fn reinitialize(git_dir: &Path) -> CargoResult<()> {
+         // for an example issue that comes up.
+         opts.external_template(false);
+         opts.bare(bare);
++        crate::util::ensure_git_init();
+         git2::Repository::init_opts(&path, &opts)?;
+         Ok(())
+     }
+diff --git a/src/sources/git/utils.rs b/src/sources/git/utils.rs
+index 1594ac4..daaff9b 100644
+--- a/src/sources/git/utils.rs
++++ b/src/sources/git/utils.rs
+@@ -153,6 +153,7 @@ impl GitRemote {
+ 
+     /// Creates a [`GitDatabase`] of this remote at `db_path`.
+     pub fn db_at(&self, db_path: &Path) -> CargoResult<GitDatabase> {
++        crate::util::ensure_git_init();
+         let repo = git2::Repository::open(db_path)?;
+         Ok(GitDatabase {
+             remote: self.clone(),
+@@ -176,6 +177,7 @@ impl GitDatabase {
+         // A non-fresh checkout can happen if the checkout operation was
+         // interrupted. In that case, the checkout gets deleted and a new
+         // clone is created.
++        crate::util::ensure_git_init();
+         let checkout = match git2::Repository::open(dest)
+             .ok()
+             .map(|repo| GitCheckout::new(self, rev, repo))
+@@ -312,6 +314,7 @@ impl<'a> GitCheckout<'a> {
+         // we're doing a local filesystem-to-filesystem clone so there should
+         // be no need to respect global configuration options, so pass in
+         // an empty instance of `git2::Config` below.
++        crate::util::ensure_git_init();
+         let git_config = git2::Config::new()?;
+ 
+         // Clone the repository, but make sure we use the "local" option in
+@@ -1518,6 +1521,7 @@ fn fetch_with_libgit2(
+         unsafe { init_git_transports(gctx) };
+     });
+ 
++    crate::util::ensure_git_init();
+     let git_config = git2::Config::open_default()?;
+     with_fetch_options(&git_config, remote_url, gctx, &mut |mut opts| {
+         if tags {
+@@ -1716,6 +1720,7 @@ fn init(path: &Path, bare: bool) -> CargoResult<git2::Repository> {
+     // for an example issue that comes up.
+     opts.external_template(false);
+     opts.bare(bare);
++    crate::util::ensure_git_init();
+     Ok(git2::Repository::init_opts(&path, &opts)?)
+ }
+ 
+diff --git a/src/sources/registry/git_remote.rs b/src/sources/registry/git_remote.rs
+index b030ee5..23df27a 100644
+--- a/src/sources/registry/git_remote.rs
++++ b/src/sources/registry/git_remote.rs
+@@ -113,6 +113,7 @@ impl<'gctx> GitRegistry<'gctx> {
+                 .gctx
+                 .assert_package_cache_locked(CacheLockMode::DownloadExclusive, &self.index_path);
+ 
++            crate::util::ensure_git_init();
+             self.repo.replace(Some(match git2::Repository::open(&path) {
+                 Ok(repo) => repo,
+                 Err(_) => {
+diff --git a/src/util/mod.rs b/src/util/mod.rs
+index fd990e4..b264fff 100644
+--- a/src/util/mod.rs
++++ b/src/util/mod.rs
+@@ -24,7 +24,9 @@ pub use self::rustc::Rustc;
+ pub use self::semver_ext::VersionReqMatchMode;
+ pub use self::semver_ext::{OptVersionReq, VersionExt};
+ pub use self::unhashed::Unhashed;
+-pub use self::vcs::{FossilRepo, GitRepo, HgRepo, PijulRepo, existing_vcs_repo};
++pub use self::vcs::{
++    FossilRepo, GitRepo, HgRepo, PijulRepo, defer_git_init, ensure_git_init, existing_vcs_repo,
++};
+ pub use self::workspace::{
+     add_path_args, path_args, print_available_benches, print_available_binaries,
+     print_available_examples, print_available_packages, print_available_tests,
+diff --git a/src/util/network/http.rs b/src/util/network/http.rs
+index 0aa44a6..cbcc6f5 100644
+--- a/src/util/network/http.rs
++++ b/src/util/network/http.rs
+@@ -40,9 +40,9 @@ pub fn http_handle_and_timeout(gctx: &GlobalContext) -> CargoResult<(Easy, HttpT
+ //
+ // The custom transport, however, is not as well battle-tested.
+ pub fn needs_custom_http_transport(gctx: &GlobalContext) -> CargoResult<bool> {
+-    Ok(super::proxy::http_proxy_exists(gctx.http_config()?, gctx)
+-        || *gctx.http_config()? != Default::default()
+-        || gctx.get_env_os("HTTP_TIMEOUT").is_some())
++    Ok(*gctx.http_config()? != Default::default()
++        || gctx.get_env_os("HTTP_TIMEOUT").is_some()
++        || super::proxy::http_proxy_exists(gctx.http_config()?, gctx))
+ }
+ /// Configure a libcurl http handle with the defaults options for Cargo
+ pub struct HandleConfiguration {
+diff --git a/src/util/network/proxy.rs b/src/util/network/proxy.rs
+index 44786bb..52b6e06 100644
+--- a/src/util/network/proxy.rs
++++ b/src/util/network/proxy.rs
+@@ -19,6 +19,7 @@ pub fn http_proxy(http: &CargoHttpConfig) -> Option<String> {
+     if let Some(s) = &http.proxy {
+         return Some(s.into());
+     }
++    crate::util::ensure_git_init();
+     git2::Config::open_default()
+         .and_then(|cfg| cfg.get_string("http.proxy"))
+         .ok()
+@@ -35,8 +36,10 @@ pub fn http_proxy(http: &CargoHttpConfig) -> Option<String> {
+ /// * `https_proxy` env var
+ /// * `HTTPS_PROXY` env var
+ pub fn http_proxy_exists(http: &CargoHttpConfig, gctx: &GlobalContext) -> bool {
+-    http_proxy(http).is_some()
++    // Cheap checks first: reading git's config initializes libgit2.
++    http.proxy.is_some()
+         || LIBCURL_HTTP_PROXY_ENVS
+             .iter()
+             .any(|v| gctx.get_env(v).is_ok())
++        || http_proxy(http).is_some()
+ }
+diff --git a/src/util/vcs.rs b/src/util/vcs.rs
+index 2d747e1..aef085d 100644
+--- a/src/util/vcs.rs
++++ b/src/util/vcs.rs
+@@ -2,6 +2,32 @@ use crate::util::CargoResult;
+ use cargo_util::ProcessBuilder;
+ use cargo_util::paths;
+ use std::path::Path;
++use std::sync::Once;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++static GIT_OWNER_VALIDATION_OFF: AtomicBool = AtomicBool::new(false);
++static GIT_INIT: Once = Once::new();
++
++/// Records that the binary wants libgit2 owner validation disabled. The
++/// option is applied by the first [`ensure_git_init`] call, so builds that
++/// never touch git avoid initializing libgit2 and its TLS stack.
++pub fn defer_git_init() {
++    GIT_OWNER_VALIDATION_OFF.store(true, Ordering::Release);
++}
++
++/// Initializes libgit2 on first use. Call before any libgit2 repository,
++/// config or transport entry point.
++pub fn ensure_git_init() {
++    GIT_INIT.call_once(|| {
++        if GIT_OWNER_VALIDATION_OFF.load(Ordering::Acquire) {
++            // SAFETY: runs once, before any repository is opened.
++            unsafe {
++                git2::opts::set_verify_owner_validation(false)
++                    .expect("set_verify_owner_validation should never fail");
++            }
++        }
++    });
++}
+ 
+ // Check if we are in an existing repo. We define that to be true if either:
+ //
+@@ -32,10 +58,12 @@ pub struct FossilRepo;
+ 
+ impl GitRepo {
+     pub fn init(path: &Path, _: &Path) -> CargoResult<GitRepo> {
++        ensure_git_init();
+         git2::Repository::init(path)?;
+         Ok(GitRepo)
+     }
+     pub fn discover(path: &Path, _: &Path) -> Result<git2::Repository, git2::Error> {
++        ensure_git_init();
+         git2::Repository::discover(path)
+     }
+ }
