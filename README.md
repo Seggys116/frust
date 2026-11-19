@@ -10,7 +10,7 @@
 
 </div>
 
-This branch starts the fRust compiler rewrite. It contains project documentation. Compiler builds, installation packages and benchmark results will appear once the toolchain is available and verified.
+This branch packages a source-equivalent Rust 1.100.0 stage-2 toolchain (`frustc`, `fcargo`, and rustdoc). Two measured compiler changes missed the frozen release-build budgets. Those probes are recorded in `qualification/CANDIDATE.md`. No faster-rebuild claim is made from them.
 
 | Area | Design target |
 | --- | --- |
