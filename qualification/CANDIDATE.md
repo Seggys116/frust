@@ -130,3 +130,21 @@ Against the frozen leaf medians (wall 19.14s, RSS 495216 kB):
 - Unstripped `rg` is 4405552 bytes, sha256 `9af9ac5e16737ca1da64263aab4c718cae9b00b4cc6f3b3b4f7885ac1f8df866`. `strip --strip-unneeded` leaves 3742608 bytes, 3742608/4024992 = 0.930, under the 0.97 bar of 3904242 bytes. `readelf -V` shows `GLIBC_ABI_DT_RELR`. `rg --version` prints ripgrep 15.2.0.
 
 `.text` is still 2538086 bytes. It is not byte-identical to the control differential `rg`: 12146 bytes differ. The corpus command (`rg --no-config -j 1 -F frust_needle_7 search.txt`) produced the same stdout from both binaries (423040 bytes, exit 0). On 30 runs after 5 warmups, in the same session, the control median was 0.005820s and the candidate median was 0.005766s, a ratio of 0.991. That is not under 0.97. The frozen corpus median of 0.004839s is not the comparison, because the control binary on this session was 0.005820s. A 30-pair build gate would time this same binary. It cannot turn 0.991 into a runtime aggregate of 0.97. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open. Syn and regex were not sampled.
+
+## Arrow Lake scheduling is not a runtime win
+
+This was a characterization on the unpatched stage-2 compiler, not a patch and not a packaged candidate. `-Z tune-cpu=arrowlake` sets LLVM's scheduling model. It does not change `target-cpu`. A small probe compiled three ways at opt-level 3 with fat LTO: the default and the arrowlake tune both had no AVX or YMM instructions, while `target-cpu=native` had 1330. The same check on the ripgrep binaries below counted 1012 YMM lines in each, so the tune did not widen the ISA. `build-control` was not modified.
+
+Both ripgrep builds used the frozen release profile (opt-level 3, fat LTO, one codegen unit, incremental, debug 0, strip none) from an empty target. They ran together, so the wall times are not cold-gate samples: default 32.57s and 446940 kB, arrowlake 32.84s and 459544 kB, both exit 0. Logs: `target/compiler-rewrite/logs/tune1-rg-base.log` and `tune1-rg-arrow.log`. The default binary matches the control differential `rg` byte for byte, sha256 `805d49a86cf3c51c68ce03e6ef30fc61ba109dcad652de1a0d0125c1a0ebd8b4`, 4687944 bytes. The tuned binary is sha256 `8c57f5500d7108b66c3980c7d8bd8e0b53766510d9013ce57074f7fa5ad2a41a`, 4738152 bytes. `strip --strip-unneeded` leaves 4024992 and 4074944 bytes. 4074944/4024992 = 1.012, so this workload's stripped file grew. The size gate requires every workload to be no larger than stock.
+
+The corpus command was `rg --no-config -j 1 -F frust_needle_7 search.txt`. Stdout matched, 423040 bytes. A first 30-run pair was taken while the rustfmt attempt below was still compiling, and it is not the result: the medians were 0.007968s and 0.008276s. After that load ended, 30 interleaved runs with the order rotated gave:
+
+| Binary | Median | Mean | Population stdev |
+| --- | --- | --- | --- |
+| default | 0.006181s | 0.006182s | 0.000075s |
+| arrowlake | 0.006230s | 0.006223s | 0.000057s |
+| control `rg` | 0.006088s | 0.006094s | 0.000074s |
+
+The tuned median over the default median is 0.006230/0.006181 = 1.008. The default binary and `target/compiler-rewrite/char/rg-control` are the same bytes, and those two medians still differ by 1.015, so a ratio this close to 1 is inside the noise of a 6ms process start. It is not a 0.97 runtime win. One workload at about 1.0 cannot be pulled under a 0.97 aggregate by the other two unless those two average about 0.94, and this workload's stripped file already grew.
+
+The locked rustfmt tree (`cebab3e99259be82ff069e5ae89e91855d79e534`, the peel of tag `5eb206859397a1cb7a6ef91790d38591c0a36ac9`) does not compile with this stage-2 compiler. Cargo got past the missing `overload` crate once the network retry ran, then `rustfmt-nightly` failed with 43 errors against the current `rustc_ast` (`EXIT:101` in `tune1-rf-base.log` and `tune1-rf-arrow.log`). The compiler tree's own rustfmt is 1.11.0 (`d957b2ec4b0120979585316f2f342400ccafb16c`) and was not substituted. Oxipng was not built: the ripgrep size regression already fails the per-workload size rule. The tune was not added to `frustc`. The 30-pair gate was not run. Thresholds are unchanged. Checklist items 5-7 stay open.
