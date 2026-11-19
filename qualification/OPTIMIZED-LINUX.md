@@ -2,11 +2,11 @@
 
 The earlier [CPU and disk measurements](CPU-DISK-BENCHMARK.md) used a release-optimized Cargo and a source-built stage-2 compiler. Official Rust 1.100.0 uses additional profile training and post-link optimization. The two compiler builds therefore start from different host optimization levels.
 
-[The optimized Linux build driver](../support/optimize-linux.sh) runs the pinned Rust checkout's own `opt-dist local` pipeline. It uses ThinLTO and one codegen unit for rustc, clang and LLD, jemalloc for Rust toolchain allocations, vendored native Cargo dependencies, and PGO for rustc, Cargo, rustdoc and Clippy. The LLVM link uses the pinned CI artifact. On this machine its SHA-256 also matched the installed official Rust LLVM library, `517f2e2d3762ccd6fe742c1b2fc720f447777c2589c99f58e7d12bfacf7b908c`.
+[The optimized Linux build driver](../support/optimize-linux.sh) runs the pinned Rust checkout's own `opt-dist local` pipeline. It uses ThinLTO, one codegen unit for rustc and the standard library, line information for the standard library, clang and LLD, jemalloc for Rust toolchain allocations, vendored native Cargo dependencies, and PGO for rustc, Cargo, rustdoc and Clippy. The LLVM link uses the pinned CI artifact. On this machine its SHA-256 also matched the installed official Rust LLVM library, `517f2e2d3762ccd6fe742c1b2fc720f447777c2589c99f58e7d12bfacf7b908c`.
 
 ## Build and compare
 
-Use an isolated checkout of the Rust pin with the intended Cargo and rustc patches applied. Initialize the pinned Cargo, LLVM, backtrace and rustc-perf submodules and the documentation submodules used by the training run. Provide clang and LLD on `PATH`. The host LLVM tool directory must provide working `bin/llvm-bolt`, `bin/merge-fdata` and `bin/llvm-profdata`. Use the pinned LLVM's profiler reader for compatible instrumentation data. The script builds in its specified work directory and uses that directory for temporary profiles.
+Use an isolated checkout of the Rust pin with the intended Cargo and rustc patches applied. Initialize the pinned Cargo, LLVM, backtrace and rustc-perf submodules and the documentation submodules used by the training run. Provide clang, LLD and a `strip` with `--keep-file-symbols` on `PATH`. BOLT requires those file symbols for split functions. The host LLVM tool directory must provide working `bin/llvm-bolt`, `bin/merge-fdata` and `bin/llvm-profdata`. Use the pinned LLVM's profiler reader for compatible instrumentation data. The script builds in its specified work directory and uses that directory for temporary profiles.
 
 ```sh
 bash support/optimize-linux.sh "$rust_source" "$work_directory" "$host_llvm_directory"
@@ -17,6 +17,8 @@ The pipeline builds instrumented tools, trains them on the pinned rustc-perf sui
 Use the [build and disk collector](cpu-benchmark.py) with official Rust and the optimized package on the same core set. Incremental allocation includes Cargo's flat and per-unit layouts and counts each inode once. The [report's strict screen](report-cpu-disk.py) checks each measured build case against official Rust. It requires a median paired CPU ratio below one, target allocation at or below official Rust, and a paired runtime CPU upper bound at or below 1.01. A pass describes the measured cases and host.
 
 The local launcher was also built with fat LTO, one codegen unit and PGO from the storage probe. It occupied 845,496 bytes compared with 1,007,000 for the release launcher. Thirty paired no-ops in each mode gave CPU ratios of 0.997 in both plain and static modes. This experiment establishes a smaller launcher and near-parity CPU for the measured no-ops. Its samples are in `target/compiler-rewrite/optimized-dist/launcher-noops.jsonl`.
+
+The PGO-only diagnostic isolated no-op overhead on a one-crate target. Across 30 alternating rounds on one core, median CPU was 36.65 ms for official Cargo, 38.94 ms for PGO fRust Cargo invoked directly, and 41.18 ms through the PGO launcher. All 90 samples reused the existing compilation. The paired launcher/direct difference was 2.30 ms. A separate syscall trace recorded two executable loads through the launcher and one in either direct invocation. Direct fRust Cargo still used 5.8% more CPU by the paired median. Samples and traces are under `target/compiler-rewrite/optimized-dist/pgo-noop-*`.
 
 ## Automatic storage
 

@@ -54,7 +54,8 @@ config = Path(source).read_text().replace(
     'metrics = true\nsubmodules = false\nallocator = "jemalloc"\nprofiler = true\n'
     'cargo-native-static = true\n'
 ).replace(
-    "[rust]\n", "[rust]\ncodegen-units = 1\nbootstrap-override-lld = true\n"
+    "[rust]\n", "[rust]\ncodegen-units = 1\ncodegen-units-std = 1\n"
+    "debuginfo-level-std = 1\nbootstrap-override-lld = true\n"
 )
 config += '\n[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\n'
 Path(destination).write_text(config)
