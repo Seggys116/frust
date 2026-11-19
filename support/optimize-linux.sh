@@ -21,6 +21,12 @@ for tool in llvm-bolt merge-fdata llvm-profdata; do
 done
 clang --version
 ld.lld --version
+host_strip=$(realpath -- "$(command -v strip)")
+export FRUST_BOOTSTRAP_STRIP="$host_strip"
+[[ $("$FRUST_BOOTSTRAP_STRIP" --help) == *--keep-file-symbols* ]] || {
+    echo "the Linux optimizer build requires strip --keep-file-symbols" >&2
+    exit 2
+}
 bash "$root/support/verify-pins.sh" "$source_dir"
 training=$(git -C "$source_dir" rev-parse HEAD:src/tools/rustc-perf)
 [[ -f "$source_dir/src/tools/rustc-perf/Cargo.toml" &&
@@ -29,7 +35,13 @@ training=$(git -C "$source_dir" rev-parse HEAD:src/tools/rustc-perf)
     exit 2
 }
 
-mkdir -p "$work/tmp"
+mkdir -p "$work/tmp" "$work/bootstrap-tools"
+cat > "$work/bootstrap-tools/strip" <<'BASH'
+#!/usr/bin/env bash
+exec "$FRUST_BOOTSTRAP_STRIP" --keep-file-symbols "$@"
+BASH
+chmod +x "$work/bootstrap-tools/strip"
+export PATH="$work/bootstrap-tools:$PATH"
 config="$work/bootstrap-optimized.toml"
 python3 - "$root/support/bootstrap.toml" "$config" "$work/build" <<'PY'
 import json
