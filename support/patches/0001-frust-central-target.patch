@@ -293,7 +293,7 @@ new file mode 100644
 index 0000000..c22b961
 --- /dev/null
 +++ b/src/frust_paths.rs
-@@ -0,0 +1,1472 @@
+@@ -0,0 +1,1535 @@
 +//! User JSON roots, workspace namespaces, and the optional artifact cache.
 +//!
 +//! This module is standard-library only so the Cargo patch can compile the same file.
@@ -549,7 +549,37 @@ index 0000000..c22b961
 +    ))
 +}
 +
-+/// Load `config.json` from the host location. A missing file uses defaults.
++/// Name of the environment variable that moves every fRust root to one directory.
++pub const HOME_ENV: &str = "FRUST_HOME";
++
++/// Apply `FRUST_HOME`: when set and non-empty it replaces both roots, so targets live in
++/// `$FRUST_HOME/targets` and the artifact cache in `$FRUST_HOME/artifacts`. It outranks the
++/// roots in `config.json`, which keeps the other settings of that file.
++pub fn apply_frust_home(
++    roots: ResolvedRoots,
++    frust_home: Option<&str>,
++) -> Result<ResolvedRoots, ConfigError> {
++    let Some(text) = frust_home.filter(|text| !text.is_empty()) else {
++        return Ok(roots);
++    };
++    let home = PathBuf::from(text);
++    if text.contains('\0') || !home.is_absolute() {
++        return Err(error(
++            &roots.config_path,
++            &format!("{HOME_ENV} must be an absolute path, got `{text}`"),
++        ));
++    }
++    Ok(ResolvedRoots {
++        targets_dir: home.join("targets"),
++        artifacts_dir: home.join("artifacts"),
++        target_root: home.clone(),
++        cache_root: home,
++        ..roots
++    })
++}
++
++/// Load `config.json` from the host location, then apply `FRUST_HOME`. A missing file uses
++/// defaults.
 +pub fn load_roots_from_host(
 +    os: HostOs,
 +    home: &Path,
@@ -557,13 +587,14 @@ index 0000000..c22b961
 +    xdg_cache_home: Option<&str>,
 +) -> Result<ResolvedRoots, ConfigError> {
 +    let path = absolute_config_path(os, home, xdg_config_home)?;
-+    match read_file(&path) {
-+        Ok(bytes) => resolve_roots(os, home, xdg_config_home, xdg_cache_home, Some(&bytes)),
++    let roots = match read_file(&path) {
++        Ok(bytes) => resolve_roots(os, home, xdg_config_home, xdg_cache_home, Some(&bytes))?,
 +        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-+            resolve_roots(os, home, xdg_config_home, xdg_cache_home, None)
++            resolve_roots(os, home, xdg_config_home, xdg_cache_home, None)?
 +        }
-+        Err(err) => Err(error(&path, &format!("could not read file ({err})"))),
-+    }
++        Err(err) => return Err(error(&path, &format!("could not read file ({err})"))),
++    };
++    apply_frust_home(roots, std::env::var(HOME_ENV).ok().as_deref())
 +}
 +
 +pub fn canonical_workspace(path: &Path) -> PathBuf {
@@ -1185,6 +1216,38 @@ index 0000000..c22b961
 +            CacheOpen::Fallback { reason: "cache path is not a directory" }
 +        );
 +        let _ = fs::remove_dir_all(&root);
++    }
++
++    #[test]
++    fn frust_home_replaces_both_roots_and_keeps_other_settings() {
++        let home = Path::new("/home/builder");
++        let config = br#"{"version":1,"target_root":"/opt/t","cache_root":"/opt/c","cache_max_bytes":2147483648}"#;
++        let roots = resolve_roots(HostOs::Linux, home, None, None, Some(config)).unwrap();
++        let moved = apply_frust_home(roots, Some("/Volumes/Secure/Frust")).unwrap();
++        assert_eq!(moved.target_root, PathBuf::from("/Volumes/Secure/Frust"));
++        assert_eq!(moved.cache_root, PathBuf::from("/Volumes/Secure/Frust"));
++        assert_eq!(moved.targets_dir, PathBuf::from("/Volumes/Secure/Frust/targets"));
++        assert_eq!(moved.artifacts_dir, PathBuf::from("/Volumes/Secure/Frust/artifacts"));
++        assert_eq!(moved.cache_max_bytes, Some(2147483648));
++    }
++
++    #[test]
++    fn unset_or_empty_frust_home_changes_nothing() {
++        let home = Path::new("/home/builder");
++        let roots = resolve_roots(HostOs::Linux, home, None, None, None).unwrap();
++        for value in [None, Some("")] {
++            let same = apply_frust_home(roots.clone(), value).unwrap();
++            assert_eq!(same.targets_dir, roots.targets_dir);
++            assert_eq!(same.artifacts_dir, roots.artifacts_dir);
++        }
++    }
++
++    #[test]
++    fn relative_frust_home_is_rejected_with_its_name() {
++        let home = Path::new("/home/builder");
++        let roots = resolve_roots(HostOs::Linux, home, None, None, None).unwrap();
++        let text = apply_frust_home(roots, Some("relative/dir")).unwrap_err().diagnostic();
++        assert!(text.contains("FRUST_HOME must be an absolute path"), "{text}");
 +    }
 +
 +    const VALID_DOC: &[u8] = br#"{"version":1,"target_root":"/tmp/a b","cache_root":"/tmp/caf\u00e9"}"#;

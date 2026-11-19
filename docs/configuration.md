@@ -34,6 +34,10 @@ An `XDG_*` value that is empty or not absolute is ignored. Targets go under `<ta
 
 ## Artifact cache directory
 
+### FRUST_HOME
+
+`FRUST_HOME=/absolute/path` moves both roots for that invocation: targets go under `$FRUST_HOME/targets` and the artifact cache under `$FRUST_HOME/artifacts`, exactly as if `target_root` and `cache_root` were both `$FRUST_HOME`. It outranks the roots in `config.json` (the other settings of that file still apply) and nothing is written to the default locations. An empty value is ignored and a relative path is rejected with a diagnostic naming the variable.
+
 The patched Cargo creates `<cache_root>/artifacts` and a `MARKER` file containing `frust-cache-v1`. If the path is not a directory, cannot be written, or holds an unreadable or different marker, the check reports a fallback. The patched Cargo ignores that result for central targets. The unit artifact cache below stores in `units/v1` inside this directory and stays off when the check does not report the directory ready. The opt-in compiler object cache described in [how-it-works](how-it-works.md) is stored next to the compiler's output object, not here.
 
 ## Unit artifact cache
