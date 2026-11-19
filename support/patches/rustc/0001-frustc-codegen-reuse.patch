@@ -1,0 +1,430 @@
+diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
+index deaa78fcd..af409cd00 100644
+--- a/compiler/rustc_codegen_llvm/src/back/write.rs
++++ b/compiler/rustc_codegen_llvm/src/back/write.rs
+@@ -948,6 +948,77 @@ pub(crate) fn optimize(
+     }
+ }
+ 
++fn invoked_as_frustc() -> bool {
++    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
++fn opt_level_tag(level: config::OptLevel) -> &'static str {
++    match level {
++        config::OptLevel::No => "0",
++        config::OptLevel::Less => "1",
++        config::OptLevel::More => "2",
++        config::OptLevel::Aggressive => "3",
++        config::OptLevel::Size => "s",
++        config::OptLevel::SizeMin => "z",
++    }
++}
++
++/// Stable object cache for frustc. The directory is the object file's parent,
++/// which is the Cargo `--out-dir` and survives incremental sessions. The
++/// per-invocation suffix on the temporary object name is not part of the key.
++fn frust_codegen_cache_path(
++    cgcx: &CodegenContext,
++    config: &ModuleConfig,
++    module: &llvm::Module,
++    obj_out: &Path,
++) -> Option<PathBuf> {
++    if !invoked_as_frustc() {
++        return None;
++    }
++    let mut has_debug = 0u8;
++    let hash = unsafe { llvm::LLVMRustModuleCodegenHash(module, &mut has_debug) };
++    if has_debug != 0 {
++        return None;
++    }
++    let parent = obj_out.parent()?;
++    let builtins = if config.no_builtins { "1" } else { "0" };
++    let opt = opt_level_tag(cgcx.opt_level);
++    let name = format!("v1-{opt}-{builtins}-{hash:016x}.o");
++    Some(parent.join("frust-codegen-cache").join(name))
++}
++
++fn copy_cached_object(cache: &Path, output: &Path) -> bool {
++    let Ok(meta) = fs::metadata(cache) else {
++        return false;
++    };
++    if !meta.is_file() || meta.len() == 0 {
++        return false;
++    }
++    fs::copy(cache, output).is_ok()
++}
++
++fn store_cached_object(cache: &Path, output: &Path) {
++    let Some(parent) = cache.parent() else {
++        return;
++    };
++    if fs::create_dir_all(parent).is_err() {
++        return;
++    }
++    let tmp = cache.with_extension("tmp");
++    if fs::copy(output, &tmp).is_err() {
++        return;
++    }
++    if fs::rename(&tmp, cache).is_err() {
++        let _ = fs::remove_file(&tmp);
++    }
++}
++
+ pub(crate) fn codegen(
+     cgcx: &CodegenContext,
+     prof: &SelfProfilerRef,
+@@ -1108,17 +1179,32 @@ extern "C" fn demangle_callback(
+                     (_, SplitDwarfKind::Split) => Some(dwo_out.as_path()),
+                 };
+ 
+-                write_output_file(
+-                    dcx,
+-                    tm.raw(),
+-                    config.no_builtins,
+-                    llmod,
+-                    &obj_out,
+-                    dwo_out,
+-                    llvm::FileType::ObjectFile,
+-                    prof,
+-                    config.verify_llvm_ir,
+-                );
++                // Split DWARF writes a paired .dwo. Reuse only a single object.
++                let cache = if dwo_out.is_none() {
++                    frust_codegen_cache_path(cgcx, config, llmod, &obj_out)
++                } else {
++                    None
++                };
++                let reused = match cache.as_deref() {
++                    Some(path) => copy_cached_object(path, &obj_out),
++                    None => false,
++                };
++                if !reused {
++                    write_output_file(
++                        dcx,
++                        tm.raw(),
++                        config.no_builtins,
++                        llmod,
++                        &obj_out,
++                        dwo_out,
++                        llvm::FileType::ObjectFile,
++                        prof,
++                        config.verify_llvm_ir,
++                    );
++                    if let Some(path) = cache.as_deref() {
++                        store_cached_object(path, &obj_out);
++                    }
++                }
+             }
+ 
+             EmitObj::Bitcode => {
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+index 655a79e34..a4e677dd5 100644
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -2445,6 +2445,12 @@ pub(crate) fn LLVMRustWriteOutputFile<'a>(
+         FileType: FileType,
+         VerifyIR: bool,
+     ) -> LLVMRustResult;
++    /// Order-independent hash of the module for object reuse. `HasDebugCompileUnit`
++    /// is set when `llvm.dbg.cu` is present; callers must not reuse those objects.
++    pub(crate) fn LLVMRustModuleCodegenHash<'a>(
++        M: &'a Module,
++        HasDebugCompileUnit: &mut u8,
++    ) -> u64;
+     pub(crate) fn LLVMRustOptimize<'a>(
+         M: &'a Module,
+         TM: &'a TargetMachine,
+diff --git a/compiler/rustc_codegen_ssa/src/back/linker.rs b/compiler/rustc_codegen_ssa/src/back/linker.rs
+index 2b9ed32f2..b2ca6dc4f 100644
+--- a/compiler/rustc_codegen_ssa/src/back/linker.rs
++++ b/compiler/rustc_codegen_ssa/src/back/linker.rs
+@@ -28,6 +28,16 @@
+ use crate::base::needs_allocator_shim_for_linking;
+ use crate::{SymbolExport, diagnostics};
+ 
++fn invoked_as_frustc() -> bool {
++    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *CACHED.get_or_init(|| {
++        env::current_exe()
++            .ok()
++            .and_then(|path| path.file_name().map(|name| name == "frustc"))
++            .unwrap_or(false)
++    })
++}
++
+ #[cfg(test)]
+ mod tests;
+ 
+@@ -702,6 +712,16 @@ fn optimize(&mut self) {
+             || self.sess.opts.optimize == config::OptLevel::Aggressive
+         {
+             self.link_arg("-O1");
++            // RELR packs relative relocations. `--pack-dyn-relocs=relr` does not
++            // emit the GLIBC_ABI_DT_RELR version, so the loader rejects the file.
++            // The rustc hardlink keeps the stock link line.
++            if self.is_gnu
++                && !self.sess.target.is_like_wasm
++                && !self.sess.crt_static(None)
++                && invoked_as_frustc()
++            {
++                self.link_args(&["-z", "pack-relative-relocs"]);
++            }
+         }
+     }
+ 
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+index beb63ad61..03aa33974 100644
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -3,7 +3,9 @@
+ #include "llvm-c/Core.h"
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/StableHashing.h"
+ #include "llvm/Analysis/Lint.h"
+ #include "llvm/Analysis/TargetLibraryInfo.h"
+ #if LLVM_VERSION_GE(22, 0)
+@@ -14,7 +16,10 @@
+ #include "llvm/CodeGen/CommandFlags.h"
+ #include "llvm/IR/AssemblyAnnotationWriter.h"
+ #include "llvm/IR/AutoUpgrade.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DebugInfoMetadata.h"
+ #include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/StructuralHash.h"
+ #include "llvm/IR/PassManager.h"
+ #include "llvm/IR/Verifier.h"
+ #include "llvm/IRPrinter/IRPrintingPasses.h"
+@@ -483,6 +488,206 @@ extern "C" void LLVMRustSetLLVMOptions(int Argc, char **Argv) {
+   cl::ParseCommandLineOptions(Argc, Argv);
+ }
+ 
++// Hash used to reuse a whole object file after optimization. Symbol order is
++// not part of the key: a hit copies one complete object, so a different legal
++// layout of the same symbols stays consistent. Debug-info nodes are omitted;
++// callers skip the cache when llvm.dbg.cu is present. Global initializers are
++// included because StructuralHash does not hash them.
++static stable_hash frust_hash_constant(const Constant *C,
++                                       DenseSet<const GlobalValue *> &Stack) {
++  SmallVector<stable_hash, 8> H;
++  H.push_back(C->getValueID());
++  H.push_back(static_cast<stable_hash>(C->getType()->getTypeID()));
++
++  if (const auto *GV = dyn_cast<GlobalValue>(C)) {
++    H.push_back(xxh3_64bits(GV->getName()));
++    if (const auto *GVar = dyn_cast<GlobalVariable>(GV)) {
++      if (GVar->hasInitializer() && Stack.insert(GV).second) {
++        H.push_back(frust_hash_constant(GVar->getInitializer(), Stack));
++        Stack.erase(GV);
++      }
++    } else if (const auto *A = dyn_cast<GlobalAlias>(GV)) {
++      if (const auto *Aliasee = A->getAliasee()) {
++        if (Stack.insert(GV).second) {
++          H.push_back(frust_hash_constant(Aliasee, Stack));
++          Stack.erase(GV);
++        }
++      }
++    }
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++  }
++
++  if (const auto *CI = dyn_cast<ConstantInt>(C)) {
++    const APInt &V = CI->getValue();
++    H.push_back(V.getBitWidth());
++    for (unsigned I = 0; I < V.getNumWords(); ++I)
++      H.push_back(V.getRawData()[I]);
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++  }
++
++  if (const auto *CF = dyn_cast<ConstantFP>(C)) {
++    APInt Bits = CF->getValueAPF().bitcastToAPInt();
++    H.push_back(Bits.getBitWidth());
++    for (unsigned I = 0; I < Bits.getNumWords(); ++I)
++      H.push_back(Bits.getRawData()[I]);
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++  }
++
++  if (const auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
++    H.push_back(xxh3_64bits(CDS->getRawDataValues()));
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++  }
++
++  if (isa<ConstantAggregateZero>(C) || isa<UndefValue>(C) || isa<PoisonValue>(C))
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++
++  if (const auto *BA = dyn_cast<BlockAddress>(C)) {
++    H.push_back(xxh3_64bits(BA->getFunction()->getName()));
++    if (const BasicBlock *BB = BA->getBasicBlock())
++      H.push_back(xxh3_64bits(BB->getName()));
++    return stable_hash_combine(ArrayRef<stable_hash>(H));
++  }
++
++  for (const Use &Op : C->operands()) {
++    if (const auto *OpC = dyn_cast<Constant>(Op))
++      H.push_back(frust_hash_constant(OpC, Stack));
++  }
++  return stable_hash_combine(ArrayRef<stable_hash>(H));
++}
++
++static stable_hash frust_hash_md(const Metadata *MD, unsigned Depth) {
++  if (!MD || Depth > 6)
++    return 0;
++  if (isa<DINode>(MD))
++    return 0;
++  if (const auto *S = dyn_cast<MDString>(MD))
++    return xxh3_64bits(S->getString());
++  if (const auto *C = dyn_cast<ConstantAsMetadata>(MD)) {
++    DenseSet<const GlobalValue *> Stack;
++    return stable_hash_combine(static_cast<stable_hash>(3),
++                               frust_hash_constant(C->getValue(), Stack));
++  }
++  if (const auto *V = dyn_cast<ValueAsMetadata>(MD)) {
++    if (const auto *C = dyn_cast<Constant>(V->getValue())) {
++      DenseSet<const GlobalValue *> Stack;
++      return stable_hash_combine(static_cast<stable_hash>(4),
++                                 frust_hash_constant(C, Stack));
++    }
++    return 5;
++  }
++  if (const auto *N = dyn_cast<MDNode>(MD)) {
++    stable_hash H = N->getNumOperands() + 17;
++    for (unsigned I = 0; I < N->getNumOperands(); ++I)
++      H = stable_hash_combine(H, frust_hash_md(N->getOperand(I).get(), Depth + 1));
++    return H;
++  }
++  return 2;
++}
++
++static stable_hash frust_function_meta(const Function &F) {
++  stable_hash H = 0;
++  for (const BasicBlock &BB : F) {
++    for (const Instruction &I : BB) {
++      SmallVector<std::pair<unsigned, MDNode *>, 8> MDS;
++      I.getAllMetadata(MDS);
++      for (const auto &MD : MDS) {
++        if (!MD.second || isa<DINode>(MD.second))
++          continue;
++        H = stable_hash_combine(H, static_cast<stable_hash>(MD.first),
++                                frust_hash_md(MD.second, 0));
++      }
++    }
++  }
++  return H;
++}
++
++static stable_hash frust_function_extra(const Function &F) {
++  SmallVector<stable_hash, 8> Parts;
++  Parts.push_back(StructuralHash(F, /*DetailedHash=*/true));
++  Parts.push_back(frust_function_meta(F));
++  Parts.push_back(static_cast<stable_hash>(F.getLinkage()));
++  Parts.push_back(static_cast<stable_hash>(F.getVisibility()));
++  Parts.push_back(static_cast<stable_hash>(F.getCallingConv()));
++  Parts.push_back(F.isDSOLocal());
++  Parts.push_back(xxh3_64bits(F.hasSection() ? F.getSection() : ""));
++  AttributeList Attrs = F.getAttributes();
++  for (unsigned I = 0; I < Attrs.getNumAttrSets(); ++I)
++    Parts.push_back(xxh3_64bits(StringRef(Attrs.getAsString(I))));
++  if (const Constant *Pers = F.hasPersonalityFn() ? F.getPersonalityFn() : nullptr) {
++    DenseSet<const GlobalValue *> Stack;
++    Parts.push_back(frust_hash_constant(Pers, Stack));
++  }
++  return stable_hash_combine(ArrayRef<stable_hash>(Parts));
++}
++
++static stable_hash frust_global_extra(const GlobalVariable &GV) {
++  SmallVector<stable_hash, 12> Parts;
++  Parts.push_back(static_cast<stable_hash>(GV.getLinkage()));
++  Parts.push_back(static_cast<stable_hash>(GV.getVisibility()));
++  Parts.push_back(static_cast<stable_hash>(GV.getUnnamedAddr()));
++  Parts.push_back(GV.isConstant());
++  Parts.push_back(static_cast<stable_hash>(GV.getThreadLocalMode()));
++  Parts.push_back(GV.getAlign().valueOrOne().value());
++  Parts.push_back(GV.isDSOLocal());
++  Parts.push_back(xxh3_64bits(GV.hasSection() ? GV.getSection() : ""));
++  Parts.push_back(xxh3_64bits(GV.hasComdat() ? GV.getComdat()->getName() : ""));
++  Parts.push_back(static_cast<stable_hash>(GV.getValueType()->getTypeID()));
++  DenseSet<const GlobalValue *> Stack;
++  if (GV.hasInitializer())
++    Parts.push_back(frust_hash_constant(GV.getInitializer(), Stack));
++  return stable_hash_combine(ArrayRef<stable_hash>(Parts));
++}
++
++static stable_hash frust_sorted_codegen_hash(const Module &M) {
++  stable_hash H = xxh3_64bits(M.getDataLayoutStr());
++  H = stable_hash_combine(H, xxh3_64bits(M.getTargetTriple().str()));
++  SmallVector<Module::ModuleFlagEntry, 8> Flags;
++  M.getModuleFlagsMetadata(Flags);
++  llvm::sort(Flags, [](const Module::ModuleFlagEntry &L, const Module::ModuleFlagEntry &R) {
++    return L.Key->getString() < R.Key->getString();
++  });
++  for (const Module::ModuleFlagEntry &Flag : Flags) {
++    H = stable_hash_combine(H, xxh3_64bits(Flag.Key->getString()),
++                            static_cast<stable_hash>(Flag.Behavior),
++                            frust_hash_md(Flag.Val, 0));
++  }
++  for (const Module::GlobalAsmFragment &Frag : M.getModuleInlineAsm()) {
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Asm));
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Props.TargetCPU));
++    H = stable_hash_combine(H, xxh3_64bits(Frag.Props.TargetFeatures));
++  }
++
++  SmallVector<std::pair<std::string, stable_hash>, 64> Items;
++  for (const GlobalVariable &GV : M.globals())
++    Items.emplace_back(GV.getName().str(), frust_global_extra(GV));
++  for (const GlobalAlias &A : M.aliases()) {
++    DenseSet<const GlobalValue *> Stack;
++    Items.emplace_back(A.getName().str(), frust_hash_constant(&A, Stack));
++  }
++  for (const GlobalIFunc &I : M.ifuncs()) {
++    DenseSet<const GlobalValue *> Stack;
++    stable_hash IH = xxh3_64bits(I.getName());
++    if (const Constant *R = I.getResolver())
++      IH = stable_hash_combine(IH, frust_hash_constant(R, Stack));
++    Items.emplace_back(I.getName().str(), IH);
++  }
++  llvm::sort(Items, [](const auto &L, const auto &R) {
++    return L.first < R.first || (L.first == R.first && L.second < R.second);
++  });
++  for (const auto &Item : Items)
++    H = stable_hash_combine(H, xxh3_64bits(StringRef(Item.first)), Item.second);
++
++  Items.clear();
++  for (const Function &F : M)
++    Items.emplace_back(F.getName().str(), frust_function_extra(F));
++  llvm::sort(Items, [](const auto &L, const auto &R) {
++    return L.first < R.first || (L.first == R.first && L.second < R.second);
++  });
++  for (const auto &Item : Items)
++    H = stable_hash_combine(H, xxh3_64bits(StringRef(Item.first)), Item.second);
++  return H;
++}
++
+ enum class LLVMRustFileType {
+   AssemblyFile,
+   ObjectFile,
+@@ -499,6 +704,16 @@ static CodeGenFileType fromRust(LLVMRustFileType Type) {
+   }
+ }
+ 
++extern "C" uint64_t LLVMRustModuleCodegenHash(LLVMModuleRef M,
++                                              uint8_t *HasDebugCompileUnit) {
++  Module *Mod = unwrap(M);
++  bool HasDebug = Mod->getNamedMetadata("llvm.dbg.cu") != nullptr;
++  *HasDebugCompileUnit = HasDebug;
++  if (HasDebug)
++    return 0;
++  return frust_sorted_codegen_hash(*Mod);
++}
++
+ extern "C" LLVMRustResult
+ LLVMRustWriteOutputFile(LLVMTargetMachineRef Target, LLVMPassManagerRef PMR,
+                         LLVMModuleRef M, const char *Path, const char *DwoPath,
