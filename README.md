@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/assets/hero.svg" alt="fRust. CPU time as a fraction of official Rust 1.100.0 on Linux x86-64: clean rebuild of fd 0.02, clean rebuild of ripgrep 0.33, no-op build 0.90, first build with an empty cache 1.02." width="880">
+<img src=".github/assets/hero.svg" alt="fRust, a Rust toolchain with a Cargo that reuses verified work." width="880">
 
 **A Rust toolchain built from pinned upstream sources, with a Cargo that reuses verified work.**
 
@@ -12,26 +12,17 @@
 
 ## Status
 
-fRust is at [0.5.0-pre.1](https://github.com/Seggys116/frust/releases/tag/v0.5.0-pre.1), a pre-release for Linux x86-64. It packages Rust 1.100.0 (upstream commit `0ef1bc386`, pinned in `support/upstream.lock`) with an optimized compiler, a patched Cargo, `fcargo`, `frustc` and rustdoc. The compiler, standard library and LLVM library match official Rust 1.100.0; the speedups come from Cargo.
+fRust packages Rust 1.100.0 (upstream commit `0ef1bc386`, pinned in `support/upstream.lock`) built from source with a patched Cargo, `fcargo`, `frustc` and rustdoc. Its compiler, standard library and LLVM come from the unmodified upstream sources; the changes are in Cargo, in the central target layout, and in how finished work is reused.
 
-CPU time of fRust divided by official Rust 1.100.0, both on the same four pinned cores with the order alternated, median of three rounds, 19 November 2026:
+Published performance numbers come from the [Benchmark workflow](.github/workflows/benchmark.yml) on GitHub-hosted runners and are recorded in [the benchmark page](docs/benchmarks.md). Dated development measurements from a local host are kept in [the qualification notes](qualification/OPTIMIZED-LINUX.md) and are not release claims.
 
-| Application, profile | First build, empty cache | Clean rebuild | No-op build |
-| --- | ---: | ---: | ---: |
-| fd, dev | 1.006 | 0.024 | 0.91 |
-| oxipng, dev | 1.022 | 0.304 | 0.89 |
-| ripgrep, dev | 1.027 | 0.331 | 0.90 |
-| ripgrep, release | 1.020 | 0.437 | 0.91 |
-
-A clean rebuild restores dependency units and heavy build script runs from a verified store instead of compiling them. A first build with an empty cache is still 1 to 3 percent slower than official Rust, because the compiler front end binary is slower; the cache bookkeeping costs about 0.1 percent. The full method, raw numbers and the compiler attribution are in [the Linux qualification notes](qualification/OPTIMIZED-LINUX.md).
-
-Not established: edited fat-LTO builds against matched incremental stock, executable runtime and size budgets, the upstream compiler and Cargo test suites against this package, the MXFrame project comparison, and everything on macOS, aarch64 Linux and Windows. The `cargo test` outcomes of ripgrep, fd and oxipng are identical to official Rust with a cold and a restored cache.
+The release workflow builds the toolchain on GitHub-hosted runners without profile-guided or BOLT optimization of the compiler, so it measures against a control built the same way and makes no claim against the official rustup toolchains. Linux x86-64 is the host with test evidence. macOS and aarch64 Linux toolchains are built by the same workflow and have only the workflow's launch check. Windows is not supported.
 
 ## Install
 
 ```sh
 cargo install --git https://github.com/Seggys116/frust frust-rs --bin frust-install
-frust-install install --version 0.5.0-pre.1
+frust-install install
 export PATH="$HOME/.local/share/frust/current/bin:$PATH"   # macOS: ~/Library/Application Support/fRust/current/bin
 fcargo build
 ```
