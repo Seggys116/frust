@@ -31,7 +31,11 @@ Thirty alternating CPU-time pairs per command on logical CPU 14 produced identic
 | ripgrep regex | 1.002 | 1.011 |
 | fd directory walk | 0.994 | 1.009 |
 
-The regex upper estimate exceeds 1.01. Compiler integration and the full performance gate remain open. These results characterize post-LTO object emission and the resulting application binaries. They provide no end-to-end compile speedup for a packaged compiler, since rustc still emitted the original object in the capture builds.
+The regex upper estimate exceeds 1.01. Compiler integration and the full performance gate remain open. The capture builds still emitted the original rustc object. The measured speedup applies to the replacement emission stage.
+
+A follow-up bucket experiment computed each symbol's default partition once. All canonical bitcode partitions matched the original. Over four alternating CPU pairs per workload, median times were 0.945 times the existing splitter on ripgrep and 0.972 on fd. Individual fd ratios ranged from 0.810 to 1.524. These results leave the upstream splitter in use.
+
+A compiler invocation requesting only LLVM bitcode printed an `LLVM_fatlto` timing but produced a 6.3 KiB module for the native-archive fixture. Requesting bitcode and link output produced a 1.4 MiB module. The compiler integration needs the post-optimization object-emission seam with ordinary executable link outputs still selected.
 
 ## Reproduction
 
