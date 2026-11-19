@@ -189,4 +189,30 @@ The locked rustfmt tree still does not compile (43 `rustc_ast` errors in `tune1-
 
 `frust-0ef1bc386-cgcache1` is the change that stays. The on-disk artifacts match the proof and the leaf sample above. The parity log `target/compiler-rewrite/parity/frust-0ef1bc386-cgcache1/prove.log` ends `PROVE_OK 2026-11-19T05:19:38+00:00`: fat LTO ran for `frustc` (1.232s) and `rustc` (1.212s), both names wrote 1 and 8 pre-optimization bitcode files at the requested codegen-unit counts, and warm/fresh `.text` and stdout matched for the leaf, revert, wide, api, native, linker-only, and restored-timestamp edits. The packaged driver is `target/compiler-rewrite/toolchains/frust-cg1/lib/librustc_driver-c56a332a1933ca87.so`, sha256 `15c710071f3babdba3ddf16a0e654fa5c9f8c43214e0f7ce0ea87825ebe8f1a4`, 155149824 bytes. The leaf `rg` is still sha256 `9af9ac5e16737ca1da64263aab4c718cae9b00b4cc6f3b3b4f7885ac1f8df866`. `strip --strip-unneeded` still leaves 3742608 bytes, and `readelf -V` still shows `GLIBC_ABI_DT_RELR`. The ripgrep cohort has no `_frust_leaf` marker.
 
-The leaf log `target/compiler-rewrite/logs/cgcache1-ripgrep-leaf.log` used `toolchains/frust-cg1/bin` and recorded 12.53s and 447136 kB. 12.53/19.14 = 0.655, under the 0.80 bar. 3742608 is smaller than the stock 4024992, so stripped size did not grow. The same-session corpus median ratio was 0.005766/0.005820 = 0.991, under the 1.01 per-workload bound. The candidate is kept on that evidence. The 0.97 runtime aggregate is still unmet, syn and regex were not sampled, and the 30-pair gate was not run, so the full Linux budget remains open. `cargo +1.100.0 test --manifest-path crates/frust-core/Cargo.toml --offline` passed 16 tests. Thresholds are unchanged.
+The leaf log `target/compiler-rewrite/logs/cgcache1-ripgrep-leaf.log` used `toolchains/frust-cg1/bin` and recorded 12.53s and 447136 kB. 12.53/19.14 = 0.655, under the 0.80 bar. 3742608 is smaller than the stock 4024992, so stripped size did not grow. The same-session corpus median ratio was 0.005766/0.005820 = 0.991, under the 1.01 per-workload bound. The candidate is kept on that evidence. The 0.97 runtime aggregate is still unmet. The syn, regex, and fd samples are in the next section. The 30-pair gate was not run, so the full Linux budget remains open. `cargo +1.100.0 test --manifest-path crates/frust-core/Cargo.toml --offline` passed 16 tests. Thresholds are unchanged.
+
+## Packaged cg1 samples of syn, regex, and fd
+
+One frozen-protocol sample each, on `toolchains/frust-cg1/bin`, from `2026-11-19T06:03:52+00:00` through `2026-11-19T06:04:52+00:00`. The driver log is `target/compiler-rewrite/logs/cg1-sample-driver.log`. Every row exited 0. Syn and regex leaves were copied from their cold targets before the edit. The fd holdout reused the fd cold target. After the exit trap, the syn, regex, and fd cohorts contain no `_frust_leaf` marker. These are single samples, not the 30-pair gate, and the gate was not started.
+
+Stock walls and RSS values are the frozen control rows in `qualification/BASELINES.md`. Ratios use wall clock and max RSS.
+
+| Workload | Kind | Wall | Cargo | Max RSS | Stock wall | Stock RSS | Wall ratio | RSS ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| syn | cold | 3.06s | 3.05s | 293104 kB | 3.05s | 292820 kB | 1.003 | 1.001 |
+| syn | no-op | 0.04s | 0.03s | 58840 kB | 0.04s | 55520 kB | 1.000 | 1.060 |
+| syn | leaf | 1.94s | 1.94s | 295356 kB | 1.89s | 290560 kB | 1.026 | 1.017 |
+| regex | cold | 4.90s | 4.90s | 350380 kB | 5.05s | 347772 kB | 0.970 | 1.007 |
+| regex | no-op | 0.01s | 0.01s | 39748 kB | 0.01s | 36348 kB | 1.000 | 1.094 |
+| regex | leaf | 0.34s | 0.33s | 200312 kB | 0.33s | 195780 kB | 1.030 | 1.023 |
+| fd | cold | 32.98s | 32.97s | 490124 kB | 33.72s | 441532 kB | 0.978 | 1.110 |
+| fd | no-op | 0.03s | 0.02s | 49376 kB | 0.03s | 47308 kB | 1.000 | 1.044 |
+| fd | holdout | 16.12s | 16.11s | 466716 kB | 15.90s | 448916 kB | 1.014 | 1.040 |
+
+Logs: `target/compiler-rewrite/logs/cg1-syn-cold.log`, `cg1-syn-noop.log`, `cg1-syn-leaf.log`, `cg1-regex-cold.log`, `cg1-regex-noop.log`, `cg1-regex-leaf.log`, `cg1-fd-cold.log`, `cg1-fd-noop.log`, and `cg1-fd-holdout.log`. Regex cold against the clean-seed wall of 4.87s is 1.006, and its RSS against 346032 kB is 1.013. Cold wall ratios are at or under 1.05. No-op wall overhead is 0, inside max(5% of the stock wall, 20 ms). Syn and regex leaf RSS ratios are under 1.10. The fd holdout RSS ratio is under 1.10. The fd cold RSS ratio is 490124/441532 = 1.110, over 1.10, on this one sample. fd is a holdout and is not used to choose the compiler change.
+
+`du -sb` after the timings is in `target/compiler-rewrite/logs/cg1-disk.log` (`2026-11-19T06:04:52+00:00`). Candidate bytes: syn-cold 40122459, syn-leaf 40257059, regex-cold 102838741, regex-leaf 102914045, fd-cold 337238480. Control bytes: syn-seed 39706133, syn-miss-1 39840747, regex-seed 102830317, regex-miss-1 102905640, fd 308291554. Ratios: 1.010, 1.010, 1.000, 1.000, and 1.094. All are under 1.20. The traces are not the same length. Control seeds are cold only, the miss directories are one reversed leaf, and the control fd directory is the earlier full trace, while fd-cold here is cold plus a no-op plus one holdout. `probes/cg1` holds 162 `frust-codegen-cache` files, which are part of the candidate byte counts.
+
+The one-sample leaf wall ratios are ripgrep 0.655, syn 1.026, and regex 1.030. Their product is about 0.692 and the geometric mean is about 0.885, above 0.80. Syn and regex are libraries. Their builds have no fat-LTO row, and the edited crate's object changed, so the post-optimization cache did not remove that work. The fd holdout wall ratio is 1.014, which is not below 1. None of these rows is a gate result.
+
+These samples do not reach a 0.97 runtime aggregate or a per-workload stripped-size bar. They measure build time, not application runtime. The kept ripgrep corpus median ratio is still 0.991. Locked rustfmt 1.9.0 still does not compile, and oxipng was not rebuilt with `frust-cg1` for this sample. With ripgrep at 0.991, the other two runtime ratios have to multiply to at most 0.921 to pull a three-workload geometric mean to 0.97, and each stripped file has to stay at or under stock. That evidence is not here. Checklist item 6 stays unchecked. Thresholds are unchanged.
