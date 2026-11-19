@@ -5,6 +5,9 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 ## [Unreleased]
 
 * Started the fRust compiler rewrite and retired the previous build accelerator from the active branch. The entries below describe earlier releases.
+* Made post-optimization object reuse and RELR opt-in research flags. Default compilation and linking retain upstream behavior.
+* Cargo skips checksumming excluded dependencies and treats dependencies saved during compiler invocation as dirty on the next build. Upgrading invalidates the earlier dependency checksum records.
+* Qualification requires the complete frozen cohort and rejects missing tail series and invalid timings. The parity fixture now compiles and links a native archive and tests an edit between compiler completion and Cargo's fingerprint write.
 
 ## [0.3.0]
 

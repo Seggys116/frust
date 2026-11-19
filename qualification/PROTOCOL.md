@@ -58,13 +58,17 @@ Edit classes, applied to a fixed file in each tree and then reverted:
 
 - Leaf: change one function body that the package tests execute.
 - Wide: change a public generic or trait method used across the crate.
-- Cold: empty target directory, same source as the leaf edit.
+- Cold: empty target directory, same source as the leaf edit (holdout edit for fd).
 - No-op: rebuild with no source change.
 - Holdout: leaf edit of fd only. fd is not used to choose the compiler change.
 
 A leaf, wide, or holdout sample starts from an incremental target built from the unmodified tree. When an earlier application of the same patch would reuse that patched work product, copy the unmodified target and time the copy. A no-op is a later build of those same unmodified sources with no edit in between. Reversing a patch updates file mtimes, so the next build is a post-revert rebuild, not a no-op. Toolchains share the cohort trees, so one toolchain must not edit a tree between another toolchain's seed build and its sample.
 
-The 0.80 geometric mean is the leaf medians of at least two primary workloads, which is what `judge_edit` computes. Wide edits join the leaf edits in the tail gate. Cold, no-op, and holdout are their own gates.
+The 0.80 geometric mean uses leaf medians from ripgrep, syn, and regex. Wide edits join the leaf edits in the tail gate. Cold, no-op, and holdout are their own gates.
+
+The 19 November review tightened the evidence gate to require every listed cohort member, measured pairs with positive durations, and all six primary tail series. Runtime and size require the three distinct executable workloads. Thresholds are unchanged. The original unused-local edits and library builds remain reproducible for historical comparison. They cannot establish speedup on meaningful binary fat-LTO edits. A successor cohort will be frozen before new candidate timing.
+
+Use `time-build.sh ... seed ...` to prepare clean incremental inputs and `cold` for an edited build in an empty target. The script records `WALL_SECONDS`, `PEAK_RSS_KIB`, the selected compiler, experimental switches and `EXIT` in the log. Accept a sample only after a zero exit status and a zero `EXIT` row. Peak RSS is the maximum reported process RSS, so collect concurrent process-tree memory separately for experiments that increase parallelism.
 
 Budgets: edited geomean and its upper bound ≤ 0.80, holdout median ratio < 1, cold median ≤ 1.05, no-op median overhead ≤ max(5% of the stock median, 20 ms), leaf and wide p95 ≤ 1.05.
 

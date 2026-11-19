@@ -432,15 +432,19 @@ fn patched_cargo_namespaces_fcargo_and_preserves_overrides() {
 
 fn passing_samples() -> String {
     let mut out = String::new();
-    for name in ["ripgrep", "syn"] {
+    for name in ["ripgrep", "syn", "regex"] {
         push_edits(&mut out, name, "leaf", 0.70, 1.0, 60);
         push_edits(&mut out, name, "wide", 0.90, 1.0, 60);
         push_edits(&mut out, name, "cold", 1.0, 1.0, 30);
         push_edits(&mut out, name, "noop", 0.20, 0.20, 30);
     }
     push_edits(&mut out, "fd", "holdout", 0.75, 1.0, 30);
-    out.push_str("resource ripgrep 100 100 100 100\n");
-    for name in ["ripgrep", "fd", "tokei"] {
+    push_edits(&mut out, "fd", "cold", 1.0, 1.0, 30);
+    push_edits(&mut out, "fd", "noop", 0.20, 0.20, 30);
+    for name in ["ripgrep", "syn", "regex", "fd"] {
+        out.push_str(&format!("resource {name} 100 100 100 100\n"));
+    }
+    for name in ["ripgrep", "rustfmt", "oxipng"] {
         let frust = vec!["0.90"; 30].join(",");
         let stock = vec!["1.0"; 30].join(",");
         out.push_str(&format!("runtime {name} 0 {frust} {stock}\n"));

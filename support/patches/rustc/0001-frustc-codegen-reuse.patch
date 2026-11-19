@@ -1,8 +1,8 @@
 diff --git a/compiler/rustc_codegen_llvm/src/back/write.rs b/compiler/rustc_codegen_llvm/src/back/write.rs
-index deaa78fcd..af409cd00 100644
+index deaa78fcd..7534e3eb4 100644
 --- a/compiler/rustc_codegen_llvm/src/back/write.rs
 +++ b/compiler/rustc_codegen_llvm/src/back/write.rs
-@@ -948,6 +948,77 @@ pub(crate) fn optimize(
+@@ -948,6 +948,80 @@ pub(crate) fn optimize(
      }
  }
  
@@ -36,7 +36,10 @@ index deaa78fcd..af409cd00 100644
 +    module: &llvm::Module,
 +    obj_out: &Path,
 +) -> Option<PathBuf> {
-+    if !invoked_as_frustc() {
++    if !invoked_as_frustc()
++        || std::env::var_os("FRUST_EXPERIMENTAL_CODEGEN_CACHE").as_deref()
++            != Some(std::ffi::OsStr::new("1"))
++    {
 +        return None;
 +    }
 +    let mut has_debug = 0u8;
@@ -80,7 +83,7 @@ index deaa78fcd..af409cd00 100644
  pub(crate) fn codegen(
      cgcx: &CodegenContext,
      prof: &SelfProfilerRef,
-@@ -1108,17 +1179,32 @@ extern "C" fn demangle_callback(
+@@ -1108,17 +1182,32 @@ extern "C" fn demangle_callback(
                      (_, SplitDwarfKind::Split) => Some(dwo_out.as_path()),
                  };
  
@@ -142,7 +145,7 @@ index 655a79e34..a4e677dd5 100644
          M: &'a Module,
          TM: &'a TargetMachine,
 diff --git a/compiler/rustc_codegen_ssa/src/back/linker.rs b/compiler/rustc_codegen_ssa/src/back/linker.rs
-index 2b9ed32f2..b2ca6dc4f 100644
+index 2b9ed32f2..2b8e526d0 100644
 --- a/compiler/rustc_codegen_ssa/src/back/linker.rs
 +++ b/compiler/rustc_codegen_ssa/src/back/linker.rs
 @@ -28,6 +28,16 @@
@@ -162,7 +165,7 @@ index 2b9ed32f2..b2ca6dc4f 100644
  #[cfg(test)]
  mod tests;
  
-@@ -702,6 +712,16 @@ fn optimize(&mut self) {
+@@ -702,6 +712,18 @@ fn optimize(&mut self) {
              || self.sess.opts.optimize == config::OptLevel::Aggressive
          {
              self.link_arg("-O1");
@@ -173,6 +176,8 @@ index 2b9ed32f2..b2ca6dc4f 100644
 +                && !self.sess.target.is_like_wasm
 +                && !self.sess.crt_static(None)
 +                && invoked_as_frustc()
++                && env::var_os("FRUST_EXPERIMENTAL_RELR").as_deref()
++                    == Some(std::ffi::OsStr::new("1"))
 +            {
 +                self.link_args(&["-z", "pack-relative-relocs"]);
 +            }

@@ -1,6 +1,6 @@
 # Compatibility
 
-This records the unpatched packaged toolchain `target/compiler-rewrite/toolchains/frust` (id `frust-0ef1bc386-central1`) against the unpatched stage-2 control from the same recipe. It is not a performance result. The frozen 0.80 / 1.10 budgets remain unmet; see `qualification/CANDIDATE.md`.
+This records the packaged toolchain `target/compiler-rewrite/toolchains/frust` (id `frust-0ef1bc386-central1`) with the stock compiler and patched Cargo against a fully unpatched stage-2 control from the same recipe. It is not a performance result. The frozen 0.80 / 1.10 budgets remain unmet; see `qualification/CANDIDATE.md`.
 
 The packaged `rustc` stub, `frustc` hardlink, `librustc_driver-c56a332a1933ca87.so`, `libstd-c2e710ac05435005.so`, and `rustdoc` match the stage-2 control byte for byte. After the stamp miss described in `CANDIDATE.md`, packaged `cargo` is the content-checksum binary `sha256 19da6cf49ae9f14389a0fb07382580c02e872172037edb13147eb9bdcad52507`. The control `stage2-tools-bin/cargo` is still `sha256 5a5dc6f6acae82ca2387b0ce36d36c191e2ea9cbeb07702cc168fe1ea3c17e5b` and still records `mtime`. The stage-2 driver was not rewritten by the suite: its mtime stayed `2026-11-19 00:03:38` and its sha256 stayed `0d5e12331727ef3d4358356bc502e81393ec056aa943e97bd34bac82725dad3d`.
 

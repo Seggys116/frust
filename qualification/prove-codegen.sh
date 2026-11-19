@@ -2,16 +2,18 @@
 # Prove the packaged compiler still runs fat LTO, honors the requested
 # codegen-unit count, and matches warm incremental output to a fresh build.
 # This is a correctness check. It does not record a performance sample.
-# Usage: prove-codegen.sh <toolchain-prefix>
+# Usage: prove-codegen.sh <toolchain-prefix> [run-label]
 set -euo pipefail
-if [[ $# -ne 1 ]]; then
-  echo "usage: prove-codegen.sh <toolchain-prefix>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: prove-codegen.sh <toolchain-prefix> [run-label]" >&2
   exit 2
 fi
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 prefix=$(CDPATH= cd -- "$1" && pwd)
 id=$(tr -d '[:space:]' < "$prefix/frust-toolchain-id")
-work=$root/target/compiler-rewrite/parity/$id
+label=${2:-$id}
+[[ $label =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "invalid run label" >&2; exit 2; }
+work=$root/target/compiler-rewrite/parity/$label
 if [[ -e "$work" ]]; then
   echo "parity directory already exists: $work" >&2
   exit 1
@@ -23,7 +25,9 @@ bins=$prefix/bin
 fixture=$root/qualification/parity/fixture
 probe=$root/qualification/parity/cgu_probe.rs
 export PATH="$bins:/usr/bin:/bin"
-unset RUSTC CARGO RUSTFLAGS RUSTUP_TOOLCHAIN FRUST_INVOCATION FRUST_PROGRESS || true
+unset RUSTC CARGO RUSTFLAGS RUSTUP_TOOLCHAIN FRUST_INVOCATION FRUST_PROGRESS
+unset CARGO_INCREMENTAL CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_TARGET
+unset CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=3
 export CARGO_PROFILE_RELEASE_LTO=fat
 export CARGO_PROFILE_RELEASE_INCREMENTAL=true
@@ -32,8 +36,10 @@ export CARGO_PROFILE_RELEASE_STRIP=none
 export CARGO_TERM_COLOR=never
 export FRUST_PROGRESS=plain
 export RUSTC=$bins/frustc
-command -v cargo >/dev/null || { echo "FAIL: cargo is not on PATH" >&2; exit 1; }
-command -v "$RUSTC" >/dev/null || { echo "FAIL: frustc is not executable" >&2; exit 1; }
+[[ -x "$bins/cargo" ]] || { echo "FAIL: packaged cargo is not executable" >&2; exit 1; }
+[[ -x "$RUSTC" ]] || { echo "FAIL: frustc is not executable" >&2; exit 1; }
+
+printf 'TOOLCHAIN %s\nCODEGEN_CACHE %s\nRELR %s\n' "$id"   "${FRUST_EXPERIMENTAL_CODEGEN_CACHE:-0}" "${FRUST_EXPERIMENTAL_RELR:-0}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -97,9 +103,9 @@ echo "CGU rustc units=8 files=$rust8"
 snapshot() {
   local src=$1 dest=$2
   mkdir -p "$dest"
-  cp -a "$src/Cargo.toml" "$src/Cargo.lock" "$src/build.rs" "$src/native.c" "$src/src" "$dest/"
+  cp -a "$src/Cargo.toml" "$src/Cargo.lock" "$src/build.rs" "$src/native.c" "$src/src" "$dest/" || return
   if [[ -d "$src/.cargo" ]]; then
-    cp -a "$src/.cargo" "$dest/"
+    cp -a "$src/.cargo" "$dest/" || return
   fi
 }
 
@@ -108,8 +114,8 @@ build_release() {
   (
     cd "$dir"
     export CARGO_TARGET_DIR=$target
-    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-    cargo build --release --locked --offline
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${3:-1}
+    CARGO_BUILD_BUILD_DIR=$target "$bins/cargo" build --release --locked --offline
   )
 }
 
@@ -125,14 +131,14 @@ compare_targets() {
   local warm_target=$1 fresh_target=$2 label=$3
   local warm=$warm_target/release/frust_parity
   local fresh=$fresh_target/release/frust_parity
-  text_bytes "$warm" "$work/$label.warm.text"
-  text_bytes "$fresh" "$work/$label.fresh.text"
+  text_bytes "$warm" "$work/$label.warm.text" || fail "$label warm .text extraction failed"
+  text_bytes "$fresh" "$work/$label.fresh.text" || fail "$label fresh .text extraction failed"
   if ! cmp -s "$work/$label.warm.text" "$work/$label.fresh.text"; then
     fail "$label .text bytes differ"
   fi
   local warm_out fresh_out
-  warm_out=$(run_bin "$warm_target")
-  fresh_out=$(run_bin "$fresh_target")
+  warm_out=$(run_bin "$warm_target") || fail "$label warm binary failed"
+  fresh_out=$(run_bin "$fresh_target") || fail "$label fresh binary failed"
   if [[ "$warm_out" != "$fresh_out" ]]; then
     fail "$label stdout $warm_out != $fresh_out"
   fi
@@ -140,14 +146,13 @@ compare_targets() {
   printf '%s\n' "$warm_out"
 }
 
-native_len=$(wc -c < "$fixture/native.c" | tr -d ' ')
-pristine_out="21 2 4 22 44 $native_len"
+pristine_out="21 2 4 22 44 3"
 echo "PRISTINE_EXPECT $pristine_out"
 
 one_case() {
   local name=$1
   local src=$work/src-$name
-  snapshot "$fixture" "$src"
+  snapshot "$fixture" "$src" || fail "$name snapshot failed"
   printf '%s\n' "$src"
 }
 
@@ -155,6 +160,11 @@ echo "PARITY $(date -Is)"
 
 leaf_src=$(one_case leaf)
 build_release "$leaf_src" "$work/leaf-base"
+if [[ ${FRUST_EXPERIMENTAL_CODEGEN_CACHE:-0} == 1 ]]; then
+  [[ -n $(find "$work/leaf-base" -path '*/frust-codegen-cache/v1-*.o' -print -quit) ]]     || fail "experimental compiler did not publish a cache object"
+elif [[ -n $(find "$work/leaf-base" -name frust-codegen-cache -print -quit) ]]; then
+  fail "default compiler published experimental cache objects"
+fi
 base_out=$(run_bin "$work/leaf-base")
 [[ "$base_out" == "$pristine_out" ]] || fail "pristine output $base_out != $pristine_out"
 python3 - "$leaf_src/src/main.rs" <<'PY'
@@ -168,10 +178,9 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 PY
 build_release "$leaf_src" "$work/leaf-base"
-snapshot "$leaf_src" "$work/src-leaf-fresh"
-build_release "$work/src-leaf-fresh" "$work/leaf-fresh"
+build_release "$leaf_src" "$work/leaf-fresh"
 leaf_out=$(compare_targets "$work/leaf-base" "$work/leaf-fresh" leaf)
-[[ "$leaf_out" == "22 2 4 22 44 $native_len" ]] || fail "leaf output $leaf_out"
+[[ "$leaf_out" == "22 2 4 22 44 3" ]] || fail "leaf output $leaf_out"
 
 python3 - "$leaf_src/src/main.rs" <<'PY'
 import pathlib, sys
@@ -184,8 +193,7 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 PY
 build_release "$leaf_src" "$work/leaf-base"
-snapshot "$leaf_src" "$work/src-revert-fresh"
-build_release "$work/src-revert-fresh" "$work/revert-fresh"
+build_release "$leaf_src" "$work/revert-fresh"
 revert_out=$(compare_targets "$work/leaf-base" "$work/revert-fresh" revert)
 [[ "$revert_out" == "$pristine_out" ]] || fail "revert output $revert_out"
 
@@ -207,10 +215,9 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 PY
 build_release "$wide_src" "$work/wide-base"
-snapshot "$wide_src" "$work/src-wide-fresh"
-build_release "$work/src-wide-fresh" "$work/wide-fresh"
+build_release "$wide_src" "$work/wide-fresh"
 wide_out=$(compare_targets "$work/wide-base" "$work/wide-fresh" wide)
-[[ "$wide_out" == "21 3 5 22 44 $native_len" ]] || fail "wide output $wide_out"
+[[ "$wide_out" == "21 3 5 22 44 3" ]] || fail "wide output $wide_out"
 
 api_src=$(one_case api)
 build_release "$api_src" "$work/api-base"
@@ -230,20 +237,17 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 PY
 build_release "$api_src" "$work/api-base"
-snapshot "$api_src" "$work/src-api-fresh"
-build_release "$work/src-api-fresh" "$work/api-fresh"
+build_release "$api_src" "$work/api-fresh"
 api_out=$(compare_targets "$work/api-base" "$work/api-fresh" api)
-[[ "$api_out" == "21 2 4 23 45 $native_len" ]] || fail "api output $api_out"
+[[ "$api_out" == "21 2 4 23 45 3" ]] || fail "api output $api_out"
 
 native_src=$(one_case native)
 build_release "$native_src" "$work/native-base"
-printf ' ' >> "$native_src/native.c"
+printf '%s\n' 'int frust_native(void) { return 7; }' > "$native_src/native.c"
 build_release "$native_src" "$work/native-base"
-snapshot "$native_src" "$work/src-native-fresh"
-build_release "$work/src-native-fresh" "$work/native-fresh"
+build_release "$native_src" "$work/native-fresh"
 native_out=$(compare_targets "$work/native-base" "$work/native-fresh" native)
-native_next=$((native_len + 1))
-[[ "$native_out" == "21 2 4 22 44 $native_next" ]] || fail "native output $native_out"
+[[ "$native_out" == "21 2 4 22 44 7" ]] || fail "native output $native_out"
 
 link_src=$(one_case link)
 build_release "$link_src" "$work/link-base"
@@ -253,8 +257,7 @@ cat > "$link_src/.cargo/config.toml" <<'EOF'
 rustflags = ["-C", "link-arg=-Wl,--defsym=frust_link_only=1"]
 EOF
 build_release "$link_src" "$work/link-base"
-snapshot "$link_src" "$work/src-link-fresh"
-build_release "$work/src-link-fresh" "$work/link-fresh"
+build_release "$link_src" "$work/link-fresh"
 link_out=$(compare_targets "$work/link-base" "$work/link-fresh" link)
 [[ "$link_out" == "$pristine_out" ]] || fail "linker-only output changed to $link_out"
 # grep -q would SIGPIPE nm under pipefail and look like a missing symbol.
@@ -267,22 +270,68 @@ fi
 
 stamp_src=$(one_case stamp)
 build_release "$stamp_src" "$work/stamp-base"
-mtime=$(stat -c %y "$stamp_src/src/main.rs")
 python3 - "$stamp_src/src/main.rs" <<'PY'
-import pathlib, sys
+import os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
+stamps = path.stat()
 text = path.read_text()
 old = "n.wrapping_add(11)"
 new = "n.wrapping_add(12)"
 if old not in text:
     raise SystemExit("stamp pattern missing")
 path.write_text(text.replace(old, new, 1))
+os.utime(path, ns=(stamps.st_atime_ns, stamps.st_mtime_ns))
 PY
-touch -d "$mtime" "$stamp_src/src/main.rs"
 build_release "$stamp_src" "$work/stamp-base"
-snapshot "$stamp_src" "$work/src-stamp-fresh"
-build_release "$work/src-stamp-fresh" "$work/stamp-fresh"
+build_release "$stamp_src" "$work/stamp-fresh"
 stamp_out=$(compare_targets "$work/stamp-base" "$work/stamp-fresh" stamp)
-[[ "$stamp_out" == "22 2 4 22 44 $native_len" ]] || fail "timestamp edit output $stamp_out"
+[[ "$stamp_out" == "22 2 4 22 44 3" ]] || fail "timestamp edit output $stamp_out"
+
+backend_src=$(one_case backend-options)
+build_release "$backend_src" "$work/backend-base" 8
+text_bytes "$work/backend-base/release/frust_parity" "$work/backend-before.text"
+mkdir -p "$backend_src/.cargo"
+cat > "$backend_src/.cargo/config.toml" <<'EOF'
+[build]
+rustflags = ["-C", "llvm-args=-align-all-functions=5"]
+EOF
+build_release "$backend_src" "$work/backend-base" 8
+build_release "$backend_src" "$work/backend-fresh" 8
+backend_out=$(compare_targets "$work/backend-base" "$work/backend-fresh" backend-options)
+[[ "$backend_out" == "$pristine_out" ]] || fail "backend options changed output to $backend_out"
+if cmp -s "$work/backend-before.text" "$work/backend-options.warm.text"; then
+  fail "backend options did not exercise a machine-code change"
+fi
+
+race_src=$(one_case mid-build-edit)
+cat > "$work/edit-after-rustc" <<'WRAPPER'
+#!/bin/bash
+set -euo pipefail
+"$@"
+while [[ $# -gt 1 ]]; do
+  if [[ $1 == --crate-name && $2 == frust_parity ]]; then
+    python3 - "$FRUST_TEST_EDIT_PATH" <<'PYTHON'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+old = "n.wrapping_add(11)"
+if old not in text:
+    raise SystemExit("mid-build edit pattern missing")
+path.write_text(text.replace(old, "n.wrapping_add(12)", 1))
+PYTHON
+    break
+  fi
+  shift
+done
+WRAPPER
+chmod +x "$work/edit-after-rustc"
+FRUST_TEST_EDIT_PATH="$race_src/src/main.rs" RUSTC_WRAPPER="$work/edit-after-rustc"   build_release "$race_src" "$work/race-base"
+[[ $(run_bin "$work/race-base") == "$pristine_out" ]] || fail "mid-build test did not start with the old binary"
+build_release "$race_src" "$work/race-base"
+build_release "$race_src" "$work/race-fresh"
+race_out=$(compare_targets "$work/race-base" "$work/race-fresh" mid-build-edit)
+[[ "$race_out" == "22 2 4 22 44 3" ]] || fail "mid-build edit output $race_out"
 
 echo "PROVE_OK $(date -Is)"

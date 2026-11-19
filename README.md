@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/assets/hero.svg" alt="fRust compiler toolchain for macOS and Linux. Rewrite in planning." width="880">
+<img src=".github/assets/hero.svg" alt="fRust compiler toolchain for macOS and Linux. Pinned Rust compiler and Cargo." width="880">
 
 **A Rust compiler and Cargo toolchain built for faster rebuilds.**
 
@@ -10,7 +10,7 @@
 
 </div>
 
-This branch packages a source-equivalent Rust 1.100.0 stage-2 toolchain (`frustc`, `fcargo`, and rustdoc). Two measured compiler changes missed the frozen release-build budgets. Those probes are recorded in `qualification/CANDIDATE.md`. No faster-rebuild claim is made from them. Host compatibility for this package is recorded in `qualification/COMPAT.md`.
+This branch packages a Rust 1.100.0 stage-2 toolchain with a patched Cargo (`frustc`, `fcargo`, and rustdoc). Two measured compiler changes missed the frozen release-build budgets. Those probes are recorded in `qualification/CANDIDATE.md`. A faster rebuild on meaningful full-LTO edits remains unqualified. Host compatibility for this package is recorded in `qualification/COMPAT.md`.
 
 | Area | Design target |
 | --- | --- |

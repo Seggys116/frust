@@ -26,8 +26,12 @@ macro_rules! generated {
     };
 }
 
+unsafe extern "C" {
+    fn frust_native() -> std::ffi::c_int;
+}
+
 fn main() {
-    let native: usize = env!("FRUST_NATIVE_BYTES").parse().unwrap();
+    let native = unsafe { frust_native() };
     println!(
         "{} {} {} {} {} {}",
         leaf(10),

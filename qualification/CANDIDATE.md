@@ -1,5 +1,23 @@
 # Candidate
 
+## Status after the 19 November performance review
+
+| Experiment | Disposition | Evidence |
+| --- | --- | --- |
+| Opt-level 0 pre-link and outliner | Archived | Higher RSS and larger artifact. |
+| Opt-level 1 pre-link | Archived | Leaf geometric mean 0.989 in single samples. |
+| Safe ICF | Archived | Equivalent output with negligible build-time change. |
+| Post-optimization whole-object cache | Opt-in research | Ripgrep's IR-neutral hit improved, and the fd miss regressed. The partial key prevents promotion. |
+| RELR | Separate opt-in research | Smaller Linux artifacts with additional loader and linker requirements. |
+| Pre-optimization fat-LTO cache | Archived | Required fd miss regressed and runtime and size evidence was incomplete. |
+| Two-thread fat-LTO codegen split | Archived | The fd miss took 1.33 times the wall time and 1.62 times peak RSS. |
+
+The source patch keeps ordinary compilation and linking on the upstream paths. This ledger supersedes retention language in the historical experiment entries. Retest historical patches against their original bases and switches. A meaningful change to fat-LTO input still runs the full pipeline. The next candidate protocol needs executable workloads with verifiable artifact changes, a fresh holdout, per-phase traces, and a runtime A/A check before timing.
+
+The qualification evaluator now reuses resampling storage and selects the median without sorting each sample. With three synthetic 60-pair groups and 2,000 resamples per evaluation, 20 alternating batches on Linux measured 11.91 ms before and 6.15 ms after. This measures the evaluator alone. The original pre-optimization sample file still fails the holdout, runtime and size gate rows.
+
+The Linux review package is `target/compiler-rewrite/toolchains/frust-0ef1bc386-review1`. Both stage-2 rebuilds and ambient-free launch passed. The revised proof passed nine warm/fresh cases, including the changed C archive, backend options with eight CGUs, and the edit after rustc returned. The original package reproduced stale warm output in that final case. The patched Cargo library suite passed 192 tests, including all 30 selected fingerprint tests. The project workspace passed 25 tests with 88.85% line and 85.45% region coverage. This is focused Linux correctness evidence. Native macOS and release performance qualification remain open.
+
 The stage-2 compiler in `target/compiler-rewrite/toolchains/frust-prelink2` (id `frust-0ef1bc386-prelink2`) contains the change below. `qualification/prove-codegen.sh` passed on that prefix before any candidate timing sample: `LLVM_fatlto` ran for both `frustc` (1.252s) and `rustc` (1.214s) on the codegen probe; fat LTO with `-C save-temps` wrote 1 pre-optimization bitcode file at `codegen-units=1` and 8 at `codegen-units=8` for both compilers; warm incremental and fresh release builds matched `.text` bytes and program output for a leaf body, its revert, a generic plus a trait method, a public function plus a macro, a native input, a linker-only `--defsym`, and a same-size edit whose timestamp was restored. This is a correctness result, not a budget ratio.
 
 The earlier prefix `frust-prelink1` has the compiler change and the previous Cargo. It does not have the content checksum below. `frust` (id `frust-0ef1bc386-central1`) remains the unpatched package.

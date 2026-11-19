@@ -12,4 +12,4 @@ Recorded on 2026-11-19 before any candidate timing sample. Each patch changes on
 | regex | wide | `edits/regex-wide.patch` | `Regex::new` |
 | fd | holdout | `edits/fd-holdout.patch` | `ensure_single_search_pattern_is_not_a_path` |
 
-Each patch applies to the clean tree on its own. Cold uses the leaf source with an empty target directory. No-op repeats the leaf command with the patch absent.
+Each patch applies to the clean tree on its own. Cold uses the leaf source (holdout source for fd) with an empty target directory. Seed compiles the unmodified source. No-op repeats the seed build without intervening edits.
