@@ -14,6 +14,8 @@ Two parts:
 
 3. Content checksums. Cargo uses `FingerprintMethod::Content` only when its rustc path is named `frustc`. After each such compile it stores a Blake3 checksum and length for every dep-info input that rustc did not already checksum. The next build compares those checksums, so a same-size edit is rebuilt when its timestamp is restored. A `rustc` invocation keeps Cargo's mtime check. The diff is `support/patches/0002-frustc-content-fingerprint.patch`.
 
+A later read of the packaged binaries, not a timing sample, checked the fingerprint JSON of a one-file crate. `frust-prelink2` and `frust-o1` record `content` when `RUSTC` is named `frustc`, and `mtime` when it is named `rustc`. The central `frust` package and the unpatched stage-2 cargo record `mtime` for both names. The central cargo binary is the older build and does not contain this behavior.
+
 The compiler diff for this dropped candidate is `support/patches/rustc/dropped/0001-frustc-fat-prelink-and-x86-outliner.patch`. `support/apply-rustc-patches.sh` does not apply `dropped/`. `qualification/time-build.sh` exports `RUSTC` to a sibling `frustc` only when that file exists. The control and official bin directories have no `frustc`, so their baselines stay on `rustc`.
 
 A control time-passes build of the syn library had no `LLVM_fatlto` row. Fat LTO of an rlib stops after the pre-link pipeline, and that pipeline was 1.430s of a 2.501s crate invocation. The skip changes that pre-link copy. A downstream fat-LTO binary still runs `run_pass_manager` at the requested opt level.
