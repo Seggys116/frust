@@ -84,4 +84,4 @@ python3 x.py build --stage 1 opt-dist
     --target-triple "$host" --checkout-dir "$source_dir" \
     --llvm-dir "$llvm" --artifact-dir "$work/profiles" --build-dir "$work/build" \
     --python "$bootstrap_python" --build-llvm=false --use-bolt \
-    -- python3 x.py dist rustc rust-std cargo
+    -- python3 x.py dist rustc rust-std cargo rust-src

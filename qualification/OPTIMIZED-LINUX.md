@@ -18,6 +18,21 @@ Use the [build and disk collector](cpu-benchmark.py) with official Rust and the 
 
 The local `frust-0ef1bc386-dist-bolt1` package completed all nine upstream workloads for compiler PGO and again for BOLT. Its driver contains `.note.bolt_info`, and the packaged LLVM digest matches official Rust 1.100.0. LLVM's `malloc` binds to the binary's compiled-in jemalloc. Codegen parity passed nine cases and the release-default check passed 22 cases. The package and verification logs are under `target/compiler-rewrite/toolchains/frust-0ef1bc386-dist-bolt1` and `target/compiler-rewrite/optimized-dist/dist-*`.
 
+## Matched measurements
+
+The Linux x86-64 matrix contains 1,476 measurements across 16 ripgrep, fd and oxipng configurations. It covers debug and project release, LTO off, ThinLTO, fat LTO, incremental and nonincremental builds, cold and fresh builds, history, no-ops, clean and clean rebuild. Each expensive build cell has one observation. No-ops use seven pairs and each runtime cell uses 30 pairs pinned to a single core. CPU seconds sum user and system time for Cargo and its waited descendants. Allocated bytes measure the target tree, separate from the installed package.
+
+| Build operation | Configurations faster than official | Median fRust / official CPU |
+| --- | ---: | ---: |
+| Cold | 5 of 16 | 1.027 |
+| Semantic edit | 1 of 16 | 1.033 |
+| No-op | 1 of 16 | 1.041 |
+| Clean rebuild | 1 of 16 | 1.038 |
+
+The fastest cold result was fd with incremental builds and LTO off, at 0.866 times official Rust's CPU. Oxipng's project-release edit used 1.216 times official CPU. That configuration also retained an incremental store, at 83.10 MiB after the edit versus 56.14 MiB for official Rust. The explicit matched profiles generally used very similar target space. All 224 timed no-ops reused every unit and all 32 cleans removed the measured target allocation. Cold-build stripped binaries ranged from 0.996 to 1.0014 times official size.
+
+All 480 executable runtime pairs produced matching application output. Eleven of 16 configurations cleared the one-sided 1% runtime limit in the original matrix. The longer oxipng LTO-off rerun cleared it at 1.0051. The project-release rerun had a 1.0209 bound, and the same-binary control had a 1.0183 bound. That cell remains unqualified at 1%. The strict screen recorded 248 failures in 324 checks across build CPU, exact allocated-byte comparisons and runtime. The matrix and separate reruns are under `target/compiler-rewrite/optimized-dist/bolt-cpu-*` and `bolt-runtime-repeat-*`.
+
 The local launcher was also built with fat LTO, one codegen unit and PGO from the storage probe. It occupied 845,496 bytes compared with 1,007,000 for the release launcher. Thirty paired no-ops in each mode gave CPU ratios of 0.997 in both plain and static modes. This experiment establishes a smaller launcher and near-parity CPU for the measured no-ops. Its samples are in `target/compiler-rewrite/optimized-dist/launcher-noops.jsonl`.
 
 The PGO-only diagnostic isolated no-op overhead on a one-crate target. Across 30 alternating rounds on one core, median CPU was 36.65 ms for official Cargo, 38.94 ms for PGO fRust Cargo invoked directly, and 41.18 ms through the PGO launcher. All 90 samples reused the existing compilation. The paired launcher/direct difference was 2.30 ms. A separate syscall trace recorded two executable loads through the launcher and one in either direct invocation. Direct fRust Cargo still used 5.8% more CPU by the paired median. Samples and traces are under `target/compiler-rewrite/optimized-dist/pgo-noop-*`.
@@ -27,6 +42,8 @@ The PGO-only diagnostic isolated no-op overhead on a one-crate target. Across 30
 On the source-built Cargo used in this trial, 100 paired no-ops took 42.09 ms median CPU through the launcher and 39.83 ms through the in-process entry. The paired ratio was 0.950 with a one-sided 95% bound of 0.955. Official Cargo used 35.72 ms median CPU in the same run. The forced-UI path adds another process launch and still needs its own performance and terminal qualification. The trial stays outside the default patch series. Raw data is in `target/compiler-rewrite/optimized-dist/cargo-fast-entry-noops-final.jsonl`.
 
 Two repeated ripgrep cold builds with LTO off, each compiling 44 Cargo artifacts, investigated a larger preliminary regression. Official Rust used 74.96 and 73.29 CPU seconds. The BOLT package used 78.12 and 77.48 CPU seconds. Per-compiler timings showed the two biggest increases in `regex_automata` and `rg`, averaging 0.75 and 0.65 CPU seconds respectively. A separate single-core trace put most of the difference in LLVM optimization and emission. Both compilers used the same LLVM binary and the same requested profile. Raw measurements are under `target/compiler-rewrite/optimized-dist/ripgrep-off-attribution.jsonl` and `ripgrep-compile-*.phases`.
+
+An allocator tuning replay tested those two expensive compiler invocations directly. Three pairs per crate produced byte-identical outputs. Median tuned CPU was 0.996 times default for `regex_automata` and 1.004 for `rg`. The latter's peak process RSS rose 12.0%. The existing allocator configuration remains the measured baseline.
 
 ## Automatic storage
 
@@ -60,4 +77,17 @@ The final retention patch repeated all 147 fRust samples with the same unit coun
 
 With the BOLT compiler and its upstream-matched standard-library settings, the same verified retention Cargo used 17.96 MiB with automatic cleanup and 89.64 MiB with cleanup disabled. Official Cargo used 89.41 MiB on the same fixture. All five managed output modes retained four of 20 configurations and all seven final no-ops stayed fresh. The lock proof passed again with the optimized compiler. Samples are under `target/compiler-rewrite/optimized-dist/bolt-with-retention-*`.
 
-The local optimized build uses the first three committed Cargo patches, the committed rustc patch, and the [initial retention trial](managed-unit-retention.patch). Its compiler tools are isolated from the shared checkout. The pipeline uses the upstream Linux distribution's static Cargo dependency setting. The older Cargo training workload still requires OpenSSL development headers from the host or an isolated SDK.
+The 16-configuration benchmark package uses the first three committed Cargo patches, the committed rustc patch, and the [initial retention trial](managed-unit-retention.patch). It uses explicit target directories for the matched CPU comparisons. The pipeline uses the upstream Linux distribution's static Cargo dependency setting. The older Cargo training workload still requires OpenSSL development headers from the host or an isolated SDK.
+
+## Final managed package
+
+`frust-0ef1bc386-dist-bolt-managed1` combines the verified BOLT compiler and sysroot with Cargo built from the committed cooperative-check and final retention patches. Cargo was rebuilt with ThinLTO, one codegen unit, static native dependencies and profile-use from the merged training data. Its Cargo snapshot is `2abdf6792160108f7e51d1f042204b228594443f`. The package contains local source trees and passed a relocation test under a path with spaces, including a native build and a vendored offline `build-std` check.
+
+The final package passed nine codegen parity cases, 22 profile-default checks, all 147 storage observations and the five cooperative-check cases. The 20-configuration storage result remained 17.96 MiB with default cleanup and 89.64 MiB with cleanup disabled. A separate three-way benchmark recorded 267 measurements for ripgrep dev and incremental fat LTO. These are CPU seconds for the two end points of that comparison.
+
+| Profile | Official cold | Final cold | Official edit | Final edit | Final runtime upper 95% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Debug | 28.88 | 25.85 | 0.601 | 0.597 | 1.0062 |
+| Incremental fat LTO | 50.87 | 56.38 | 26.02 | 26.21 | 1.0014 |
+
+The final package cleared the 1% runtime limit in both profiles. Its no-op CPU medians were 28.7 ms in debug and 29.2 ms with fat LTO, versus 25.4 ms and 26.3 ms for official Rust. The strict combined screen recorded 24 failures in 34 checks. The local package is under `target/compiler-rewrite/toolchains/frust-0ef1bc386-dist-bolt-managed1`. Its logs and measurements are under `target/compiler-rewrite/optimized-dist/managed-pgo-*`.

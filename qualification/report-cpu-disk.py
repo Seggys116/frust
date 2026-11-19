@@ -37,7 +37,7 @@ def observations(lanes):
     return groups
 
 
-def metrics(groups):
+def metrics(groups, runtime_reference=None):
     result = {}
     for (workload, profile), cases in groups.items():
         result.setdefault(workload, {})[profile] = summary = {}
@@ -75,7 +75,7 @@ def metrics(groups):
                         )
                 item["samples"] = len(rows)
                 compare_candidate = tool in ("compressed", "candidate") and "frust" in by_tool
-                reference = "frust" if compare_candidate else "official"
+                reference = runtime_reference or ("frust" if compare_candidate else "official")
                 if case == "runtime" and tool != reference:
                     baseline = by_tool.get(reference, {})
                     paired = [row["cpu"] / baseline[key]["cpu"]
@@ -317,6 +317,8 @@ def screen(groups, candidate):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lanes", nargs="+", type=Path)
+    parser.add_argument("--runtime-reference", choices=TOOL_NAMES,
+                        help="select the reference for reported paired runtime CPU")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--html", action="store_true")
     mode.add_argument("--screen", choices=("frust", "candidate"),
@@ -327,7 +329,7 @@ def main():
         parser.error("no samples found")
     if args.screen:
         return screen(observed, args.screen)
-    (print_html if args.html else print_markdown)(metrics(observed))
+    (print_html if args.html else print_markdown)(metrics(observed, args.runtime_reference))
 
 
 if __name__ == "__main__":
