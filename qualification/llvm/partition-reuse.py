@@ -90,6 +90,7 @@ def emit(args, label, inputs, cached, retain_hit_bitcode=False, exact_cache=None
         inputs = prefix
     cpu_after_split = cpu_time()
     bitcode_bytes = 0
+    retained_object_bytes = 0
     emission_cpu = 0.0
     for index in range(args.parts):
         source = Path(f"{inputs}{index}")
@@ -115,6 +116,7 @@ def emit(args, label, inputs, cached, retain_hit_bitcode=False, exact_cache=None
                 "-disable-verify=false", canonical, "-o", obj,
             ], check=True)
             emission_cpu += cpu_time() - emission_start
+            retained_object_bytes += obj.stat().st_size
             produced[key] = obj
         else:
             hits += 1
@@ -135,7 +137,7 @@ def emit(args, label, inputs, cached, retain_hit_bitcode=False, exact_cache=None
         "link_cpu": finish_cpu - link_start,
         "partition_hits": hits,
         "bitcode_bytes": bitcode_bytes,
-        "retained_object_bytes": sum(path.stat().st_size for path in produced.values()),
+        "retained_object_bytes": retained_object_bytes,
         "parts": args.parts,
         "exact_module_hit": False,
         "sha256": fingerprint(merged),
