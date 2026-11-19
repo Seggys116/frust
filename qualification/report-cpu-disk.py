@@ -274,16 +274,58 @@ if ([...profile.options].some(option => option.value === 'fat16-incremental')) {
 </script>""")
 
 
+def screen(groups, candidate):
+    failures = 0
+    checks = 0
+    for (workload, profile), cases in groups.items():
+        for case, per_tool in cases.items():
+            if case.startswith("trace-"):
+                continue
+            label = f"{workload} {profile} {case}"
+            checks += 1
+            official, tested = per_tool.get("official", {}), per_tool.get(candidate, {})
+            if not official or official.keys() != tested.keys():
+                print(f"FAIL {label} missing paired samples")
+                failures += 1
+                continue
+            ratios = [tested[key]["cpu"] / row["cpu"] for key, row in official.items()]
+            if case == "runtime":
+                bound = runtime_upper(ratios)
+                failed = bound is None or bound > 1.01
+                if failed:
+                    print(f"FAIL {label} runtime upper {bound} exceeds 1.01 or is unavailable")
+            else:
+                ratio = median(ratios)
+                failed = ratio >= 1
+                if failed:
+                    print(f"FAIL {label} build CPU ratio {ratio:.4f} is at least 1.00")
+            failures += failed
+            if all("disk" in row and "disk" in tested[key] for key, row in official.items()):
+                disk = median(tested[key]["disk"]["allocated"] - row["disk"]["allocated"]
+                              for key, row in official.items())
+                checks += 1
+                if disk > 0:
+                    failures += 1
+                    print(f"FAIL {label} retained {disk / MIB:.3f} MiB more than official Rust")
+    print(f"{failures} failures in {checks} measured checks")
+    return int(failures > 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lanes", nargs="+", type=Path)
-    parser.add_argument("--html", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--html", action="store_true")
+    mode.add_argument("--screen", choices=("frust", "candidate"),
+                      help="require faster paired build CPU and no storage or runtime regression")
     args = parser.parse_args()
-    result = metrics(observations(args.lanes))
-    if not result:
+    observed = observations(args.lanes)
+    if not observed:
         parser.error("no samples found")
-    (print_html if args.html else print_markdown)(result)
+    if args.screen:
+        return screen(observed, args.screen)
+    (print_html if args.html else print_markdown)(metrics(observed))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
