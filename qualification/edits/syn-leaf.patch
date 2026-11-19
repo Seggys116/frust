@@ -1,0 +1,10 @@
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -166,6 +166,7 @@
+         return new(span, message.to_string());
+ 
+         fn new(span: Span, message: String) -> Error {
++            let _frust_leaf = message.len();
+             Error {
+                 messages: vec![ErrorMessage {
+                     span: ThreadBound::new(SpanRange {

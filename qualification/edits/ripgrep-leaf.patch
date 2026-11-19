@@ -1,0 +1,10 @@
+--- a/crates/core/search.rs
++++ b/crates/core/search.rs
+@@ -383,6 +383,7 @@ fn search_path<M: Matcher, W: WriteColor>(
+     printer: &mut Printer<W>,
+     path: &Path,
+ ) -> io::Result<SearchResult> {
++    let _frust_leaf = path.as_os_str().len();
+     match *printer {
+         Printer::Standard(ref mut p) => {
+             let mut sink = p.sink_with_path(&matcher, path);

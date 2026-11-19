@@ -1,0 +1,10 @@
+--- a/crates/searcher/src/searcher/mod.rs
++++ b/crates/searcher/src/searcher/mod.rs
+@@ -652,6 +652,7 @@
+         S: Sink,
+     {
+         let path = path.as_ref();
++        let _frust_wide = path.as_os_str().len();
+         let file = File::open(path).map_err(S::Error::error_io)?;
+         self.search_file_maybe_path(matcher, Some(path), &file, write_to)
+     }

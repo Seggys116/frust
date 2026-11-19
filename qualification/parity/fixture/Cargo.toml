@@ -1,0 +1,8 @@
+[package]
+name = "frust_parity"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "frust_parity"
+path = "src/main.rs"

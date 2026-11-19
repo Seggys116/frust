@@ -1,0 +1,10 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -193,6 +193,7 @@ fn ensure_search_pattern_is_not_a_path(opts: &Opts) -> Result<()> {
+ fn ensure_single_search_pattern_is_not_a_path(pattern: &str) -> Result<()> {
+     // Start with the cheap check: '/' is always a path separator, including on
+     // Windows, and has no regex meaning, so flagging it is safe and catches the
++    let _frust_leaf = pattern.len();
+     // Linux/macOS mistake of pasting a full path as the pattern.
+     #[cfg_attr(not(windows), allow(unused_mut))]
+     let mut should_warn = pattern.contains('/');
