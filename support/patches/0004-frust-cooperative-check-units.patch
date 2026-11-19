@@ -1,0 +1,841 @@
+diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
+index 4bf69f6..7494979 100644
+--- a/src/compiler/build_runner/mod.rs
++++ b/src/compiler/build_runner/mod.rs
+@@ -94,6 +94,7 @@ pub struct BuildRunner<'a, 'gctx> {
+ 
+     /// Manages locks for build units when fine grain locking is enabled.
+     pub lock_manager: Arc<LockManager>,
++    pub(super) cooperative_check: bool,
+ }
+ 
+ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+@@ -135,6 +136,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
+             unused_dep_state: UnusedDepState::new(bcx),
+             lock_manager: Arc::new(LockManager::new()),
++            cooperative_check: super::unit_join::supports(bcx),
+         })
+     }
+ 
+@@ -432,8 +434,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+             | UserIntent::Doctest
+             | UserIntent::Bench => true,
+         };
+-        let host_layout =
+-            Layout::new(self.bcx.ws, None, &dest, must_take_artifact_dir_lock, false)?;
++        let shared_build_dir =
++            self.cooperative_check || self.bcx.gctx.cli_unstable().fine_grain_locking;
++        let host_layout = Layout::new(
++            self.bcx.ws,
++            None,
++            &dest,
++            must_take_artifact_dir_lock,
++            shared_build_dir,
++        )?;
+         let mut targets = HashMap::default();
+         for kind in self.bcx.all_kinds.iter() {
+             if let CompileKind::Target(target) = *kind {
+@@ -442,7 +451,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+                     Some(target),
+                     &dest,
+                     must_take_artifact_dir_lock,
+-                    false,
++                    shared_build_dir,
+                 )?;
+                 targets.insert(target, layout);
+             }
+diff --git a/src/compiler/fingerprint/join.rs b/src/compiler/fingerprint/join.rs
+new file mode 100644
+index 0000000..8be0bc2
+--- /dev/null
++++ b/src/compiler/fingerprint/join.rs
+@@ -0,0 +1,211 @@
++//! Re-reads a unit's on-disk record after another Cargo process may have built it.
++//!
++//! A [`JoinProbe`] answers the question [`prepare_target`] answered at plan
++//! time, but from the filesystem as it is now and from a job thread. It accepts
++//! a unit only when the record would also be fresh for a new invocation.
++//!
++//! [`prepare_target`]: super::prepare_target
++
++use std::ffi::{OsStr, OsString};
++use std::path::PathBuf;
++#[cfg(unix)]
++use std::os::unix::fs::MetadataExt;
++use std::sync::Arc;
++
++use cargo_util::paths;
++use filetime::FileTime;
++
++use super::BuildRunner;
++use super::Fingerprint;
++use super::LocalFingerprint;
++use super::Unit;
++use super::find_stale_file;
++use super::parse_dep_info;
++use crate::CARGO_ENV;
++use crate::context::FingerprintMethod;
++use crate::util;
++use crate::util::data_structures::HashMap;
++use crate::util::errors::CargoResult;
++use crate::workspace::manifest::ManifestMetadata;
++
++/// Everything needed to re-check one unit, owned so a job thread can hold it.
++pub(crate) struct JoinProbe {
++    fingerprint: Arc<Fingerprint>,
++    hash_path: PathBuf,
++    pkg_root: PathBuf,
++    metadata: ManifestMetadata,
++    build_root: PathBuf,
++    cargo_exe: PathBuf,
++    env_config: Arc<HashMap<String, OsString>>,
++    env: HashMap<String, String>,
++}
++
++impl JoinProbe {
++    /// Captures the planned fingerprint of `unit` after [`prepare_target`] ran.
++    ///
++    /// Returns `None` when the unit has no dep-info record to re-check, so the
++    /// caller keeps the normal build path.
++    ///
++    /// [`prepare_target`]: super::prepare_target
++    pub(crate) fn new(
++        build_runner: &BuildRunner<'_, '_>,
++        unit: &Unit,
++    ) -> CargoResult<Option<JoinProbe>> {
++        let Some(fingerprint) = build_runner.fingerprints.get(unit).cloned() else {
++            return Ok(None);
++        };
++        let rechecked = {
++            let local = fingerprint.local.lock().unwrap();
++            !local.is_empty()
++                && local
++                    .iter()
++                    .all(|l| matches!(l, LocalFingerprint::CheckDepInfo { .. }))
++        };
++        if !rechecked || fingerprint.outputs.is_empty() {
++            return Ok(None);
++        }
++        let gctx = build_runner.bcx.gctx;
++        Ok(Some(JoinProbe {
++            fingerprint,
++            hash_path: build_runner.files().fingerprint_file_path(unit, ""),
++            pkg_root: unit.pkg.root().to_path_buf(),
++            metadata: unit.pkg.manifest().metadata().clone(),
++            build_root: super::build_root(build_runner),
++            cargo_exe: gctx.cargo_exe()?.to_path_buf(),
++            env_config: Arc::clone(gctx.env_config()?),
++            env: gctx
++                .env()
++                .map(|(k, v)| (k.to_owned(), v.to_owned()))
++                .collect(),
++        }))
++    }
++
++    /// Whether the record on disk is complete and fresh right now.
++    ///
++    /// Any error or doubt reports `false`, which makes the caller build.
++    pub(crate) fn is_current(&self) -> bool {
++        self.check().unwrap_or(false)
++    }
++
++    fn check(&self) -> CargoResult<bool> {
++        let fingerprint = &*self.fingerprint;
++
++        // The hash file is emptied before a rebuild and written after the
++        // outputs, so a match means a producer finished this exact identity.
++        let Ok(recorded) = paths::read(&self.hash_path) else {
++            return Ok(false);
++        };
++        if recorded != util::to_hex(fingerprint.hash_u64()) {
++            return Ok(false);
++        }
++
++        let mut own_mtime: Option<FileTime> = None;
++        for output in &fingerprint.outputs {
++            let Ok(mtime) = paths::mtime(output) else {
++                return Ok(false);
++            };
++            own_mtime = own_mtime.max(Some(mtime));
++        }
++        let Some(own_mtime) = own_mtime else {
++            return Ok(false);
++        };
++
++        // Read dependency outputs again: a dependency another process rebuilt
++        // after this unit was planned must not predate this unit's outputs.
++        for dep in &fingerprint.deps {
++            let mut dep_mtime: Option<FileTime> = None;
++            for output in &dep.fingerprint.outputs {
++                if dep.only_requires_rmeta && output.extension() != Some(OsStr::new("rmeta")) {
++                    continue;
++                }
++                let Ok(mtime) = paths::mtime(output) else {
++                    return Ok(false);
++                };
++                dep_mtime = dep_mtime.max(Some(mtime));
++            }
++            match dep_mtime {
++                Some(dep_mtime) if dep_mtime > own_mtime => return Ok(false),
++                Some(_) => {}
++                None if dep.only_requires_rmeta => return Ok(false),
++                None => {}
++            }
++        }
++
++        // Fresh caches: the planning pass may have cached older mtimes.
++        let mut mtime_cache = HashMap::default();
++        let mut checksum_cache = HashMap::default();
++        for local in fingerprint.local.lock().unwrap().iter() {
++            let LocalFingerprint::CheckDepInfo {
++                dep_info,
++                fingerprint: method,
++            } = local
++            else {
++                return Ok(false);
++            };
++            let dep_info = self.build_root.join(dep_info);
++            let Some(info) = parse_dep_info(&self.pkg_root, &self.build_root, &dep_info)? else {
++                return Ok(false);
++            };
++            #[cfg(unix)]
++            {
++                // Cargo stamps translated dep-info with the compiler invocation time.
++                // ctime also changes when a save restores the previous mtime.
++                let invocation = paths::mtime(&dep_info)?;
++                for input in info.files.keys() {
++                    let link = std::fs::symlink_metadata(input)?;
++                    let target = std::fs::metadata(input)?;
++                    if [&link, &target].into_iter().any(|meta| {
++                        FileTime::from_unix_time(meta.ctime(), meta.ctime_nsec() as u32)
++                            >= invocation
++                    }) {
++                        return Ok(false);
++                    }
++                }
++            }
++            if info
++                .env
++                .iter()
++                .any(|(key, previous)| self.env_changed(key, previous))
++            {
++                return Ok(false);
++            }
++            let stale = match method {
++                FingerprintMethod::Content => find_stale_file(
++                    &mut mtime_cache,
++                    &mut checksum_cache,
++                    &dep_info,
++                    info.files.iter().map(|(file, checksum)| (file, *checksum)),
++                    *method,
++                ),
++                FingerprintMethod::Mtime => find_stale_file(
++                    &mut mtime_cache,
++                    &mut checksum_cache,
++                    &dep_info,
++                    info.files.into_keys().map(|path| (path, None)),
++                    *method,
++                ),
++            };
++            if stale.is_some() {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    /// Mirrors the environment check of `LocalFingerprint::find_stale_item`.
++    fn env_changed(&self, key: &str, previous: &Option<String>) -> bool {
++        if let Some(value) = self.metadata.env_var(key) {
++            if Some(value.as_ref()) == previous.as_deref() {
++                return false;
++            }
++        }
++        let current = if key == CARGO_ENV {
++            self.cargo_exe.to_str()
++        } else if let Some(value) = self.env_config.get(key) {
++            value.to_str()
++        } else {
++            self.env.get(key).map(String::as_str)
++        };
++        current != previous.as_deref()
++    }
++}
+diff --git a/src/compiler/fingerprint/mod.rs b/src/compiler/fingerprint/mod.rs
+index d388e63..8fd11e9 100644
+--- a/src/compiler/fingerprint/mod.rs
++++ b/src/compiler/fingerprint/mod.rs
+@@ -378,6 +378,7 @@
+ 
+ mod dep_info;
+ mod dirty_reason;
++mod join;
+ mod rustdoc;
+ 
+ use crate::util::data_structures::HashMap;
+@@ -426,6 +427,7 @@ pub use self::dep_info::parse_dep_info;
+ pub use self::dep_info::parse_rustc_dep_info;
+ pub use self::dep_info::translate_dep_info;
+ pub use self::dirty_reason::DirtyReason;
++pub(crate) use self::join::JoinProbe;
+ pub use self::rustdoc::RustdocFingerprint;
+ 
+ /// Result of comparing fingerprints between the current and previous builds.
+@@ -472,10 +474,14 @@ pub fn prepare_target(
+     // information about failed comparisons to aid in debugging.
+     let fingerprint = calculate(build_runner, unit)?;
+     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
+-    let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
+-    {
+-        FingerprintComparison::Fresh => None,
+-        FingerprintComparison::Dirty { reason } => Some(reason),
++    let dirty_reason = if build_runner.cooperative_check {
++        // Output records are read by the worker under the unit lock.
++        Some(DirtyReason::FreshBuild)
++    } else {
++        match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force) {
++            FingerprintComparison::Fresh => None,
++            FingerprintComparison::Dirty { reason } => Some(reason),
++        }
+     };
+ 
+     if let Some(logger) = bcx.logger {
+@@ -542,7 +548,7 @@ pub fn prepare_target(
+     // But the executable is corrupt and needs to be rebuilt. Clearing the
+     // fingerprint at step 3 ensures that Cargo never mistakes a partially
+     // written output as up-to-date.
+-    if loc.exists() {
++    if !build_runner.cooperative_check && loc.exists() {
+         // Truncate instead of delete so that compare_old_fingerprint will
+         // still log the reason for the fingerprint failure instead of just
+         // reporting "failed to read fingerprint" during the next build if
+@@ -1555,16 +1561,18 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
+ 
+     // After we built the initial `Fingerprint` be sure to update the
+     // `fs_status` field of it.
+-    let build_root = build_root(build_runner);
+-    let cargo_exe = build_runner.bcx.gctx.cargo_exe()?;
+-    fingerprint.check_filesystem(
+-        &mut build_runner.mtime_cache,
+-        &mut build_runner.checksum_cache,
+-        &unit.pkg,
+-        &build_root,
+-        cargo_exe,
+-        build_runner.bcx.gctx,
+-    )?;
++    if !build_runner.cooperative_check {
++        let build_root = build_root(build_runner);
++        let cargo_exe = build_runner.bcx.gctx.cargo_exe()?;
++        fingerprint.check_filesystem(
++            &mut build_runner.mtime_cache,
++            &mut build_runner.checksum_cache,
++            &unit.pkg,
++            &build_root,
++            cargo_exe,
++            build_runner.bcx.gctx,
++        )?;
++    }
+ 
+     let fingerprint = Arc::new(fingerprint);
+     build_runner
+@@ -1674,6 +1682,12 @@ fn calculate_normal(
+         },
+     ));
+     let mut config = StableHasher::new();
++    if build_runner.cooperative_check {
++        // The record is valid only for checks of this workspace and compiler.
++        "frust-cooperative-check-v1".hash(&mut config);
++        build_runner.bcx.ws.root().hash(&mut config);
++        build_runner.bcx.rustc().path.hash(&mut config);
++    }
+     let linker = if unit.target.for_host() && !build_runner.bcx.gctx.target_applies_to_host()? {
+         build_runner.compilation.host_linker()
+     } else {
+@@ -1974,6 +1988,17 @@ fn local_fingerprints_deps(
+     local
+ }
+ 
++/// Invalidates the old fingerprint before a cooperative worker writes outputs.
++pub(super) fn invalidate_before_build(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Work {
++    let loc = build_runner.files().fingerprint_file_path(unit, "");
++    Work::new(move |_| {
++        if loc.exists() {
++            paths::write(&loc, b"")?;
++        }
++        Ok(())
++    })
++}
++
+ /// Writes the short fingerprint hash value to `<loc>`
+ /// and logs detailed JSON information to `<loc>.json`.
+ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
+diff --git a/src/compiler/job_queue/job.rs b/src/compiler/job_queue/job.rs
+index 0c9d302..bf104c9 100644
+--- a/src/compiler/job_queue/job.rs
++++ b/src/compiler/job_queue/job.rs
+@@ -5,6 +5,8 @@ use std::mem;
+ 
+ use super::JobState;
+ use crate::compiler::fingerprint::DirtyReason;
++use crate::compiler::locking::LockManager;
++use crate::compiler::unit_join::{Readiness, UnitJoin};
+ use crate::util::CargoResult;
+ 
+ /// Represents a unit of [`Work`] with a [`Freshness`] for caller
+@@ -12,6 +14,7 @@ use crate::util::CargoResult;
+ pub struct Job {
+     work: Work,
+     fresh: Freshness,
++    join: Option<(UnitJoin, Work)>,
+ }
+ 
+ /// The basic unit of work.
+@@ -56,6 +59,7 @@ impl Job {
+         Job {
+             work: Work::noop(),
+             fresh: Freshness::Fresh,
++            join: None,
+         }
+     }
+ 
+@@ -64,6 +68,7 @@ impl Job {
+         Job {
+             work,
+             fresh: Freshness::Dirty(dirty_reason),
++            join: None,
+         }
+     }
+ 
+@@ -91,6 +96,30 @@ impl Job {
+         let prev = mem::replace(&mut self.work, Work::noop());
+         self.work = prev.then(next);
+     }
++
++    pub(in crate::compiler) fn join_when_ready(&mut self, join: UnitJoin, replay: Work) {
++        self.join = Some((join, replay));
++    }
++
++    pub(super) fn is_cooperative(&self) -> bool {
++        self.join.is_some()
++    }
++
++    pub(super) fn prepare_to_run(&mut self, locks: &LockManager) -> CargoResult<bool> {
++        let Some((join, _)) = &self.join else {
++            return Ok(true);
++        };
++        match join.readiness(locks)? {
++            Readiness::Waiting => return Ok(false),
++            Readiness::Reuse => {
++                let (_, replay) = self.join.take().unwrap();
++                self.work = replay;
++                self.fresh = Freshness::Fresh;
++            }
++            Readiness::Build => self.join = None,
++        }
++        Ok(true)
++    }
+ }
+ 
+ impl fmt::Debug for Job {
+diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
+index a581e11..ca934d9 100644
+--- a/src/compiler/job_queue/mod.rs
++++ b/src/compiler/job_queue/mod.rs
+@@ -588,8 +588,13 @@ impl<'gctx> DrainState<'gctx> {
+         // The `pending_queue` is sorted in ascending priority order, and we
+         // remove items from its end to schedule the highest priority items
+         // sooner.
+-        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
+-            let (unit, job, _) = self.pending_queue.pop().unwrap();
++        let mut index = self.pending_queue.len();
++        while self.has_extra_tokens() && index > 0 {
++            index -= 1;
++            if !self.pending_queue[index].1.prepare_to_run(&build_runner.lock_manager)? {
++                continue;
++            }
++            let (unit, job, _) = self.pending_queue.remove(index);
+             *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
+             // Print out some nice progress information.
+             // NOTE: An error here will drop the job without starting it.
+@@ -768,7 +773,7 @@ impl<'gctx> DrainState<'gctx> {
+     }
+ 
+     // This will also tick the progress bar as appropriate
+-    fn wait_for_events(&mut self) -> Vec<Message> {
++    fn wait_for_events(&mut self, retry_units: bool) -> Vec<Message> {
+         // Drain all events at once to avoid displaying the progress bar
+         // unnecessarily. If there's no events we actually block waiting for
+         // an event, but we keep a "heartbeat" going to allow `record_cpu`
+@@ -779,12 +784,14 @@ impl<'gctx> DrainState<'gctx> {
+         if events.is_empty() {
+             loop {
+                 self.tick_progress();
+-                self.tokens.truncate(self.active.len() - 1);
+-                match self.messages.pop(Duration::from_millis(500)) {
++                self.tokens.truncate(self.active.len().saturating_sub(1));
++                let timeout = if retry_units { 50 } else { 500 };
++                match self.messages.pop(Duration::from_millis(timeout)) {
+                     Some(message) => {
+                         events.push(message);
+                         break;
+                     }
++                    None if retry_units => break,
+                     None => continue,
+                 }
+             }
+@@ -828,9 +835,10 @@ impl<'gctx> DrainState<'gctx> {
+                 }
+             }
+ 
+-            // If after all that we're not actually running anything then we're
+-            // done!
+-            if self.active.is_empty() {
++            let retry_units = (errors.count == 0 || build_runner.bcx.build_config.keep_going)
++                && self.has_extra_tokens()
++                && self.pending_queue.iter().any(|(_, job, _)| job.is_cooperative());
++            if self.active.is_empty() && !retry_units {
+                 break;
+             }
+ 
+@@ -839,7 +847,7 @@ impl<'gctx> DrainState<'gctx> {
+             // jobserver interface is architected we may acquire a token that we
+             // don't actually use, and if this happens just relinquish it back
+             // to the jobserver itself.
+-            for event in self.wait_for_events() {
++            for event in self.wait_for_events(retry_units) {
+                 if let Err(event_err) = self.handle_event(build_runner, event) {
+                     self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, event_err);
+                 }
+diff --git a/src/compiler/layout.rs b/src/compiler/layout.rs
+index adb148b..9425546 100644
+--- a/src/compiler/layout.rs
++++ b/src/compiler/layout.rs
+@@ -235,7 +235,7 @@ impl Layout {
+         target: Option<CompileTarget>,
+         dest: &str,
+         must_take_artifact_dir_lock: bool,
+-        must_take_build_dir_lock_exclusively: bool,
++        shared_build_dir: bool,
+     ) -> CargoResult<Layout> {
+         let is_new_layout = ws.gctx().cli_unstable().build_dir_new_layout;
+         let mut root = ws.target_dir();
+@@ -262,8 +262,7 @@ impl Layout {
+         let build_dir_lock = if is_on_nfs_mount(build_root.as_path_unlocked()) {
+             None
+         } else {
+-            if ws.gctx().cli_unstable().fine_grain_locking && !must_take_build_dir_lock_exclusively
+-            {
++            if shared_build_dir {
+                 Some(build_dest.open_ro_shared_create(
+                     ".cargo-build-lock",
+                     ws.gctx(),
+diff --git a/src/compiler/locking.rs b/src/compiler/locking.rs
+index 531aa63..e77c6d7 100644
+--- a/src/compiler/locking.rs
++++ b/src/compiler/locking.rs
+@@ -11,6 +11,7 @@ use crate::util::data_structures::HashMap;
+ use anyhow::bail;
+ use std::{
+     fmt::{Display, Formatter},
++    fs::TryLockError,
+     path::PathBuf,
+     sync::RwLock,
+ };
+@@ -60,6 +61,21 @@ impl LockManager {
+         Ok(key)
+     }
+ 
++    /// Opens the unit's lock file without waiting for another builder.
++    pub(super) fn register(
++        &self,
++        build_runner: &BuildRunner<'_, '_>,
++        unit: &Unit,
++    ) -> CargoResult<LockKey> {
++        let key = LockKey::from_unit(build_runner, unit);
++        let mut locks = self.locks.write().unwrap();
++        if !locks.contains_key(&key) {
++            let fs = Filesystem::new(key.0.clone());
++            locks.insert(key.clone(), fs.open_rw_unlocked_create(&key.0)?);
++        }
++        Ok(key)
++    }
++
+     #[instrument(skip(self))]
+     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
+         let locks = self.locks.read().unwrap();
+@@ -72,6 +88,32 @@ impl LockManager {
+         Ok(())
+     }
+ 
++    /// Takes an exclusive lock without waiting and returns whether it was taken.
++    #[instrument(skip(self))]
++    pub fn try_lock_exclusive(&self, key: &LockKey) -> CargoResult<bool> {
++        self.try_lock(key, flock::try_lock_exclusive)
++    }
++
++    pub fn try_lock_shared(&self, key: &LockKey) -> CargoResult<bool> {
++        self.try_lock(key, flock::try_lock_shared)
++    }
++
++    fn try_lock(
++        &self,
++        key: &LockKey,
++        acquire: fn(&std::fs::File) -> Result<(), TryLockError>,
++    ) -> CargoResult<bool> {
++        let locks = self.locks.read().unwrap();
++        let Some(lock) = locks.get(key) else {
++            bail!("lock was not found in lock manager: {key}");
++        };
++        match acquire(lock.file()) {
++            Ok(()) => Ok(true),
++            Err(TryLockError::WouldBlock) => Ok(false),
++            Err(TryLockError::Error(e)) => Err(e.into()),
++        }
++    }
++
+     /// Upgrades an existing exclusive lock into a shared lock.
+     #[instrument(skip(self))]
+     pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index d38634f..e35b9f6 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -52,6 +52,7 @@ pub(crate) mod trim_paths;
+ mod unit;
+ pub mod unit_dependencies;
+ pub mod unit_graph;
++pub(crate) mod unit_join;
+ pub mod unused_deps;
+ 
+ use crate::util::data_structures::{HashMap, HashSet};
+@@ -98,6 +99,7 @@ use self::trim_paths::trim_paths_args;
+ use self::trim_paths::trim_paths_args_rustdoc;
+ use self::unit_graph::UnitDep;
+ 
++use crate::compiler::fingerprint::JoinProbe;
+ use crate::compiler::future_incompat::FutureIncompatReport;
+ use crate::compiler::locking::LockKey;
+ use crate::compiler::timings::SectionTiming;
+@@ -195,7 +197,10 @@ fn compile<'gctx>(
+         return Ok(());
+     }
+ 
+-    let lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
++    let cooperative = build_runner.cooperative_check;
++    let lock = if cooperative {
++        Some(build_runner.lock_manager.register(build_runner, unit)?)
++    } else if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
+         Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
+     } else {
+         None
+@@ -242,23 +247,11 @@ fn compile<'gctx>(
+                 };
+                 work.then(link_targets(build_runner, unit, false)?)
+             } else {
+-                let output_options = OutputOptions::for_fresh(build_runner, unit);
+-                let manifest = ManifestErrorContext::new(build_runner, unit);
+-                let work = replay_output_cache(
+-                    unit.pkg.package_id(),
+-                    manifest,
+-                    &unit.target,
+-                    build_runner.files().message_cache_path(unit),
+-                    output_options,
+-                );
+-                // Need to link targets on both the dirty and fresh.
+-                work.then(link_targets(build_runner, unit, true)?)
++                replay_and_link(build_runner, unit)?
+             });
+ 
+-            // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
+-            // lock before starting, then downgrade to a shared lock after the job is finished.
+-            if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
+-            {
++            // Guard dirty work with a unit lock and retain shared access after it completes.
++            if job.freshness().is_dirty() {
+                 if let Some(lock) = lock {
+                     // Here we unlock the current shared lock to avoid deadlocking with other cargo
+                     // processes. Then we configure our compile job to take an exclusive lock
+@@ -266,8 +259,26 @@ fn compile<'gctx>(
+                     // we downgrade to a shared lock to allow other cargo's to read the build unit.
+                     // We will hold this shared lock for the remainder of compilation to prevent
+                     // other cargo from re-compiling while we are still using the unit.
+-                    build_runner.lock_manager.unlock(&lock)?;
+-                    job.before(prebuild_lock_exclusive(lock.clone()));
++                    if cooperative {
++                        job.before(fingerprint::invalidate_before_build(build_runner, unit));
++                    } else {
++                        build_runner.lock_manager.unlock(&lock)?;
++                    }
++                    let probe = if cooperative && joinable(build_runner, unit, force)? {
++                        JoinProbe::new(build_runner, unit)?
++                    } else {
++                        None
++                    };
++                    if let Some(probe) = probe {
++                        // Wait for a producer and reuse its result when it is current.
++                        let joined = replay_and_link(build_runner, unit)?;
++                        job.join_when_ready(
++                            unit_join::UnitJoin { lock: lock.clone(), probe },
++                            joined,
++                        );
++                    } else {
++                        job.before(prebuild_lock_exclusive(lock.clone()));
++                    }
+                     job.after(downgrade_lock_to_shared(lock));
+                 }
+             }
+@@ -286,6 +297,35 @@ fn compile<'gctx>(
+     Ok(())
+ }
+ 
++/// Builds the work that replays a unit's recorded output and links its targets
++/// without compiling it.
++fn replay_and_link(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Work> {
++    let output_options = OutputOptions::for_fresh(build_runner, unit);
++    let manifest = ManifestErrorContext::new(build_runner, unit);
++    let work = replay_output_cache(
++        unit.pkg.package_id(),
++        manifest,
++        &unit.target,
++        build_runner.files().message_cache_path(unit),
++        output_options,
++    );
++    // Need to link targets on both the dirty and fresh.
++    Ok(work.then(link_targets(build_runner, unit, true)?))
++}
++
++/// Whether a dirty `unit` may be replaced by another process's finished build.
++///
++/// Only `cargo check` qualifies: it uplifts nothing and takes no artifact
++/// directory lock, so a unit's outputs live entirely in the shared build
++/// directory. Forced units always run.
++fn joinable(build_runner: &BuildRunner<'_, '_>, unit: &Unit, force: bool) -> CargoResult<bool> {
++    Ok(!force
++        && build_runner
++            .outputs(unit)?
++            .iter()
++            .all(|output| output.hardlink.is_none()))
++}
++
+ /// Generates the warning message used when fallible doc-scrape units fail,
+ /// either for rustdoc or rustc.
+ fn make_failed_scrape_diagnostic(
+diff --git a/src/compiler/unit_join.rs b/src/compiler/unit_join.rs
+new file mode 100644
+index 0000000..a08419d
+--- /dev/null
++++ b/src/compiler/unit_join.rs
+@@ -0,0 +1,63 @@
++//! Opt-in joining of equivalent units between Cargo processes sharing a build directory.
++//!
++//! With `FRUST_EXPERIMENTAL_UNIT_JOIN=1`, a dirty `cargo check` unit waits for
++//! any process compiling it and, when that process left a record that is fresh
++//! for this invocation, replays it instead of running the compiler again.
++//!
++//! Checks with build scripts use the normal path.
++
++use super::build_context::BuildContext;
++use super::locking::{LockKey, LockManager};
++use super::{CompileMode, UserIntent};
++use crate::compiler::fingerprint::JoinProbe;
++use crate::util::errors::CargoResult;
++
++/// Environment variable that enables joining when set to `1`.
++const ENV: &str = "FRUST_EXPERIMENTAL_UNIT_JOIN";
++
++/// Whether this process may join units built by another Cargo process.
++#[allow(clippy::disallowed_methods)]
++pub(super) fn supports(bcx: &BuildContext<'_, '_>) -> bool {
++    cfg!(unix)
++        && std::env::var(ENV).as_deref() == Ok("1")
++        && matches!(bcx.build_config.intent, UserIntent::Check { .. })
++        && !bcx.build_config.timing_report
++        && bcx.gctx.cli_unstable().build_dir_new_layout
++        && bcx.gctx.jobserver_from_env().is_none()
++        && bcx.unit_graph.keys().all(|unit| {
++            matches!(unit.mode, CompileMode::Check { .. }) && !unit.artifact.is_true()
++        })
++}
++
++pub(super) enum Readiness {
++    Waiting,
++    Reuse,
++    Build,
++}
++
++pub(super) struct UnitJoin {
++    pub lock: LockKey,
++    pub probe: JoinProbe,
++}
++
++impl UnitJoin {
++    /// Checks a ready unit with nonblocking locks, before it consumes a job slot.
++    pub fn readiness(&self, locks: &LockManager) -> CargoResult<Readiness> {
++        if !locks.try_lock_shared(&self.lock)? {
++            return Ok(Readiness::Waiting);
++        }
++        if self.probe.is_current() {
++            return Ok(Readiness::Reuse);
++        }
++        locks.unlock(&self.lock)?;
++        if !locks.try_lock_exclusive(&self.lock)? {
++            return Ok(Readiness::Waiting);
++        }
++        if self.probe.is_current() {
++            locks.downgrade_to_shared(&self.lock)?;
++            Ok(Readiness::Reuse)
++        } else {
++            Ok(Readiness::Build)
++        }
++    }
++}
+diff --git a/src/ops/cargo_clean.rs b/src/ops/cargo_clean.rs
+index fa33bb2..1938a29 100644
+--- a/src/ops/cargo_clean.rs
++++ b/src/ops/cargo_clean.rs
+@@ -198,13 +198,13 @@ fn clean_specs(
+     let target_data = RustcTargetData::new(ws, &requested_kinds)?;
+     let (pkg_set, resolve) = ops::resolve_ws(ws, dry_run)?;
+     let prof_dir_name = profiles.get_dir_name();
+-    let host_layout = Layout::new(ws, None, &prof_dir_name, true, true)?;
++    let host_layout = Layout::new(ws, None, &prof_dir_name, true, false)?;
+     // Convert requested kinds to a Vec of layouts.
+     let target_layouts: Vec<(CompileKind, Layout)> = requested_kinds
+         .into_iter()
+         .filter_map(|kind| match kind {
+             CompileKind::Target(target) => {
+-                match Layout::new(ws, Some(target), &prof_dir_name, true, true) {
++                match Layout::new(ws, Some(target), &prof_dir_name, true, false) {
+                     Ok(layout) => Some(Ok((kind, layout))),
+                     Err(e) => Some(Err(e)),
+                 }
+diff --git a/src/util/flock.rs b/src/util/flock.rs
+index 14a2fde..563d5c3 100644
+--- a/src/util/flock.rs
++++ b/src/util/flock.rs
+@@ -21,9 +21,7 @@ use cargo_util::paths;
+ 
+ pub(crate) use self::imp::lock_exclusive;
+ pub(crate) use self::imp::lock_shared;
+-#[expect(unused_imports, reason = "for non-blocking lock callers")]
+ pub(crate) use self::imp::try_lock_exclusive;
+-#[expect(unused_imports, reason = "for non-blocking lock callers")]
+ pub(crate) use self::imp::try_lock_shared;
+ pub(crate) use self::imp::unlock;
+ 
+@@ -271,6 +269,14 @@ impl Filesystem {
+         }
+     }
+ 
++    /// Opens a file that the caller will lock after scheduling its work.
++    pub(crate) fn open_rw_unlocked_create(&self, path: &Path) -> CargoResult<FileLock> {
++        let mut opts = OpenOptions::new();
++        opts.read(true).write(true).create(true);
++        let (path, f) = self.open(path, &opts, true)?;
++        Ok(FileLock { f: Some(f), path })
++    }
++
+     /// Opens read-only shared access to a file, returning the locked version of a file.
+     ///
+     /// This function will fail if `path` doesn't already exist, but if it does

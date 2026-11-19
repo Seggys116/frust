@@ -6,6 +6,14 @@ The user-level JSON file accepts separate paths for the target root and cache ro
 
 Explicit Cargo directory controls take precedence. Tooling should discover final artifact paths through Cargo metadata or build messages. [Cargo build directories](https://doc.rust-lang.org/cargo/reference/build-cache.html) · [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)
 
+## Cooperative checks
+
+Run `FRUST_EXPERIMENTAL_UNIT_JOIN=1 fcargo check` in each terminal to share eligible check units in the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler rechecks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics.
+
+The experiment uses the current Cargo build-directory layout and the invocation's own jobserver. Graphs with build scripts, proc macros or artifact dependencies use ordinary Cargo scheduling. Cargo defers contended units before assigning a job slot, so independent work can proceed even with `-j1`. Switching the experiment on or off can cause a rebuild because the fingerprint identities differ. Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks.
+
+The qualification probe covers local Linux x86-64 builds. [Concurrent check probe](../qualification/cooperative-builds.py)
+
 ## Native fat-LTO defaults
 
 When `fcargo` selects `frustc` for a native x86-64 GNU Linux build, local packages in release-derived profiles using fat LTO at opt level 3 default to incremental compilation and 16 codegen units. Use the project's ordinary release or custom profile command. Cargo honors explicit profile, package, environment, and command-line settings as well as its existing CI incremental policy.

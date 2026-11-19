@@ -11,6 +11,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Cargo skips checksumming excluded dependencies and treats dependencies saved during compiler invocation as dirty on the next build. Upgrading invalidates the earlier dependency checksum records.
 * Qualification requires the complete frozen cohort and rejects missing tail series and invalid timings. The parity fixture now compiles and links a native archive and tests an edit between compiler completion and Cargo's fingerprint write.
 
+* Experimental cooperative `cargo check` with `FRUST_EXPERIMENTAL_UNIT_JOIN=1`. Eligible concurrent checks share verified unit outputs in the same workspace, and independent units can start while another unit waits for its producer.
+
 ## [0.3.0]
 
 ### Changed
