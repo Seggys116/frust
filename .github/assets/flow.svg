@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 276" width="960" height="276" role="img" aria-labelledby="title desc">
-  <title id="title">fRust planned build flow</title>
-  <desc id="desc">Cargo resolves and schedules builds. The compiler analyzes and generates code, with validated reuse from a central store. The native platform linker produces the final artifact.</desc>
+  <title id="title">fRust build flow</title>
+  <desc id="desc">Cargo resolves and schedules builds and consults a verified store of dependency outputs and heavy build script runs before running the compiler. The compiler analyzes and generates code. The native platform linker produces the final artifact.</desc>
   <defs>
     <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
       <path d="M0 0l7 3.5L0 7z" fill="#e9805d"/>
@@ -8,15 +8,15 @@
   </defs>
   <rect x="1" y="1" width="958" height="274" rx="17" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
   <g fill="#151c25" stroke="#455261" stroke-width="2">
-    <rect x="42" y="58" width="250" height="82" rx="5"/>
-    <rect x="355" y="58" width="250" height="82" rx="5" stroke="#ce422b"/>
+    <rect x="42" y="58" width="250" height="82" rx="5" stroke="#ce422b"/>
+    <rect x="355" y="58" width="250" height="82" rx="5"/>
     <rect x="668" y="58" width="250" height="82" rx="5"/>
-    <rect x="355" y="190" width="250" height="56" rx="5" stroke="#a1874c"/>
+    <rect x="42" y="190" width="250" height="56" rx="5" stroke="#a1874c"/>
   </g>
   <g fill="none" stroke="#e9805d" stroke-width="2" marker-end="url(#arrow)">
     <path d="M293 99h59"/>
     <path d="M606 99h59"/>
-    <path d="M480 145v41" marker-start="url(#arrow)"/>
+    <path d="M167 145v41" marker-start="url(#arrow)"/>
   </g>
   <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" text-anchor="middle">
     <g fill="#f0f3f6" font-size="18" font-weight="700">
@@ -25,10 +25,11 @@
       <text x="793" y="92">Native linker</text>
     </g>
     <g fill="#afb8c1" font-size="13">
-      <text x="167" y="116">Resolve and schedule</text>
+      <text x="167" y="116">Resolve, schedule, restore</text>
       <text x="480" y="116">Analyze and generate code</text>
       <text x="793" y="116">Link the final artifact</text>
     </g>
-    <text x="480" y="224" fill="#ffd23f" font-size="15">Central compiler cache</text>
+    <text x="167" y="214" fill="#ffd23f" font-size="13">Unit and build script cache</text>
+    <text x="167" y="234" fill="#afb8c1" font-size="12">verified before every restore</text>
   </g>
 </svg>

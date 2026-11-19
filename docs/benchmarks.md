@@ -83,7 +83,16 @@ Stock-compiler characterizations on ripgrep, with oxipng added for the x86-64-v3
 
 ### Cargo unit cache and no-op overhead
 
-Results for the Cargo unit artifact cache (patches `0006`, `0007` and `0008`) and for no-op invocation overhead are recorded in `qualification/OPTIMIZED-LINUX.md` once measured. This page has none of them yet. Cold builds with an empty store also pay for writing entries.
+Measured on 19 November 2026 on Linux x86-64 (Intel Core Ultra 7 255H) with `frust-0ef1bc386-dist-bolt-uc4` against official Rust 1.100.0. [The paired benchmark](../qualification/run-store-bench.py) pins every build of both toolchains to four E-cores with four jobs and alternates which toolchain runs first, because the host's mixed core types moved unpinned CPU seconds by several percent between identical runs. Each application was built from its locked sources with an empty target and an empty store (first build), again after deleting the target with the store populated (clean rebuild), and five times unchanged (no-op, median). The table gives CPU seconds of fRust divided by CPU seconds of official Rust, median of three rounds; below 1 is faster.
+
+| Application, profile | First build | Clean rebuild | No-op | Official first build (CPU s) |
+| --- | ---: | ---: | ---: | ---: |
+| fd, dev | 1.006 | 0.024 | 0.91 | 114.4 |
+| oxipng, dev | 1.022 | 0.304 | 0.89 | 40.0 |
+| ripgrep, dev | 1.027 | 0.331 | 0.90 | 17.6 |
+| ripgrep, release | 1.020 | 0.437 | 0.91 | 56.3 |
+
+fd's clean rebuild restored 59 registry units and the 33-second `tikv-jemalloc-sys` build script run, 2.7 CPU seconds against 113.5. The other applications still compile their workspace crates. A first build is 1 to 3 percent above official Rust. With the unit cache switched off the same comparison on ripgrep dev gave 1.019, so the gap is the compiler front end binary (type checking, borrow checking and monomorphization collection ran 6 to 12 percent slower per pass on `regex_automata` while LLVM passes differed by 1.6 percent, with an identical LLVM library). The cache's own cost on a cold ripgrep release build was 60 ms of wall time. All raw samples and the attribution runs are described in [the Linux qualification notes](../qualification/OPTIMIZED-LINUX.md). One concurrent unrelated benchmark session shared the machine, so single rounds can be disturbed; minimum ratios agree with the medians within 1 percent except ripgrep release (1.090 first build), whose official minimum was an unusually quiet round.
 
 ## Rules for new measurements
 
