@@ -49,14 +49,19 @@ def measure(args, mode, helpers):
     if mode == "explicit-target":
         env["CARGO_TARGET_DIR"] = str(lane / "explicit-target")
     extra = {"quiet": ["--quiet"], "json": ["--message-format=json"]}.get(mode, [])
+    launcher = args.fcargo or args.cargo
     try:
         for generation in range(args.generations):
-            command = [args.fcargo, "build", "--offline", "--features",
+            command = [launcher, "build", "--offline", "--features",
                        f"variant{generation}", *extra]
             log = lane / f"{generation}.log"
             timing = helpers["timed"](command, source, env, log, args.cpus)
-            profiles = ([lane / "explicit-target/debug"] if mode == "explicit-target"
-                        else list((store / "targets").glob("*/*/debug")))
+            if mode == "explicit-target":
+                profiles = [lane / "explicit-target/debug"]
+            elif args.fcargo:
+                profiles = list((store / "targets").glob("*/*/debug"))
+            else:
+                profiles = [source / "target/debug"]
             if len(profiles) != 1:
                 raise RuntimeError(f"expected one central debug profile in {store}")
             profile, = profiles
@@ -71,7 +76,7 @@ def measure(args, mode, helpers):
             print(json.dumps(dict(mode=mode, revision=generation,
                                   live_generation=live_generation, executables=len(units),
                                   disk=helpers["disk_usage"](profile.parent), **timing)), flush=True)
-        command = [args.fcargo, "build", "--offline", "--features",
+        command = [launcher, "build", "--offline", "--features",
                    f"variant{args.generations - 1}", "--message-format=json"]
         log = lane / "noop.log"
         timing = helpers["timed"](command, source, env, log, args.cpus)
@@ -86,7 +91,9 @@ def measure(args, mode, helpers):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fcargo", type=Path, required=True)
+    tool = parser.add_mutually_exclusive_group(required=True)
+    tool.add_argument("--fcargo", type=Path)
+    tool.add_argument("--official", action="store_true", help="invoke Cargo directly")
     parser.add_argument("--cargo", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cpus", required=True)
@@ -94,7 +101,8 @@ def main():
     if (args := parser.parse_args()).generations < 4:
         parser.error("at least four generations are needed to observe eviction")
     for key in ("fcargo", "cargo", "output"):
-        setattr(args, key, getattr(args, key).resolve())
+        if path := getattr(args, key):
+            setattr(args, key, path.resolve())
     args.output.mkdir()
     helpers = runpy.run_path(Path(__file__).with_name("cpu-benchmark.py"))
     for mode in MODES:

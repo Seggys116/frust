@@ -36,4 +36,14 @@ The active executable produced the expected output on each revision and remained
 
 A second probe compiled an application with a build script and a feature-sensitive path dependency. The current and previous retained configurations reused all three Cargo artifacts without compiling again. The executable verified both the build-script value and the selected dependency feature. Its log is `target/compiler-rewrite/optimized-dist/storage-dependency-proof.log`.
 
+The 20-variant stress run compared the retention trial with official Rust 1.100.0 on Linux x86-64 and ext4. Each toolchain completed 140 builds and seven verified no-ops. The table shows static progress for fRust and the corresponding direct Cargo run. Normal noninteractive, plain, quiet and JSON calls produced the same unit counts.
+
+| Toolchain | Retained executables | Allocated target | Of which incremental |
+| --- | ---: | ---: | ---: |
+| Official Cargo | 20 | 89.41 MiB | 2.82 MiB |
+| fRust trial with cleanup disabled | 20 | 12.46 MiB | 2.97 MiB |
+| fRust trial with automatic cleanup | 4 | 2.52 MiB | 0.60 MiB |
+
+Automatic cleanup reduced target allocation by 79.8% against the same trial with cleanup disabled. The managed trial occupied 97.2% less target space than official Cargo for this fixture. The two compilers produce debug executables of different sizes, which accounts for much of the cross-toolchain difference. The fRust trial used a source-built compiler and the optimized launcher. The data is in `target/compiler-rewrite/optimized-dist/storage-20-*.jsonl`.
+
 The local optimized retry uses the first three committed Cargo patches, the committed rustc patch, and the retention trial. Its compiler tools are isolated from the shared checkout. The first instrumented build reached Cargo and hit the host's missing OpenSSL development files. The retry uses the upstream Linux distribution's static Cargo dependency setting.
