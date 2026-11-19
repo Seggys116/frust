@@ -1,0 +1,10 @@
+[package]
+name = "frust-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Path resolution, progress frames, whole-program reuse decisions, and release-gate arithmetic for fRust."
+
+[dependencies]

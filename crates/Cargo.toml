@@ -1,0 +1,9 @@
+[workspace]
+members = ["frust-core", "frust-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.100"
