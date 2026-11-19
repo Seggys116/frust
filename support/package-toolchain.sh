@@ -2,12 +2,16 @@
 # Assemble a relocatable toolchain tree from a finished stage-2 build.
 # Arguments: <stage2-dir> <cargo-bin> <fcargo-bin> <dest-prefix> [id] [host]
 set -euo pipefail
+trap 'echo "package-toolchain.sh failed at line $LINENO" >&2' ERR
 stage2=$1
 cargo_bin=$2
 fcargo_bin=$3
 dest=$4
 id=${5:-frust-0ef1bc386-central1}
 host=${6:-x86_64-unknown-linux-gnu}
+# Shared libraries are .dylib on macOS and .so elsewhere.
+dylib=.so
+[[ $(uname -s) == Darwin ]] && dylib=.dylib
 
 if [[ -e "$dest" ]]; then
     echo "destination already exists: $dest" >&2
@@ -35,7 +39,7 @@ do
         if [[ ! -e "$libdir/$base" ]]; then
             cp -a "$file" "$libdir/$base"
         fi
-    done < <(find "$rustc_build" -path '*/out/lib*' \( -name '*.rlib' -o -name '*.rmeta' -o -name '*.so' \) -print0)
+    done < <(find "$rustc_build" -path '*/out/lib*' \( -name '*.rlib' -o -name '*.rmeta' -o -name "*$dylib" \) -print0)
 done
 if [[ "$found_build" -ne 1 ]]; then
     echo "rustc-dev build directory is missing beside $stage2" >&2
@@ -74,9 +78,9 @@ test -s "$dest/manifest.json"
 # Same inode: sysroot discovery follows the invoked path.
 test "$dest/bin/rustc" -ef "$dest/bin/frustc"
 test -e "$libdir/libthin_vec-"*.rlib
-span=$(find "$libdir" -name 'librustc_span-*.rlib' -print -quit)
-macros=$(find "$libdir" -name 'librustc_macros-*.so' -print -quit)
-derive_where=$(find "$libdir" -name 'libderive_where-*.so' -print -quit)
+span=$(find "$libdir" -name 'librustc_span-*.rlib' -print | sed -n 1p)
+macros=$(find "$libdir" -name "librustc_macros-*$dylib" -print | sed -n 1p)
+derive_where=$(find "$libdir" -name "libderive_where-*$dylib" -print | sed -n 1p)
 test -n "$span"
 test -n "$macros"
 test -n "$derive_where"
