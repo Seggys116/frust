@@ -20,7 +20,8 @@ host=${4:-$(get host)}
 src=$work/rust
 build=$work/build
 git init -q "$src"
-git -C "$src" fetch -q --depth 1 https://github.com/rust-lang/rust.git "$(get rust_commit)"
+# Bootstrap resolves the prebuilt LLVM from the first parent of the pinned merge commit.
+git -C "$src" fetch -q --depth 2 https://github.com/rust-lang/rust.git "$(get rust_commit)"
 git -C "$src" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
 # Cargo is patched before bootstrap runs, so its submodule is populated here.
 git -C "$src" submodule update -q --init --depth 1 src/tools/cargo
