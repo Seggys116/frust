@@ -10,6 +10,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 20 November 2026: a ripgrep build with the machine outliner and `-C force-unwind-tables=no`, and without RELR, was not kept. Stripped size was 4010848/4024992 (0.99648596). That ratio cannot carry a 0.97 size geomean. Oxipng, rustfmt, and the full judge were not run. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: enabling loop fusion in LLVM's `default<O3>` and `lto<O3>` pipelines left the memchr and ripgrep bitcode unchanged. The switch is not a `rustc` user flag. No stage-2 rebuild and no full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: `-attributor-enable=full` crashed `frustc` with SIGSEGV while optimizing regex-automata 0.4.15. No ripgrep binary was produced. No full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
+* 20 November 2026: enabling NewGVN in LLVM's `lto<O3>` pipeline grew the ripgrep pre-LTO module by 9856 bytes and left `Finder::find_impl` unchanged. The memchr module's textual differences are SSA and block names. An earlier final-crate flag sample had already missed the runtime aggregate and stripped size. No stage-2 rebuild and no new full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
 ## [0.5.0] - 2026-11-20
 
