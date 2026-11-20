@@ -6,7 +6,7 @@ index 77dd77c..ff2036e 100644
  use crate::command_prelude::*;
 
  fn main() {
-+    #[cfg(target_os = "linux")]
++    #[cfg(unix)]
 +    select_frust_entry();
      let _guard = setup_logger();
 
@@ -15,7 +15,7 @@ index 77dd77c..ff2036e 100644
      }
  }
 
-+#[cfg(target_os = "linux")]
++#[cfg(unix)]
 +fn select_frust_entry() {
 +    use std::io::IsTerminal;
 +    use std::os::unix::fs::MetadataExt;

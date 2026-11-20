@@ -57,7 +57,7 @@ After a store, a size scan runs at most once per process, and only when the size
 
 ## Direct entry
 
-In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. On Linux, `fcargo` runs Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO` and, when `RUSTC` is unset and a sibling `frustc` exists, `RUSTC` set, unless one of these holds, in which case it executes `fcargo-ui` with the same arguments:
+In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. On Linux and macOS, `fcargo` runs Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO` and, when `RUSTC` is unset and a sibling `frustc` exists, `RUSTC` set, unless one of these holds, in which case it executes `fcargo-ui` with the same arguments:
 
 - Progress is not plain. It is plain when `TERM=dumb`, when `FRUST_PROGRESS` is `plain` or `off`, or when `FRUST_PROGRESS` is not `static` or `interactive` and stderr is not a terminal.
 - `FRUST_CARGO` is set and not empty.
