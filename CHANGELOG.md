@@ -4,9 +4,11 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-20
+
 * Native Linux x86-64 fCargo builds now default to incremental compilation with 16 codegen units for local packages using fat LTO at opt level 3. Explicit Cargo profile and incremental settings take precedence.
 
-Compiler rewrite. No release of the compiler toolchain has been made, and no compiler change has passed the frozen performance budgets. Measurements are on Linux x86-64 and dated 2026-11-19. See `docs/benchmarks.md` and `qualification/CANDIDATE.md`.
+Compiler rewrite. fRust is now a Rust 1.100.0 toolchain built from pinned upstream sources, with a patched Cargo (`fcargo`), `frustc`, the unit and build script cache, central targets and `frust-install`. The earlier 0.4.x line is kept on the `legacy-0.4` branch. Toolchains are built for Linux x86-64, macOS on Apple Silicon and macOS on Intel by the release workflow. See `docs/benchmarks.md` and `qualification/CANDIDATE.md`.
 
 ### Added
 
