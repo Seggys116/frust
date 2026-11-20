@@ -201,7 +201,25 @@ fn assert_rejected(prefix: &Path, result: Result<PrefixState, InstallError>, nee
 }
 
 fn state(current: &str, previous: Option<&str>) -> PrefixState {
-    PrefixState { current: Some(current.to_string()), previous: previous.map(str::to_string) }
+    PrefixState { current: Some(current.to_string()), previous: previous.map(str::to_string), current_variant: None, previous_variant: None }
+}
+
+fn variant_state(current: (&str, Option<&str>), previous: Option<(&str, Option<&str>)>) -> PrefixState {
+    PrefixState {
+        current: Some(current.0.to_string()),
+        previous: previous.map(|(id, _)| id.to_string()),
+        current_variant: current.1.map(str::to_string),
+        previous_variant: previous.and_then(|(_, variant)| variant).map(str::to_string),
+    }
+}
+
+/// A toolchain whose manifest names a variant, as the release archives of Linux x86-64 do.
+fn variant_toolchain(dir: &Path, id: &str, variant: Option<&str>, marker: &str) -> (PathBuf, PathBuf) {
+    let manifest = match variant {
+        Some(variant) => format!("{{\"id\":\"{id}\",\"variant\":\"{variant}\"}}\n"),
+        None => format!("{{\"id\":\"{id}\"}}\n"),
+    };
+    toolchain(dir, &format!("{id}-{marker}"), &manifest, marker, &[])
 }
 
 #[test]
@@ -628,6 +646,85 @@ fn a_failed_upgrade_leaves_the_active_version_untouched() {
     assert_eq!(rustc(&prefix), "one");
     assert_eq!(versions(&prefix), ["first"]);
     assert_clean(&prefix);
+}
+
+#[test]
+fn the_installed_variant_is_recorded_swapped_by_rollback_and_kept_by_a_reinstall() {
+    let scratch = Scratch::new("variant-state");
+    let prefix = scratch.path("prefix");
+    assert_eq!(install::current_variant(&prefix).unwrap(), None);
+    let (base, base_sum) = variant_toolchain(&scratch.root, "rel-1", Some("baseline"), "base");
+    let (fast, fast_sum) = variant_toolchain(&scratch.root, "rel-1-v3", Some("v3"), "fast");
+
+    assert_eq!(install::install(&prefix, &base, &base_sum).unwrap(), variant_state(("rel-1", Some("baseline")), None));
+    assert_eq!(state_field(&prefix, "current_variant").as_deref(), Some("baseline"));
+    assert_eq!(state_field(&prefix, "previous_variant"), None);
+    assert_eq!(install::current_variant(&prefix).unwrap().as_deref(), Some("baseline"));
+
+    let switched = install::install(&prefix, &fast, &fast_sum).unwrap();
+    assert_eq!(switched, variant_state(("rel-1-v3", Some("v3")), Some(("rel-1", Some("baseline")))));
+    assert_eq!(state_field(&prefix, "current_variant").as_deref(), Some("v3"));
+    assert_eq!(state_field(&prefix, "previous_variant").as_deref(), Some("baseline"));
+    assert_eq!(install::current_variant(&prefix).unwrap().as_deref(), Some("v3"));
+
+    // Installing the live id again must not turn the rollback target into itself or lose its variant.
+    assert_eq!(install::install(&prefix, &fast, &fast_sum).unwrap(), switched);
+
+    let back = install::rollback(&prefix).unwrap();
+    assert_eq!(back, variant_state(("rel-1", Some("baseline")), Some(("rel-1-v3", Some("v3")))));
+    assert_eq!(install::current_variant(&prefix).unwrap().as_deref(), Some("baseline"));
+    assert_eq!(rustc(&prefix), "base");
+    let forward = install::rollback(&prefix).unwrap();
+    assert_eq!(forward, switched);
+    assert_clean(&prefix);
+}
+
+#[test]
+fn a_state_file_without_variant_fields_is_read_and_repaired_from_the_manifests() {
+    let scratch = Scratch::new("variant-legacy");
+    let prefix = scratch.path("prefix");
+    let (first, first_sum) = variant_toolchain(&scratch.root, "first", None, "one");
+    let (second, second_sum) = variant_toolchain(&scratch.root, "second", Some("v3"), "two");
+    install::install(&prefix, &first, &first_sum).unwrap();
+    install::install(&prefix, &second, &second_sum).unwrap();
+
+    // The state of an installer that predates variants.
+    fs::write(prefix.join("state.json"), "{\n  \"current\": \"second\",\n  \"previous\": \"first\"\n}\n").unwrap();
+    assert_eq!(install::current_variant(&prefix).unwrap().as_deref(), Some("v3"));
+    assert_eq!(install::rollback(&prefix).unwrap(), variant_state(("first", None), Some(("second", Some("v3")))));
+    assert_eq!(state_field(&prefix, "previous_variant").as_deref(), Some("v3"));
+
+    // A swap that died before the state write: the state names another current than the link does.
+    fs::write(prefix.join("state.json"), "{\"current\": \"first\", \"previous\": \"second\", \"current_variant\": null, \"previous_variant\": \"v3\"}\n").unwrap();
+    fs::remove_file(prefix.join("current")).unwrap();
+    std::os::unix::fs::symlink("versions/second", prefix.join("current")).unwrap();
+    assert_eq!(install::current_variant(&prefix).unwrap().as_deref(), Some("v3"));
+    assert_eq!(install::rollback(&prefix).unwrap(), variant_state(("first", None), Some(("second", Some("v3")))));
+}
+
+#[test]
+fn bad_variant_names_are_rejected_in_manifests_and_in_state() {
+    let scratch = Scratch::new("variant-bad");
+    let prefix = scratch.path("prefix");
+    for bad in ["V3", "../v3", "v 3", ""] {
+        let (archive, sum) = variant_toolchain(&scratch.root, "first", Some(bad), "one");
+        let err = install::install(&prefix, &archive, &sum).unwrap_err();
+        assert!(err.message.contains("variant"), "{bad:?}: {}", err.message);
+        assert!(fs::symlink_metadata(prefix.join("current")).is_err(), "{bad:?}: current was created");
+    }
+    let (first, first_sum) = variant_toolchain(&scratch.root, "first", Some("v3"), "one");
+    let (second, second_sum) = variant_toolchain(&scratch.root, "second", Some("baseline"), "two");
+    install::install(&prefix, &first, &first_sum).unwrap();
+    for text in [
+        "{\"current\": \"first\", \"current_variant\": \"V3\"}",
+        "{\"current\": \"first\", \"previous_variant\": 3}",
+        "{\"current\": \"first\", \"previous_variant\": {\"a\": 1}}",
+    ] {
+        fs::write(prefix.join("state.json"), text).unwrap();
+        let err = install::install(&prefix, &second, &second_sum).unwrap_err();
+        assert!(err.message.contains("state.json"), "{text:?}: {}", err.message);
+        assert_eq!(rustc(&prefix), "one", "{text:?}");
+    }
 }
 
 #[test]

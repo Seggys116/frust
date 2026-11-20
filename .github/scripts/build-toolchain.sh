@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a stage-2 toolchain from the pinned sources and pack it as a tar.zst.
-# Usage: build-toolchain.sh <control|frust> <workdir> <output.tar.zst> [host-triple]
+# Usage: build-toolchain.sh <control|frust> <workdir> <output.tar.zst> [host-triple [cpu]]
 # control is the unpatched stage-2 with its stock Cargo. frust applies support/patches and is
 # packaged with fcargo. Both use the same recipe for a given host, so the control stays a fair
 # baseline: support/bootstrap.toml, the overrides of upstream's dist builds in
@@ -8,6 +8,15 @@
 # environment that linux_env or macos_env sets. The host defaults to the one in support/upstream.lock and
 # must be the machine this runs on. Supported hosts: x86_64-unknown-linux-gnu, aarch64-apple-darwin
 # and x86_64-apple-darwin.
+#
+# The shipped Linux x86-64 toolchain (frust on x86_64-unknown-linux-gnu) is the exception: it is
+# built by support/optimize-linux-v2.sh from stored PGO and BOLT profiles, with the clang, LLVM tools
+# and profile bundles that support/fetch-build-assets.sh downloads (docs/build-assets.md). The
+# optional cpu is baseline (the default, plain x86-64) or v3 (compiler and tools built for
+# x86-64-v3); it only applies to that recipe. FRUST_RECIPE=plain forces the generic recipe below for
+# it (no bundles needed, no PGO unless FRUST_PGO_PROFILES is set), FRUST_RECIPE=optimized insists on
+# the optimized one. FRUST_OFFICIAL_TOOLCHAIN names the official Rust that builds Cargo there
+# (default: the rustup toolchain of rust_release in support/upstream.lock).
 #
 # Optional profile-guided optimization. When FRUST_PGO_PROFILES names a directory, the profiles in
 # it are passed to bootstrap as pgo.<component>.use. The directory must hold a MANIFEST file with
@@ -18,7 +27,7 @@
 # from, and both variants use them when the variable is set. When the variable is unset the
 # toolchain is built without PGO and the log says so.
 set -euo pipefail
-variant=${1:?usage: build-toolchain.sh <control|frust> <workdir> <output.tar.zst> [host-triple]}
+variant=${1:?usage: build-toolchain.sh <control|frust> <workdir> <output.tar.zst> [host-triple [cpu]]}
 work=$(mkdir -p "${2:?}" && cd "$2" && pwd)
 out=$(cd "$(dirname "${3:?}")" && pwd)/$(basename "$3")
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -35,6 +44,30 @@ case $host in
     aarch64-apple-darwin | x86_64-apple-darwin) platform=macos ;;
     *) echo "no upstream-matched recipe for host $host" >&2; exit 2 ;;
 esac
+
+cpu=${5:-}
+case $cpu in
+    '' | baseline | v3) ;;
+    *) echo "unknown cpu $cpu, expected baseline or v3" >&2; exit 2 ;;
+esac
+recipe=${FRUST_RECIPE:-auto}
+case $recipe in
+    auto)
+        if [[ $variant == frust && $host == x86_64-unknown-linux-gnu ]]; then recipe=optimized; else recipe=plain; fi
+        ;;
+    plain | optimized) ;;
+    *) echo "unknown FRUST_RECIPE $recipe, expected auto, plain or optimized" >&2; exit 2 ;;
+esac
+if [[ $recipe == optimized ]]; then
+    [[ $variant == frust && $host == x86_64-unknown-linux-gnu ]] || {
+        echo "the optimized recipe builds the fRust toolchain for x86_64-unknown-linux-gnu only" >&2
+        exit 2
+    }
+    cpu=${cpu:-baseline}
+elif [[ -n $cpu && $cpu != baseline ]]; then
+    echo "cpu $cpu needs the optimized recipe" >&2
+    exit 2
+fi
 
 # Environment for the bootstrap process only, as KEY=value words for env(1). Never empty.
 build_env=()
@@ -140,6 +173,79 @@ add_pgo_profiles() {
     [[ $used -gt 0 ]] || { echo "MANIFEST in $dir lists no usable profile" >&2; exit 2; }
     echo "PGO: using $used profile(s) from $dir"
 }
+
+# The optimized Linux x86-64 recipe: support/optimize-linux-v2.sh in stored-profile mode. It trains
+# nothing: the stage-2 tools are built with the stored PGO profiles, the rustc driver is
+# BOLT-optimized with the stored data, and Cargo is rebuilt from the patched submodule. Its
+# inputs, all pinned in support/upstream.lock and support/build-assets.lock, are
+#   - the build tools bundle (clang, lld, llvm-ar, llvm-profdata, llvm-bolt, merge-fdata, the profile
+#     and BOLT runtimes) of the pinned LLVM, which also compiles the C parts of rustc;
+#   - the profile bundle of this Rust commit for the cpu (baseline or v3), each with a SHA256SUMS;
+#   - official Rust, to build Cargo.
+# The result is packed with the same layout as the plain recipe: a top directory named frust.
+build_optimized() {
+    local commit9 tools_asset profiles_asset dirs tools profiles libstdcxx official checkout package id
+    local run_env=()
+    commit9=$(get rust_commit | cut -c1-9)
+    tools_asset=frust-build-tools-$(get llvm_version)-linux-x86_64.tar.zst
+    id=frust-$commit9-ci
+    if [[ $cpu == v3 ]]; then
+        profiles_asset=frust-pgo-profiles-$commit9-x86-64-v3.tar.zst
+        id=$id-v3
+    else
+        profiles_asset=frust-pgo-profiles-$commit9-x86-64.tar.zst
+    fi
+
+    # The downloads go through the work directory, which sits on the large disk of the runner.
+    mkdir -p "$work/tmp"
+    dirs=$(TMPDIR=$work/tmp bash "$root/support/fetch-build-assets.sh" "$work/assets" "$tools_asset" "$profiles_asset")
+    tools=$(awk -v name="$tools_asset" '$1 == name { print $2 }' <<< "$dirs")
+    profiles=$(awk -v name="$profiles_asset" '$1 == name { print $2 }' <<< "$dirs")
+    [[ -d $tools && -d $profiles ]] || { echo "fetch-build-assets.sh did not unpack $tools_asset and $profiles_asset" >&2; exit 2; }
+    # The bundled clang has to run on this machine and to find the system's static libstdc++. Check
+    # both now, since a failure would otherwise only show once bootstrap links the compiler, hours
+    # into the build.
+    "$tools/bin/clang++" --version > /dev/null || { echo "the bundled clang++ does not run on this machine" >&2; exit 2; }
+    libstdcxx=$("$tools/bin/clang++" -print-file-name=libstdc++.a)
+    [[ $libstdcxx == /* && -f $libstdcxx ]] || {
+        echo "the bundled clang++ cannot find a static libstdc++ ($libstdcxx); install libstdc++-dev" >&2
+        exit 2
+    }
+
+    official=${FRUST_OFFICIAL_TOOLCHAIN:-$(rustup run "$(get rust_release)" rustc --print sysroot 2> /dev/null || true)}
+    [[ -x $official/bin/rustc && -x $official/bin/cargo ]] || {
+        echo "official Rust $(get rust_release) is not installed; the optimized recipe builds Cargo with it (set FRUST_OFFICIAL_TOOLCHAIN)" >&2
+        exit 2
+    }
+
+    checkout=$work/checkout
+    "$root/support/tools/prepare-rust-checkout.sh" "$checkout"
+    # The shallow checkout holds the pinned merge commit only. Bootstrap resolves the prebuilt LLVM
+    # from the first parent of that commit, as the generic recipe below notes, so keep one more.
+    git -C "$checkout" fetch -q --depth 2 https://github.com/rust-lang/rust.git "$(get rust_commit)"
+
+    (cd "$root/crates" && cargo build --release --locked -p frust-rs --bin fcargo --target-dir "$work/fcargo")
+
+    package=$work/prefix/frust
+    mkdir -p "$work/prefix"
+    run_env=("FRUST_OFFICIAL_TOOLCHAIN=$official" "FRUST_STORED_PROFILES=$profiles")
+    if [[ $cpu == v3 ]]; then
+        run_env+=(FRUST_COMPILER_TARGET_CPU=x86-64-v3)
+    fi
+    echo "optimized recipe for $host: cpu $cpu, tools $tools, profiles $profiles"
+    env "${run_env[@]}" "$root/support/optimize-linux-v2.sh" \
+        "$checkout" "$work/opt" "$tools" "$package" "$work/fcargo/release/fcargo" "$id"
+
+    # The logs stay in $work/opt for the workflow to upload; the build trees are what fills the disk.
+    rm -rf "$work/opt/build" "$work/opt/cargo-build" "$work/opt/package-host"
+    tar -cf - -C "$work/prefix" frust | zstd -T0 -3 -q > "$out"
+    echo "packed frust ($cpu) for $host into $out"
+}
+
+if [[ $recipe == optimized ]]; then
+    build_optimized
+    exit 0
+fi
 
 read_overrides "$root/support/bootstrap-common.toml"
 read_overrides "$root/support/bootstrap-$platform.toml"

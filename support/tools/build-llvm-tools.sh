@@ -65,6 +65,32 @@ flags=(
     -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF
     -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON
 )
+# Portable tools for CI (the frust-build-tools bundle, support/tools/package-build-tools.sh):
+# FRUST_TOOLS_SYSROOT names a sysroot from fetch-noble-sysroot.py. Everything, the compiler-rt
+# profile runtime included, is compiled and linked against its glibc (Ubuntu 24.04, 2.39);
+# libstdc++, libgcc, zlib and zstd are linked statically, so the tools need only libc, libm and
+# the dynamic loader. Optional host libraries that would otherwise be picked up are disabled.
+if [[ -n ${FRUST_TOOLS_SYSROOT:-} ]]; then
+    sysroot=$(realpath -- "$FRUST_TOOLS_SYSROOT")
+    [[ -f $sysroot/usr/lib/x86_64-linux-gnu/libc.so.6 ]] || {
+        echo "not a sysroot: $sysroot" >&2
+        exit 2
+    }
+    flags+=(
+        -DCMAKE_SYSROOT="$sysroot"
+        "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+        "-DCMAKE_SHARED_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+        -DLLVM_ENABLE_ZLIB=FORCE_ON
+        -DZLIB_USE_STATIC_LIBS=ON
+        -DLLVM_ENABLE_ZSTD=FORCE_ON
+        -DLLVM_USE_STATIC_ZSTD=ON
+        -DLLVM_ENABLE_LIBEDIT=OFF
+        -DLLVM_ENABLE_LIBPFM=OFF
+        -DLLVM_ENABLE_FFI=OFF
+        -DLLVM_ENABLE_CURL=OFF
+        -DLLVM_ENABLE_HTTPLIB=OFF
+    )
+fi
 targets=(
     install-clang install-clang-resource-headers install-lld install-runtimes
     install-llvm-ar install-llvm-ranlib install-llvm-profdata

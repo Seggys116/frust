@@ -65,6 +65,17 @@ In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`suppo
 
 If `FRUST_CARGO` names an `fcargo` that is the same file as this executable, it exits with an error naming the problem. On other hosts `fcargo` is still the patched Cargo, but the direct entry code is not compiled.
 
+## Installer variants
+
+On Linux x86-64 a release has two toolchain archives. `frust-toolchain-x86_64-unknown-linux-gnu` is the baseline build for any x86-64 CPU. `frust-toolchain-x86_64-unknown-linux-gnu-v3` has its compiler and tools built for x86-64-v3; the standard library and the programs you compile keep the baseline target. Each has its own `.sha256` and `.id` file, and the v3 toolchain id ends in `-v3`, so both can sit in `versions/` at once. Other hosts (macOS, Linux on ARM) have one archive and no variants.
+
+`frust-install` reads `FRUST_VARIANT` when it downloads:
+
+- `auto` (the default, also an empty value): the v3 build when the CPU reports every extension it uses and the release lists a v3 archive, otherwise the baseline. The extensions are AVX, AVX2, BMI1, BMI2, FMA, MOVBE, LZCNT, F16C and XSAVE, on top of the x86-64-v2 set (CMPXCHG16B, POPCNT, SSE3, SSSE3, SSE4.1, SSE4.2). A virtual machine that hides any of them gets the baseline.
+- `baseline` or `v3`: that build. `v3` fails when the release has no v3 archive, and on a host that has no variants. On a CPU that lacks an extension it installs with a warning, because the toolchain may not run there. Any other value is a usage error (exit status 2).
+
+`state.json` records `current_variant` and `previous_variant` next to `current` and `previous`, read from the optional `variant` member of each archive's `manifest.json`. `rollback` switches both back. `install` and `update` keep the installed variant unless `FRUST_VARIANT` is `baseline` or `v3`, so a machine moved to another CPU is not changed behind your back, and to move an installed baseline to v3 you run `FRUST_VARIANT=v3 frust-install update`. An installation made before variants existed records none, so its first update chooses as `auto` does. `FRUST_VARIANT` is ignored with `--archive`, which installs the variant its manifest names.
+
 ## Environment variables
 
 | Variable | Read by | Effect |
@@ -78,6 +89,7 @@ If `FRUST_CARGO` names an `fcargo` that is the same file as this executable, it 
 | `FRUST_TOOLCHAIN_ID` | patched Cargo | Overrides the toolchain id used in the central target path. |
 | `FRUST_EXPERIMENTAL_CODEGEN_CACHE` | `frustc` | `1` enables the post-LTO object cache. |
 | `FRUST_EXPERIMENTAL_RELR` | `frustc` | `1` enables packed relative relocations on eligible GNU links. |
+| `FRUST_VARIANT` | `frust-install` | `auto`, `baseline` or `v3`: which Linux x86-64 build to install. Default `auto`. See [Installer variants](#installer-variants). |
 
 `fcargo` also sets `RUSTC` to a `frustc` next to the Cargo executable when `RUSTC` is unset and that file exists. It forwards Cargo's exit code. Plain mode, `--quiet`, `-q`, `--message-format` and `--json` pass straight through to Cargo.
 

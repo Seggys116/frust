@@ -47,7 +47,7 @@ cargo install --git https://github.com/Seggys116/frust frust-rs --bin frust-inst
 frust-install
 ```
 
-The installer verifies a sha-256 digest before extracting and keeps the previous version. It installs under `~/.local/share/frust` (macOS: `~/Library/Application Support/fRust`); add `current/bin` of that directory to `PATH`.
+The installer verifies a sha-256 digest before extracting and keeps the previous version. It installs under `~/.local/share/frust` (macOS: `~/Library/Application Support/fRust`); add `current/bin` of that directory to `PATH`. On Linux x86-64 it installs the build for x86-64-v3 when your CPU supports it and the baseline build otherwise; `FRUST_VARIANT=baseline` or `v3` overrides that, and updates keep the installed build (see [configuration](docs/configuration.md#installer-variants)).
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 

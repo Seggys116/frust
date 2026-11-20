@@ -5,7 +5,9 @@
 //! active only after the digest matches, the tar headers pass validation, the
 //! tree is extracted and checked, and the `current` symlink is swapped. The
 //! symlink is the source of truth for the active version; `state.json` only
-//! adds the rollback target and is reconciled against it.
+//! adds the rollback target and is reconciled against it. It also records the
+//! build variant (`baseline`, `v3`) that each of the two versions was packaged
+//! as, taken from the optional `variant` member of their `manifest.json`.
 
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -24,6 +26,7 @@ const WORK_PREFIX: &str = ".partial-work.";
 const ASIDE_PREFIX: &str = ".partial-aside.";
 const COPY_BUFFER: usize = 64 * 1024;
 const MAX_ID_LEN: usize = 128;
+const MAX_VARIANT_LEN: usize = 32;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_JSON_DEPTH: usize = 32;
 const REQUIRED_FILES: [&str; 3] = ["bin/rustc", "bin/cargo", "bin/rustdoc"];
@@ -43,6 +46,16 @@ impl InstallError {
 pub struct PrefixState {
     pub current: Option<String>,
     pub previous: Option<String>,
+    /// Variant of `current`; `None` when its manifest names none (macOS, installs made before variants).
+    pub current_variant: Option<String>,
+    /// Variant of `previous`, with the same meaning.
+    pub previous_variant: Option<String>,
+}
+
+/// What the installer reads from a tree's `manifest.json`.
+struct Manifest {
+    id: String,
+    variant: Option<String>,
 }
 
 fn io_context(what: impl Display) -> impl FnOnce(io::Error) -> InstallError {
@@ -58,10 +71,10 @@ pub fn install(prefix: &Path, archive: &Path, checksum: &Path) -> Result<PrefixS
     let recorded = reconcile(prefix)?;
     let work = Work::create(prefix)?;
     let tree = unpack(&work, &mut source, archive, &expected)?;
-    let id = read_manifest(&tree)?;
+    let manifest = read_manifest(&tree)?;
     require_tree(&tree)?;
-    let aside = publish(prefix, &tree, &id)?;
-    let result = activate(prefix, &id, &recorded);
+    let aside = publish(prefix, &tree, &manifest.id)?;
+    let result = activate(prefix, &manifest, &recorded);
     if let Some(aside) = aside {
         let _ = fs::remove_dir_all(aside);
     }
@@ -95,7 +108,10 @@ pub fn rollback(prefix: &Path) -> Result<PrefixState, InstallError> {
         return Err(InstallError::new(format!("previous version {previous} is not installed")));
     }
     switch_current(prefix, &previous)?;
-    let next = PrefixState { current: Some(previous), previous: state.current };
+    // A state written before variants existed names none; the manifests fill them in.
+    let current_variant = state.previous_variant.clone().or_else(|| installed_variant(prefix, &previous));
+    let previous_variant = state.current_variant.clone().or_else(|| state.current.as_deref().and_then(|id| installed_variant(prefix, id)));
+    let next = PrefixState { current: Some(previous), previous: state.current, current_variant, previous_variant };
     write_state(prefix, &next)?;
     Ok(next)
 }
@@ -119,6 +135,21 @@ pub fn current_version(prefix: &Path) -> Result<Option<String>, InstallError> {
     active_version(prefix)
 }
 
+/// The variant of the active version, or `None` when nothing is installed or its manifest names none.
+pub fn current_variant(prefix: &Path) -> Result<Option<String>, InstallError> {
+    let Some(active) = active_version(prefix)? else {
+        return Ok(None);
+    };
+    // An unreadable state.json is not an error here: the install that follows reports it. A state
+    // written before variants existed names none, so the manifest of the tree answers then.
+    if let Ok(recorded) = read_state(prefix) {
+        if recorded.current.as_deref() == Some(active.as_str()) && recorded.current_variant.is_some() {
+            return Ok(recorded.current_variant);
+        }
+    }
+    Ok(installed_variant(prefix, &active))
+}
+
 pub fn verify_checksum(archive: &Path, checksum: &Path) -> Result<(), InstallError> {
     let expected = read_expected_digest(checksum)?;
     let mut file = open_archive(archive)?;
@@ -126,11 +157,16 @@ pub fn verify_checksum(archive: &Path, checksum: &Path) -> Result<(), InstallErr
     compare_digest(archive, &expected, &actual)
 }
 
-fn activate(prefix: &Path, id: &str, recorded: &PrefixState) -> Result<PrefixState, InstallError> {
+fn activate(prefix: &Path, manifest: &Manifest, recorded: &PrefixState) -> Result<PrefixState, InstallError> {
+    let id = manifest.id.as_str();
     // Re-activating the live id must not turn the rollback target into itself.
-    let previous = if recorded.current.as_deref() == Some(id) { recorded.previous.clone() } else { recorded.current.clone() };
+    let (previous, previous_variant) = if recorded.current.as_deref() == Some(id) {
+        (recorded.previous.clone(), recorded.previous_variant.clone())
+    } else {
+        (recorded.current.clone(), recorded.current_variant.clone())
+    };
     switch_current(prefix, id)?;
-    let state = PrefixState { current: Some(id.to_string()), previous };
+    let state = PrefixState { current: Some(id.to_string()), previous, current_variant: manifest.variant.clone(), previous_variant };
     write_state(prefix, &state)?;
     Ok(state)
 }
@@ -277,7 +313,19 @@ fn validate_id(id: &str) -> Result<(), InstallError> {
     Ok(())
 }
 
-fn read_manifest(tree: &Path) -> Result<String, InstallError> {
+/// Variant names appear in state.json and in release asset names, so they get a plain lowercase charset.
+fn validate_variant(variant: &str) -> Result<(), InstallError> {
+    let first_ok = variant.chars().next().is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit());
+    let rest_ok = variant.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'));
+    if variant.len() > MAX_VARIANT_LEN || !first_ok || !rest_ok {
+        return Err(InstallError::new(format!(
+            "variant {variant:?} is not allowed: use 1 to {MAX_VARIANT_LEN} characters from a-z 0-9 _ - and start with a letter or digit"
+        )));
+    }
+    Ok(())
+}
+
+fn read_manifest(tree: &Path) -> Result<Manifest, InstallError> {
     let file = File::open(tree.join("manifest.json")).map_err(|err| InstallError::new(format!("archive has no manifest.json ({err})")))?;
     let mut bytes = Vec::new();
     file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes).map_err(io_context("could not read manifest.json"))?;
@@ -297,7 +345,21 @@ fn read_manifest(tree: &Path) -> Result<String, InstallError> {
         return Err(InstallError::new("manifest.json id is not a string"));
     };
     validate_id(id)?;
-    Ok(id.clone())
+    let variant = match members.iter().filter(|(key, _)| key == "variant").collect::<Vec<_>>().as_slice() {
+        [] | [(_, JsonValue::Null)] => None,
+        [(_, JsonValue::Text(variant))] => {
+            validate_variant(variant)?;
+            Some(variant.clone())
+        }
+        [_] => return Err(InstallError::new("manifest.json variant is not a string")),
+        _ => return Err(InstallError::new("manifest.json has more than one variant")),
+    };
+    Ok(Manifest { id: id.clone(), variant })
+}
+
+/// The variant recorded in the manifest of an installed version, when it can be read.
+fn installed_variant(prefix: &Path, id: &str) -> Option<String> {
+    read_manifest(&prefix.join("versions").join(id)).ok().and_then(|manifest| manifest.variant)
 }
 
 fn require_tree(tree: &Path) -> Result<(), InstallError> {
@@ -333,8 +395,15 @@ fn reconcile(prefix: &Path) -> Result<PrefixState, InstallError> {
     if recorded.current == active {
         return Ok(recorded);
     }
-    let previous = recorded.current.clone().or(recorded.previous.clone()).filter(|id| Some(id) != active.as_ref());
-    let repaired = PrefixState { current: active, previous };
+    let (previous, previous_variant) = if recorded.current.is_some() {
+        (recorded.current, recorded.current_variant)
+    } else {
+        (recorded.previous, recorded.previous_variant)
+    };
+    let (previous, previous_variant) = if previous == active { (None, None) } else { (previous, previous_variant) };
+    // The manifest of the active tree is the authority on its own variant.
+    let current_variant = active.as_deref().and_then(|id| installed_variant(prefix, id));
+    let repaired = PrefixState { current: active, previous, current_variant, previous_variant };
     write_state(prefix, &repaired)?;
     Ok(repaired)
 }
@@ -343,7 +412,9 @@ fn read_state(prefix: &Path) -> Result<PrefixState, InstallError> {
     let path = prefix.join("state.json");
     match fs::read_to_string(&path) {
         Ok(text) => parse_state(&text),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(PrefixState { current: None, previous: None }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(PrefixState { current: None, previous: None, current_variant: None, previous_variant: None })
+        }
         Err(err) => Err(InstallError::new(format!("could not read {}: {err}", path.display()))),
     }
 }
@@ -351,7 +422,24 @@ fn read_state(prefix: &Path) -> Result<PrefixState, InstallError> {
 fn parse_state(text: &str) -> Result<PrefixState, InstallError> {
     let members = parse_object(text)
         .map_err(|why| InstallError::new(format!("state.json is corrupt ({why}); remove it to reset the recorded versions")))?;
-    Ok(PrefixState { current: state_field(&members, "current")?, previous: state_field(&members, "previous")? })
+    Ok(PrefixState {
+        current: state_field(&members, "current")?,
+        previous: state_field(&members, "previous")?,
+        current_variant: state_variant_field(&members, "current_variant")?,
+        previous_variant: state_variant_field(&members, "previous_variant")?,
+    })
+}
+
+/// The variant fields were added later, so a state.json without them is valid.
+fn state_variant_field(members: &[(String, JsonValue)], field: &str) -> Result<Option<String>, InstallError> {
+    match members.iter().find(|(key, _)| key == field).map(|(_, value)| value) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Text(variant)) => {
+            validate_variant(variant).map_err(|_| InstallError::new(format!("state.json field {field} holds an invalid variant; remove state.json to reset it")))?;
+            Ok(Some(variant.clone()))
+        }
+        Some(JsonValue::Other) => Err(InstallError::new(format!("state.json field {field} is not a string; remove state.json to reset it"))),
+    }
 }
 
 fn state_field(members: &[(String, JsonValue)], field: &str) -> Result<Option<String>, InstallError> {
@@ -368,9 +456,11 @@ fn state_field(members: &[(String, JsonValue)], field: &str) -> Result<Option<St
 fn write_state(prefix: &Path, state: &PrefixState) -> Result<(), InstallError> {
     fs::create_dir_all(prefix).map_err(io_context(format!("could not create {}", prefix.display())))?;
     let body = format!(
-        "{{\n  \"current\": {},\n  \"previous\": {}\n}}\n",
+        "{{\n  \"current\": {},\n  \"previous\": {},\n  \"current_variant\": {},\n  \"previous_variant\": {}\n}}\n",
         json_opt(state.current.as_deref()),
-        json_opt(state.previous.as_deref())
+        json_opt(state.previous.as_deref()),
+        json_opt(state.current_variant.as_deref()),
+        json_opt(state.previous_variant.as_deref())
     );
     let temporary = prefix.join(format!(".state.json.next.{}", unique_suffix()));
     let commit = || -> io::Result<()> {
@@ -387,7 +477,7 @@ fn write_state(prefix: &Path, state: &PrefixState) -> Result<(), InstallError> {
     Ok(())
 }
 
-// Ids are validated to a charset that needs no JSON escaping.
+// Ids and variants are validated to a charset that needs no JSON escaping.
 fn json_opt(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("\"{value}\""),
@@ -1065,6 +1155,42 @@ mod tests {
         for bad in ["", ".", "..", ".hidden", ".partial-x", "a/b", "../x", "-x", "a b", long.as_str()] {
             assert!(validate_id(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn variant_validation_accepts_only_plain_lowercase_names() {
+        for good in ["baseline", "v3", "x86-64_v4", "0"] {
+            assert!(validate_variant(good).is_ok(), "{good}");
+        }
+        let long = "a".repeat(MAX_VARIANT_LEN + 1);
+        for bad in ["", "V3", "-v3", "_v3", "v 3", "v3/x", "../v3", "v3\"", long.as_str()] {
+            assert!(validate_variant(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn manifests_name_at_most_one_plain_variant() {
+        let dir = scratch();
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let cases = [
+            ("{\"id\":\"a\"}", Some(None)),
+            ("{\"id\":\"a\",\"variant\":null}", Some(None)),
+            ("{\"id\":\"a\",\"variant\":\"v3\"}", Some(Some("v3"))),
+            ("{\"variant\":\"baseline\",\"id\":\"a\"}", Some(Some("baseline"))),
+            ("{\"id\":\"a\",\"variant\":3}", None),
+            ("{\"id\":\"a\",\"variant\":\"V3\"}", None),
+            ("{\"id\":\"a\",\"variant\":\"v3\",\"variant\":\"baseline\"}", None),
+        ];
+        for (text, expected) in cases {
+            fs::write(tree.join("manifest.json"), text).unwrap();
+            let read = read_manifest(&tree);
+            match expected {
+                Some(variant) => assert_eq!(read.unwrap().variant.as_deref(), variant, "{text}"),
+                None => assert!(read.is_err(), "{text}"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

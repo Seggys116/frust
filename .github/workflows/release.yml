@@ -3,6 +3,12 @@ name: Release
 # Pushing a v* tag builds the toolchain, publishes a GitHub release that `frust-install` downloads,
 # then publishes the crates. Run by hand from a branch for a dry run that builds and smoke-tests
 # everything and publishes nothing.
+#
+# Linux x86-64 ships two archives: frust-toolchain-x86_64-unknown-linux-gnu (baseline x86-64) and
+# frust-toolchain-x86_64-unknown-linux-gnu-v3 (compiler and tools built for x86-64-v3), each with
+# its .sha256 and .id file. `frust-install` picks the v3 one on a CPU that supports it. The v3
+# smoke test runs only on a runner CPU with AVX2 and BMI2 and the rest of the v3 set, and says so
+# when it is skipped; the baseline one always runs.
 on:
   push:
     tags: ["v*"]
@@ -69,12 +75,13 @@ jobs:
           echo "CI passed: $(jq -r .html_url <<< "$run")"
 
   # The released toolchain has the experimental switches off, so parity is checked in that state.
-  # macOS arm64 and Intel are built natively on their own runners.
+  # macOS arm64 and Intel are built natively on their own runners. Linux x86-64 is built twice,
+  # for the baseline CPU and for x86-64-v3, both with the launch check and the parity proof.
   toolchains:
     needs: preflight
     uses: ./.github/workflows/toolchains.yml
     with:
-      builds: '[{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"},{"variant":"frust","target":"aarch64-apple-darwin","os":"macos-latest"},{"variant":"frust","target":"x86_64-apple-darwin","os":"macos-15-intel"}]'
+      builds: '[{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","cpu":"baseline"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","cpu":"v3"},{"variant":"frust","target":"aarch64-apple-darwin","os":"macos-latest"},{"variant":"frust","target":"x86_64-apple-darwin","os":"macos-15-intel"}]'
       codegen-cache: false
       relr: false
 
@@ -89,8 +96,11 @@ jobs:
       - run: cargo publish --workspace --dry-run --locked
         working-directory: crates
 
+  # One job per archive. toolchain names the build artifact of the toolchains job (frust-v3 is the
+  # x86-64-v3 build) and variant is what package-release.sh records for the targets that have two
+  # builds; it is empty for the others.
   package:
-    name: package and smoke-test (${{ matrix.target }})
+    name: package and smoke-test (${{ matrix.target }}${{ matrix.variant == 'v3' && ' v3' || '' }})
     needs: [preflight, toolchains]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -98,38 +108,67 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust, variant: baseline }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust-v3, variant: v3 }
+          - { target: aarch64-apple-darwin, os: macos-latest, toolchain: frust, variant: "" }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, toolchain: frust, variant: "" }
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: actions/download-artifact@v8
         with:
-          name: toolchain-frust-${{ matrix.target }}
+          name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
           path: ${{ runner.temp }}/toolchain
       - name: Build frust-install
         working-directory: crates
         run: cargo build --release --locked -p frust-rs --bin frust-install
       - name: Package the release files
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
-          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/frust-${{ matrix.target }}.tar.zst" \
-            "${{ needs.preflight.outputs.version }}" "${{ matrix.target }}" crates/target/release/frust-install dist
+          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/${{ matrix.toolchain }}-${{ matrix.target }}.tar.zst" \
+            "${{ needs.preflight.outputs.version }}" "${{ matrix.target }}" crates/target/release/frust-install dist ${VARIANT:+"$VARIANT"}
           ls -l dist
-      # frust-install is the way users get the toolchain, so the smoke test uses it end to end.
+      # The v3 toolchain only runs on a CPU with every extension it uses, and the GitHub runner pool is
+      # not guaranteed to have them. The baseline smoke test never depends on this step.
+      - id: cpu
+        name: Check that this runner can run the v3 toolchain
+        if: matrix.variant == 'v3'
+        run: |
+          if message=$(bash .github/scripts/cpu-supports-v3.sh); then
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+            echo "$message"
+          else
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=v3 smoke test skipped::$message. The v3 archive was packaged but not run on this runner."
+            echo "The v3 smoke test was skipped: $message" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # frust-install is the way users get the toolchain, so the smoke test uses it end to end. The
+      # variant is forced, so each Linux job tests its own archive whatever the runner CPU is.
       - name: Install from the release files and build with the result
+        if: matrix.variant != 'v3' || steps.cpu.outputs.runnable == 'true'
+        env:
+          FRUST_VARIANT: ${{ matrix.variant }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           export FRUST_RELEASE_BASE="file://$PWD/dist"
           prefix=$RUNNER_TEMP/smoke
           crates/target/release/frust-install install --prefix "$prefix"
+          if [[ -n $VARIANT ]]; then
+            grep -F "\"variant\":\"$VARIANT\"" "$prefix/current/manifest.json"
+            grep -F "\"current_variant\": \"$VARIANT\"" "$prefix/state.json"
+          fi
           "$prefix/current/bin/frustc" -vV
           "$prefix/current/bin/frust-install" update --prefix "$prefix"
+          if [[ -n $VARIANT ]]; then
+            grep -F "\"current_variant\": \"$VARIANT\"" "$prefix/state.json"
+          fi
           mkdir -p "$RUNNER_TEMP/launch"
           support/launch-check.sh "$prefix/current" "$RUNNER_TEMP/launch" "$RUNNER_TEMP/launch/launch.log"
           cat "$RUNNER_TEMP/launch/launch.log"
       - uses: actions/upload-artifact@v7
         with:
-          name: release-files-${{ matrix.target }}
+          name: release-files-${{ matrix.toolchain }}-${{ matrix.target }}
           path: dist
           retention-days: 14
 

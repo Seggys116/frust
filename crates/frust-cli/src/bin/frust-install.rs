@@ -14,7 +14,10 @@ const USAGE: &str = "usage: frust-install [install|update|upgrade|stage|rollback
   rollback          switch back to the previous version
   uninstall         remove the installation
 With no command, frust-install installs the latest release. The default prefix is
-$FRUST_PREFIX, then $XDG_DATA_HOME/frust or ~/.local/share/frust (macOS: ~/Library/Application Support/fRust).";
+$FRUST_PREFIX, then $XDG_DATA_HOME/frust or ~/.local/share/frust (macOS: ~/Library/Application Support/fRust).
+On Linux x86-64, $FRUST_VARIANT picks the build: auto (the default) installs the v3 build when this CPU
+supports it and the release has one, baseline or v3 force one. install and update keep the installed
+variant unless $FRUST_VARIANT names another.";
 const USAGE_ERROR: u8 = 2;
 const OPERATION_ERROR: u8 = 1;
 
@@ -74,8 +77,8 @@ fn path_hint(prefix: &Path) {
     eprintln!("  export PATH=\"{}:$PATH\"", prefix.join("current").join("bin").display());
 }
 
-fn install_latest(prefix: &Path, version: Option<&str>) -> Result<String, install::InstallError> {
-    match release::install_release(prefix, version)? {
+fn install_latest(prefix: &Path, version: Option<&str>, variant: release::VariantRequest) -> Result<String, install::InstallError> {
+    match release::install_release(prefix, version, variant)? {
         Outcome::UpToDate(id) => {
             eprintln!("frust-install: {id} is already installed and up to date");
             Ok(format!("current={id}\n"))
@@ -131,11 +134,20 @@ fn main() -> ExitCode {
             Err(err) => return usage_error(&err.message),
         },
     };
+    // FRUST_VARIANT only matters for a download; a local archive carries its own variant.
+    let variant = if downloads && local.is_none() {
+        match release::variant_request_from_environment() {
+            Ok(variant) => variant,
+            Err(err) => return usage_error(&err.message),
+        }
+    } else {
+        release::VariantRequest::default()
+    };
     let result = match (command.as_str(), local) {
         ("install" | "update" | "upgrade", Some((archive, checksum))) => {
             install::install(&prefix, &archive, &checksum).map(|state| format!("current={}\n", state.current.unwrap_or_default()))
         }
-        ("install" | "update" | "upgrade", None) => install_latest(&prefix, options.version.as_deref()),
+        ("install" | "update" | "upgrade", None) => install_latest(&prefix, options.version.as_deref(), variant),
         ("stage", Some((archive, checksum))) => install::stage_without_activate(&prefix, &archive, &checksum).map(|path| {
             let current = install::current_version(&prefix).ok().flatten().unwrap_or_default();
             format!("partial={}\ncurrent={current}\n", path.display())

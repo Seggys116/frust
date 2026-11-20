@@ -17,7 +17,9 @@
 # Usage: optimize-linux-v2.sh RUST_SOURCE WORK LLVM_TOOLS PACKAGE_DEST LAUNCHER [PACKAGE_ID]
 #   RUST_SOURCE  isolated checkout from support/tools/prepare-rust-checkout.sh
 #   WORK         fresh work directory (build tree, profiles, logs, progress.log)
-#   LLVM_TOOLS   prefix produced by support/tools/build-llvm-tools.sh
+#   LLVM_TOOLS   prefix produced by support/tools/build-llvm-tools.sh, or an extracted
+#                frust-build-tools bundle (support/tools/package-build-tools.sh); both are
+#                checked by support/tools/check-build-tools.sh before anything is built
 #   PACKAGE_DEST toolchain directory to create (must not exist)
 #   LAUNCHER     the fcargo-ui launcher binary to package
 # Environment:
@@ -27,6 +29,16 @@
 #   FRUST_PROFILE_EXPORT      directory to receive the profiles and a MANIFEST (optional)
 #   FRUST_TRAINING_SYSROOT    extracted libssl-dev tree (usr/include, usr/lib/<multiarch>) for
 #                             the cargo-0.87.1 training crate when the host lacks OpenSSL headers
+#   FRUST_STORED_PROFILES     directory holding rustc-pgo, rustdoc-pgo, clippy-pgo and rustc-bolt
+#                             .profdata with a SHA256SUMS (a FRUST_PROFILE_EXPORT of an earlier
+#                             run). Training is skipped: the stage-2 tools are built with these PGO
+#                             profiles and the rustc driver is BOLT-optimized with the stored data,
+#                             exactly as opt-dist does after its training stages. The MANIFEST
+#                             must name the same rust and llvm pins and a target-cpu equal to
+#                             FRUST_COMPILER_TARGET_CPU (x86-64 when unset); otherwise it is refused.
+#   FRUST_COMPILER_TARGET_CPU target CPU (for example x86-64-v3) for the compiler and tools only:
+#                             crates built into stage2-rustc/ and stage2-tools/ and Cargo. The
+#                             standard library and compiler_builtins keep the baseline target.
 set -euo pipefail
 
 if [[ $# -lt 5 || $# -gt 6 ]]; then
@@ -47,6 +59,9 @@ official=${FRUST_OFFICIAL_TOOLCHAIN:-$HOME/.rustup/toolchains/$release-$host}
 # Resolve relative paths now; the build later runs inside the source checkout.
 [[ -z ${FRUST_PROFILE_EXPORT:-} ]] || FRUST_PROFILE_EXPORT=$(realpath -m -- "$FRUST_PROFILE_EXPORT")
 [[ -z ${FRUST_TRAINING_SYSROOT:-} ]] || FRUST_TRAINING_SYSROOT=$(realpath -- "$FRUST_TRAINING_SYSROOT")
+[[ -z ${FRUST_STORED_PROFILES:-} ]] || FRUST_STORED_PROFILES=$(realpath -- "$FRUST_STORED_PROFILES")
+target_cpu=${FRUST_COMPILER_TARGET_CPU:-}
+[[ $target_cpu =~ ^[A-Za-z0-9_.-]*$ ]] || { echo "invalid FRUST_COMPILER_TARGET_CPU" >&2; exit 2; }
 
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
     echo "this recipe requires Linux x86-64" >&2
@@ -64,10 +79,11 @@ step() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$progress"; }
 trap 'step "FAILED at line $LINENO"' ERR
 step "start source=$source_dir tools=$tools package=$package jobs=$jobs"
 
-for tool in clang clang++ ld.lld llvm-ar llvm-ranlib llvm-profdata llvm-bolt merge-fdata; do
-    "$tools/bin/$tool" --version > /dev/null
-done
-test -f "$tools/lib/libbolt_rt_instr.a"
+bash "$root/support/tools/check-build-tools.sh" "$tools" > "$work/build-tools-check.txt" 2>&1 || {
+    cat "$work/build-tools-check.txt" >&2
+    exit 2
+}
+step "build tools checked ($work/build-tools-check.txt)"
 host_strip=$(realpath -- "$(command -v strip)")
 export FRUST_BOOTSTRAP_STRIP=$host_strip
 [[ $("$FRUST_BOOTSTRAP_STRIP" --help) == *--keep-file-symbols* ]] || {
@@ -76,11 +92,35 @@ export FRUST_BOOTSTRAP_STRIP=$host_strip
 }
 bash "$root/support/verify-pins.sh" "$source_dir" "$work/pins.txt"
 training=$(git -C "$source_dir" rev-parse HEAD:src/tools/rustc-perf)
-[[ -f $source_dir/src/tools/rustc-perf/Cargo.toml &&
-   $(git -C "$source_dir/src/tools/rustc-perf" rev-parse HEAD) == "$training" ]] || {
+if [[ -n ${FRUST_STORED_PROFILES:-} ]]; then
+    (cd "$FRUST_STORED_PROFILES" && sha256sum --quiet -c SHA256SUMS)
+    for name in rustc-pgo rustdoc-pgo clippy-pgo rustc-bolt; do
+        test -s "$FRUST_STORED_PROFILES/$name.profdata"
+    done
+    # PGO and BOLT profiles only fit the code they were trained on: the same sources and the
+    # same compiler target CPU (target features change the IR before instrumentation).
+    stored_manifest=$FRUST_STORED_PROFILES/MANIFEST
+    [[ -f $stored_manifest ]] || { echo "stored profiles lack a MANIFEST" >&2; exit 2; }
+    stored_cpu=$(awk '$1 == "target-cpu" { print $2 }' "$stored_manifest")
+    [[ -n $stored_cpu ]] || { echo "stored MANIFEST has no target-cpu line" >&2; exit 2; }
+    if [[ $stored_cpu != "${target_cpu:-x86-64}" ]]; then
+        echo "stored profiles were trained with target-cpu $stored_cpu;" \
+            "FRUST_COMPILER_TARGET_CPU requests ${target_cpu:-x86-64}" >&2
+        exit 2
+    fi
+    for pin in rust llvm; do
+        if [[ $(awk -v p="$pin" '$1 == "pin" && $2 == p { print $3 }' "$stored_manifest") != \
+              $(awk -v p="$pin" '$1 == p { print $2 }' "$work/pins.txt") ]]; then
+            echo "stored profiles were trained on a different $pin commit" >&2
+            exit 2
+        fi
+    done
+    step "stored profiles $FRUST_STORED_PROFILES (target-cpu $stored_cpu)"
+elif [[ ! -f $source_dir/src/tools/rustc-perf/Cargo.toml ||
+        $(git -C "$source_dir/src/tools/rustc-perf" rev-parse HEAD) != "$training" ]]; then
     echo "initialize the pinned rustc-perf submodule first" >&2
     exit 2
-}
+fi
 
 # Rustc and Cargo series: only patches tracked by git; untracked files there are other work in
 # progress. support/patches/build/ belongs to this recipe alone and is applied as it stands.
@@ -173,7 +213,8 @@ if [[ -n ${FRUST_TRAINING_SYSROOT:-} ]]; then
     export OPENSSL_INCLUDE_DIR=$sdk/usr/include OPENSSL_LIB_DIR=$sdk/usr/lib/x86_64-linux-gnu
     step "training SDK headers $sdk"
 fi
-if ! printf '#include <openssl/opensslv.h>\n' | cc -E -x c - > /dev/null 2>&1; then
+if [[ -z ${FRUST_STORED_PROFILES:-} ]] &&
+    ! printf '#include <openssl/opensslv.h>\n' | cc -E -x c - > /dev/null 2>&1; then
     echo "OpenSSL headers are required by the cargo-0.87.1 training crate;" \
         "set FRUST_TRAINING_SYSROOT" >&2
     exit 2
@@ -195,9 +236,70 @@ exec python3 "${args[@]}"
 BASH
 chmod +x "$bootstrap_python"
 
+# Compiler-only target CPU. rust.rustflags and RUSTFLAGS_NOT_BOOTSTRAP also reach the standard
+# library, so the flag is added by a rustc wrapper instead: bootstrap hands an inherited
+# RUSTC_WRAPPER to its shim as RUSTC_WRAPPER_REAL, and every rustc that Cargo starts sees the
+# CARGO_TARGET_DIR bootstrap chose for the mode. stage2-rustc holds the compiler crates and
+# stage2-tools the rustdoc and clippy builds; stage*-std and stage1-* keep the baseline CPU.
+if [[ -n $target_cpu ]]; then
+    cat > "$work/bootstrap-tools/compiler-cpu-rustc" <<'BASH'
+#!/usr/bin/env bash
+case ${CARGO_TARGET_DIR:-} in
+    */stage2-rustc | */stage2-tools) exec "$@" "-Ctarget-cpu=$FRUST_COMPILER_TARGET_CPU" ;;
+esac
+exec "$@"
+BASH
+    chmod +x "$work/bootstrap-tools/compiler-cpu-rustc"
+    export FRUST_COMPILER_TARGET_CPU=$target_cpu
+    export RUSTC_WRAPPER=$work/bootstrap-tools/compiler-cpu-rustc
+    step "compiler target CPU $target_cpu (wrapper $RUSTC_WRAPPER)"
+fi
+bolt_flags=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions
+    -split-strategy=cdsplit -split-all-cold -jump-tables=move -icf=all
+    -update-debug-sections -dyno-stats)
+
 cd "$source_dir"
 # Completed stages leave a marker; a rerun with the same work directory resumes after them.
-if [[ -f $work/opt-dist.done ]]; then
+if [[ -n ${FRUST_STORED_PROFILES:-} ]]; then
+    # The steps opt-dist runs after training (Stage 1 "Build PGO optimized rustc", Stage 3
+    # "Optimize rustc with BOLT", Stage 5 dist), fed with the stored profiles.
+    mkdir -p "$work/profiles"
+    for name in rustc-pgo rustdoc-pgo clippy-pgo rustc-bolt; do
+        cmp -s "$FRUST_STORED_PROFILES/$name.profdata" "$work/profiles/$name.profdata" ||
+            cp "$FRUST_STORED_PROFILES/$name.profdata" "$work/profiles/$name.profdata"
+    done
+    pgo_use=(--set "pgo.rustc.use=\"$work/profiles/rustc-pgo.profdata\""
+        --set "pgo.cargo.use=\"$work/profiles/rustc-pgo.profdata\""
+        --set "pgo.rustdoc.use=\"$work/profiles/rustdoc-pgo.profdata\""
+        --set "pgo.clippy.use=\"$work/profiles/clippy-pgo.profdata\"")
+    if [[ ! -f $work/stored-build.done ]]; then
+        step "build PGO-optimized stage 2 from stored profiles; log $work/stored-build.log"
+        RUST_BACKTRACE=full python3 x.py build --target "$host" --host "$host" --stage 2 \
+            library rustdoc cargo clippy "${pgo_use[@]}" --enable-bolt-settings \
+            > "$work/stored-build.log" 2>&1
+        touch "$work/stored-build.done"
+    fi
+    if [[ ! -f $work/stored-bolt.done ]]; then
+        rustc_lib=$(find "$work/build/$host/stage2/lib" -maxdepth 1 \
+            -name 'librustc_driver-*.so' -print -quit)
+        # Keep the PGO-only input: it is what the stored BOLT profile must match.
+        cp "$rustc_lib" "$work/rustc-driver-prebolt.so"
+        step "BOLT $rustc_lib with the stored profile; log $work/stored-bolt.log"
+        # Like opt-dist, write through the existing path so that its hard links follow.
+        "$tools/bin/llvm-bolt" "$work/rustc-driver-prebolt.so" \
+            -data "$work/profiles/rustc-bolt.profdata" -o "$rustc_lib" "${bolt_flags[@]}" \
+            > "$work/stored-bolt.log" 2>&1
+        touch "$work/stored-bolt.done"
+    fi
+    if [[ ! -f $work/opt-dist.done ]]; then
+        step "dist (keeping the BOLT-optimized stage 2); log $work/stored-dist.log"
+        RUST_BACKTRACE=full python3 x.py dist rustc rust-std cargo rust-src "${pgo_use[@]}" \
+            --keep-stage 0 --keep-stage 1 \
+            --reproducible-artifact "$work/profiles/rustc-bolt.profdata" \
+            > "$work/stored-dist.log" 2>&1
+        touch "$work/opt-dist.done"
+    fi
+elif [[ -f $work/opt-dist.done ]]; then
     step "opt-dist already finished"
 else
     step "build opt-dist"
@@ -222,12 +324,12 @@ else
     step "build Cargo (official rustc, ThinLTO, 1 CGU, profile-use, all-static); log $work/cargo-build.log"
     (
         cd "$source_dir/src/tools/cargo"
-        env -u RUSTFLAGS -u CARGO_TARGET_DIR \
+        env -u RUSTFLAGS -u CARGO_TARGET_DIR -u RUSTC_WRAPPER \
             PATH="$official/bin:/usr/bin:/bin" \
             RUSTC="$official/bin/rustc" \
             CARGO_TARGET_DIR="$work/cargo-build" \
             CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-            RUSTFLAGS="-Cprofile-use=$profile" \
+            RUSTFLAGS="-Cprofile-use=$profile${target_cpu:+ -Ctarget-cpu=$target_cpu}" \
             "$official/bin/cargo" build --release --locked -j "$jobs" --features all-static
     ) > "$work/cargo-build.log" 2>&1
     touch "$work/cargo.done"
@@ -287,6 +389,17 @@ if [[ -n ${FRUST_PROFILE_EXPORT:-} ]]; then
     {
         echo "package $package_id"
         echo "recipe support/optimize-linux-v2.sh"
+        echo "target-cpu ${target_cpu:-x86-64}"
+        if [[ -n $target_cpu ]]; then
+            echo "compiler-flags -Ctarget-cpu=$target_cpu for stage2-rustc and stage2-tools" \
+                "(RUSTC_WRAPPER), PGO-instrumented and profile-use builds alike, and Cargo;" \
+                "standard library baseline"
+        else
+            echo "compiler-flags none beyond the bootstrap config (baseline x86-64)"
+        fi
+        echo "frust-commit $(git -C "$root" rev-parse HEAD)"
+        echo "frust-recipe-sha256 $(sha256sum "$root/support/optimize-linux-v2.sh" | cut -d' ' -f1)"
+        echo "profiles-from ${FRUST_STORED_PROFILES:-training in this run (opt-dist local)}"
         sed 's/^/pin /' "$work/pins.txt"
         echo "tools $("$tools/bin/clang" --version | sed -n 1p)"
         echo "tools $("$tools/bin/llvm-profdata" --version 2>&1 | sed -n 2p | sed 's/^ *//')"
