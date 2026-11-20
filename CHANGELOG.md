@@ -5,6 +5,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 ## [Unreleased]
 
 * 20 November 2026: the interface-hash cutoff was judged on the full paired Linux cohort and not kept. Build-time gates passed and the runtime aggregate and stripped-size gates failed, because the three application binaries matched stock. No candidate has passed every frozen Linux budget. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
+* 20 November 2026: prelink-span reuse (`frust-0ef1bc386-prelinkspan1`) was judged on the same cohort and not kept. The leaf build budgets passed. Disk, the runtime aggregate, and stripped size failed. The three application binaries matched stock. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
 ## [0.5.0] - 2026-11-20
 

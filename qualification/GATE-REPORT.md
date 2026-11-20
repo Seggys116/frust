@@ -6,7 +6,7 @@ The judge is the shipped `frust-gates` binary. It exits 1 when any gate is not `
 
 ## Full paired judge
 
-The only full paired judge on 20 November is the interface-hash cutoff, prefix `toolchains/frust-0ef1bc386-cutoff1`, report `target/compiler-rewrite/logs/cutoff-gates.json`, sha256 `7bf8d360b8d72e684f516189ba8ea84237c44aa07f75112f113d08ef13713a7a`. The judge exited 1. `FRUST_INTERFACE_CUTOFF=1` was set on the fRust side only. The three application binaries were byte-identical to stock (ripgrep 4024992, oxipng 1338440, rustfmt port 3835192), so the per-workload runtime bound is waived and the runtime aggregate stays at 1.
+The first full paired judge on 20 November is the interface-hash cutoff, prefix `toolchains/frust-0ef1bc386-cutoff1`, report `target/compiler-rewrite/logs/cutoff-gates.json`, sha256 `7bf8d360b8d72e684f516189ba8ea84237c44aa07f75112f113d08ef13713a7a`. The judge exited 1. `FRUST_INTERFACE_CUTOFF=1` was set on the fRust side only. The three application binaries were byte-identical to stock (ripgrep 4024992, oxipng 1338440, rustfmt port 3835192), so the per-workload runtime bound is waived and the runtime aggregate stays at 1.
 
 | Gate | Status | Figure |
 | --- | --- | --- |
@@ -22,6 +22,23 @@ The only full paired judge on 20 November is the interface-hash cutoff, prefix `
 | stripped-size | failed | geomean 1.00000000 |
 
 The build-time passes belong to that cutoff compiler. They are not copied onto any other compiler. The cutoff is not the default toolchain. Identical emitted code cannot meet the 0.97 runtime or stripped-size aggregates.
+
+The second full paired judge is prefix `toolchains/frust-0ef1bc386-prelinkspan1`. The driver is the 2026-11-20 07:51:20 stage-2 `librustc_driver-c56a332a1933ca87.so` (155292136 bytes). It contains `frust-prelink-span`, `frust-fatspan-cache`, `DeadValidity`, and `FRUSTSPAN1`. It does not contain the later post-link contraction. Cargo is the content-checksum binary, sha256 `19da6cf49ae9f14389a0fb07382580c02e872172037edb13147eb9bdcad52507`. `FRUST_INTERFACE_HASH` and `FRUST_INTERFACE_CUTOFF` were unset. Samples are `target/compiler-rewrite/logs/prelinkspan-gate/samples.txt`, sha256 `dfc4ba56b31a970df4025c692e446669faa4ee695813b4b7a0e0c535208c6bbd` (630 edit pairs, four resource traces, and 30 runtime runs of each workload). Shipped `frust-gates` wrote `target/compiler-rewrite/logs/prelinkspan-gate/gates.json`, sha256 `9ef47b85c6c72379cb74f4aecfacb16f91c3d67e21cdf591bdfa4d63a2896b74`, and exited 1. A second run matched those bytes. `gates.rs` was not edited. The resume started at load 0.10 on 2026-11-20T19:25:29Z and the judge finished at 2026-11-20T22:10:29Z.
+
+| Gate | Status | Figure |
+| --- | --- | --- |
+| edited-release-build | passed | geomean 0.38807512, upper 0.38955465 |
+| holdout-build | passed | median 0.08624574 |
+| cold-build | passed | median 1.02498955 |
+| noop-overhead | passed | 0.00084712 s, allowance 0.02000000 s |
+| tail-latency | passed | ripgrep/wide p95 1.02704013, every primary and wide series at or under 1.05 |
+| peak-memory | passed | max 1.03380829 |
+| disk-bytes | failed | max 1.25765371 |
+| runtime-workloads | passed | identical code waives the 1.01 upper |
+| runtime-aggregate | failed | geomean 1.00478501, upper 1.01877364 |
+| stripped-size | failed | geomean 1.00000000 |
+
+Leaf medians were ripgrep 0.34329093, syn 0.31461318, and regex 0.54113815. Syn wide was 0.31050997 and regex wide was 0.54324718. Ripgrep wide stayed near the control, median 1.01595885. The three application binaries matched stock (ripgrep 4024992, oxipng 1338440, rustfmt port 3835192). Their runtime medians were 1.00816456, 1.00846285, and 0.99776465. The disk miss is the ripgrep trace target, 221265920 bytes against 175935488. Syn, regex, and fd stayed under 1.20 (1.07875774, 1.06219488, and 1.11444453). This prefix stays off the default toolchain.
 
 ## Later probes that are not a full candidate
 
@@ -97,4 +114,4 @@ Isolated source snapshot of `/home/seggy116/Projects/mx-frame` at `a7e6ef9db6312
 
 ## What remains failed
 
-Runtime aggregate and stripped size on the full paired judge. Every later codegen probe either missed the 0.97 runtime upper, missed stripped size, or both, or was not a compiler change. macOS install and execution are unverified.
+The cutoff judge misses the runtime aggregate and stripped size. The prelink-span judge passes edited-release, holdout, cold, noop, tail, and peak memory, and misses disk (ripgrep target 1.25765371), the runtime aggregate, and stripped size. Every later codegen probe either missed the 0.97 runtime upper, missed stripped size, or both, or was not a compiler change. macOS install and execution are unverified.

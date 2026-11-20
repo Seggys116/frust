@@ -5,7 +5,7 @@ No fRust compiler change has passed the frozen Linux budgets. Nothing here is a 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judge is the interface-hash cutoff, recorded after that table.
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -27,10 +27,15 @@ Rows marked single sample are one build each, not gate results.
 | Fat-LTO location splice (`frust-0ef1bc386-span1`) | Full paired gate, same pair counts. | Failed four gates. Not qualified. |
 | Post-LTO object reuse plus RELR (`frust-0ef1bc386-cgcache1`, `frust-cg1`) | Single samples, see below. | Kept as opt-in research, not qualified. Gate not run. |
 | Interface-hash cutoff (`frust-0ef1bc386-cutoff1`) | Full paired judge on 2026-11-20. | Build-time gates passed. Runtime aggregate and stripped size failed. Not kept. |
+| Prelink-span reuse (`frust-0ef1bc386-prelinkspan1`) | Full paired judge on 2026-11-20. | Leaf, holdout, cold, noop, tail, and memory passed. Disk, runtime aggregate, and stripped size failed. Not kept. |
 
 ### Interface-hash cutoff, 20 November
 
 `frust-gates` wrote `target/compiler-rewrite/logs/cutoff-gates.json` (sha256 `7bf8d360b8d72e684f516189ba8ea84237c44aa07f75112f113d08ef13713a7a`) and exited 1. Edited-release geomean 0.68822331 (upper 0.68958244), holdout median 0.21986888, cold median 1.00599739, no-op overhead -0.00064504 s, tail within 1.05, peak RSS 1.06854079, and disk 1.09510395 passed. Runtime-workloads passed only because ripgrep, oxipng, and the rustfmt port were byte-identical to stock. Runtime aggregate failed at geomean 0.99844853, upper 1.00384281. Stripped size failed at geomean 1.00000000. Those build-time passes are this compiler's. The cutoff is not the default toolchain. The figures are repeated in `qualification/GATE-REPORT.md`.
+
+### Prelink-span reuse, 20 November
+
+`frust-gates` wrote `target/compiler-rewrite/logs/prelinkspan-gate/gates.json` (sha256 `9ef47b85c6c72379cb74f4aecfacb16f91c3d67e21cdf591bdfa4d63a2896b74`) and exited 1. A second run matched those bytes. Samples sha256 `dfc4ba56b31a970df4025c692e446669faa4ee695813b4b7a0e0c535208c6bbd`. Edited-release geomean 0.38807512 (upper 0.38955465), holdout median 0.08624574, cold median 1.02498955, no-op overhead 0.00084712 s, tail within 1.05, and peak RSS 1.03380829 passed. Disk failed at 1.25765371 because the ripgrep trace target was 221265920 bytes against 175935488. Runtime-workloads passed because ripgrep, oxipng, and the rustfmt port were byte-identical to stock (4024992, 1338440, and 3835192). Runtime aggregate failed at geomean 1.00478501, upper 1.01877364. Stripped size failed at geomean 1.00000000. Leaf medians were ripgrep 0.34329093, syn 0.31461318, and regex 0.54113815. This prefix stays off the default toolchain. The figures are repeated in `qualification/GATE-REPORT.md`.
 
 ### Pre-optimization cache gate
 
