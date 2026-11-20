@@ -5,7 +5,7 @@ No fRust compiler change has passed the frozen Linux budgets. Nothing here is a 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge.
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge. The same day's Attributor screen is a ripgrep release build that crashed in LLVM, not a paired judge.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -31,6 +31,7 @@ Rows marked single sample are one build each, not gate results.
 | x86-64-v3 plus the hotfreq16 flags, on `frust-0ef1bc386-prelinkspan1` | 30 runtime pairs per workload on 2026-11-20. User flags, not a new compiler. | Runtime geomean 0.98290005. Stripped size under 0.97 only with opt-in RELR. Not kept. Gate not run. |
 | Machine outliner plus `-C force-unwind-tables=no`, on `frust-0ef1bc386-prelinkspan1` | One ripgrep release build on 2026-11-20. No RELR. | Stripped 4010848/4024992 (0.99648596). Not kept. Oxipng, rustfmt, and the gate were not run. |
 | Loop fusion (`-enable-loopfusion` on the packaged `opt`) | Bitcode comparison on 2026-11-20. Not a user `rustc` flag. | memchr `default<O3>` and ripgrep `lto<O3>` matched with the switch off. Not kept. Gate not run. |
+| Attributor (`-attributor-enable=full`) on `frust-0ef1bc386-prelinkspan1` | One ripgrep release build on 2026-11-20. No RELR and no `-C target-cpu`. | `frustc` SIGSEGV while optimizing regex-automata 0.4.15. No binary. Not kept. Gate not run. |
 
 ### Interface-hash cutoff, 20 November
 
@@ -51,6 +52,10 @@ The same driver built ripgrep once with `-enable-machine-outliner=always` and `-
 ### Loop fusion bitcode check, 20 November
 
 `PipelineTuningOptions::LoopFusion` stays false in rustc's pass builder, which does not read `--enable-loopfusion`. The packaged LLVM 23.1.5 `opt` does. The memchr prelink module through `default<O3>` was 103976 bytes either way. The ripgrep pre-LTO module through `lto<O3>` was 5211360 bytes either way. The memchr module contains one `find_impl`. The ripgrep module contains none. No stage-2 rebuild was started and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
+
+### Attributor size screen, 20 November
+
+`-attributor-enable=full` adds `attributor` and `attributor-cgscc` to `default<O3>` and adds neither to `lto<O3>`. The ripgrep release build used that flag and the frozen profile, without RELR or `-C target-cpu`. `frustc` SIGSEGV'd while optimizing regex-automata 0.4.15. The backtrace cycles through `Attributor::isAssumedDead` until rustc stops at its maximum depth. The same library compiled without the flag. No ripgrep binary was produced, and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
 
 ### Pre-optimization cache gate
 
