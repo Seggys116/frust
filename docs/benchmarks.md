@@ -1,11 +1,11 @@
 # Benchmark methodology and results
 
-No fRust compiler change has passed the frozen Linux budgets. Nothing here is a qualified faster-rebuild result. The detail, including logs and hashes, is in `qualification/CANDIDATE.md`. The raw logs live in a local, git-ignored build directory and are not in the repository, so a clone cannot recheck these numbers.
+No fRust compiler change has passed the frozen Linux budgets. Nothing here is a qualified faster-rebuild result. The 20 November close-out, with each gate marked passed or failed, is in `qualification/GATE-REPORT.md`. Earlier candidate logs and hashes are in `qualification/CANDIDATE.md`. The raw logs live in a local, git-ignored build directory and are not in the repository, so a clone cannot recheck these numbers.
 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: every candidate sample below was taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`).
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judge is the interface-hash cutoff, recorded after that table.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -25,7 +25,12 @@ Rows marked single sample are one build each, not gate results.
 | Two-thread fat-LTO codegen split (`frust-0ef1bc386-par1`) | Single paired sample: ripgrep leaf 6.37s against 19.37s. fd holdout 21.19s against 15.90s, peak RSS 1.62 times stock. | Gate not run. Dropped. |
 | Ordered fat-LTO stream cache (`frust-0ef1bc386-fatkey1`) | Full paired gate, same pair counts as the pre-optimization cache. | Failed five gates. Dropped. |
 | Fat-LTO location splice (`frust-0ef1bc386-span1`) | Full paired gate, same pair counts. | Failed four gates. Not qualified. |
-| Post-LTO object reuse plus RELR (`frust-0ef1bc386-cgcache1`, `frust-cg1`) | Single samples, see below. | Kept, not qualified. Gate not run. |
+| Post-LTO object reuse plus RELR (`frust-0ef1bc386-cgcache1`, `frust-cg1`) | Single samples, see below. | Kept as opt-in research, not qualified. Gate not run. |
+| Interface-hash cutoff (`frust-0ef1bc386-cutoff1`) | Full paired judge on 2026-11-20. | Build-time gates passed. Runtime aggregate and stripped size failed. Not kept. |
+
+### Interface-hash cutoff, 20 November
+
+`frust-gates` wrote `target/compiler-rewrite/logs/cutoff-gates.json` (sha256 `7bf8d360b8d72e684f516189ba8ea84237c44aa07f75112f113d08ef13713a7a`) and exited 1. Edited-release geomean 0.68822331 (upper 0.68958244), holdout median 0.21986888, cold median 1.00599739, no-op overhead -0.00064504 s, tail within 1.05, peak RSS 1.06854079, and disk 1.09510395 passed. Runtime-workloads passed only because ripgrep, oxipng, and the rustfmt port were byte-identical to stock. Runtime aggregate failed at geomean 0.99844853, upper 1.00384281. Stripped size failed at geomean 1.00000000. Those build-time passes are this compiler's. The cutoff is not the default toolchain. The figures are repeated in `qualification/GATE-REPORT.md`.
 
 ### Pre-optimization cache gate
 

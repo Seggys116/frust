@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+* 20 November 2026: the interface-hash cutoff was judged on the full paired Linux cohort and not kept. Build-time gates passed and the runtime aggregate and stripped-size gates failed, because the three application binaries matched stock. No candidate has passed every frozen Linux budget. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
+
 ## [0.5.0] - 2026-11-20
 
 * Native Linux x86-64 fCargo builds now default to incremental compilation with 16 codegen units for local packages using fat LTO at opt level 3. Explicit Cargo profile and incremental settings take precedence.

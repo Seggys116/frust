@@ -1,5 +1,7 @@
 # Candidate
 
+The 20 November close-out is `qualification/GATE-REPORT.md`. No candidate passed every frozen Linux budget. The ledger below is the 19 November review and the experiments that preceded that close-out.
+
 ## Status after the 19 November performance review
 
 | Experiment | Disposition | Evidence |
