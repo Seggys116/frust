@@ -135,7 +135,14 @@ for want in "${wanted[@]}"; do
 
     rm -rf "$dir"
     mkdir -p "$dir"
-    zstd -dc "$file" | tar -xf - -C "$dir" --no-same-owner || die "could not unpack $name"
+    # The archives hold one top-level directory named like the asset. It is dropped, so that the
+    # files land directly in $dir. An archive laid out differently is unpacked as it is.
+    strip=0
+    top=${name%.tar.zst}
+    if ! grep -v "^$top\(/\|\$\)" "$listing" | grep -q .; then
+        strip=1
+    fi
+    zstd -dc "$file" | tar -xf - -C "$dir" --no-same-owner --strip-components="$strip" || die "could not unpack $name"
     printf '%s\n' "$sha" > "$stamp"
     rm -f "$file" "$listing"
     echo "fetch-build-assets: unpacked $name into $dir" >&2
