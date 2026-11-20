@@ -30,27 +30,10 @@ on:
         type: boolean
         default: true
       pairs:
-        description: Pairs per median series (cold, no-op, holdout). The gates need 30.
-        default: "30"
-      tail-pairs:
-        description: Pairs per leaf and wide series. The tail gate needs 60.
-        default: "60"
-      clean-pairs:
-        description: Pairs for the clean rebuild series of the protocol jobs (two builds per toolchain per pair)
-        default: "10"
-      runtime-runs:
-        description: Paired runs per runtime workload. The gates need 30.
+        description: Pairs per series and runtime runs per workload. The gates need 30. Leaf and wide series use twice as many pairs (the tail gate needs 60) and the clean series uses a third, at least 1.
         default: "30"
       unit-cache:
         description: Cargo unit cache for the fRust side of the protocol jobs
-        type: boolean
-        default: true
-      codegen-cache:
-        description: FRUST_EXPERIMENTAL_CODEGEN_CACHE for the fRust toolchain in the protocol jobs
-        type: boolean
-        default: true
-      relr:
-        description: FRUST_EXPERIMENTAL_RELR for the fRust toolchain in the protocol jobs
         type: boolean
         default: true
       cohorts:
@@ -90,8 +73,8 @@ env:
   # The official toolchain of the comparison. It is installed with exactly this version.
   OFFICIAL_RELEASE: "1.100.0"
   FRUST_ENV: >-
-    --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=${{ inputs.codegen-cache && '1' || '0' }}
-    --frust-env FRUST_EXPERIMENTAL_RELR=${{ inputs.relr && '1' || '0' }}
+    --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=1
+    --frust-env FRUST_EXPERIMENTAL_RELR=1
 
 jobs:
   # Validates the inputs and turns them into the toolchain builds and the comparison matrix.
@@ -167,8 +150,8 @@ jobs:
     uses: ./.github/workflows/toolchains.yml
     with:
       rebuild: ${{ inputs.rebuild-toolchains }}
-      codegen-cache: ${{ inputs.codegen-cache }}
-      relr: ${{ inputs.relr }}
+      codegen-cache: true
+      relr: true
       builds: ${{ needs.plan.outputs.linux-builds }}
 
   # The macOS toolchains are the shipped fRust ones, built natively like the release does. The
@@ -230,17 +213,17 @@ jobs:
           WORKLOAD: ${{ matrix.workload }}
           KINDS: ${{ matrix.kinds }}
           PAIRS_MAIN: ${{ inputs.pairs }}
-          PAIRS_TAIL: ${{ inputs.tail-pairs }}
-          PAIRS_CLEAN: ${{ inputs.clean-pairs }}
           UNIT_CACHE: ${{ inputs.unit-cache && 'on' || 'off' }}
           WORK: ${{ steps.setup.outputs.work }}
         run: |
+          tail_pairs=$((PAIRS_MAIN * 2))
+          clean_pairs=$(((PAIRS_MAIN + 2) / 3))
           toolchains=$PWD/target/compiler-rewrite/toolchains
           for entry in $KINDS; do
             kind=${entry%%:*}
             case ${entry##*:} in
-              tail) pairs=$PAIRS_TAIL ;;
-              clean) pairs=$PAIRS_CLEAN ;;
+              tail) pairs=$tail_pairs ;;
+              clean) pairs=$clean_pairs ;;
               *) pairs=$PAIRS_MAIN ;;
             esac
             # shellcheck disable=SC2086
@@ -301,7 +284,7 @@ jobs:
       - name: Build both toolchains' binaries and time them
         env:
           WORKLOAD: ${{ matrix.workload }}
-          RUNS: ${{ inputs.runtime-runs }}
+          RUNS: ${{ inputs.pairs }}
           WORK: ${{ steps.setup.outputs.work }}
         run: |
           toolchains=$PWD/target/compiler-rewrite/toolchains
