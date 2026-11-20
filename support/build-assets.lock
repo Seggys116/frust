@@ -1,0 +1,5 @@
+# Build assets of the optimized Linux toolchain build. See docs/build-assets.md.
+# release: build-assets-1
+frust-build-tools-23.1.5-linux-x86_64.tar.zst 8aca1e89c84ceb4ade91a532d5378a7f59d62b707ba17c4dc9b0b9be67a96f4e 65458808 https://github.com/Seggys116/frust/releases/download/build-assets-1/frust-build-tools-23.1.5-linux-x86_64.tar.zst
+frust-pgo-profiles-0ef1bc386-x86-64.tar.zst 59bd668e217ccab89bebb4401f59df0951a2187890eba5461db7fc74fa0c2c3c 28285988 https://github.com/Seggys116/frust/releases/download/build-assets-1/frust-pgo-profiles-0ef1bc386-x86-64.tar.zst
+frust-pgo-profiles-0ef1bc386-x86-64-v3.tar.zst b3230e416ba2f353b5649880cf686b350c1a87e70df74e1a5caa71c77d931e0a 28357068 https://github.com/Seggys116/frust/releases/download/build-assets-1/frust-pgo-profiles-0ef1bc386-x86-64-v3.tar.zst

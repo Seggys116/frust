@@ -47,7 +47,7 @@ The digest is lowercase hex, the url is `https://` (or `file://` for a local tes
 To refresh it:
 
 1. Produce the assets as above.
-2. Create the release that will hold them and upload the files. Make it a pre-release and not the latest release: `frust-install` downloads from `releases/latest`, which must stay the toolchain release. For example `gh release create <tag> --prerelease --latest=false --title "build assets <tag>" NAME.tar.zst ...`.
+2. Create the release that will hold them and upload the files. Make it a normal release that is not marked latest: `frust-install` downloads from `releases/latest`, which must stay the toolchain release. For example `gh release create <tag> --latest=false --title "build assets <tag>" NAME.tar.zst ...`.
 3. For each file write its line: `sha256sum NAME.tar.zst`, `stat -c %s NAME.tar.zst` and the download url `https://github.com/Seggys116/frust/releases/download/<tag>/NAME.tar.zst`. Set the `# release:` comment to the tag.
 4. Check the lock against the uploaded files before committing it: `bash support/fetch-build-assets.sh "$(mktemp -d)" NAME.tar.zst ...` downloads each file, compares the size and digest and unpacks it.
 5. Commit the lock. Do not edit a digest by hand; a mismatch means the asset or the line is wrong.
