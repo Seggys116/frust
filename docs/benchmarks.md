@@ -5,7 +5,7 @@ No fRust compiler change has passed the frozen Linux budgets. Nothing here is a 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table.
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -28,6 +28,7 @@ Rows marked single sample are one build each, not gate results.
 | Post-LTO object reuse plus RELR (`frust-0ef1bc386-cgcache1`, `frust-cg1`) | Single samples, see below. | Kept as opt-in research, not qualified. Gate not run. |
 | Interface-hash cutoff (`frust-0ef1bc386-cutoff1`) | Full paired judge on 2026-11-20. | Build-time gates passed. Runtime aggregate and stripped size failed. Not kept. |
 | Prelink-span reuse (`frust-0ef1bc386-prelinkspan1`) | Full paired judge on 2026-11-20. | Leaf, holdout, cold, noop, tail, and memory passed. Disk, runtime aggregate, and stripped size failed. Not kept. |
+| x86-64-v3 plus the hotfreq16 flags, on `frust-0ef1bc386-prelinkspan1` | 30 runtime pairs per workload on 2026-11-20. User flags, not a new compiler. | Runtime geomean 0.98290005. Stripped size under 0.97 only with opt-in RELR. Not kept. Gate not run. |
 
 ### Interface-hash cutoff, 20 November
 
@@ -36,6 +37,10 @@ Rows marked single sample are one build each, not gate results.
 ### Prelink-span reuse, 20 November
 
 `frust-gates` wrote `target/compiler-rewrite/logs/prelinkspan-gate/gates.json` (sha256 `9ef47b85c6c72379cb74f4aecfacb16f91c3d67e21cdf591bdfa4d63a2896b74`) and exited 1. A second run matched those bytes. Samples sha256 `dfc4ba56b31a970df4025c692e446669faa4ee695813b4b7a0e0c535208c6bbd`. Edited-release geomean 0.38807512 (upper 0.38955465), holdout median 0.08624574, cold median 1.02498955, no-op overhead 0.00084712 s, tail within 1.05, and peak RSS 1.03380829 passed. Disk failed at 1.25765371 because the ripgrep trace target was 221265920 bytes against 175935488. Runtime-workloads passed because ripgrep, oxipng, and the rustfmt port were byte-identical to stock (4024992, 1338440, and 3835192). Runtime aggregate failed at geomean 1.00478501, upper 1.01877364. Stripped size failed at geomean 1.00000000. Leaf medians were ripgrep 0.34329093, syn 0.31461318, and regex 0.54113815. This prefix stays off the default toolchain. The figures are repeated in `qualification/GATE-REPORT.md`.
+
+### x86-64-v3 codegen preflight, 20 November
+
+The same prelink-span driver rebuilt ripgrep, oxipng, and the rustfmt port with `-C target-cpu=x86-64-v3`, ext-TSP, `-hot-callsite-rel-freq=16`, and `-Wl,-z,pack-relative-relocs` on the fRust side. Oxipng's C archive used Clang 21 and no extra `CFLAGS`. Median ratios were ripgrep 0.99123229, oxipng 0.94419073, and rustfmt 1.01459543. Their product is 0.94957238 and the geomean is 0.98290005. Stripped sizes were 3797080/4024992, 1333624/1338440, and 3656480/3835192, geomean 0.96412151, with `DT_RELR` in each fRust binary. Section arithmetic that restores the stock reloc section puts all three files above stock. RELR stays opt-in. No prefix was packaged and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
 
 ### Pre-optimization cache gate
 
