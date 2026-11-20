@@ -18,12 +18,21 @@ empty is a failure, because the store would not be isolated and the clean series
 An unmeasured official build runs first, so unpacking the fetched registry sources is not charged
 to whichever toolchain builds first in round 0.
 
+Page-cache state (Linux). Whether the compiler maps librustc_driver and libLLVM text with 2 MiB
+pages depends on how those files entered the page cache (qualification/toolchain-folio-state.py),
+so the run records it for both toolchains, as "folio" records, before the first timed build and
+after the last. --cache-state installed leaves the toolchains as their installers left them, which
+is what users get. --cache-state evicted drops the cached pages of both toolchains' libraries
+(qualification/page-cache-state.py evict) before every build, so both start every build from the
+same cold-cache state and the compilers alone are compared.
+
 CPU is user plus system seconds of the cargo process tree from wait4. On Linux builds are
 pinned with taskset. macOS has no taskset, so there nothing is pinned and the metadata record
 says so. The Toolchain class and the helpers come from run-store-bench.py.
 
-The output is JSON lines: one meta record (host, toolchains, commit, cohort, pinning), then one
-sample record per build and a stop record when the time budget ended the run early.
+The output is JSON lines: one meta record (host, toolchains, commit, cohort, pinning, cache
+state), the folio records, then one sample record per build and a stop record when the time
+budget ended the run early.
 """
 import argparse
 import contextlib
@@ -59,6 +68,9 @@ PROFILE = {
     "CARGO_PROFILE_RELEASE_STRIP": "none",
 }
 UNIT_EVENT = re.compile(r"frust-unit-cache: (script-)?(hit|miss|store|skip) ")
+PAGE_CACHE_STATE = ROOT / "qualification" / "page-cache-state.py"
+FOLIO_STATE = ROOT / "qualification" / "toolchain-folio-state.py"
+FOLIO_FIELD = re.compile(r"(\w+)=(\d+)MiB")
 
 
 def load_store_bench():
@@ -174,6 +186,16 @@ def copy_tree(source, dest):
         subprocess.run(["cp", "-a", "--reflink=auto", str(source), str(dest)], check=True)
 
 
+def evict_page_cache(prefixes):
+    """Drop the cached pages of the toolchains' libraries. Dirty pages are written out first, because
+    POSIX_FADV_DONTNEED leaves them cached."""
+    os.sync()
+    done = subprocess.run([sys.executable, "-I", str(PAGE_CACHE_STATE), "evict", *map(str, prefixes)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if done.returncode != 0:
+        sys.exit(f"page-cache-state.py evict failed: {done.stderr.strip()}")
+
+
 def log_counts(log):
     text = pathlib.Path(log).read_text(errors="replace")
     events = Counter(f"{prefix}{kind}" for prefix, kind in UNIT_EVENT.findall(text))
@@ -183,12 +205,15 @@ def log_counts(log):
 class CiToolchain(STORE.Toolchain):
     """run-store-bench's Toolchain with the frozen profile, FRUST_HOME isolation and optional pinning."""
 
-    def __init__(self, name, cargo, rustc, work, pin, jobs, uses_store, extra_env):
+    def __init__(self, name, cargo, rustc, work, pin, jobs, uses_store, extra_env, evict_prefixes=()):
         super().__init__(name, cargo, rustc, work, pin or "", jobs, uses_store)
         self.pin = pin
         self.store = self.work / f"{name}-store"
         self.xdg_cache = self.work / f"{name}-xdg-cache"
         self.extra_env = extra_env
+        # The toolchain directory: <prefix>/bin/cargo.
+        self.prefix = pathlib.Path(cargo).parent.parent
+        self.evict_prefixes = list(evict_prefixes)
 
     def env(self, target):
         env = super().env(target)
@@ -208,6 +233,8 @@ class CiToolchain(STORE.Toolchain):
             command.append("--release")
         if self.pin:
             command = ["taskset", "-c", self.pin] + command
+        if self.evict_prefixes:
+            evict_page_cache(self.evict_prefixes)
         cpu, wall, rss, status = STORE.tree_cpu(command, app, self.env(target), log)
         if sys.platform == "darwin":
             rss //= 1024  # ru_maxrss is bytes on macOS and KiB on Linux
@@ -332,11 +359,30 @@ class Bench:
         if status != 0:
             sys.exit(f"official warm-up build failed; see {log}")
 
-    def run(self):
-        budget = self.args.time_budget_minutes * 60
-        started = time.monotonic()
-        self.warm_up()
-        durations = []
+    def probe_folio(self, phase):
+        """Record how each toolchain's driver and LLVM text is mapped during a compile (Linux only).
+
+        Under --cache-state evicted the pages are dropped first, so the record shows the state the
+        next timed build starts from. A failed probe is recorded and does not stop the run."""
+        if not sys.platform.startswith("linux"):
+            return
+        if self.args.cache_state == "evicted":
+            evict_page_cache([chain.prefix for chain in (self.official, self.frust)])
+        for chain in (self.official, self.frust):
+            done = subprocess.run([sys.executable, "-I", str(FOLIO_STATE), str(chain.prefix)],
+                                  capture_output=True, text=True)
+            record = dict(type="folio", schema=SCHEMA, phase=phase, toolchain=chain.name,
+                          prefix=str(chain.prefix), cache_state=self.args.cache_state)
+            lines = done.stdout.strip().splitlines()
+            if done.returncode == 0 and lines:
+                record.update(raw=lines[-1], mib={name: int(value) for name, value in FOLIO_FIELD.findall(lines[-1])})
+                print(f"folio {phase:6} {chain.name:8} {lines[-1]}", flush=True)
+            else:
+                record["error"] = (done.stderr.strip() or done.stdout.strip() or f"exit {done.returncode}")[-400:]
+                print(f"folio {phase:6} {chain.name:8} probe failed: {record['error']}", flush=True)
+            self.emit(record)
+
+    def rounds(self, budget, started, durations):
         for round_number in range(self.args.rounds):
             if budget and durations and (time.monotonic() - started) + 1.15 * max(durations) > budget:
                 self.emit(dict(type="stop", schema=SCHEMA, reason="time budget",
@@ -349,6 +395,17 @@ class Bench:
             for position, chain in enumerate(order):
                 self.sequence(chain, round_number, position)
             durations.append(time.monotonic() - began)
+
+    def run(self):
+        budget = self.args.time_budget_minutes * 60
+        started = time.monotonic()
+        self.warm_up()
+        self.probe_folio("before")
+        durations = []
+        try:
+            self.rounds(budget, started, durations)
+        finally:
+            self.probe_folio("after")
         for chain in (self.official, self.frust):
             chain.reset_store()
             shutil.rmtree(chain.store, ignore_errors=True)
@@ -370,6 +427,9 @@ def parse_args():
     parser.add_argument("--frust-env", action="append", default=[], metavar="KEY=VALUE",
                         help="extra environment for fRust builds only")
     parser.add_argument("--frust-store", choices=("on", "off"), default="on")
+    parser.add_argument("--cache-state", choices=("installed", "evicted"), default="installed",
+                        help="installed: leave the toolchains' page-cache state as the installers left it; "
+                             "evicted (Linux): drop both toolchains' library pages before every build")
     parser.add_argument("--app", required=True, help="cohort application directory, named after its workload")
     parser.add_argument("--label", required=True, help="platform label recorded in the results")
     parser.add_argument("--rounds", type=int, default=5)
@@ -405,9 +465,14 @@ def main():
     if forbidden:
         sys.exit(f"{', '.join(forbidden)} is controlled by this script, not by --frust-env")
 
+    if args.cache_state == "evicted" and not sys.platform.startswith("linux"):
+        sys.exit("--cache-state evicted needs Linux (POSIX_FADV_DONTNEED on the page cache)")
     official = CiToolchain("official", args.official_cargo, args.official_rustc, work, pin, jobs, False, {})
     frust = CiToolchain("frust", args.frust_cargo, args.frust_rustc, work, pin, jobs,
                         args.frust_store == "on", extra)
+    if args.cache_state == "evicted":
+        for chain in (official, frust):
+            chain.evict_prefixes = [official.prefix, frust.prefix]
     versions = {"official": tool_versions(args.official_cargo, args.official_rustc),
                 "frust": tool_versions(args.frust_cargo, args.frust_rustc)}
     release_line = re.search(r"^release: (\S+)$", versions["official"]["rustc"] or "", re.M)
@@ -431,6 +496,7 @@ def main():
         pinning=dict(cpus=pin, note=pin_note), jobs=jobs, logical_cpus_in_use=cpu_count,
         profile=PROFILE, rounds_requested=args.rounds, noops=args.noops, edits=list(kinds),
         time_budget_minutes=args.time_budget_minutes, unit_cache=args.frust_store,
+        cache_state=args.cache_state, toolchain_prefixes=dict(official=str(official.prefix), frust=str(frust.prefix)),
         frust_env=extra, toolchains=versions,
         commit=os.environ.get("GITHUB_SHA") or git_head(ROOT),
         run=dict(id=os.environ.get("GITHUB_RUN_ID"), attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),

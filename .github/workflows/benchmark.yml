@@ -5,11 +5,28 @@ name: Benchmark
 # 1. The frozen qualification protocol (qualification/PROTOCOL.md) on Linux x86-64: paired
 #    control and fRust builds, runtime and stripped size, then the release gates.
 # 2. The official comparison: official Rust (rustup, minimal profile, pinned to OFFICIAL_RELEASE)
-#    against the fRust toolchain with its Cargo unit cache, on Linux x86-64, macOS arm64 and
-#    macOS x86-64, with the cohort sources locked by qualification/cohorts.lock. Scenarios are
-#    cold, clean rebuild, no-op and edit rebuild, reported as fRust CPU as a percent of official
-#    CPU. The report job turns the raw results into a markdown table and SVG charts and uploads
-#    them. It commits nothing: numbers are published only from a completed run, by hand.
+#    against the fRust toolchain with its Cargo unit cache, on Linux x86-64 (the baseline build and
+#    the x86-64-v3 build, each against official), macOS arm64 and macOS x86-64, with the cohort
+#    sources locked by qualification/cohorts.lock. Scenarios are cold, clean rebuild, no-op and edit
+#    rebuild, reported as fRust CPU as a percent of official CPU. The report job turns the raw
+#    results into a markdown table and SVG charts and uploads them. It commits nothing: numbers are
+#    published only from a completed run, by hand.
+#
+# Both toolchains of the comparison are installed the way users get them. Official comes from
+# rustup. fRust is packed into the release archive format by .github/scripts/package-release.sh,
+# the script of the Release workflow, and installed by frust-install --archive, which is the
+# user path. This matters for more than hygiene: whether the compiler gets 2 MiB pages for its
+# libraries depends on how the files were written (rustup writes in large chunks, tar in small
+# ones, and frust-install rewrites large files with large writes after extraction), so unpacking
+# with tar would measure a state no user has. Every job records that state for both toolchains
+# before the first timed build and after the last (the folio records of the results, written by
+# qualification/ci-bench.py with qualification/toolchain-folio-state.py). The cache-state input
+# chooses between measuring the toolchains as installed and evicting the library pages of both
+# before every timed build, which compares the compilers alone.
+#
+# The v3 build needs a CPU with the x86-64-v3 extensions. A compare job on a runner without them
+# says so in a warning and in the run summary, runs nothing, and leaves a record that the report
+# lists in its run notes.
 #
 # Unit cache store rules, which keep a cold fRust build from ever being served by an earlier pair
 # or round. The fRust store lives in a directory the driver owns (FRUST_HOME), never in the
@@ -40,18 +57,21 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux macos-arm64 macos-x86_64)
-        default: "linux macos-arm64 macos-x86_64"
+        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64)
+        default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
-        description: Rounds per scenario in the official comparison. One round is one pair.
-        default: "5"
+        description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
+        default: "8"
       noops:
         description: No-op builds per round in the official comparison. The median is the sample.
         default: "5"
-      compare-experimental:
-        description: Run the official comparison with the experimental switches on. Off measures the shipped defaults.
-        type: boolean
-        default: false
+      cache-state:
+        description: Page-cache state of the toolchains in the official comparison. evicted drops both toolchains' library pages before every build (Linux only)
+        type: choice
+        options:
+          - installed
+          - evicted
+        default: installed
       rebuild-toolchains:
         description: Ignore cached toolchains and build them again
         type: boolean
@@ -85,6 +105,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       linux-builds: ${{ steps.plan.outputs.linux-builds }}
+      v3-builds: ${{ steps.plan.outputs.v3-builds }}
       mac-builds: ${{ steps.plan.outputs.mac-builds }}
       run-linux: ${{ steps.plan.outputs.run-linux }}
     steps:
@@ -93,16 +114,35 @@ jobs:
           COHORTS: ${{ inputs.cohorts }}
           PLATFORMS: ${{ inputs.platforms }}
           PROTOCOL: ${{ inputs.protocol }}
+          CACHE_STATE: ${{ inputs.cache-state }}
+          ROUNDS: ${{ inputs.rounds }}
+          NOOPS: ${{ inputs.noops }}
         run: |
           python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
 
+          # toolchain is the name of the artifact the Toolchains workflow uploads (toolchain-<toolchain>-<target>)
+          # and cpu is what package-release.sh records as the variant; it is empty where there is no choice.
           PLATFORMS = {
-              "linux": {"label": "linux-x86_64", "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
-              "macos-arm64": {"label": "macos-arm64", "os": "macos-latest", "target": "aarch64-apple-darwin"},
-              "macos-x86_64": {"label": "macos-x86_64", "os": "macos-15-intel", "target": "x86_64-apple-darwin"},
+              "linux": {
+                  "label": "linux-x86_64", "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
+                  "toolchain": "frust", "cpu": "baseline",
+              },
+              "linux-v3": {
+                  "label": "linux-x86_64-v3", "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
+                  "toolchain": "frust-v3", "cpu": "v3",
+              },
+              "macos-arm64": {
+                  "label": "macos-arm64", "os": "macos-latest", "target": "aarch64-apple-darwin",
+                  "toolchain": "frust", "cpu": "",
+              },
+              "macos-x86_64": {
+                  "label": "macos-x86_64", "os": "macos-15-intel", "target": "x86_64-apple-darwin",
+                  "toolchain": "frust", "cpu": "",
+              },
           }
+          CACHE_STATES = ("installed", "evicted")
           # The build-time cohort of qualification/PROTOCOL.md. Each has frozen edits in qualification/edits.
           WORKLOADS = ("ripgrep", "syn", "regex", "fd")
 
@@ -119,6 +159,11 @@ jobs:
               return chosen
 
 
+          if os.environ["CACHE_STATE"] not in CACHE_STATES:
+              raise SystemExit(f"unknown cache-state {os.environ['CACHE_STATE']!r}, expected one of {', '.join(CACHE_STATES)}")
+          for name in ("ROUNDS", "NOOPS"):
+              if not os.environ[name].isdigit() or int(os.environ[name]) < 1:
+                  raise SystemExit(f"{name.lower()} must be a whole number of at least 1, got {os.environ[name]!r}")
           platforms = choose("PLATFORMS", tuple(PLATFORMS), True)
           workloads = choose("COHORTS", WORKLOADS, bool(not platforms))
           matrix = [
@@ -127,11 +172,15 @@ jobs:
           mac = [
               {"variant": "frust", "target": PLATFORMS[p]["target"], "os": PLATFORMS[p]["os"]}
               for p in platforms
-              if p != "linux"
+              if p.startswith("macos")
           ]
-          linux = [{"variant": "frust", "target": PLATFORMS["linux"]["target"], "os": PLATFORMS["linux"]["os"]}]
+          linux_target, linux_os = PLATFORMS["linux"]["target"], PLATFORMS["linux"]["os"]
+          linux = [{"variant": "frust", "target": linux_target, "os": linux_os}]
           if os.environ["PROTOCOL"] == "true":
-              linux.insert(0, {"variant": "control", "target": PLATFORMS["linux"]["target"], "os": PLATFORMS["linux"]["os"]})
+              linux.insert(0, {"variant": "control", "target": linux_target, "os": linux_os})
+          # The v3 toolchain is built by its own call of the Toolchains workflow, so a runner that cannot
+          # build it (it needs the x86-64-v3 extensions) does not take the baseline comparison down with it.
+          v3 = [{"variant": "frust", "target": linux_target, "os": linux_os, "cpu": "v3"}] if "linux-v3" in platforms else []
 
 
           def dump(value):
@@ -140,6 +189,7 @@ jobs:
 
           print(f"matrix={dump(matrix)}")
           print(f"linux-builds={dump(linux)}")
+          print(f"v3-builds={dump(v3)}")
           print(f"mac-builds={dump(mac)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
           PY
@@ -153,6 +203,19 @@ jobs:
       codegen-cache: true
       relr: true
       builds: ${{ needs.plan.outputs.linux-builds }}
+
+  # The x86-64-v3 fRust toolchain, for the linux-v3 platform. It has its own call so that a failed
+  # v3 build only affects the v3 comparison. The protocol jobs never use it: the setup action
+  # unpacks every toolchain artifact of the run, and they put the baseline toolchain back as built.
+  toolchains-v3:
+    needs: plan
+    if: ${{ needs.plan.outputs.v3-builds != '[]' }}
+    uses: ./.github/workflows/toolchains.yml
+    with:
+      rebuild: ${{ inputs.rebuild-toolchains }}
+      codegen-cache: true
+      relr: true
+      builds: ${{ needs.plan.outputs.v3-builds }}
 
   # The macOS toolchains are the shipped fRust ones, built natively like the release does. The
   # official comparison needs no control toolchain.
@@ -200,8 +263,9 @@ jobs:
         with:
           workloads: ${{ matrix.workload }}
       # The setup action unpacks every toolchain-* artifact of the run, and the macOS fRust
-      # toolchains share the name of the top directory with the Linux one. Put the Linux fRust
-      # toolchain back exactly as built, so nothing else can be mixed into it.
+      # toolchains and the Linux v3 one share the name of the top directory with the baseline
+      # Linux one. Put the baseline Linux fRust toolchain back exactly as built, so nothing else
+      # can be mixed into it.
       - name: Restore the Linux fRust toolchain
         run: |
           dest=target/compiler-rewrite/toolchains
@@ -362,11 +426,13 @@ jobs:
 
   # Official Rust against the fRust toolchain with its unit cache. One job per platform and
   # workload, so the largest job (rounds of cold, clean, no-op and edit builds with fat LTO)
-  # stays well inside the six hour limit. The driver stops starting rounds at 300 minutes and
-  # the results then say how many pairs were taken.
+  # stays well inside the six hour limit. The driver stops starting rounds at 285 minutes, which
+  # leaves the setup before it (about 25 minutes at most) and the page-cache probe and upload after
+  # it inside the 350 minute job limit, and the results then say how many pairs were taken. The
+  # report lists every such stop, so a short series is never mistaken for a full one.
   compare:
     name: compare ${{ matrix.label }} ${{ matrix.workload }}
-    needs: [plan, toolchains, toolchains-macos]
+    needs: [plan, toolchains, toolchains-v3, toolchains-macos]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
@@ -379,16 +445,47 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
-      - name: Require the toolchain build
+      # The v3 toolchain needs every x86-64-v3 extension. The runner pool is not guaranteed to have
+      # them, so a runner without them reports that, leaves a record for the report and runs nothing
+      # else. Every later step is conditional on runnable not being false; the steps of the other
+      # platforms never set it, which counts as runnable.
+      - id: cpu
+        name: Check that this runner can run the v3 toolchain
+        if: matrix.cpu == 'v3'
         env:
-          RESULT: ${{ runner.os == 'Linux' && needs.toolchains.result || needs.toolchains-macos.result }}
+          LABEL: ${{ matrix.label }}
+          WORKLOAD: ${{ matrix.workload }}
+        run: |
+          if message=$(bash .github/scripts/cpu-supports-v3.sh); then
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+            echo "$message"
+          else
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=$LABEL skipped::$message. The v3 comparison for this workload was not run."
+            echo "$LABEL $WORKLOAD was skipped: $message" >> "$GITHUB_STEP_SUMMARY"
+            mkdir -p "$RUNNER_TEMP/out"
+            python3 -I - "$LABEL" "$WORKLOAD" "$message" > "$RUNNER_TEMP/out/skipped.jsonl" <<'PY'
+          import json
+          import sys
+
+          label, workload, message = sys.argv[1:]
+          print(json.dumps({"schema": "frust-compare-1", "type": "skipped", "label": label, "workload": workload,
+                            "reason": f"{message}, so the x86-64-v3 toolchain cannot run on this runner."}, sort_keys=True))
+          PY
+          fi
+      - name: Require the toolchain build
+        if: steps.cpu.outputs.runnable != 'false'
+        env:
+          RESULT: ${{ runner.os == 'Linux' && (matrix.toolchain == 'frust-v3' && needs.toolchains-v3.result || needs.toolchains.result) || needs.toolchains-macos.result }}
           TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
         run: |
           if [[ $RESULT != success ]]; then
-            echo "::error::The fRust toolchain build for $TARGET finished as $RESULT"
+            echo "::error::The $TOOLCHAIN toolchain build for $TARGET finished as $RESULT"
             exit 1
           fi
       - name: Choose the work directory
+        if: steps.cpu.outputs.runnable != 'false'
         run: |
           if [[ $RUNNER_OS == Linux ]]; then
             # Targets, stores and seeded copies need more room than the system disk has.
@@ -399,20 +496,60 @@ jobs:
             mkdir -p "$RUNNER_TEMP/bench"
             echo "WORK=$RUNNER_TEMP/bench" >> "$GITHUB_ENV"
           fi
+      # frust-install is built here, with its target directory in the job's temporary area, and
+      # then installs the toolchain the way a user's copy is installed.
+      - uses: ./.github/actions/setup-rust
+        if: steps.cpu.outputs.runnable != 'false'
+      - name: Build frust-install
+        if: steps.cpu.outputs.runnable != 'false'
+        working-directory: crates
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/frust-install-target
+        run: cargo build --release --locked -p frust-rs --bin frust-install
       - uses: actions/download-artifact@v8
+        if: steps.cpu.outputs.runnable != 'false'
         with:
-          name: toolchain-frust-${{ matrix.target }}
+          name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
           path: ${{ runner.temp }}/toolchain
-      - name: Unpack the fRust toolchain
+      # The same script and arguments as the package job of the Release workflow, so the archive
+      # has the release layout: manifest with the release id and variant, frust-install inside.
+      - name: Package the release files
+        if: steps.cpu.outputs.runnable != 'false'
         env:
           TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          CPU: ${{ matrix.cpu }}
         run: |
           command -v zstd > /dev/null || brew install zstd
-          mkdir -p "$WORK/toolchains"
-          zstd -dc "$RUNNER_TEMP/toolchain/frust-$TARGET.tar.zst" | tar -xf - -C "$WORK/toolchains"
-          rm -f "$RUNNER_TEMP/toolchain/frust-$TARGET.tar.zst"
-          ls -l "$WORK/toolchains/frust/bin"
+          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          files=$RUNNER_TEMP/release-files
+          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst" "$version" "$TARGET" \
+            "$RUNNER_TEMP/frust-install-target/release/frust-install" "$files" ${CPU:+"$CPU"}
+          rm -f "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst"
+          suffix=
+          if [[ $CPU == v3 ]]; then suffix=-v3; fi
+          echo "RELEASE_ARCHIVE=$files/frust-toolchain-$TARGET$suffix.tar.gz" >> "$GITHUB_ENV"
+          ls -l "$files"
+      # The prefix is under the home directory, on the file system rustup uses for the official
+      # toolchain. Its current/bin is the fRust toolchain that the driver measures.
+      - name: Install the fRust toolchain with frust-install
+        if: steps.cpu.outputs.runnable != 'false'
+        env:
+          CPU: ${{ matrix.cpu }}
+        run: |
+          prefix=$HOME/frust-bench-prefix
+          rm -rf "$prefix"
+          "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
+            --archive "$RELEASE_ARCHIVE" --checksum "$RELEASE_ARCHIVE.sha256" --prefix "$prefix"
+          rm -rf "$RUNNER_TEMP/release-files"
+          if [[ -n $CPU ]]; then
+            grep -F "\"variant\":\"$CPU\"" "$prefix/current/manifest.json"
+          fi
+          echo "FRUST_BIN=$prefix/current/bin" >> "$GITHUB_ENV"
+          "$prefix/current/bin/fcargo" -V
+          "$prefix/current/bin/frustc" -Vv
       - name: Install the official toolchain
+        if: steps.cpu.outputs.runnable != 'false'
         run: |
           rustup toolchain install "$OFFICIAL_RELEASE" --profile minimal --no-self-update
           cargo_path=$(rustup which --toolchain "$OFFICIAL_RELEASE" cargo)
@@ -436,29 +573,39 @@ jobs:
       # The registry is fetched with each toolchain's own Cargo, so both builds run --offline
       # against sources their Cargo can find.
       - name: Fetch the frozen cohort
+        if: steps.cpu.outputs.runnable != 'false'
         env:
           WORKLOAD: ${{ matrix.workload }}
         run: |
           PATH="$OFFICIAL_BIN:$PATH" qualification/fetch-cohort.sh "$WORKLOAD" "$WORK/cohorts" "$OFFICIAL_BIN/cargo"
-          (cd "$WORK/cohorts/$WORKLOAD" && PATH="$WORK/toolchains/frust/bin:$PATH" "$WORK/toolchains/frust/bin/cargo" fetch --locked)
+          (cd "$WORK/cohorts/$WORKLOAD" && PATH="$FRUST_BIN:$PATH" "$FRUST_BIN/cargo" fetch --locked)
+      # The experimental switches are off: the comparison measures the shipped defaults. The driver
+      # records the page-cache state of both toolchains before the first timed build and after the
+      # last, and under cache-state evicted drops both toolchains' library pages before every build.
       - name: Measure
+        if: steps.cpu.outputs.runnable != 'false'
         env:
           WORKLOAD: ${{ matrix.workload }}
           LABEL: ${{ matrix.label }}
           ROUNDS: ${{ inputs.rounds }}
           NOOPS: ${{ inputs.noops }}
-          EXPERIMENTAL: ${{ inputs.compare-experimental && '1' || '0' }}
+          CACHE_STATE: ${{ inputs.cache-state }}
         run: |
+          if [[ $CACHE_STATE == evicted && $RUNNER_OS != Linux ]]; then
+            echo "::notice title=cache-state evicted ignored::Evicting the page cache needs Linux. $LABEL ran with the toolchains as installed."
+            CACHE_STATE=installed
+          fi
           mkdir -p "$RUNNER_TEMP/out"
           python3 -I qualification/ci-bench.py \
             --official-cargo "$OFFICIAL_BIN/cargo" --official-rustc "$OFFICIAL_BIN/rustc" \
             --expect-official-release "$OFFICIAL_RELEASE" \
-            --frust-cargo "$WORK/toolchains/frust/bin/fcargo" --frust-rustc "$WORK/toolchains/frust/bin/frustc" \
-            --frust-env "FRUST_EXPERIMENTAL_CODEGEN_CACHE=$EXPERIMENTAL" --frust-env "FRUST_EXPERIMENTAL_RELR=$EXPERIMENTAL" \
+            --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$FRUST_BIN/frustc" \
+            --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
+            --cache-state "$CACHE_STATE" \
             --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --rounds "$ROUNDS" --noops "$NOOPS" \
-            --time-budget-minutes 300 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
+            --time-budget-minutes 285 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
       - name: Stage results
-        if: always()
+        if: always() && steps.cpu.outputs.runnable != 'false'
         run: |
           mkdir -p "$RUNNER_TEMP/out/logs"
           cp -R "$WORK/run/logs/." "$RUNNER_TEMP/out/logs/" || true

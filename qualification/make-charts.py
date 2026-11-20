@@ -9,6 +9,12 @@ official and fRust build of the same round and states the median of the paired C
 the number of pairs. A scenario where fRust is not faster at the median, where it is not faster
 in every pair, or that has too few pairs is flagged in the table and in the chart, never dropped.
 
+Platforms are grouped by label. The two Linux variants have their own labels (linux-x86_64 and
+linux-x86_64-v3), each is compared with the official toolchain of its own runner, and when both are
+present the report adds a table with the two side by side. The page-cache probe records of each job
+("folio", see ci-bench.py) become one row per job, and a job a runner skipped (a "skipped" record,
+written when the runner CPU cannot run the v3 toolchain) is listed in the run notes.
+
 The output is deterministic: the same input gives byte-identical files. Standard library only.
 Written to DIR: results.md, summary.json and one chart-<platform>.svg per platform.
 """
@@ -72,20 +78,28 @@ def find_files(inputs):
 
 
 def load_runs(files):
-    """One entry per file that has a meta record of this schema. Other files are listed as skipped."""
-    runs, skipped = [], []
+    """Return (runs, skipped, omitted).
+
+    runs has one entry per file with a meta record of this schema. omitted holds the records of
+    jobs that declined to run (type "skipped"). Any other file is listed in skipped."""
+    runs, skipped, omitted = [], [], []
     for path in files:
         records = [r for r in read_jsonl(path) if r.get("schema") == SCHEMA]
         metas = [r for r in records if r.get("type") == "meta"]
         if not metas:
-            skipped.append(path)
+            declined = [r for r in records if r.get("type") == "skipped"]
+            if declined:
+                omitted.extend(declined)
+            else:
+                skipped.append(path)
             continue
         runs.append(dict(
             path=path, meta=metas[0],
             samples=[r for r in records if r.get("type") == "sample"],
             stops=[r for r in records if r.get("type") == "stop"],
+            folio=[r for r in records if r.get("type") == "folio"],
         ))
-    return runs, skipped
+    return runs, skipped, omitted
 
 
 def first_line(text):
@@ -213,6 +227,7 @@ def host_summary(runs):
             first_line((tools.get("official") or {}).get("rustc")), first_line((tools.get("official") or {}).get("cargo")),
             first_line((tools.get("frust") or {}).get("rustc")), first_line((tools.get("frust") or {}).get("cargo")),
             meta.get("commit") or "unknown", meta.get("unit_cache") or "unknown",
+            meta.get("cache_state") or "not recorded",
             json.dumps(meta.get("frust_env") or {}, sort_keys=True),
         )
         hosts[key] = hosts.get(key, 0) + 1
@@ -221,6 +236,72 @@ def host_summary(runs):
 
 def cell(text):
     return str(text).replace("|", "/")
+
+
+def paired_variants(rows):
+    """(baseline label, v3 label) for every platform that was measured with both Linux variants."""
+    labels = {row["label"] for row in rows}
+    return [(label[:-3], label) for label in sorted(labels) if label.endswith("-v3") and label[:-3] in labels]
+
+
+def variant_table(rows, baseline, v3):
+    """Markdown lines putting the two variants of one platform side by side."""
+    by_key = {(row["label"], row["scenario"], row["workload"]): row for row in rows}
+    keys = sorted({key[1:] for key in by_key if key[0] in (baseline, v3)},
+                  key=lambda key: order_key(dict(by_key.get((baseline, *key)) or by_key[(v3, *key)], label="")))
+    out = ["", f"## {baseline} and {v3} side by side", "",
+           "Each percentage is fRust CPU as a percent of the official CPU measured on the same runner as that "
+           "variant, so every column is a comparison with official. The two variants ran on different runners, "
+           "possibly with different CPU models (see Hosts), which is why the CPU times are not set against each "
+           "other here.", "",
+           f"| Workload | Scenario | {baseline}: fRust as % of official | Pairs | {v3}: fRust as % of official | Pairs "
+           f"| Difference (percentage points) |",
+           "| --- | --- | --- | --- | --- | --- | --- |"]
+    for scenario, workload in keys:
+        first, second = by_key.get((baseline, scenario, workload)), by_key.get((v3, scenario, workload))
+        difference = f"{(second['ratio'] - first['ratio']) * 100:+.1f}" if first and second else "-"
+        out.append("| " + " | ".join(cell(part) for part in (
+            workload, SCENARIO_NAMES.get(scenario, scenario),
+            percent(first["ratio"]) if first else "-", first["pairs"] if first else "-",
+            percent(second["ratio"]) if second else "-", second["pairs"] if second else "-", difference)) + " |")
+    return out
+
+
+def folio_summary(run, toolchain, phase):
+    """Text for one cell of the page-cache table: PMD-mapped MiB of the driver and of libLLVM."""
+    records = [r for r in run.get("folio", []) if r.get("toolchain") == toolchain and r.get("phase") == phase]
+    if not records:
+        return "-"
+    record = records[-1]
+    if "mib" not in record:
+        return "probe failed"
+    mib = record["mib"]
+    return f"{mib.get('librustc_driver_FilePmdMapped', 0)} / {mib.get('libLLVM_FilePmdMapped', 0)}"
+
+
+def folio_table(runs):
+    """Markdown lines with one row per job that recorded the page-cache state of its toolchains."""
+    members = [run for run in runs if run.get("folio")]
+    if not members:
+        return []
+    members.sort(key=lambda run: (run["meta"]["label"],
+                                  WORKLOADS.index(run["meta"]["workload"]) if run["meta"]["workload"] in WORKLOADS
+                                  else len(WORKLOADS), run["meta"]["workload"]))
+    out = ["", "## Page-cache state of the compilers", "",
+           "MiB of `librustc_driver` / `libLLVM` text that a probe compile mapped with 2 MiB pages "
+           "(`FilePmdMapped` in `/proc/PID/smaps`), taken before the first timed build and after the last. 0 means "
+           "4 KiB pages. This depends on how the files entered the page cache, so a toolchain at 0 against one with "
+           "large pages is slower for that reason alone. With cache state `evicted` the pages of both toolchains "
+           "are dropped before every build and the probe follows an eviction.", "",
+           "| Platform | Workload | Cache state | Official before | Official after | fRust before | fRust after |",
+           "| --- | --- | --- | --- | --- | --- | --- |"]
+    for run in members:
+        meta = run["meta"]
+        out.append("| " + " | ".join(cell(part) for part in (
+            meta["label"], meta["workload"], meta.get("cache_state") or "not recorded",
+            folio_summary(run, "official", "before"), folio_summary(run, "official", "after"),
+            folio_summary(run, "frust", "before"), folio_summary(run, "frust", "after"))) + " |")
+    return out
 
 
 def markdown(runs, skipped, rows, failures, notes, args):
@@ -242,16 +323,22 @@ def markdown(runs, skipped, rows, failures, notes, args):
         "between rounds. The percentage is the median of the per-pair ratios of fRust CPU to official CPU, so "
         "100% means equal CPU and lower means fRust used less. Both sides build the same frozen sources with the "
         "same release profile. The fRust cold build starts with an empty unit cache store, the clean rebuild with "
-        "the store filled by that round's cold build, and the official toolchain has no store.",
+        "the store filled by that round's cold build, and the official toolchain has no store. The fRust toolchain "
+        "is installed with `frust-install` from the release-format archive, the way users get it. The cache state "
+        "column of the hosts table says whether the toolchains were left as installed or had their library pages "
+        "evicted before every build.",
         "",
         "## Hosts",
         "",
         "| Platform | CPU | Cores (physical/logical) | OS | Pinning | Official rustc | Official cargo | fRust rustc "
-        "| fRust cargo | Commit | Unit cache | fRust env | Jobs |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| fRust cargo | Commit | Unit cache | Cache state | fRust env | Jobs |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for key, count in host_summary(runs):
         out.append("| " + " | ".join(cell(part) for part in key) + f" | {count} |")
+    out += folio_table(runs)
+    for baseline, v3 in paired_variants(rows):
+        out += variant_table(rows, baseline, v3)
     for label in labels:
         out += ["", f"## {label}", "",
                 "| Workload | Scenario | Official CPU | fRust CPU | fRust as % of official | Range over pairs "
@@ -369,10 +456,12 @@ def main():
     parser.add_argument("--min-pairs", type=int, default=3)
     args = parser.parse_args()
 
-    runs, skipped = load_runs(find_files(args.inputs))
+    runs, skipped, omitted = load_runs(find_files(args.inputs))
     if not runs:
         sys.exit("no frust-compare-1 results found in the inputs")
     pairs, failures, notes, requested = collect(runs)
+    notes += [f"{item.get('label', 'unknown')} {item.get('workload', 'unknown')}: not run. "
+              f"{item.get('reason', 'no reason recorded')}" for item in omitted]
     rows = summarize(pairs, requested, args.min_pairs)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
