@@ -5,7 +5,7 @@ No fRust compiler change has passed the frozen Linux budgets. Nothing here is a 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge. The same day's Attributor screen is a ripgrep release build that crashed in LLVM, not a paired judge. The same day's NewGVN check is a bitcode comparison, not a paired judge.
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge. The same day's Attributor screen is a ripgrep release build that crashed in LLVM, not a paired judge. The same day's NewGVN check is a bitcode comparison, not a paired judge. The same day's GVN-sink check is a bitcode comparison, not a paired judge.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -33,6 +33,7 @@ Rows marked single sample are one build each, not gate results.
 | Loop fusion (`-enable-loopfusion` on the packaged `opt`) | Bitcode comparison on 2026-11-20. Not a user `rustc` flag. | memchr `default<O3>` and ripgrep `lto<O3>` matched with the switch off. Not kept. Gate not run. |
 | Attributor (`-attributor-enable=full`) on `frust-0ef1bc386-prelinkspan1` | One ripgrep release build on 2026-11-20. No RELR and no `-C target-cpu`. | `frustc` SIGSEGV while optimizing regex-automata 0.4.15. No binary. Not kept. Gate not run. |
 | NewGVN (`-enable-newgvn` on the packaged `opt`) | Bitcode comparison on 2026-11-20. Not a user `rustc` flag. | Ripgrep pre-LTO grew by 9856 bytes. `find_impl` unchanged. An earlier final-crate flag sample already missed runtime and size. Not kept. |
+| GVN sink (`-enable-gvn-sink` on the packaged `opt`) | Bitcode comparison on 2026-11-20. The pass is not in `lto<O3>`. | Frozen memchr `find_impl` stays at 695 instructions. Not kept. Gate not run. |
 
 ### Interface-hash cutoff, 20 November
 
@@ -61,6 +62,11 @@ The same driver built ripgrep once with `-enable-machine-outliner=always` and `-
 ### NewGVN bitcode check, 20 November
 
 `-enable-newgvn` defaults off. Before `-passes`, the packaged LLVM 23.1.5 `opt` prints `newgvn` in `lto<O3>` where it otherwise prints `gvn<>`. The memchr prelink module through `default<O3>` grew from 103976 to 104004 bytes. Its 43 functions match after SSA names, block labels, and debug metadata are stripped, and `Finder::find_impl` is unchanged. The ripgrep pre-LTO module through `lto<O3>` grew from 5211360 to 5221216 bytes. Of 2415 functions, 463 bodies differ and none is `find_impl`. An earlier final-crate flag sample had already missed the runtime aggregate (geomean 1.00150149, upper 1.00678247) and stripped size (geomean 1.00427080). This comparison was not judged again. No stage-2 rebuild was started. The figures are repeated in `qualification/GATE-REPORT.md`.
+
+### GVN-sink bitcode check, 20 November
+
+`-enable-gvn-sink` inserts `gvn-sink` into `default<O3>` and does not insert it into `lto<O3>`. On the frozen memchr prelink module the switch moves the output from 103976 to 103952 bytes and leaves `find_impl` at 695 instructions. From unoptimized memchr 2.8.3 the AVX2 `find_impl` stays at 902 instructions, and the lines that differ are not the vector loop. No stage-2 rebuild was started and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
+
 
 ### Pre-optimization cache gate
 
