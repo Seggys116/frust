@@ -8,6 +8,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 20 November 2026: prelink-span reuse (`frust-0ef1bc386-prelinkspan1`) was judged on the same cohort and not kept. The leaf build budgets passed. Disk, the runtime aggregate, and stripped size failed. The three application binaries matched stock. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: an x86-64-v3 codegen preflight on that compiler, with the hotfreq16 flags and opt-in RELR, was not kept. Oxipng's median ratio was 0.94419073. The three-workload runtime geomean was 0.98290005, and rustfmt's median was 1.01459543. Stripped size beat 0.97 only while RELR stayed on. No full judge was run. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: a ripgrep build with the machine outliner and `-C force-unwind-tables=no`, and without RELR, was not kept. Stripped size was 4010848/4024992 (0.99648596). That ratio cannot carry a 0.97 size geomean. Oxipng, rustfmt, and the full judge were not run. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
+* 20 November 2026: enabling loop fusion in LLVM's `default<O3>` and `lto<O3>` pipelines left the memchr and ripgrep bitcode unchanged. The switch is not a `rustc` user flag. No stage-2 rebuild and no full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
 ## [0.5.0] - 2026-11-20
 

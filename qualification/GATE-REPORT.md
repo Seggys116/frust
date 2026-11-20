@@ -137,3 +137,9 @@ A 0.97 size geomean needs the product of the three stripped ratios to be at most
 ## What remains failed
 
 The cutoff judge misses the runtime aggregate and stripped size. The prelink-span judge passes edited-release, holdout, cold, noop, tail, and peak memory, and misses disk (ripgrep target 1.25765371), the runtime aggregate, and stripped size. The x86-64-v3 preflight on that same compiler misses the runtime aggregate (geomean 0.98290005, rustfmt median 1.01459543) and, without opt-in RELR, misses stripped size. The outliner plus `force-unwind-tables=no` screen, also without RELR, leaves stripped ripgrep at 0.99648596, which cannot carry a 0.97 size geomean. Every later codegen probe either missed the 0.97 runtime upper, missed stripped size, or both, or was not a compiler change. macOS install and execution are unverified.
+
+## Loop fusion bitcode check, 20 November
+
+`-C llvm-args` turns the prelink and fat-span caches off, so a user flag cannot keep the leaf budgets those caches passed. Loop fusion is the fat-LTO pipeline switch that is not a user flag. `PipelineTuningOptions::LoopFusion` defaults false, and rustc's pass builder does not read `--enable-loopfusion`. The packaged `opt` from `frust-0ef1bc386-prelinkspan1` does. LLVM 23.1.5.
+
+Two comparisons used that binary. The memchr prelink module, which contains one `find_impl`, went through `default<O3>` with and without `-enable-loopfusion`. Both outputs are 103976 bytes and the same hash. The ripgrep pre-LTO module went through `lto<O3>` with and without the flag. Both outputs are 5211360 bytes and the same hash. That module contains no `find_impl`. Oxipng's sampled time is in libdeflate, which this pipeline does not compile. No stage-2 rebuild was started. No prefix was packaged. `frust-gates` was not run. Checklist item 6 stays open. `gates.rs` was not edited.
