@@ -67,6 +67,10 @@ The same driver built ripgrep once with `-enable-machine-outliner=always` and `-
 
 `-enable-gvn-sink` inserts `gvn-sink` into `default<O3>` and does not insert it into `lto<O3>`. On the frozen memchr prelink module the switch moves the output from 103976 to 103952 bytes and leaves `find_impl` at 695 instructions. From unoptimized memchr 2.8.3 the AVX2 `find_impl` stays at 902 instructions, and the lines that differ are not the vector loop. No stage-2 rebuild was started and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
 
+### Extra vectorizer passes, 20 November
+
+`-extra-vectorizer-passes` inserts `extra-vector-passes` into `lto<O3>` and adds `early-cse` after `slp-vectorizer`. On the frozen memchr prelink module the switch leaves all 43 bodies matching and leaves `find_impl` at 580 instructions. The ripgrep pre-LTO module shrinks from 5211360 to 5210928 bytes. Of 2415 functions, 27 bodies differ and none is `find_impl`. Reaching a 0.97 ratio on this module would remove 156341 bytes. An earlier span1 sample of the same flag already missed both budgets: runtime geomean 0.99336408, upper 0.99959463, stripped-size geomean 0.99993278. This comparison was not judged again. The figures are repeated in `qualification/GATE-REPORT.md`.
+
 ### Pre-optimization cache gate
 
 The shipped `frust-gates` judged the paired file. Cold (median ratio 1.0050), no-op, tail, peak RSS (maximum 1.0844) and target bytes (maximum 1.1445) passed. The leaf geometric mean was 0.6885 (upper 0.6889), but it comes from one workload. The median paired ratios were ripgrep 0.3316 (6.29s against 19.02s), syn 0.9844 and regex 1.0000. The ripgrep leaf edit adds an unused local that is removed before the fat-LTO merge, so the cache hit. The ripgrep wide edit changes the merged module and ran at 1.0296.
