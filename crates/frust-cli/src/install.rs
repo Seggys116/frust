@@ -8,6 +8,9 @@
 //! adds the rollback target and is reconciled against it. It also records the
 //! build variant (`baseline`, `v3`) that each of the two versions was packaged
 //! as, taken from the optional `variant` member of their `manifest.json`.
+//! On Linux the large files of the extracted tree are rewritten with large
+//! writes before activation, so the page cache holds them in large folios (see
+//! [`relayout`]).
 
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -218,6 +221,10 @@ fn unpack(work: &Work, source: &mut File, archive: &Path, expected: &str) -> Res
     let tree = work.dir.join("tree");
     fs::create_dir(&tree).map_err(io_context(format!("could not create {}", tree.display())))?;
     extract(&private, &tree)?;
+    // Only Linux page caches are known to size folios by the write; elsewhere the pass would cost time for nothing.
+    if cfg!(target_os = "linux") {
+        relayout::rewrite_large_files(&tree)?;
+    }
     Ok(tree)
 }
 
@@ -299,6 +306,102 @@ fn extract(archive: &Path, destination: &Path) -> Result<(), InstallError> {
         return Err(InstallError::new(format!("tar exited {status} extracting the verified archive")));
     }
     Ok(())
+}
+
+/// Rewrites the large regular files of an extracted tree with large writes.
+///
+/// On Linux file systems with large folio support (ext4 on recent kernels, XFS) a buffered write
+/// allocates page-cache folios sized by the write, and a later `mmap` maps a cached 2 MiB folio
+/// with one PMD entry. `tar` writes 10 KiB at a time, which leaves the compiler's shared libraries
+/// cached in small folios, while rustup writes 16 MiB at a time and its libraries end up mapped with
+/// 2 MiB pages: same bytes, measurably fewer iTLB misses for rustup's copy. Truncating a file drops
+/// its cached folios, so writing the bytes back in large chunks gives the tree the same page-cache
+/// state as a rustup install. Inode, hard links, mode and times are kept.
+///
+/// Anything that fails before a file is truncated leaves that file as `tar` wrote it; a failure
+/// after the truncation fails the install, because the bytes on disk are no longer complete.
+mod relayout {
+    use super::*;
+    use std::fs::{FileTimes, Metadata, Permissions};
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// One PMD-sized folio: smaller files cannot be mapped with 2 MiB pages anyway.
+    pub(super) const MIN_BYTES: u64 = 2 << 20;
+    /// Whole files are buffered; above this the file is left as extracted.
+    const MAX_BYTES: u64 = 1 << 30;
+    /// Large enough that every 2 MiB aligned range is covered by one write.
+    const CHUNK: usize = 32 << 20;
+
+    /// Returns how many files were rewritten.
+    pub(super) fn rewrite_large_files(tree: &Path) -> Result<usize, InstallError> {
+        let mut seen = HashSet::new();
+        let mut rewritten = 0;
+        let mut pending = vec![tree.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() && (MIN_BYTES..=MAX_BYTES).contains(&metadata.len()) && seen.insert((metadata.dev(), metadata.ino())) {
+                    rewritten += usize::from(rewrite(&path, &metadata)?);
+                }
+            }
+        }
+        Ok(rewritten)
+    }
+
+    fn rewrite(path: &Path, metadata: &Metadata) -> Result<bool, InstallError> {
+        let original = metadata.permissions();
+        let writable = original.mode() & 0o200 != 0;
+        if !writable && fs::set_permissions(path, Permissions::from_mode(original.mode() | 0o200)).is_err() {
+            return Ok(false);
+        }
+        let result = rewrite_writable(path, metadata);
+        let restored = fs::set_permissions(path, original);
+        match result {
+            Ok(done) => restored.map(|()| done).map_err(io_context(format!("could not restore the mode of {}", path.display()))),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rewrite_writable(path: &Path, metadata: &Metadata) -> Result<bool, InstallError> {
+        let length = metadata.len();
+        let Ok(mut file) = OpenOptions::new().read(true).write(true).open(path) else { return Ok(false) };
+        let mut data = Vec::new();
+        if data.try_reserve_exact(length as usize).is_err() {
+            return Ok(false);
+        }
+        if (&mut file).take(length + 1).read_to_end(&mut data).is_err() || data.len() as u64 != length {
+            return Ok(false);
+        }
+        write_back(&mut file, &data).map_err(io_context(format!("could not rewrite {}", path.display())))?;
+        // The bytes are complete; times only keep the tree identical to what tar extracted.
+        let mut times = FileTimes::new();
+        if let Ok(modified) = metadata.modified() {
+            times = times.set_modified(modified);
+        }
+        if let Ok(accessed) = metadata.accessed() {
+            times = times.set_accessed(accessed);
+        }
+        let _ = file.set_times(times);
+        Ok(true)
+    }
+
+    /// Truncation drops every cached folio of the file, so the writes allocate fresh ones.
+    fn write_back(file: &mut File, data: &[u8]) -> io::Result<()> {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        for chunk in data.chunks(CHUNK) {
+            file.write_all(chunk)?;
+        }
+        if file.metadata()?.len() != data.len() as u64 {
+            return Err(io::Error::other("length changed while rewriting"));
+        }
+        Ok(())
+    }
 }
 
 /// Ids become directory names, so only a conservative, non-hidden charset is allowed.
@@ -1240,6 +1343,115 @@ mod tests {
         uninstall(&prefix).unwrap();
         assert!(!prefix.join("current").exists());
         assert!(!prefix.join("versions").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn pattern(length: usize, seed: usize) -> Vec<u8> {
+        (0..length).map(|index| ((index * 131 + seed) % 251) as u8).collect()
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn large_files_are_rewritten_in_place_keeping_bytes_links_modes_and_times() {
+        let dir = scratch();
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("lib/nested")).unwrap();
+        let min = relayout::MIN_BYTES as usize;
+        let past = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let files: [(&str, usize, u32); 5] = [
+            ("lib/big.so", 2 * min + 12_345, 0o751),
+            ("lib/readonly.so", min + 1, 0o444),
+            ("lib/nested/exact.rlib", min, 0o644),
+            ("lib/below.so", min - 1, 0o755),
+            ("bin/small", 100, 0o640),
+        ];
+        for (index, (name, length, mode)) in files.iter().enumerate() {
+            let path = tree.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, pattern(*length, index)).unwrap();
+            File::options().write(true).open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(past)).unwrap();
+            set_mode(&path, *mode);
+        }
+        fs::hard_link(tree.join("lib/big.so"), tree.join("lib/big-link.so")).unwrap();
+        std::os::unix::fs::symlink("big.so", tree.join("lib/alias.so")).unwrap();
+        let inodes: Vec<u64> = files.iter().map(|(name, _, _)| inode_of(&tree.join(name))).collect();
+
+        // big.so (once for both of its names), readonly.so and exact.rlib; the rest is too small.
+        assert_eq!(relayout::rewrite_large_files(&tree).unwrap(), 3);
+
+        for (index, (name, length, mode)) in files.iter().enumerate() {
+            let path = tree.join(name);
+            assert_eq!(fs::read(&path).unwrap(), pattern(*length, index), "{name}");
+            assert_eq!(mode_of(&path), *mode, "{name}");
+            assert_eq!(inode_of(&path), inodes[index], "{name}");
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), past, "{name}");
+        }
+        assert_eq!(inode_of(&tree.join("lib/big-link.so")), inodes[0]);
+        assert_eq!(fs::read_link(tree.join("lib/alias.so")).unwrap(), Path::new("big.so"));
+        assert!(fs::symlink_metadata(tree.join("lib/alias.so")).unwrap().file_type().is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A toolchain archive with a file large enough to be rewritten, a hard link and a symlink to it.
+    fn large_archive(dir: &Path, id: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+        let (small, _) = archive(dir, id, "marker");
+        let root = dir.join(format!("tree-{id}"));
+        fs::remove_file(&small).unwrap();
+        let big = pattern(relayout::MIN_BYTES as usize * 3 / 2 + 7, 3);
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/libbig.so"), &big).unwrap();
+        set_mode(&root.join("lib/libbig.so"), 0o755);
+        fs::hard_link(root.join("lib/libbig.so"), root.join("lib/libbig-link.so")).unwrap();
+        std::os::unix::fs::symlink("libbig.so", root.join("lib/libbig.so.1")).unwrap();
+        let archive = dir.join(format!("{id}.tar"));
+        let status = Command::new("tar").arg("-c").arg("-f").arg(&archive).arg("-C").arg(&root).arg(".").status().unwrap();
+        assert!(status.success());
+        let sum = dir.join(format!("{id}.sha256"));
+        fs::write(&sum, format!("{}\n", hex32(&sha256(&fs::read(&archive).unwrap())))).unwrap();
+        (archive, sum, big)
+    }
+
+    #[test]
+    fn installed_large_files_keep_bytes_modes_hard_links_and_symlinks() {
+        let dir = scratch();
+        let prefix = dir.join("prefix");
+        let (archive_path, sum, big) = large_archive(&dir, "large");
+        install(&prefix, &archive_path, &sum).unwrap();
+        let lib = prefix.join("current/lib");
+        assert_eq!(fs::read(lib.join("libbig.so")).unwrap(), big);
+        assert_eq!(mode_of(&lib.join("libbig.so")), 0o755);
+        assert_eq!(inode_of(&lib.join("libbig-link.so")), inode_of(&lib.join("libbig.so")));
+        assert_eq!(fs::read_link(lib.join("libbig.so.1")).unwrap(), Path::new("libbig.so"));
+        assert_eq!(fs::read_to_string(prefix.join("current/bin/rustc")).unwrap(), "marker");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_archive_with_a_large_file_is_rejected() {
+        let dir = scratch();
+        let prefix = dir.join("prefix");
+        let (archive_path, sum, _) = large_archive(&dir, "cut");
+        let bytes = fs::read(&archive_path).unwrap();
+        fs::write(&archive_path, &bytes[..bytes.len() / 2]).unwrap();
+        fs::write(&sum, format!("{}\n", hex32(&sha256(&bytes[..bytes.len() / 2])))).unwrap();
+        let err = install(&prefix, &archive_path, &sum).unwrap_err();
+        assert!(err.message.contains("truncated"), "{}", err.message);
+        assert!(!prefix.join("current").exists());
+        assert!(!prefix.join("versions/cut").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
