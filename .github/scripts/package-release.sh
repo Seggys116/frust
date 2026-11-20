@@ -39,6 +39,15 @@ with open(path, "w") as out:
     out.write("\n")
 PY
 
+# Symlinks with an absolute or empty target point into the build machine (rustc-src/rust does)
+# and the installer rejects them, so they are dropped.
+while IFS= read -r -d '' link; do
+    destination=$(readlink "$link")
+    case $destination in
+        ''|/*) echo "dropping symlink ${link#"$work/tree"/} -> ${destination:-<empty>}"; rm -f "$link" ;;
+    esac
+done < <(find "$work/tree" -type l -print0)
+
 archive=frust-toolchain-$target.tar.gz
 tar -cf - -C "$work/tree" . | gzip -9n > "$out/$archive"
 # sha256sum is not on macOS; both tools print "<digest>  <name>".
