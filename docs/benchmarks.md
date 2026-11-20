@@ -67,7 +67,6 @@ The same driver built ripgrep once with `-enable-machine-outliner=always` and `-
 
 `-enable-gvn-sink` inserts `gvn-sink` into `default<O3>` and does not insert it into `lto<O3>`. On the frozen memchr prelink module the switch moves the output from 103976 to 103952 bytes and leaves `find_impl` at 695 instructions. From unoptimized memchr 2.8.3 the AVX2 `find_impl` stays at 902 instructions, and the lines that differ are not the vector loop. No stage-2 rebuild was started and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
 
-
 ### Pre-optimization cache gate
 
 The shipped `frust-gates` judged the paired file. Cold (median ratio 1.0050), no-op, tail, peak RSS (maximum 1.0844) and target bytes (maximum 1.1445) passed. The leaf geometric mean was 0.6885 (upper 0.6889), but it comes from one workload. The median paired ratios were ripgrep 0.3316 (6.29s against 19.02s), syn 0.9844 and regex 1.0000. The ripgrep leaf edit adds an unused local that is removed before the fat-LTO merge, so the cache hit. The ripgrep wide edit changes the merged module and ran at 1.0296.
@@ -132,16 +131,19 @@ The Benchmark workflow (`.github/workflows/benchmark.yml`) is started by hand an
 
 ### Official comparison
 
-Official Rust against the fRust toolchain with its Cargo unit cache, on three GitHub-hosted platforms:
+Official Rust against the fRust toolchain with its Cargo unit cache, on four GitHub-hosted platforms. Linux x86-64 has two, one per shipped build of the toolchain, and each is compared with the official toolchain installed on its own runner:
 
-| Platform | Runner label | Target |
-| --- | --- | --- |
-| `linux-x86_64` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `macos-arm64` | `macos-latest` | `aarch64-apple-darwin` |
-| `macos-x86_64` | `macos-15-intel` | `x86_64-apple-darwin` |
+| Platform | Runner label | Target | fRust build |
+| --- | --- | --- | --- |
+| `linux-x86_64` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | baseline x86-64 |
+| `linux-x86_64-v3` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | compiler and tools built for x86-64-v3 |
+| `macos-arm64` | `macos-latest` | `aarch64-apple-darwin` | the one macOS build |
+| `macos-x86_64` | `macos-15-intel` | `x86_64-apple-darwin` | the one macOS build |
+
+The `platforms` input names them `linux`, `linux-v3`, `macos-arm64` and `macos-x86_64`. The v3 build runs only where the runner CPU has every x86-64-v3 extension (`.github/scripts/cpu-supports-v3.sh`). A job on a runner without them runs nothing, says so in a workflow warning and in the run summary, and leaves a record that the report lists in its run notes.
 
 - Official toolchain: `rustup toolchain install 1.100.0 --profile minimal`, pinned to that exact version. The driver refuses to run unless `rustc -Vv` reports `release: 1.100.0`.
-- fRust toolchain: the packaged stage-2 toolchain built natively on a runner of the same kind by the Toolchains workflow, run as shipped through `fcargo` and `frustc`. The experimental switches are off unless the `compare-experimental` input turns them on. The published binaries of official Rust are PGO builds and the fRust recipe is not, which is why the frozen stock budgets use the unpatched stage-2 of the same recipe instead (`qualification/PROTOCOL.md`).
+- fRust toolchain: the packaged stage-2 toolchain built natively on a runner of the same kind by the Toolchains workflow, run as shipped through `fcargo` and `frustc`, and installed the way a user installs it (see [Installing the toolchains](#installing-the-toolchains)). The experimental switches are off, so the comparison measures the shipped defaults. The published binaries of official Rust are PGO builds and the fRust recipe is not, which is why the frozen stock budgets use the unpatched stage-2 of the same recipe instead (`qualification/PROTOCOL.md`).
 - Sources: the commits and `Cargo.lock` hashes of `qualification/cohorts.lock`, fetched by `qualification/fetch-cohort.sh`, built `--locked --offline`. Each job builds one workload, from ripgrep, syn, regex and fd. Both toolchains build the same tree.
 - Profile: the shared release profile of the protocol (opt-level 3, fat LTO, one codegen unit, incremental, no debug info, no strip) on both sides.
 - Driver: `qualification/ci-bench.py`, which reuses the `Toolchain` class and helpers of `qualification/run-store-bench.py`. Charts and tables: `qualification/make-charts.py`.
@@ -154,6 +156,20 @@ Scenarios, each measured once per round per toolchain:
 | clean rebuild | Target directory removed. The fRust store holds the entries written by that round's cold build. Official Rust has no store, so this is its cold build again. |
 | no-op rebuild | Immediate rebuild in the clean rebuild's target. The sample is the median of several builds (`noops` input). |
 | edit rebuild | The frozen edit of `qualification/edits/` (leaf and wide for ripgrep, syn and regex, holdout for fd) applied to a copy of the clean rebuild's target, then reversed with the original file times restored, so one edit never makes the next sample rebuild extra files. |
+
+### Installing the toolchains
+
+Each toolchain is installed by its own installer, so that the files are in the state a user gets:
+
+- Official Rust is installed by rustup, as above.
+- fRust goes through `frust-install`, which each compare job builds from the repository. The toolchain that the Toolchains workflow built is packed into the release archive format by `.github/scripts/package-release.sh`, the script and arguments of the Release workflow (the archive, its `.sha256`, a manifest with the release id and, on Linux x86-64, the variant). `frust-install install --archive ... --checksum ... --prefix ...` then installs it into a prefix under the home directory, the file system rustup uses for the official toolchain, and the driver runs `current/bin/fcargo` and `current/bin/frustc` of that prefix. The job checks that the installed manifest names the variant it asked for.
+
+This matters beyond fidelity. Whether the compiler maps `librustc_driver` and `libLLVM` text with 2 MiB pages depends on how those files entered the page cache, not on their bytes. Large buffered writes give large folios on Linux file systems that support them (rustup writes in 16 MiB chunks, and `frust-install` rewrites large files with 32 MiB writes after extraction). `tar` writes in 10 KiB chunks and gives small folios, as does faulting an evicted file back in. A toolchain unpacked with `tar` and measured against one installed by rustup would therefore differ in iTLB behaviour, which shows up as a small CPU difference that has nothing to do with the compilers. GitHub runner kernels are recent enough for this to apply.
+
+Two controls follow, both Linux only:
+
+- Every job records the state for both toolchains before the first timed build and after the last: the largest `Rss` and `FilePmdMapped` of the driver and of `libLLVM` seen in `/proc/PID/smaps` while a probe compile runs (`qualification/toolchain-folio-state.py`). They are stored as `folio` records in the raw results, and the report shows the PMD-mapped amounts per job. A toolchain at 0 against one with large mappings is a state difference, not a compiler difference. The probe itself reads the files, so a file that reclaim had already evicted is faulted back in with small folios by the probe, as it would be by the first build.
+- The `cache-state` input chooses what the timed builds see. `installed`, the default, leaves both toolchains as their installers left them, which is what users get. `evicted` runs `qualification/page-cache-state.py evict` on the library files of both toolchains before every timed build (after a `sync`, because dirty pages are not dropped), so both start every build from the same cold-cache state and the compilers alone are compared. It is a diagnostic series: its results say how much of a difference comes from the page cache, and they are not what a user sees. On macOS the input has no effect, the job says so in a notice, and the results record `installed`.
 
 ### Unit cache store rules
 
@@ -176,15 +192,15 @@ The frozen pair protocol jobs (`qualification/run-pairs.py`, control against fRu
 - The reported figure per scenario is the median of the per-pair ratios of fRust CPU to official CPU, as a percent, with the number of pairs, the range of the pair ratios and the number of pairs in which fRust was faster. The medians of the two CPU columns are shown for scale. A summary row per scenario is the geometric mean of the per-workload medians.
 - A scenario is flagged, in the table and in the chart, when the median is not below 100 percent, when fRust was slower in some pairs, when fewer than three pairs were taken, when fewer pairs were taken than requested, or when a no-op rebuild compiled units. Nothing is dropped because it is unfavourable.
 - Builds that exit non-zero are recorded, excluded from the pairs and listed in the report.
-- A job starts no round that would end after 300 minutes, so jobs stay inside the six hour limit of a hosted runner. A run cut short this way records a stop line and the report states how many pairs it has.
+- A job starts no round that would end after 285 minutes of measuring, so jobs stay inside the six hour limit of a hosted runner once the setup before the measurement (building and installing the toolchains, fetching the cohort) and the closing probe and upload are added. The default is eight rounds. A run cut short by the budget records a stop line, the report lists it in its run notes and flags the scenarios that have fewer pairs than requested, so a short series is visible as one.
 
 ### Recorded environment
 
-Each raw result file starts with a meta record: platform label, runner CPU model, physical and logical core counts (and performance and efficiency cores on Apple silicon), OS, memory, pinning mode, `-j`, both toolchains' `cargo -V` and `rustc -Vv` output, the repository commit, the workflow run, the cohort commit and `Cargo.lock` hash, the profile and the fRust environment. The report lists every distinct host, because runner hardware varies between jobs of one platform.
+Each raw result file starts with a meta record: platform label, runner CPU model, physical and logical core counts (and performance and efficiency cores on Apple silicon), OS, memory, pinning mode, `-j`, both toolchains' `cargo -V` and `rustc -Vv` output, the repository commit, the workflow run, the cohort commit and `Cargo.lock` hash, the profile, the cache state, the toolchain prefixes and the fRust environment. The `folio` records of the page-cache probe follow it. The report lists every distinct host, because runner hardware varies between jobs of one platform, and the two Linux variants run on separate runners that can differ.
 
 ### Output
 
-Every `compare` job uploads its raw JSON lines and cargo logs as `compare-<platform>-<workload>`. The `report` job downloads them all and uploads `benchmark-report`, with `results.md`, `summary.json` and one `chart-<platform>.svg` per platform. Each chart has one horizontal bar per scenario and workload, with 100 percent marked. The job also writes the table to the run summary and commits nothing.
+Every `compare` job uploads its raw JSON lines (samples and page-cache records) and cargo logs as `compare-<platform>-<workload>`. The `report` job downloads them all and uploads `benchmark-report`, with `results.md`, `summary.json` and one `chart-<platform>.svg` per platform. Each chart has one horizontal bar per scenario and workload, with 100 percent marked. The report has a table of the page-cache state of both toolchains per job, and where both Linux variants were measured, a table that sets the two side by side, each as a percent of its own official toolchain. The job also writes the table to the run summary and commits nothing.
 
 ### Limits
 
