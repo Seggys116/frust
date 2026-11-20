@@ -1,0 +1,30 @@
+# Settings for x86_64-unknown-linux-gnu, on top of support/bootstrap.toml and
+# support/bootstrap-common.toml. Same format and rules as bootstrap-common.toml. Sources: the
+# dist-x86_64-linux image (src/ci/docker/host-x86_64/dist-x86_64-linux/Dockerfile) and
+# src/ci/run.sh at the commit in support/upstream.lock.
+#
+# build-toolchain.sh also exports what the Dockerfile exports: CC=clang and CXX=clang++, so
+# bootstrap builds the C and C++ parts of rustc (jemalloc, llvm-wrapper) with clang and adds
+# -flto=thin to them because rust.lto is thin. AR=llvm-ar, so those LTO objects land in
+# archives with a usable symbol index. LIBCURL_NO_PKG_CONFIG=1, so Cargo builds its own libcurl.
+
+# Upstream: --set rust.bootstrap-override-lld=true. Build rustc with the lld found on PATH. This makes
+# bootstrap compile the compiler with -Zdefault-visibility=protected (fewer dynamic relocations, faster
+# start-up) and link it with --icf=all (identical code folding). Needs lld and clang from the same LLVM
+# major version, see the check in build-toolchain.sh.
+rust.bootstrap-override-lld = true
+
+# Upstream: --enable-llvm-static-stdcpp for dist jobs (run.sh). With a prebuilt LLVM this only
+# affects how rustc_llvm links: libstdc++ is linked statically, so the toolchain does not need the
+# host's libstdc++ at run time.
+llvm.static-libstdcpp = true
+
+# Upstream: --set target.x86_64-unknown-linux-gnu.linker=clang. Link the compiler's own
+# binaries through clang, which also runs lld because of rust.bootstrap-override-lld.
+target.x86_64-unknown-linux-gnu.linker = "clang"
+
+# Not set, on purpose. Upstream sets llvm.thin-lto=true and llvm.libzstd=true because it builds
+# LLVM from source with ThinLTO. This recipe uses the LLVM that upstream CI already built with
+# those options (llvm.download-ci-llvm in bootstrap.toml), where the options have no effect and
+# bootstrap only checks them against the artifact. The LLVM is linked dynamically, as upstream's
+# is, because that is how the artifact was built.

@@ -1,6 +1,9 @@
 # Shared stage-2 recipe for the unpatched control and fRust.
 # The build script appends an absolute `build-dir`. Do not set profile flags here
 # that are not used for both builds.
+# The optimization settings of upstream's dist builds are not here. They are applied on top of
+# this file as overrides from bootstrap-common.toml and the bootstrap-linux.toml or
+# bootstrap-macos.toml of the host. Do not repeat their keys in this file.
 change-id = 162423
 
 [llvm]

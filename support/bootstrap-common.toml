@@ -1,0 +1,46 @@
+# Optimization settings that upstream Rust's dist builds use on all three release targets
+# (dist-x86_64-linux, dist-aarch64-apple, dist-x86_64-apple), and that are identical for them.
+# Pinned upstream sources: src/ci/run.sh, src/ci/github-actions/jobs.yml and
+# src/ci/docker/host-x86_64/dist-x86_64-linux/Dockerfile at the commit in support/upstream.lock.
+#
+# These are not a standalone bootstrap.toml. build-toolchain.sh applies every line below as a
+# `--set key = value` override on top of support/bootstrap.toml, so keep exactly one dotted
+# key per line, no section headers, no trailing comments, and no key that bootstrap.toml or
+# the platform file already sets (bootstrap rejects duplicates). Control and fRust read the
+# same files, so the unpatched control stays a fair baseline.
+#
+# Already in bootstrap.toml and matching upstream: rust.lto = "thin" (jobs.yml and the Dockerfile
+# pass --set rust.lto=thin), rust.debuginfo-level = 0 and rust.remap-debuginfo = true (dist profile).
+
+# Upstream passes --set build.allocator=jemalloc (Dockerfile, jobs.yml). The compiler and its tools
+# then allocate with jemalloc instead of the system allocator. On aarch64 bootstrap also sets
+# JEMALLOC_SYS_WITH_LG_PAGE=16 by itself.
+build.allocator = "jemalloc"
+
+# Upstream passes --enable-profiler (Dockerfile, jobs.yml): ship profiler_builtins so that
+# -C profile-generate and -C instrument-coverage work with the toolchain.
+build.profiler = true
+
+# Upstream passes --set build.optimized-compiler-builtins (run.sh) so compiler_builtins uses the C
+# routines from LLVM's compiler-rt. It is also the default for the stable channel, set explicitly
+# so it cannot silently change. Needs the src/llvm-project submodule, which bootstrap checks out.
+build.optimized-compiler-builtins = true
+
+# Upstream passes --enable-cargo-native-static for every CI job (run.sh): Cargo is built with the
+# all-static feature (vendored OpenSSL and libgit2, static curl) so it does not depend on host libraries.
+build.cargo-native-static = true
+
+# Upstream passes --set rust.codegen-units=1 for the dist jobs (Dockerfile, jobs.yml): one
+# codegen unit per crate for rustc and its tools, trading build time for better code.
+rust.codegen-units = 1
+
+# Upstream passes --set rust.codegen-units-std=1 for every CI job (run.sh): same for the standard library.
+rust.codegen-units-std = 1
+
+# Upstream passes --debuginfo-level-std=1 for dist jobs (run.sh): line tables in the standard library
+# so backtraces and profilers resolve std frames. rust.debuginfo-level for rustc stays 0.
+rust.debuginfo-level-std = 1
+
+# Upstream passes --set rust.lld=true (run.sh): build and ship rust-lld. On x86_64-unknown-linux-gnu
+# bootstrap also makes it the default linker of the produced compiler.
+rust.lld = true

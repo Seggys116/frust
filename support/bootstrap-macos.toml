@@ -1,0 +1,14 @@
+# Settings for aarch64-apple-darwin and x86_64-apple-darwin, on top of support/bootstrap.toml and
+# support/bootstrap-common.toml. Same format and rules as bootstrap-common.toml. Source:
+# the dist-aarch64-apple and dist-x86_64-apple jobs in src/ci/github-actions/jobs.yml at the
+# commit in support/upstream.lock.
+#
+# Upstream's macOS dist jobs use no settings beyond the common ones: no PGO, no BOLT, Apple's clang
+# and ld64 (bootstrap passes -flto=thin to the C and C++ parts of rustc because rust.lto is thin).
+# What they add is the deployment target, which build-toolchain.sh exports:
+# MACOSX_DEPLOYMENT_TARGET and MACOSX_STD_DEPLOYMENT_TARGET are 11.0 for aarch64-apple-darwin and
+# 10.12 for x86_64-apple-darwin, so the toolchain runs on every macOS version upstream supports.
+#
+# Not set, on purpose. Upstream sets llvm.link-shared=true. With llvm.download-ci-llvm bootstrap
+# reads the link type from the prebuilt LLVM artifact, which upstream built with that option, so the
+# setting would only print a warning here.

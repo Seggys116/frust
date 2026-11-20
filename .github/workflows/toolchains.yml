@@ -1,8 +1,11 @@
 name: Toolchains
 
 # Manual, and called by Benchmark and Release. Builds the stage-2 toolchains from the pinned sources:
-# the unpatched control and the patched fRust one. Each fRust toolchain is then launched with no
-# ambient state, and on Linux it also passes the fat-LTO, codegen-unit and warm-fresh parity proof.
+# the unpatched control and the patched fRust one, both with the optimization settings of upstream's
+# official dist builds for their platform (support/bootstrap-*.toml), except PGO and BOLT. PGO profiles
+# can be supplied through FRUST_PGO_PROFILES (see build-toolchain.sh), this workflow does not set it.
+# Each fRust toolchain is then launched with no ambient state, and on Linux it also passes the
+# fat-LTO, codegen-unit and warm-fresh parity proof.
 on:
   workflow_dispatch:
     inputs:
@@ -46,7 +49,9 @@ jobs:
   build:
     name: ${{ matrix.variant }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 350
+    # The upstream-matched recipe (one codegen unit, thin LTO) is slower to build than the stock one.
+    # 355 keeps a few minutes of the 360 minute hosted-runner limit for GitHub's own job teardown.
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       matrix:
@@ -55,12 +60,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Name the archive
         run: echo "ARCHIVE=$RUNNER_TEMP/${{ matrix.variant }}-${{ matrix.target }}.tar.zst" >> "$GITHUB_ENV"
-      # A toolchain is rebuilt only when its recipe, patches or packaging inputs change.
+      # A toolchain is rebuilt only when its recipe, patches or packaging inputs change. The recipe
+      # is the lock, every support/bootstrap*.toml (base, common, Linux and macOS settings) and the
+      # build script that sets the compiler environment and applies them.
       - id: key
         env:
           NAME: ${{ matrix.variant }}-${{ matrix.target }}
           VARIANT: ${{ matrix.variant }}
-          RECIPE: ${{ hashFiles('support/upstream.lock', 'support/bootstrap.toml', '.github/scripts/build-toolchain.sh') }}
+          RECIPE: ${{ hashFiles('support/upstream.lock', 'support/bootstrap*.toml', '.github/scripts/build-toolchain.sh') }}
           PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
         run: |
           if [[ $VARIANT == frust ]]; then
@@ -98,6 +105,24 @@ jobs:
       - name: Install build dependencies
         if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+      # The recipe builds with clang and links with lld, as upstream's Linux dist image does, and
+      # bootstrap compiles the C parts of rustc with -flto=thin. The linker has to read that bitcode,
+      # so lld must be the same LLVM version as clang or newer. On ubuntu-24.04 the packages clang,
+      # lld and llvm are all version 18.1.x. Install them only when a tool is missing, then print the
+      # versions. build-toolchain.sh checks them again and fails early on a mismatch.
+      - name: Install clang and lld
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          missing=0
+          for tool in clang clang++ lld ld.lld llvm-ar; do
+            command -v "$tool" > /dev/null || missing=1
+          done
+          if [[ $missing == 1 ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang lld llvm
+          fi
+          clang --version
+          ld.lld --version
       - uses: ./.github/actions/setup-rust
         if: steps.cache.outputs.cache-hit != 'true' && matrix.variant == 'frust'
       - name: Build and pack

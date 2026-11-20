@@ -83,7 +83,74 @@ Stock-compiler characterizations on ripgrep, with oxipng added for the x86-64-v3
 
 ### Cargo unit cache and no-op overhead
 
-These results come from the Benchmark workflow (`clean` and `noop` series, control against fRust, both built by the Toolchains workflow). No workflow run is recorded here yet; each recorded result will name its run and commit and contain no local-host numbers. Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are not release claims. A first build with an empty store also pays for writing cache entries.
+These results come from the Benchmark workflow (the official comparison described in [CI measurement method](#ci-measurement-method)). No workflow run is recorded here yet; each recorded result will name its run and commit and contain no local-host numbers. Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are not release claims. A first build with an empty store also pays for writing cache entries.
+
+## CI measurement method
+
+The Benchmark workflow (`.github/workflows/benchmark.yml`) is started by hand and holds two measurements. Neither writes a number into this repository. Numbers are published only from a completed run, by hand, with the run and commit named.
+
+### Official comparison
+
+Official Rust against the fRust toolchain with its Cargo unit cache, on three GitHub-hosted platforms:
+
+| Platform | Runner label | Target |
+| --- | --- | --- |
+| `linux-x86_64` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `macos-arm64` | `macos-latest` | `aarch64-apple-darwin` |
+| `macos-x86_64` | `macos-15-intel` | `x86_64-apple-darwin` |
+
+- Official toolchain: `rustup toolchain install 1.100.0 --profile minimal`, pinned to that exact version. The driver refuses to run unless `rustc -Vv` reports `release: 1.100.0`.
+- fRust toolchain: the packaged stage-2 toolchain built natively on a runner of the same kind by the Toolchains workflow, run as shipped through `fcargo` and `frustc`. The experimental switches are off unless the `compare-experimental` input turns them on. The published binaries of official Rust are PGO builds and the fRust recipe is not, which is why the frozen stock budgets use the unpatched stage-2 of the same recipe instead (`qualification/PROTOCOL.md`).
+- Sources: the commits and `Cargo.lock` hashes of `qualification/cohorts.lock`, fetched by `qualification/fetch-cohort.sh`, built `--locked --offline`. Each job builds one workload, from ripgrep, syn, regex and fd. Both toolchains build the same tree.
+- Profile: the shared release profile of the protocol (opt-level 3, fat LTO, one codegen unit, incremental, no debug info, no strip) on both sides.
+- Driver: `qualification/ci-bench.py`, which reuses the `Toolchain` class and helpers of `qualification/run-store-bench.py`. Charts and tables: `qualification/make-charts.py`.
+
+Scenarios, each measured once per round per toolchain:
+
+| Scenario | Starting state |
+| --- | --- |
+| cold build | Empty target directory. fRust starts with an empty unit cache store. |
+| clean rebuild | Target directory removed. The fRust store holds the entries written by that round's cold build. Official Rust has no store, so this is its cold build again. |
+| no-op rebuild | Immediate rebuild in the clean rebuild's target. The sample is the median of several builds (`noops` input). |
+| edit rebuild | The frozen edit of `qualification/edits/` (leaf and wide for ripgrep, syn and regex, holdout for fd) applied to a copy of the clean rebuild's target, then reversed with the original file times restored, so one edit never makes the next sample rebuild extra files. |
+
+### Unit cache store rules
+
+The store is in the cache directory, so a store left by an earlier build would turn a cold fRust build into a warm one. The driver therefore owns it:
+
+- `FRUST_HOME` points into the job's scratch directory for fRust builds. It moves the store on Linux and on macOS, where `XDG_CACHE_HOME` is not read (`docs/configuration.md`). Ambient `FRUST_HOME` and `FRUST_UNIT_CACHE*` values are dropped, and `XDG_CACHE_HOME` is redirected to a scratch directory as well.
+- Before every cold fRust build the store is deleted and checked empty. A store that cannot be emptied stops the run.
+- After the cold build the store must hold files. An empty store means the cache did not use the isolated path, so the cold and clean series would be wrong, and the run fails.
+- A clean rebuild always follows the cold build of the same round, so its store contents come from that round only.
+- The official toolchain has no store, and `FRUST_UNIT_CACHE` is `0` for it.
+- The unit cache prints one line per decision with `FRUST_UNIT_CACHE_DEBUG=1`. The driver enables it for fRust builds and records the counts, so the report can show hits and misses next to the CPU.
+
+The frozen pair protocol jobs (`qualification/run-pairs.py`, control against fRust on Linux) follow the same rules with `--unit-cache on`: the store is emptied before the series and before every fRust cold sample, and a clean series builds the unmodified tree cold into an empty target with a fresh store before the timed rebuild. The clean series is not a gate input. It and the size of the store around every build are written to a separate JSON lines file. The resource gate still counts target bytes only, and the trace record carries the store bytes beside it.
+
+### Measurement and statistics
+
+- CPU is user plus system seconds of the whole cargo process tree, read from `wait4`. Wall time and peak RSS are recorded beside it.
+- A pair is one round. The two toolchains build one after the other on the same runner, and the order alternates between rounds. Each round also resets the store and the target, so rounds are independent. One unmeasured official build runs before the first round, so unpacking the fetched registry sources is not charged to whichever toolchain happens to build first.
+- On Linux both sides run under `taskset` on every available CPU with `-j` equal to that count. macOS has no `taskset`, so nothing is pinned there, `-j` is the logical CPU count, and the metadata record says so. macOS runners are virtual machines on shared hosts and their timing is noisier.
+- The reported figure per scenario is the median of the per-pair ratios of fRust CPU to official CPU, as a percent, with the number of pairs, the range of the pair ratios and the number of pairs in which fRust was faster. The medians of the two CPU columns are shown for scale. A summary row per scenario is the geometric mean of the per-workload medians.
+- A scenario is flagged, in the table and in the chart, when the median is not below 100 percent, when fRust was slower in some pairs, when fewer than three pairs were taken, when fewer pairs were taken than requested, or when a no-op rebuild compiled units. Nothing is dropped because it is unfavourable.
+- Builds that exit non-zero are recorded, excluded from the pairs and listed in the report.
+- A job starts no round that would end after 300 minutes, so jobs stay inside the six hour limit of a hosted runner. A run cut short this way records a stop line and the report states how many pairs it has.
+
+### Recorded environment
+
+Each raw result file starts with a meta record: platform label, runner CPU model, physical and logical core counts (and performance and efficiency cores on Apple silicon), OS, memory, pinning mode, `-j`, both toolchains' `cargo -V` and `rustc -Vv` output, the repository commit, the workflow run, the cohort commit and `Cargo.lock` hash, the profile and the fRust environment. The report lists every distinct host, because runner hardware varies between jobs of one platform.
+
+### Output
+
+Every `compare` job uploads its raw JSON lines and cargo logs as `compare-<platform>-<workload>`. The `report` job downloads them all and uploads `benchmark-report`, with `results.md`, `summary.json` and one `chart-<platform>.svg` per platform. Each chart has one horizontal bar per scenario and workload, with 100 percent marked. The job also writes the table to the run summary and commits nothing.
+
+### Limits
+
+- Shared runners are noisy and their hardware is not chosen. The ratios are within-job, so they do not depend on the runner, but they are valid only for the hardware recorded with them.
+- The edit scenarios use the frozen edits, which sit inside the inlining cone of their callers (see below). They are not a general edit workload.
+- The official comparison does not use `qualification/time-build.sh`, whose empty-target check uses `find -quit`, which is GNU specific, and which always runs plain `cargo` rather than `fcargo`. The protocol jobs still use it, turn the unit cache on with `FRUST_UNIT_CACHE=1`, and stay on Linux x86-64.
+- The runtime and stripped size gates are not part of the official comparison.
 
 ## Rules for new measurements
 
