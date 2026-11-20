@@ -1,0 +1,15 @@
+--- a/src/build_helper/src/lib.rs
++++ b/src/build_helper/src/lib.rs
+@@ -33,4 +33,12 @@
+     "diesel-2.2.10",
+     "bitmaps-3.2.1",
+     "serde-1.0.219-new-solver",
++    // fRust: application-style crates in addition to the upstream stress set. Workloads used to
++    // measure fRust (qualification/cohorts.lock: ripgrep, regex, syn, fd, rustfmt, oxipng,
++    // zstd-rs) are deliberately absent, so syn-2.0.101, regex-automata and ripgrep are not here.
++    "serde-1.0.219",
++    "clap_derive-4.5.32",
++    "hyper-1.6.0",
++    "html5ever-0.31.0",
++    "eza-0.21.2",
+ ];
