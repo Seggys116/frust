@@ -1,24 +1,46 @@
 name: Release
 
-# Pushing a v* tag builds the toolchain, publishes a GitHub release that `frust-install` downloads,
-# then publishes the crates. Run by hand from a branch for a dry run that builds and smoke-tests
-# everything and publishes nothing.
+# Pushing a v* tag builds the toolchain, validates it, publishes a GitHub release that `frust-install`
+# downloads, then publishes the crates. A run started by hand (workflow_dispatch) is a dry run: it builds,
+# packages and validates everything exactly as a tag does and publishes nothing, whatever ref it runs on.
+# Prove a release commit before tagging it with
+#
+#   gh workflow run release.yml --ref main
+#
+# (add -f rebuild=true to ignore the cached toolchains and build them again, which takes about two
+# hours with the macOS Intel build; without it unchanged recipes reuse their cached build and the run
+# takes about 25 minutes). The run lists its jobs in `gh run watch`. Only a green dry run on the commit
+# to be tagged shows that the tag will publish.
+#
+# Every archive is a complete toolchain: the fRust compiler and Cargo, clippy, rustfmt, rust-analyzer,
+# rust-docs, the extra std targets of its platform and the frust, fclippy, frustfmt and frustup commands.
+# The package job of each archive installs it with frust-install and runs the validation suite
+# (support/toolchain-suite.sh) against the installed copy. The release is created only when every one of
+# the four archives passed: each package job leaves a validation record with the sha256 of the archive it
+# validated, and the publishing job refuses an archive without a record of its exact bytes.
 #
 # Linux x86-64 ships two archives: frust-toolchain-x86_64-unknown-linux-gnu (baseline x86-64) and
 # frust-toolchain-x86_64-unknown-linux-gnu-v3 (compiler and tools built for x86-64-v3), each with
-# its .sha256 and .id file. `frust-install` picks the v3 one on a CPU that supports it. The v3
-# smoke test runs only on a runner CPU with AVX2 and BMI2 and the rest of the v3 set, and says so
-# when it is skipped; the baseline one always runs.
+# its .sha256 and .id file. `frust-install` picks the v3 one on a CPU that supports it. The v3 archive can
+# be validated only on a runner CPU with AVX2, BMI2 and the rest of the v3 set. A tag run fails the v3 job
+# on a runner without them (re-run the failed job to get another runner); a dry run reports the skip as a
+# warning and the baseline archive is still validated in full.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Ignore cached toolchains and build them again
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# A dry run never holds up a tag run, and two tag runs never publish at the same time.
 concurrency:
-  group: release
+  group: release-${{ github.event_name == 'push' && 'publish' || 'dry-run' }}
   cancel-in-progress: false
 
 env:
@@ -76,11 +98,13 @@ jobs:
 
   # The released toolchain has the experimental switches off, so parity is checked in that state.
   # macOS arm64 and Intel are built natively on their own runners. Linux x86-64 is built twice,
-  # for the baseline CPU and for x86-64-v3, both with the launch check and the parity proof.
+  # for the baseline CPU and for x86-64-v3, both with the launch check and the parity proof. Every
+  # build includes clippy and rustfmt, and the launch check runs them.
   toolchains:
     needs: preflight
     uses: ./.github/workflows/toolchains.yml
     with:
+      rebuild: ${{ inputs.rebuild == true }}
       builds: '[{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","cpu":"baseline"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","cpu":"v3"},{"variant":"frust","target":"aarch64-apple-darwin","os":"macos-latest"},{"variant":"frust","target":"x86_64-apple-darwin","os":"macos-15-intel"}]'
       codegen-cache: false
       relr: false
@@ -96,25 +120,55 @@ jobs:
       - run: cargo publish --workspace --dry-run --locked
         working-directory: crates
 
+  # The lock is what package-release.sh downloads and verifies, so a bad pin is caught here in seconds
+  # and not after the toolchains were built.
+  official-lock:
+    name: official components lock
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: support
+      - run: python3 -I support/tools/check-official-components-lock.py
+
   # One job per archive. toolchain names the build artifact of the toolchains job (frust-v3 is the
   # x86-64-v3 build) and variant is what package-release.sh records for the targets that have two
-  # builds; it is empty for the others.
+  # builds; it is empty for the others. The job packages the archive with the official components
+  # (rust-std targets, rust-docs, rust-analyzer: package-release.sh downloads them over https and checks
+  # every sha256 against support/official-components.lock), installs it with frust-install and runs the
+  # whole validation suite on the installed copy. Needs bash, curl, tar, python3 and gzip, which the
+  # Linux and macOS runner images have.
   package:
-    name: package and smoke-test (${{ matrix.target }}${{ matrix.variant == 'v3' && ' v3' || '' }})
-    needs: [preflight, toolchains]
+    name: package and validate (${{ matrix.target }}${{ matrix.variant == 'v3' && ' v3' || '' }})
+    needs: [preflight, toolchains, official-lock]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The macOS suite also cross-compiles and links for the iOS targets and runs the simulator-free
+    # checks; the Linux suite builds for every bundled target. 120 minutes is several times the 0.5.1
+    # smoke test, which took five.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust, variant: baseline }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust-v3, variant: v3 }
-          - { target: aarch64-apple-darwin, os: macos-latest, toolchain: frust, variant: "" }
-          - { target: x86_64-apple-darwin, os: macos-15-intel, toolchain: frust, variant: "" }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust, variant: baseline, bundle: linux }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, toolchain: frust-v3, variant: v3, bundle: linux }
+          - { target: aarch64-apple-darwin, os: macos-latest, toolchain: frust, variant: "", bundle: macos-aarch64 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, toolchain: frust, variant: "", bundle: macos-x86_64 }
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
+      - name: Prepare the runner
+        run: |
+          command -v zstd > /dev/null || brew install zstd
+          echo "FRUST_OFFICIAL_CACHE=$RUNNER_TEMP/official-components" >> "$GITHUB_ENV"
+      # The official packages are pinned by hash, so a cached download is used only when it still matches
+      # (fetch-official-components.sh checks), and a changed lock gets a new cache key.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/official-components
+          key: official-components-${{ matrix.target }}-${{ hashFiles('support/official-components.lock') }}
       - uses: actions/download-artifact@v8
         with:
           name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
@@ -128,9 +182,12 @@ jobs:
         run: |
           .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/${{ matrix.toolchain }}-${{ matrix.target }}.tar.zst" \
             "${{ needs.preflight.outputs.version }}" "${{ matrix.target }}" crates/target/release/frust-install dist ${VARIANT:+"$VARIANT"}
+          rm -f "$RUNNER_TEMP/toolchain/${{ matrix.toolchain }}-${{ matrix.target }}.tar.zst"
           ls -l dist
+          df -h "$RUNNER_TEMP"
       # The v3 toolchain only runs on a CPU with every extension it uses, and the GitHub runner pool is
-      # not guaranteed to have them. The baseline smoke test never depends on this step.
+      # not guaranteed to have them. The baseline validation never depends on this step. A tag run does
+      # not publish a v3 archive that was not run, so there a runner without the extensions fails the job.
       - id: cpu
         name: Check that this runner can run the v3 toolchain
         if: matrix.variant == 'v3'
@@ -138,14 +195,18 @@ jobs:
           if message=$(bash .github/scripts/cpu-supports-v3.sh); then
             echo "runnable=true" >> "$GITHUB_OUTPUT"
             echo "$message"
+          elif [[ $GITHUB_EVENT_NAME == push ]]; then
+            echo "::error title=v3 archive not validated::$message. Re-run this job to get another runner: the release does not publish a v3 archive that was not run."
+            exit 1
           else
             echo "runnable=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=v3 smoke test skipped::$message. The v3 archive was packaged but not run on this runner."
-            echo "The v3 smoke test was skipped: $message" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=v3 validation skipped::$message. The v3 archive was packaged but not run on this runner."
+            echo "The v3 validation was skipped: $message" >> "$GITHUB_STEP_SUMMARY"
           fi
-      # frust-install is the way users get the toolchain, so the smoke test uses it end to end. The
+      # frust-install is the way users get the toolchain, so the validation uses it end to end. The
       # variant is forced, so each Linux job tests its own archive whatever the runner CPU is.
-      - name: Install from the release files and build with the result
+      - id: install
+        name: Install from the release files
         if: matrix.variant != 'v3' || steps.cpu.outputs.runnable == 'true'
         env:
           FRUST_VARIANT: ${{ matrix.variant }}
@@ -163,19 +224,69 @@ jobs:
           if [[ -n $VARIANT ]]; then
             grep -F "\"current_variant\": \"$VARIANT\"" "$prefix/state.json"
           fi
+          echo "FRUST_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Launch with no ambient state
+        if: steps.install.outcome == 'success'
+        run: |
           mkdir -p "$RUNNER_TEMP/launch"
-          support/launch-check.sh "$prefix/current" "$RUNNER_TEMP/launch" "$RUNNER_TEMP/launch/launch.log"
+          support/launch-check.sh "$FRUST_PREFIX/current" "$RUNNER_TEMP/launch" "$RUNNER_TEMP/launch/launch.log"
           cat "$RUNNER_TEMP/launch/launch.log"
+      # The suite runs against the installed prefix, so it also exercises frust-install and frustup, and with
+      # FRUST_SUITE_ONLINE it adds a target from the real official channel. It needs no other network. A failed
+      # check does not stop it: the log lists every failure and the step fails at the end.
+      - name: Validation suite
+        if: steps.install.outcome == 'success'
+        env:
+          BUNDLE: ${{ matrix.bundle }}
+          FRUST_SUITE_ONLINE: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/suite-output"
+          # The default shell has no pipefail, so the status is kept here and not taken from a pipe.
+          status=0
+          support/toolchain-suite.sh "$FRUST_PREFIX" "$RUNNER_TEMP/suite" "$BUNDLE" > "$RUNNER_TEMP/suite-output/suite.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/suite-output/suite.txt"
+          {
+            echo "### Validation suite, ${{ matrix.target }}${{ matrix.variant == 'v3' && ' v3' || '' }}"
+            echo "passed: $(grep -c '^PASS' "$RUNNER_TEMP/suite-output/suite.txt" || true), failed: $(grep -c '^FAIL' "$RUNNER_TEMP/suite-output/suite.txt" || true), skipped: $(grep -c '^SKIP' "$RUNNER_TEMP/suite-output/suite.txt" || true)"
+            sed -n '/^FAILED CHECKS:/,$p' "$RUNNER_TEMP/suite-output/suite.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      # A record of the exact archive that passed. The publishing job refuses an archive without one.
+      - name: Record the validation
+        if: steps.install.outcome == 'success'
+        env:
+          ARCHIVE: frust-toolchain-${{ matrix.target }}${{ matrix.variant == 'v3' && '-v3' || '' }}.tar.gz
+        run: |
+          mkdir -p validated
+          cp "dist/$ARCHIVE.sha256" "validated/$ARCHIVE.validated"
+          cat "validated/$ARCHIVE.validated"
       - uses: actions/upload-artifact@v7
         with:
           name: release-files-${{ matrix.toolchain }}-${{ matrix.target }}
           path: dist
           retention-days: 14
+      - uses: actions/upload-artifact@v7
+        if: steps.install.outcome == 'success'
+        with:
+          name: validated-${{ matrix.toolchain }}-${{ matrix.target }}
+          path: validated
+          retention-days: 14
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: validation-logs-${{ matrix.toolchain }}-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/launch/launch.log
+            ${{ runner.temp }}/suite-output/suite.txt
+            ${{ runner.temp }}/suite/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
 
+  # Only a tag push publishes. A dry run (workflow_dispatch) ends before this job, on any ref.
   github-release:
     name: publish the GitHub release
     needs: [preflight, package, crates-check]
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -186,6 +297,45 @@ jobs:
           pattern: release-files-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: validated-*
+          path: validated
+          merge-multiple: true
+      # Exactly these four archives, each with its checksum and id, and for each the record that a
+      # package job installed and validated an archive with the same sha256. Nothing else is published.
+      - name: Require four validated archives
+        run: |
+          expected=(
+            frust-toolchain-x86_64-unknown-linux-gnu
+            frust-toolchain-x86_64-unknown-linux-gnu-v3
+            frust-toolchain-aarch64-apple-darwin
+            frust-toolchain-x86_64-apple-darwin
+          )
+          status=0
+          for name in "${expected[@]}"; do
+            for file in "$name.tar.gz" "$name.tar.gz.sha256" "$name.id"; do
+              [[ -s dist/$file ]] || { echo "::error::missing release file $file"; status=1; }
+            done
+            if [[ ! -f validated/$name.tar.gz.validated ]]; then
+              echo "::error::$name.tar.gz was not validated"
+              status=1
+            elif ! cmp -s "dist/$name.tar.gz.sha256" "validated/$name.tar.gz.validated"; then
+              echo "::error::$name.tar.gz is not the archive that was validated"
+              status=1
+            elif [[ $(cut -d' ' -f1 "dist/$name.tar.gz.sha256") != $(sha256sum "dist/$name.tar.gz" | cut -d' ' -f1) ]]; then
+              echo "::error::$name.tar.gz does not match its sha256 file"
+              status=1
+            fi
+          done
+          count=$(find dist -type f | wc -l)
+          if [[ $count -ne $(( ${#expected[@]} * 3 )) ]]; then
+            echo "::error::dist holds $count files, expected $(( ${#expected[@]} * 3 ))"
+            find dist -type f
+            status=1
+          fi
+          ls -l dist
+          exit $status
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -200,7 +350,7 @@ jobs:
   crates-io:
     name: publish the crates
     needs: github-release
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

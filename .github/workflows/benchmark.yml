@@ -511,6 +511,13 @@ jobs:
         with:
           name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
           path: ${{ runner.temp }}/toolchain
+      # The archive carries the official components of its platform, which package-release.sh downloads
+      # and checks against the pins of support/official-components.lock. The downloads are cached.
+      - uses: actions/cache@v6
+        if: steps.cpu.outputs.runnable != 'false'
+        with:
+          path: ${{ runner.temp }}/official-components
+          key: official-components-${{ matrix.target }}-${{ hashFiles('support/official-components.lock') }}
       # The same script and arguments as the package job of the Release workflow, so the archive
       # has the release layout: manifest with the release id and variant, frust-install inside.
       - name: Package the release files
@@ -518,6 +525,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           TOOLCHAIN: ${{ matrix.toolchain }}
+          FRUST_OFFICIAL_CACHE: ${{ runner.temp }}/official-components
           CPU: ${{ matrix.cpu }}
         run: |
           command -v zstd > /dev/null || brew install zstd

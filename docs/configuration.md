@@ -6,7 +6,7 @@ fRust keeps build outputs in per-user central storage when Cargo is started thro
 
 The patched Cargo uses a central target directory only when all of these hold:
 
-- Cargo was started by `fcargo` (which sets `FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`.
+- Cargo was started by `fcargo`, `frust` or `fclippy` (which set `FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`, `frust` or `fclippy`.
 - `FRUST_CENTRAL_TARGET` is not `off`.
 - No target directory or build directory was chosen another way, for example `CARGO_TARGET_DIR` or a Cargo configuration setting.
 - The workspace is not an ephemeral or embedded manifest.
@@ -44,7 +44,7 @@ The patched Cargo creates `<cache_root>/artifacts` and a `MARKER` file containin
 
 The patched Cargo (`support/patches/0007-frust-unit-cache.patch`) keeps a content-addressed store of finished rustc outputs for registry, git and directory-source dependencies, and of heavy build script runs of registry and git packages. It lives in `<cache_root>/artifacts/units/v1` (default `~/.cache/frust/artifacts/units/v1` on Linux). `HOME` must be an absolute path. [How it works](how-it-works.md#unit-artifact-cache) describes what is stored, the key and the fallbacks.
 
-The cache is on when Cargo was started by `fcargo` (`FRUST_INVOCATION=fcargo`) or its executable is named `fcargo`. It is available on Linux and macOS only.
+The cache is on when Cargo was started by `fcargo`, `frust` or `fclippy` (`FRUST_INVOCATION=fcargo`) or its executable has one of those names. It is available on Linux and macOS only.
 
 | Variable | Effect |
 | --- | --- |
@@ -57,13 +57,29 @@ After a store, a size scan runs at most once per process, and only when the size
 
 ## Direct entry
 
-In the packaged toolchain `fcargo` is a hard link of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. On Linux and macOS, `fcargo` runs Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO` and, when `RUSTC` is unset and a sibling `frustc` exists, `RUSTC` set, unless one of these holds, in which case it executes `fcargo-ui` with the same arguments:
+In the packaged toolchain `fcargo`, `frust` and `fclippy` are hard links of the patched `cargo` (`support/patches/0008-frust-direct-entry.patch`), and the terminal progress launcher is installed as `fcargo-ui`. The patched Cargo looks at the file name it was started as:
+
+| Name | Behavior |
+| --- | --- |
+| `fcargo` | Cargo with the fRust defaults described below. |
+| `frust` | Identical to `fcargo`, plus the `where` command below. |
+| `fclippy` | `fcargo clippy ARGS...`. The `clippy` subcommand is inserted for you, after a leading `+toolchain` if there is one: `fclippy +nightly --all-targets` is `fcargo +nightly clippy --all-targets`. |
+
+On Linux and macOS these names run Cargo directly, with `FRUST_INVOCATION=fcargo`, `CARGO`, the toolchain's `bin` directory put first on `PATH` (so its `cargo-clippy`, `cargo-fmt` and `rustfmt` win over a rustup proxy of the same name) and, when `RUSTC` is unset and the compiler exists, `RUSTC` set. `RUSTC` is the sibling `frustc`, except for the `clippy` subcommand, where it is the sibling `rustc` (the same binary): clippy-driver runs as a wrapper and only recognises the compiler path Cargo hands it when the file stem is `rustc`. Clippy runs therefore skip the behaviors keyed on the name `frustc` (content fingerprints, the fat LTO defaults and the interface cutoff). The central target directory and the unit cache apply to all three names. A run is handed to `fcargo-ui` with the same arguments (with `clippy` inserted for `fclippy`) when one of these holds:
 
 - Progress is not plain. It is plain when `TERM=dumb`, when `FRUST_PROGRESS` is `plain` or `off`, or when `FRUST_PROGRESS` is not `static` or `interactive` and stderr is not a terminal.
 - `FRUST_CARGO` is set and not empty.
 - The first argument starts with `+`.
 
-If `FRUST_CARGO` names an `fcargo` that is the same file as this executable, it exits with an error naming the problem. On other hosts `fcargo` is still the patched Cargo, but the direct entry code is not compiled.
+A plain `fclippy` cannot change its own argument list, so it starts the same executable again as `cargo` with `clippy` inserted; the environment above is inherited and the second start does not enter this logic again.
+
+If `FRUST_CARGO` names an `fcargo`, `frust` or `fclippy` that is the same file as this executable, it exits with an error naming the problem. On other hosts these names are still the patched Cargo, but the direct entry code is not compiled.
+
+### `frust where`
+
+`frust where` (and `fcargo where`) prints, on one line, the target directory a build in the workspace of the current directory would use, and exits 0. It is the central directory described above, or `<workspace>/target` with `FRUST_CENTRAL_TARGET=off`, or whatever `CARGO_TARGET_DIR` or `build.target-dir` chooses, honoring `FRUST_HOME` and `config.json` like a build. `frust where --manifest-path PATH` asks about another workspace. Outside a workspace it fails with Cargo's usual `could not find Cargo.toml` error (exit 101).
+
+The command is recognised only under the names `fcargo` and `frust`, and only as exactly `where` or `where --manifest-path PATH`; any longer command line goes to Cargo unchanged. It is handled before a terminal hand-over, so it never starts the progress launcher. Stock Cargo has no `where` command, but a `cargo-where` plugin or a `where` alias would be shadowed by `fcargo where` and `frust where`; run `cargo where` (the plain `cargo` entry) for those.
 
 ## Installer variants
 
@@ -75,6 +91,27 @@ On Linux x86-64 a release has two toolchain archives. `frust-toolchain-x86_64-un
 - `baseline` or `v3`: that build. `v3` fails when the release has no v3 archive, and on a host that has no variants. On a CPU that lacks an extension it installs with a warning, because the toolchain may not run there. Any other value is a usage error (exit status 2).
 
 `state.json` records `current_variant` and `previous_variant` next to `current` and `previous`, read from the optional `variant` member of each archive's `manifest.json`. `rollback` switches both back. `install` and `update` keep the installed variant unless `FRUST_VARIANT` is `baseline` or `v3`, so a machine moved to another CPU is not changed behind your back, and to move an installed baseline to v3 you run `FRUST_VARIANT=v3 frust-install update`. An installation made before variants existed records none, so its first update chooses as `auto` does. `FRUST_VARIANT` is ignored with `--archive`, which installs the variant its manifest names.
+
+## Targets and components
+
+An archive already has the standard library for the targets listed in the [README](../README.md#use). `frust-install` (also installed as `frustup`, which behaves the same and prints its help when run with no command) adds and removes others, and adds the compiler-independent components of the official Rust 1.100.0 channel:
+
+```sh
+frust-install target list [--installed]
+frust-install target add thumbv7em-none-eabihf
+frust-install target remove thumbv7em-none-eabihf
+frust-install component list [--installed]
+frust-install component add rust-src
+frust-install component remove rust-src
+frust-install show
+frust-install which cargo-clippy
+```
+
+`target add` takes any target of the channel. `component add` takes `rust-docs`, `rust-src` or `llvm-tools`, and leaves one that the toolchain already has alone (the archive bundles `rust-docs` and `rust-src`). Cargo, rustc, rustdoc, clippy, rustfmt and rust-analyzer (with its proc-macro server) are built into every archive and are replaced by an update, so they are not added or removed; the official rust-analyzer links the official compiler driver and cannot start next to the fRust compiler. `show` prints the installed version, variant, host, targets and components, and `which TOOL` prints the path of a tool of the installed toolchain. All of them take `--prefix`.
+
+The commands read the channel manifest of the Rust release the toolchain was built from (`https://static.rust-lang.org/dist/channel-rust-1.100.0.toml`), check it against its published sha-256, download the package for the host and target, check the package against the sha-256 in the manifest, and validate the archive before unpacking it into the installed toolchain. A package never overwrites a file that is already there, so the standard library of the host stays the one fRust built. This is sound for the same reason the bundled libraries are: the fRust compiler reports the same `rustc -vV` as official Rust 1.100.0 ([how it works](how-it-works.md#what-the-toolchain-contains)). `FRUST_DIST_BASE` replaces the download location, for a mirror.
+
+The installer records every target and component you add in `extras.list` in the prefix. After `frust-install install`, `update` or `upgrade` downloads a new toolchain, it adds the recorded ones to it again, except those the new archive already bundles. A failure in that step is reported with the command that retries it and does not undo the update. `rollback` only switches back to the previous version tree.
 
 ## Environment variables
 
@@ -89,6 +126,7 @@ On Linux x86-64 a release has two toolchain archives. `frust-toolchain-x86_64-un
 | `FRUST_TOOLCHAIN_ID` | patched Cargo | Overrides the toolchain id used in the central target path. |
 | `FRUST_EXPERIMENTAL_CODEGEN_CACHE` | `frustc` | `1` enables the post-LTO object cache. |
 | `FRUST_EXPERIMENTAL_RELR` | `frustc` | `1` enables packed relative relocations on eligible GNU links. |
+| `FRUST_DIST_BASE` | `frust-install`, `frustup` | Download location of the official channel for `target` and `component` commands. Default `https://static.rust-lang.org/dist`. |
 | `FRUST_VARIANT` | `frust-install` | `auto`, `baseline` or `v3`: which Linux x86-64 build to install. Default `auto`. See [Installer variants](#installer-variants). |
 
 `fcargo` also sets `RUSTC` to a `frustc` next to the Cargo executable when `RUSTC` is unset and that file exists. It forwards Cargo's exit code. Plain mode, `--quiet`, `-q`, `--message-format` and `--json` pass straight through to Cargo.

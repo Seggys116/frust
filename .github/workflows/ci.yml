@@ -60,12 +60,24 @@ jobs:
             qualification
       - name: Syntax with each script's own interpreter
         run: |
-          for script in .github/scripts/*.sh support/*.sh qualification/*.sh; do
+          for script in .github/scripts/*.sh support/*.sh support/tools/*.sh qualification/*.sh; do
             interpreter=$(head -n 1 "$script" | sed 's|^#! */\(usr/\)\?bin/\(env \)\?||')
             "$interpreter" -n "$script"
           done
       # Info and style findings stay advisory; errors fail the job.
-      - run: shellcheck -x -S error .github/scripts/*.sh support/*.sh qualification/*.sh
+      - run: shellcheck -x -S error .github/scripts/*.sh support/*.sh support/tools/*.sh qualification/*.sh
+      # The scripts that run on the macOS runners (the macOS build, the packaging and the validation
+      # suite) start with #!/bin/bash, which there is bash 3.2. A syntax error or a bash 4 construct
+      # that parses only there would pass the check above and fail after an hour of building.
+      - name: Syntax under bash 3.2
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" --workdir /repo bash:3.2 bash -c '
+            status=0
+            for script in .github/scripts/*.sh support/*.sh support/tools/*.sh qualification/*.sh; do
+              [[ $(head -n 1 "$script") == "#!/bin/bash" ]] || continue
+              bash -n "$script" || status=1
+            done
+            exit $status'
 
   workflows:
     name: workflow lint
@@ -111,6 +123,63 @@ jobs:
         run: FRUST_RUST_SRC="$RUNNER_TEMP/rust" support/apply-rustc-patches.sh
       - name: Apply Cargo patches
         run: FRUST_CARGO_SRC="$RUNNER_TEMP/rust/src/tools/cargo" support/apply-patches.sh
+
+  # The release bundles official rust-std, rust-docs and rust-src packages that this lock pins.
+  # The check needs the network: it compares every pin with the channel manifest that static.rust-lang.org
+  # serves for the release, so a hash that was mistyped or that the lock took from somewhere else fails here
+  # and not in the middle of the release build.
+  official:
+    name: official components lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: support
+      - name: Pins match the channel manifest
+        run: python3 -I support/tools/check-official-components-lock.py
+      - name: Python tools compile
+        run: |
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache"
+          python3 -I -m py_compile support/tools/*.py
+
+  # fetch-official-components.sh is what package-release.sh runs to add the official packages to a
+  # toolchain. This runs it for real, for each bundle, into an empty tree: every package is downloaded,
+  # its hash checked against the pin, its layout checked and unpacked, and no package may overwrite another.
+  # The macOS bundles unpack on Linux too, so the check needs no macOS runner.
+  bundles:
+    name: official components (${{ matrix.bundle }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: [linux, macos-aarch64, macos-x86_64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: support
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/official-components
+          key: official-components-${{ matrix.bundle }}-${{ hashFiles('support/official-components.lock') }}
+      - name: Fetch and unpack the bundle
+        env:
+          BUNDLE: ${{ matrix.bundle }}
+          FRUST_OFFICIAL_CACHE: ${{ runner.temp }}/official-components
+        run: |
+          tree=$RUNNER_TEMP/tree
+          mkdir -p "$tree/bin" "$tree/lib/rustlib"
+          support/fetch-official-components.sh "$BUNDLE" "$tree" "$RUNNER_TEMP/report.txt"
+          cat "$RUNNER_TEMP/report.txt"
+          pinned=$(grep -c "^$BUNDLE " support/official-components.lock)
+          installed=$(wc -l < "$RUNNER_TEMP/report.txt")
+          if [[ $pinned -eq 0 || $pinned -ne $installed ]]; then
+            echo "::error::the lock pins $pinned packages for $BUNDLE and $installed were installed"
+            exit 1
+          fi
+          test -f "$tree/share/doc/rust/html/index.html"
+          test -d "$tree/lib/rustlib/src/rust/library"
 
   clippy:
     runs-on: ubuntu-latest
@@ -188,7 +257,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [diff, svg, shell, workflows, corpus, upstream, clippy, rustdoc, test, package, cross]
+    needs: [diff, svg, shell, workflows, corpus, upstream, official, bundles, clippy, rustdoc, test, package, cross]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

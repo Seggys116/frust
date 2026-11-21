@@ -208,12 +208,19 @@ jobs:
         with:
           name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
           path: ${{ runner.temp }}/toolchain
+      # The archive carries the official components of its platform, which package-release.sh downloads
+      # and checks against the pins of support/official-components.lock. The downloads are cached.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/official-components
+          key: official-components-${{ matrix.target }}-${{ hashFiles('support/official-components.lock') }}
       # The same script and arguments as the package job of the Release workflow, so the archive
       # has the release layout: manifest with the release id, frust-install inside.
       - name: Package the release files
         env:
           TARGET: ${{ matrix.target }}
           TOOLCHAIN: ${{ matrix.toolchain }}
+          FRUST_OFFICIAL_CACHE: ${{ runner.temp }}/official-components
         run: |
           command -v zstd > /dev/null || brew install zstd
           version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')

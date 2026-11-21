@@ -1861,7 +1861,7 @@ index ca56daf..9254b67 100644
 +        Path::new(&argv0)
 +            .file_name()
 +            .and_then(|name| name.to_str())
-+            == Some("fcargo")
++            .is_some_and(|name| matches!(name, "fcargo" | "frust" | "fclippy"))
 +    })
 +}
 +

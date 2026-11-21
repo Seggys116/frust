@@ -9,8 +9,11 @@ name: Toolchains
 # settings of upstream's official dist builds for their platform (support/bootstrap-*.toml), except
 # PGO and BOLT. PGO profiles can be supplied to that plain recipe through FRUST_PGO_PROFILES (see
 # build-toolchain.sh), this workflow does not set it.
-# Each fRust toolchain is then launched with no ambient state, and on Linux it also passes the
-# fat-LTO, codegen-unit and warm-fresh parity proof, both variants.
+# Every fRust toolchain includes clippy and rustfmt (built by bootstrap against its own compiler). Each is
+# then launched with no ambient state, which runs a build, rustdoc, clippy and rustfmt, and on Linux it also
+# passes the fat-LTO, codegen-unit and warm-fresh parity proof, both variants. The archive that users get is
+# made from the artifact by the package job of the Release workflow, which adds the official components and
+# runs the validation suite on the installed result.
 #
 # A builds entry is {variant, target, os} with an optional cpu, baseline or v3. cpu is only for the
 # fRust toolchain on x86_64-unknown-linux-gnu, and an entry without it is the baseline. The
@@ -110,7 +113,7 @@ jobs:
           NAME: ${{ steps.name.outputs.name }}-${{ matrix.target }}
           VARIANT: ${{ matrix.variant }}
           RECIPE: ${{ hashFiles('support/upstream.lock', 'support/bootstrap*.toml', '.github/scripts/build-toolchain.sh') }}
-          PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
+          PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/package-tools.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
           OPTIMIZED_INPUTS: ${{ hashFiles('support/optimize-linux-v2.sh', 'support/tools/**', 'support/patches/build/**', 'support/build-assets.lock', 'support/fetch-build-assets.sh', 'support/verify-pins.sh') }}
         run: |
           if [[ $VARIANT != frust ]]; then
@@ -126,6 +129,23 @@ jobs:
         with:
           path: ${{ env.ARCHIVE }}
           key: ${{ steps.key.outputs.value }}
+      # The key hashes every input of the build and of the packaging, so a toolchain from before
+      # clippy and rustfmt were built (the 0.5.1 recipe) cannot match it. This looks inside a cached
+      # archive anyway, and stops the job rather than let a tree without the tools reach the release.
+      # The fix for a stale entry is to run again with rebuild set.
+      - name: Require clippy and rustfmt in a cached toolchain
+        if: steps.cache.outputs.cache-hit == 'true' && matrix.variant == 'frust'
+        run: |
+          zstd -dc "$ARCHIVE" | tar -tf - > "$RUNNER_TEMP/cached-files.txt"
+          missing=0
+          for tool in cargo cargo-clippy clippy-driver rustfmt cargo-fmt; do
+            if ! grep -Eq "^(\./)?frust/bin/$tool\$" "$RUNNER_TEMP/cached-files.txt"; then
+              echo "::error::the cached toolchain has no bin/$tool; run again with rebuild set"
+              missing=1
+            fi
+          done
+          rm -f "$RUNNER_TEMP/cached-files.txt"
+          exit "$missing"
       # The optimized build keeps the checkout, the build tree, the unpacked assets and Cargo's
       # build on /mnt, which has the room that the system disk lacks.
       - name: Make room on Linux
@@ -188,6 +208,14 @@ jobs:
         env:
           CPU: ${{ matrix.cpu }}
         run: .github/scripts/build-toolchain.sh "${{ matrix.variant }}" "$BUILD_DIR" "$ARCHIVE" "${{ matrix.target }}" "$CPU"
+      # What the build used and what it left, so a runner that runs short of disk is seen in the log
+      # before it fails: clippy and rustfmt add two more tools to build and link than the 0.5.1 recipe did.
+      - name: Disk after the build
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          df -h /
+          if [[ -d /mnt ]]; then df -h /mnt; fi
+          if [[ -n ${BUILD_DIR:-} && -d $BUILD_DIR ]]; then du -sh "$BUILD_DIR" || true; fi
       # The build logs stay in the work directory of the optimized recipe. They are what explains a
       # failure after hours of building, so a failed or cancelled run uploads them.
       - uses: actions/upload-artifact@v7
@@ -215,6 +243,27 @@ jobs:
           mkdir -p "$RUNNER_TEMP/launch"
           support/launch-check.sh "$RUNNER_TEMP/unpacked/frust" "$RUNNER_TEMP/launch" "$RUNNER_TEMP/launch/launch.log"
           cat "$RUNNER_TEMP/launch/launch.log"
+      # The tree that the build packed is used the way a user uses an installed toolchain: build, test, check,
+      # clippy (and a lint it must reject), rustfmt (and a file it must reject), doc, doctests, frust where, the
+      # unit cache and a library build for the target. The installer, rust-analyzer, rust-docs and the extra std
+      # targets are added when the release is packaged, and the release job runs the whole suite on them
+      # (FRUST_SUITE_SCOPE=release). A failed check does not stop the suite: the log lists every failure.
+      - name: Validate the packaged toolchain
+        if: matrix.variant == 'frust'
+        env:
+          FRUST_SUITE_SCOPE: built
+        run: |
+          mkdir -p "$RUNNER_TEMP/suite-output"
+          # The default shell has no pipefail, so the status is kept here and not taken from a pipe.
+          status=0
+          support/toolchain-suite.sh "$RUNNER_TEMP/unpacked/frust" "$RUNNER_TEMP/suite" > "$RUNNER_TEMP/suite-output/suite.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/suite-output/suite.txt"
+          {
+            echo "### Validation suite, ${{ matrix.target }}${{ matrix.cpu == 'v3' && ' v3' || '' }}"
+            echo "passed: $(grep -c '^PASS' "$RUNNER_TEMP/suite-output/suite.txt" || true), failed: $(grep -c '^FAIL' "$RUNNER_TEMP/suite-output/suite.txt" || true), skipped: $(grep -c '^SKIP' "$RUNNER_TEMP/suite-output/suite.txt" || true)"
+            sed -n '/^FAILED CHECKS:/,$p' "$RUNNER_TEMP/suite-output/suite.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Prove fat LTO, codegen units and warm-fresh parity
         if: matrix.variant == 'frust' && runner.os == 'Linux'
         env:
@@ -228,6 +277,8 @@ jobs:
           name: verify-logs-${{ steps.name.outputs.name }}-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/launch/launch.log
+            ${{ runner.temp }}/suite-output/suite.txt
+            ${{ runner.temp }}/suite/logs/**
             target/compiler-rewrite/parity/ci-${{ steps.name.outputs.name }}/prove.log
           if-no-files-found: ignore
           retention-days: 7

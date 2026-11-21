@@ -2260,7 +2260,7 @@ new file mode 100644
 index 0000000..5bd104d
 --- /dev/null
 +++ b/src/frust_unit_cache.rs
-@@ -0,0 +1,3272 @@
+@@ -0,0 +1,3277 @@
 +//! Shared content-addressed store of finished rustc outputs for registry and git units.
 +//!
 +//! `UnitCache::lookup` runs inside Cargo's `rustc()` work closure right before rustc would be
@@ -3676,7 +3676,12 @@ index 0000000..5bd104d
 +    }
 +    std::env::args()
 +        .next()
-+        .is_some_and(|argv0| Path::new(&argv0).file_name().and_then(OsStr::to_str) == Some("fcargo"))
++        .is_some_and(|argv0| {
++            matches!(
++                Path::new(&argv0).file_name().and_then(OsStr::to_str),
++                Some("fcargo" | "frust" | "fclippy")
++            )
++        })
 +}
 +
 +fn enabled_by_env() -> bool {

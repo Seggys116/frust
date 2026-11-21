@@ -12,6 +12,10 @@ host=${6:-x86_64-unknown-linux-gnu}
 # Shared libraries are .dylib on macOS and .so elsewhere.
 dylib=.so
 [[ $(uname -s) == Darwin ]] && dylib=.dylib
+# install_clippy_rustfmt, install_rust_analyzer, sign_unsigned_macho, link_tool_names, check_clippy_rustfmt
+# and check_rust_analyzer.
+# shellcheck source=support/package-tools.sh
+source "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/package-tools.sh"
 
 if [[ -e "$dest" ]]; then
     echo "destination already exists: $dest" >&2
@@ -48,6 +52,12 @@ fi
 install -m 755 "$cargo_bin" "$dest/bin/cargo"
 # fcargo is the patched Cargo itself (direct entry); the launcher serves terminals and overrides.
 install -m 755 "$fcargo_bin" "$dest/bin/fcargo-ui"
+# clippy and rustfmt, built by bootstrap against this compiler, must be in the tree. On Apple
+# Silicon every Mach-O file must be signed before the first hard link is made (a signature is part of
+# the file, so links, copies and tar keep it).
+install_clippy_rustfmt "$host_dir" "$dest"
+install_rust_analyzer "$host_dir" "$dest"
+sign_unsigned_macho "$dest" "$host"
 ln "$dest/bin/cargo" "$dest/bin/fcargo"
 ln "$dest/bin/rustc" "$dest/bin/frustc"
 ln "$dest/bin/rustdoc" "$dest/bin/frustdoc"
@@ -84,4 +94,9 @@ derive_where=$(find "$libdir" -name "libderive_where-*$dylib" -print | sed -n 1p
 test -n "$span"
 test -n "$macros"
 test -n "$derive_where"
+link_tool_names "$dest"
+tools_scratch=$(mktemp -d)
+check_clippy_rustfmt "$dest" "$tools_scratch"
+check_rust_analyzer "$dest" "$tools_scratch"
+rm -rf "$tools_scratch"
 echo "packaged $dest id=$id"

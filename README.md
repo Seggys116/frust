@@ -47,24 +47,38 @@ cargo install --git https://github.com/Seggys116/frust frust-rs --bin frust-inst
 frust-install
 ```
 
-The installer verifies a sha-256 digest before extracting and keeps the previous version. It installs under `~/.local/share/frust` (macOS: `~/Library/Application Support/fRust`); add `current/bin` of that directory to `PATH`. On Linux x86-64 it installs the build for x86-64-v3 when your CPU supports it and the baseline build otherwise; `FRUST_VARIANT=baseline` or `v3` overrides that, and updates keep the installed build (see [configuration](docs/configuration.md#installer-variants)).
+The installer verifies a sha-256 digest before extracting and keeps the previous version. The archive is the whole toolchain: Cargo, the compiler, rustdoc, clippy, rustfmt, rust-analyzer, the offline docs and the standard library for the host and the extra targets listed below. It installs under `~/.local/share/frust` (macOS: `~/Library/Application Support/fRust`); add `current/bin` of that directory to `PATH`. On Linux x86-64 it installs the build for x86-64-v3 when your CPU supports it and the baseline build otherwise; `FRUST_VARIANT=baseline` or `v3` overrides that, and updates keep the installed build (see [configuration](docs/configuration.md#installer-variants)).
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 
 ## Use
 
-Use `fcargo` wherever you would use `cargo`:
+Use `fcargo` (or `frust`, the same program) wherever you would use `cargo`:
 
 ```sh
 fcargo build --release
 fcargo +nightly test -p mycrate -- --nocapture
+fcargo clippy --all-targets
+fcargo fmt --check
+fcargo build --target wasm32-unknown-unknown
 ```
 
 | Command | Purpose |
 |---|---|
+| `fcargo`, `frust` | Cargo, with the unit cache and central targets. `frust where` prints the central target directory of the workspace in the current directory |
+| `fclippy` | `cargo clippy` (`cargo-clippy` and `clippy-driver` are in the toolchain) |
+| `frustfmt` | `rustfmt` (`cargo-fmt` is in the toolchain, so `fcargo fmt` works) |
+| `frustc` | `rustc` |
+| `frustdoc` | `rustdoc` |
+| `rust-analyzer` | The language server, for editors |
+| `frustup` | `frust-install` under the name of the tool it replaces |
 | `frust-install update` | Install the newest release |
 | `frust-install rollback` | Switch back to the previous version |
 | `frust-install uninstall` | Remove the installation |
+| `frust-install target add <target>` | Add a standard library for another target |
+| `frust-install target list` | List installed and available targets |
+
+Every archive carries the standard library for these targets besides the host. Linux x86-64: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `wasm32-unknown-unknown` and `wasm32-wasip1`. macOS (Apple Silicon and Intel): both `apple-darwin` targets, the iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`, `aarch64-apple-ios-macabi`, `x86_64-apple-ios-macabi`), `wasm32-unknown-unknown` and `wasm32-wasip1`. Any other target of the official channel is one command away, for example `frust-install target add thumbv7em-none-eabihf`. Targets you add are installed again after `frust-install update`. Building for iOS still needs Xcode and its SDK.
 
 `FRUST_UNIT_CACHE=0` turns the unit cache off. Paths, budgets and the other controls are in [configuration](docs/configuration.md).
 

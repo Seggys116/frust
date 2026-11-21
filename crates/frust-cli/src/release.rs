@@ -15,7 +15,6 @@ use std::io::IsTerminal;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::install::{self, InstallError};
 
@@ -118,7 +117,7 @@ fn host_supports_v3() -> bool {
     false
 }
 
-fn error(message: impl Into<String>) -> InstallError {
+pub(crate) fn error(message: impl Into<String>) -> InstallError {
     InstallError { message: message.into() }
 }
 
@@ -258,14 +257,13 @@ fn parse_id(text: &str) -> Result<String, InstallError> {
     Ok(id.to_string())
 }
 
-struct Downloads {
-    dir: PathBuf,
+pub(crate) struct Downloads {
+    pub(crate) dir: PathBuf,
 }
 
 impl Downloads {
-    fn create() -> Result<Self, InstallError> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0);
-        let dir = env::temp_dir().join(format!("frust-install-{}-{nanos}", std::process::id()));
+    pub(crate) fn create() -> Result<Self, InstallError> {
+        let dir = env::temp_dir().join(format!("frust-install-{}", install::unique_suffix()));
         fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|err| error(format!("could not create {}: {err}", dir.display())))?;
         Ok(Self { dir })
     }
@@ -282,7 +280,7 @@ fn available(tool: &str) -> bool {
 }
 
 /// Without an override, only https is allowed, including across redirects.
-fn fetch(url: &str, dest: &Path, restricted: bool) -> Result<(), InstallError> {
+pub(crate) fn fetch(url: &str, dest: &Path, restricted: bool) -> Result<(), InstallError> {
     fetch_with(url, dest, restricted, false)
 }
 

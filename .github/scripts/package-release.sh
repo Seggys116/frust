@@ -66,8 +66,108 @@ while IFS= read -r -d '' link; do
     esac
 done < <(find "$work/tree" -type l -print0)
 
+# Every binary the release promises has to be in the built tree before anything is downloaded.
+# cargo-clippy, clippy-driver, rustfmt, cargo-fmt, rust-analyzer and libexec/rust-analyzer-proc-macro-srv
+# link the compiler's own crates, so they come from the build (package-toolchain.sh), never from the
+# official packages.
+for required in bin/cargo bin/rustc bin/rustdoc bin/cargo-clippy bin/clippy-driver bin/rustfmt bin/cargo-fmt \
+    bin/rust-analyzer libexec/rust-analyzer-proc-macro-srv bin/frust-install; do
+    if [[ ! -f $work/tree/$required || ! -x $work/tree/$required ]]; then
+        echo "package-release.sh: the toolchain has no executable $required" >&2
+        exit 1
+    fi
+done
+# Extra command names are hard links, so sysroot discovery and the argv[0] dispatch of the patched
+# Cargo see the real binary: frust and fclippy are Cargo, frustfmt is rustfmt, frustup is the installer.
+ln -f "$work/tree/bin/cargo" "$work/tree/bin/frust"
+ln -f "$work/tree/bin/cargo" "$work/tree/bin/fclippy"
+ln -f "$work/tree/bin/rustfmt" "$work/tree/bin/frustfmt"
+ln -f "$work/tree/bin/frust-install" "$work/tree/bin/frustup"
+
+# Extra std targets, rust-docs and rust-src are the official packages, pinned by sha256 in
+# support/official-components.lock (the fRust rustc reports the same -vV as official 1.100.0).
+case $target in
+    x86_64-unknown-linux-gnu) bundle=linux ;;
+    aarch64-apple-darwin) bundle=macos-aarch64 ;;
+    x86_64-apple-darwin) bundle=macos-x86_64 ;;
+    *) echo "package-release.sh: no official component bundle for $target" >&2; exit 2 ;;
+esac
+"$root/support/fetch-official-components.sh" "$bundle" "$work/tree" "$work/official-components.txt"
+for required in lib/rustlib/src/rust/library/core/src/lib.rs lib/rustlib/src/rust/library/std/src/lib.rs lib/rustlib/src/rust/library/Cargo.toml; do
+    if [[ ! -f $work/tree/$required ]]; then
+        echo "package-release.sh: the toolchain has no $required (rust-src)" >&2
+        exit 1
+    fi
+done
+for linked in frust fclippy fcargo fcargo-ui frustc frustdoc frustfmt frustup; do
+    if [[ ! -f $work/tree/bin/$linked ]]; then
+        echo "package-release.sh: the toolchain has no bin/$linked" >&2
+        exit 1
+    fi
+done
+
+# Record what the tree holds in the manifest (frust-install lists targets and components from it)
+# and refuse a tree whose target set differs from the host plus the pinned bundle.
+python3 -I - "$work/tree" "$work/official-components.txt" "$root/support/official-components.lock" "$bundle" "$target" <<'PY'
+import glob
+import json
+import os
+import sys
+
+tree, report, lock, bundle, host = sys.argv[1:]
+pinned = []
+for line in open(lock):
+    fields = line.split()
+    if len(fields) == 5 and not line.startswith("#") and fields[0] == bundle and fields[1] == "rust-std":
+        pinned.append(fields[2])
+reported = []
+official = set()
+for line in open(report):
+    component, component_target = line.split()
+    if component == "rust-std":
+        reported.append(component_target)
+    else:
+        official.add(component)
+if reported != pinned:
+    sys.exit(f"package-release.sh: fetched std targets {reported} differ from the pinned {pinned}")
+targets = [host] + pinned
+found = sorted(
+    os.path.basename(path)
+    for path in glob.glob(os.path.join(tree, "lib", "rustlib", "*"))
+    if glob.glob(os.path.join(path, "lib", "*.rlib"))
+)
+if found != sorted(targets):
+    sys.exit(f"package-release.sh: lib/rustlib holds std for {found}, expected {sorted(targets)}")
+for name in targets:
+    libs = glob.glob(os.path.join(tree, "lib", "rustlib", name, "lib", "lib*.rlib"))
+    names = {os.path.basename(path).split("-")[0] for path in libs}
+    missing = {"libcore", "liballoc", "libstd"} - names
+    if missing:
+        sys.exit(f"package-release.sh: std for {name} lacks {sorted(missing)}")
+components = ["cargo", "rustc", "rustdoc", "clippy", "rustfmt"]
+if not os.path.isfile(os.path.join(tree, "bin", "rust-analyzer")):
+    sys.exit("package-release.sh: bin/rust-analyzer is missing")
+components.append("rust-analyzer")
+if "rust-docs" in official:
+    components.append("rust-docs")
+if "rust-src" in official:
+    components.append("rust-src")
+if not {"rust-docs", "rust-src"} <= set(components):
+    sys.exit("package-release.sh: rust-docs or rust-src was not installed")
+path = os.path.join(tree, "manifest.json")
+manifest = json.load(open(path))
+manifest["targets"] = targets
+manifest["components"] = components
+with open(path, "w") as out:
+    json.dump(manifest, out, separators=(",", ":"))
+    out.write("\n")
+PY
+
 archive=frust-toolchain-$target$suffix.tar.gz
-tar -cf - -C "$work/tree" . | gzip -9n > "$out/$archive"
+# pigz writes the same gzip format on all cores; the tree is several GB with the official components.
+compress=gzip
+command -v pigz > /dev/null && compress=pigz
+tar -cf - -C "$work/tree" . | "$compress" -9n > "$out/$archive"
 # sha256sum is not on macOS; both tools print "<digest>  <name>".
 if command -v sha256sum > /dev/null; then
     (cd "$out" && sha256sum "$archive" > "$archive.sha256")

@@ -61,3 +61,13 @@ bash support/fetch-build-assets.sh DEST NAME...
 Each asset is verified against the lock and then unpacked into `DEST/<name without .tar.zst>`; the script prints one `<name> <directory>` line per asset on standard output and logs on standard error. A name the lock does not list, a missing lock and a size or digest mismatch are errors, and nothing is unpacked in the last case. An asset already unpacked from the same digest is not downloaded again. `FRUST_BUILD_ASSETS_LOCK` points the script at another lock file. It needs `curl`, `zstd`, `tar`, `awk` and `sha256sum` or `shasum`.
 
 `.github/scripts/build-toolchain.sh` calls it for the Linux x86-64 fRust toolchain, passes the unpacked build tools as the LLVM tools prefix and the unpacked profiles as `FRUST_STORED_PROFILES`, and adds `FRUST_COMPILER_TARGET_CPU=x86-64-v3` for the v3 variant.
+
+## Official components
+
+The target libraries, the HTML documentation and the library sources (`rust-src`) in an archive are not built here. They are the official Rust 1.100.0 packages, pinned in `support/official-components.lock` ([how it works](how-it-works.md#what-the-toolchain-contains) explains why they fit). Each line of that file is `bundle component target sha256 url`, with the bundles `linux`, `macos-aarch64` and `macos-x86_64`, and a header that names the release, its date and the sha-256 of the channel manifest the pins were taken from.
+
+- `support/tools/lock-official-components.py CHANNEL.toml MANIFEST_SHA256` writes the lock from an official channel manifest.
+- `support/tools/check-official-components-lock.py` checks the lock's shape and that every bundle has the entries the release promises. Without `--offline` it also downloads the channel manifest and compares every pin with the hash the manifest gives.
+- `support/fetch-official-components.sh BUNDLE TREE` downloads the packages of one bundle, checks each sha-256 before unpacking, and installs them into a toolchain tree that already holds the fRust host standard library. It never overwrites an existing path, so the host library stays fRust's. `FRUST_OFFICIAL_CACHE=DIR` keeps the downloads between runs.
+
+A new Rust release asks for a new lock: regenerate it from the new channel manifest and run the checker before committing. A stale lock fails the check because its release no longer matches `support/upstream.lock`.

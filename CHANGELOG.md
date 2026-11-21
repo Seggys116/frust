@@ -38,6 +38,22 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 21 November 2026: `-sink-common-insts` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Stripped sizes grew to 4082336/4024992, 1382560/1338440, and 3996104/3835192. Shipped `frust-gates` exited 1: runtime geomean 1.00555891, upper 1.00902087, size geomean 1.02965759. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: `-enable-knowledge-retention` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Every stripped file stayed under stock (4019392/4024992, 1336456/1338440, 3827128/3835192). Shipped `frust-gates` exited 1: runtime geomean 0.99701744, upper 1.00079480, size geomean 0.99834120. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
+## [0.5.2] - 2026-11-21
+
+### Fixed
+
+* The 0.5.1 archives shipped only `cargo`, `rustc` and `rustdoc` with the standard library of the host. They had no clippy, no rustfmt, no rust-analyzer, no documentation and no other targets, so `fcargo clippy` failed with "cargo-clippy is not installed", and `fcargo fmt` only ran when a rustup `cargo-fmt` happened to be on `PATH`. The toolchain had also never been run the way a user runs it. Every archive now has to pass the validation suite below before a release is published.
+
+### Added
+
+* `cargo-clippy`, `clippy-driver`, `rustfmt` and `cargo-fmt`, built from the same pinned sources as the compiler. On Linux x86-64 clippy is built with the stored PGO profile.
+* `rust-analyzer` (with its proc-macro server), built from source with the fRust compiler like clippy and rustfmt, and the `rust-docs` HTML documentation and `rust-src` library sources, taken from the official packages. The official rust-analyzer links the official compiler driver, which an fRust tree does not have, so it cannot be used.
+* Target libraries bundled in the archive. Linux x86-64: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `wasm32-unknown-unknown` and `wasm32-wasip1`, next to the host. macOS on Apple Silicon and on Intel: both `apple-darwin` targets, `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`, `aarch64-apple-ios-macabi`, `x86_64-apple-ios-macabi`, `wasm32-unknown-unknown` and `wasm32-wasip1`. These come from the official `rust-std` packages of the same release and commit, pinned by sha-256 in [support/official-components.lock](support/official-components.lock). That is sound because the fRust compiler reports the same `rustc -vV` as official Rust 1.100.0 (commit `0ef1bc386`), so it reads and writes the same crate metadata. Clippy, rustfmt and rust-analyzer link the compiler's internal crates and are built here instead.
+* The commands `frust` (the same program as `fcargo`; `frust where` prints the central target directory of the workspace in the current directory), `fclippy`, `frustfmt` and `frustup`. `frustup` is `frust-install` under the name of the tool it replaces.
+* `frust-install target add|remove|list` and `frust-install component add|remove|list`. `target` takes any target of the official Rust 1.100.0 channel and `component` takes `rust-docs`, `rust-src` or `llvm-tools`; clippy, rustfmt and rust-analyzer are built into the archive and cannot be added or removed. Packages are fetched through the official channel manifest and verified against its sha-256. `frust-install show` and `frust-install which TOOL` print what is installed. Added targets and components are applied again after `frust-install update`.
+* `support/toolchain-suite.sh`, which runs an installed toolchain the way a user does: every command, clippy, rustfmt, rust-analyzer, `frust where`, builds for the bundled targets, and the installer's target and component commands. A release archive has to pass it before it is published.
+* [docs/how-it-works.md](docs/how-it-works.md#what-the-toolchain-contains) lists what is built from source and what is taken from the official packages.
+
 ## [0.5.1] - 2026-11-21
 
 ### Added

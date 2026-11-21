@@ -93,12 +93,12 @@ fn main() {
     let rustc = select_frustc(&args, env::var_os("RUSTC").is_some(), &selection, exe.as_deref(), |path| path.is_file());
     let mode = mode_from_env(env::var("FRUST_PROGRESS").ok().as_deref(), env::var("TERM").ok().as_deref(), stderr_is_tty());
     match launch_plan(mode, &args) {
-        Launch::Passthrough => exec_cargo(cargo_command(&selection.cargo, &raw, rustc.as_deref())),
+        Launch::Passthrough => exec_cargo(cargo_command(&selection, &raw, rustc.as_deref())),
         Launch::Wrapped { insert_at } => {
             let no_color = env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
             let ansi = wants_ansi(&args, env::var("CARGO_TERM_COLOR").ok().as_deref(), no_color, color_enabled());
             let argv = inject(&raw, insert_at, json_format(ansi));
-            run_wrapped(cargo_command(&selection.cargo, &argv, rustc.as_deref()), &args, mode);
+            run_wrapped(cargo_command(&selection, &argv, rustc.as_deref()), &args, mode);
         }
     }
 }
@@ -142,6 +142,9 @@ fn select_cargo(explicit: Option<OsString>, exe: Option<&Path>, is_file: impl Fn
 }
 
 /// RUSTC is left alone when the user set it or when a `+toolchain` must choose its own compiler.
+/// `cargo clippy` gets the toolchain's `rustc` instead of `frustc`: clippy-driver runs as a
+/// workspace wrapper and only recognises the compiler argument cargo passes when its file stem is
+/// `rustc`. It is the same binary, so only the frustc-named behaviours are skipped.
 fn select_frustc(
     args: &[String],
     rustc_set: bool,
@@ -152,9 +155,10 @@ fn select_frustc(
     if rustc_set || leading_toolchain(args).is_some() {
         return None;
     }
-    let beside_cargo = selection.cargo.parent().filter(|dir| !dir.as_os_str().is_empty()).map(|dir| dir.join("frustc"));
+    let name = if subcommand(args) == Some("clippy") { "rustc" } else { "frustc" };
+    let beside_cargo = selection.cargo.parent().filter(|dir| !dir.as_os_str().is_empty()).map(|dir| dir.join(name));
     let beside_exe = if selection.source == CargoSource::Search {
-        exe.and_then(Path::parent).map(|dir| dir.join("frustc"))
+        exe.and_then(Path::parent).map(|dir| dir.join(name))
     } else {
         None
     };
@@ -291,13 +295,28 @@ fn color_choice(args: &[String]) -> Option<&str> {
     found
 }
 
-fn cargo_command(cargo: &Path, args: &[OsString], rustc: Option<&Path>) -> Command {
-    let mut command = Command::new(cargo);
+fn cargo_command(selection: &Selection, args: &[OsString], rustc: Option<&Path>) -> Command {
+    let mut command = Command::new(&selection.cargo);
     command.args(args).env("FRUST_INVOCATION", "fcargo");
     if let Some(rustc) = rustc {
         command.env("RUSTC", rustc);
     }
+    // The packaged toolchain's own cargo-clippy, cargo-fmt and rustfmt must win over a rustup proxy
+    // of the same name that happens to come earlier on PATH.
+    if selection.source == CargoSource::Packaged {
+        if let Some(dir) = selection.cargo.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            if let Some(path) = path_with_first(dir, env::var_os("PATH").as_deref()) {
+                command.env("PATH", path);
+            }
+        }
+    }
     command
+}
+
+/// `path` with `dir` as its first entry; any later copy of `dir` is dropped.
+fn path_with_first(dir: &Path, path: Option<&OsStr>) -> Option<OsString> {
+    let rest = path.map(env::split_paths).into_iter().flatten().filter(|entry| entry != dir);
+    env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
 }
 
 fn exec_cargo(mut command: Command) -> ! {
@@ -1355,6 +1374,27 @@ mod tests {
         assert_eq!(select_frustc(&strs(&["build"]), false, &searched, None, present), None);
         let explicit = Selection { cargo: PathBuf::from("/elsewhere/cargo"), source: CargoSource::Explicit };
         assert_eq!(select_frustc(&strs(&["build"]), false, &explicit, Some(exe), present), None);
+    }
+
+    #[test]
+    fn the_toolchain_directory_leads_path_exactly_once() {
+        let dir = Path::new("/opt/frust/bin");
+        let joined = path_with_first(dir, Some(OsStr::new("/usr/bin:/opt/frust/bin:/bin"))).unwrap();
+        assert_eq!(joined, OsString::from("/opt/frust/bin:/usr/bin:/bin"));
+        assert_eq!(path_with_first(dir, None).unwrap(), OsString::from("/opt/frust/bin"));
+    }
+
+    #[test]
+    fn clippy_gets_the_rustc_name_that_clippy_driver_recognises() {
+        let rustc = PathBuf::from("/opt/frust/bin/rustc");
+        let present = |path: &Path| path == Path::new("/opt/frust/bin/rustc") || path == Path::new("/opt/frust/bin/frustc");
+        let exe = Path::new("/opt/frust/bin/fcargo-ui");
+        let packaged = Selection { cargo: PathBuf::from("/opt/frust/bin/cargo"), source: CargoSource::Packaged };
+        assert_eq!(select_frustc(&strs(&["clippy"]), false, &packaged, Some(exe), present), Some(rustc.clone()));
+        assert_eq!(select_frustc(&strs(&["--manifest-path", "x/Cargo.toml", "clippy", "--all"]), false, &packaged, Some(exe), present), Some(rustc));
+        assert_eq!(select_frustc(&strs(&["clippy"]), true, &packaged, Some(exe), present), None);
+        assert_eq!(select_frustc(&strs(&["+nightly", "clippy"]), false, &packaged, Some(exe), present), None);
+        assert_eq!(select_frustc(&strs(&["check"]), false, &packaged, Some(exe), present), Some(PathBuf::from("/opt/frust/bin/frustc")));
     }
 
     #[test]

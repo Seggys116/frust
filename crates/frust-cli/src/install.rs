@@ -40,7 +40,7 @@ pub struct InstallError {
 }
 
 impl InstallError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self { message: message.into() }
     }
 }
@@ -61,7 +61,7 @@ struct Manifest {
     variant: Option<String>,
 }
 
-fn io_context(what: impl Display) -> impl FnOnce(io::Error) -> InstallError {
+pub(crate) fn io_context(what: impl Display) -> impl FnOnce(io::Error) -> InstallError {
     let what = what.to_string();
     move |err| InstallError::new(format!("{what}: {err}"))
 }
@@ -128,7 +128,7 @@ pub fn uninstall(prefix: &Path) -> Result<(), InstallError> {
     // The lock file stays: deleting it would let a waiting process lock a dead inode.
     let _lock = lock_prefix(prefix, false)?;
     clear_temporaries(prefix)?;
-    for child in ["current", "versions", "state.json"] {
+    for child in ["current", "versions", "state.json", crate::dist::EXTRAS_FILE] {
         remove_path(&prefix.join(child))?;
     }
     Ok(())
@@ -136,6 +136,11 @@ pub fn uninstall(prefix: &Path) -> Result<(), InstallError> {
 
 pub fn current_version(prefix: &Path) -> Result<Option<String>, InstallError> {
     active_version(prefix)
+}
+
+/// The version `rollback` would switch to, as recorded in `state.json`.
+pub fn previous_version(prefix: &Path) -> Result<Option<String>, InstallError> {
+    Ok(read_state(prefix)?.previous)
 }
 
 /// The variant of the active version, or `None` when nothing is installed or its manifest names none.
@@ -186,12 +191,12 @@ fn switch_current(prefix: &Path, id: &str) -> Result<(), InstallError> {
 }
 
 /// Tree copies live under `versions/` so a rename into place never crosses filesystems.
-struct Work {
-    dir: PathBuf,
+pub(crate) struct Work {
+    pub(crate) dir: PathBuf,
 }
 
 impl Work {
-    fn create(prefix: &Path) -> Result<Self, InstallError> {
+    pub(crate) fn create(prefix: &Path) -> Result<Self, InstallError> {
         let versions = prefix.join("versions");
         fs::create_dir_all(&versions).map_err(io_context(format!("could not create {} (the prefix must be writable)", versions.display())))?;
         let dir = versions.join(format!("{WORK_PREFIX}{}", unique_suffix()));
@@ -271,7 +276,7 @@ fn compare_digest(archive: &Path, expected: &str, actual: &str) -> Result<(), In
 }
 
 /// Hashes `source` with a fixed buffer, optionally copying every byte to `sink`.
-fn digest_stream(source: &mut File, mut sink: Option<&mut File>) -> io::Result<String> {
+pub(crate) fn digest_stream(source: &mut File, mut sink: Option<&mut File>) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; COPY_BUFFER];
     loop {
@@ -292,7 +297,7 @@ fn digest_stream(source: &mut File, mut sink: Option<&mut File>) -> io::Result<S
     Ok(hex32(&hasher.finish()))
 }
 
-fn extract(archive: &Path, destination: &Path) -> Result<(), InstallError> {
+pub(crate) fn extract(archive: &Path, destination: &Path) -> Result<(), InstallError> {
     let status = Command::new("tar")
         .arg("-x")
         .arg("--no-same-owner")
@@ -405,7 +410,7 @@ mod relayout {
 }
 
 /// Ids become directory names, so only a conservative, non-hidden charset is allowed.
-fn validate_id(id: &str) -> Result<(), InstallError> {
+pub(crate) fn validate_id(id: &str) -> Result<(), InstallError> {
     let first_ok = id.chars().next().is_some_and(|ch| ch.is_ascii_alphanumeric());
     let rest_ok = id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
     if id.len() > MAX_ID_LEN || !first_ok || !rest_ok {
@@ -460,6 +465,25 @@ fn read_manifest(tree: &Path) -> Result<Manifest, InstallError> {
     Ok(Manifest { id: id.clone(), variant })
 }
 
+/// Every string member of the `manifest.json` of an installed version tree, in file order.
+pub(crate) fn manifest_text_fields(tree: &Path) -> Result<Vec<(String, String)>, InstallError> {
+    let file = File::open(tree.join("manifest.json")).map_err(|err| InstallError::new(format!("{} has no manifest.json ({err})", tree.display())))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes).map_err(io_context("could not read manifest.json"))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(InstallError::new("manifest.json is too large"));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| InstallError::new("manifest.json is not UTF-8"))?;
+    let members = parse_object(&text).map_err(|why| InstallError::new(format!("manifest.json is not a valid JSON object ({why})")))?;
+    Ok(members
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            JsonValue::Text(text) => Some((key, text)),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The variant recorded in the manifest of an installed version, when it can be read.
 fn installed_variant(prefix: &Path, id: &str) -> Option<String> {
     read_manifest(&prefix.join("versions").join(id)).ok().and_then(|manifest| manifest.variant)
@@ -475,7 +499,7 @@ fn require_tree(tree: &Path) -> Result<(), InstallError> {
 }
 
 /// The `current` symlink decides which version is active.
-fn active_version(prefix: &Path) -> Result<Option<String>, InstallError> {
+pub(crate) fn active_version(prefix: &Path) -> Result<Option<String>, InstallError> {
     let link = prefix.join("current");
     let target = match fs::read_link(&link) {
         Ok(target) => target,
@@ -592,19 +616,19 @@ fn archive_token(path: &Path) -> String {
     hex32(&sha256(path.to_string_lossy().as_bytes()))[..12].to_string()
 }
 
-fn unique_suffix() -> String {
+pub(crate) fn unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or(0);
     format!("{:x}-{:x}-{:x}", std::process::id(), nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(handle) = File::open(dir) {
         let _ = handle.sync_all();
     }
 }
 
-fn remove_path(path: &Path) -> Result<(), InstallError> {
+pub(crate) fn remove_path(path: &Path) -> Result<(), InstallError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -615,11 +639,11 @@ fn remove_path(path: &Path) -> Result<(), InstallError> {
 }
 
 /// Exclusive for the whole operation; released when the guard drops.
-struct PrefixLock {
+pub(crate) struct PrefixLock {
     _file: File,
 }
 
-fn lock_prefix(prefix: &Path, create: bool) -> Result<PrefixLock, InstallError> {
+pub(crate) fn lock_prefix(prefix: &Path, create: bool) -> Result<PrefixLock, InstallError> {
     if create {
         fs::create_dir_all(prefix).map_err(io_context(format!("could not create prefix {}", prefix.display())))?;
     } else {
@@ -641,7 +665,7 @@ fn lock_prefix(prefix: &Path, create: bool) -> Result<PrefixLock, InstallError> 
     Ok(PrefixLock { _file: file })
 }
 
-fn clear_leftovers(prefix: &Path) -> Result<(), InstallError> {
+pub(crate) fn clear_leftovers(prefix: &Path) -> Result<(), InstallError> {
     clear_temporaries(prefix)?;
     let versions = prefix.join("versions");
     let entries = match fs::read_dir(&versions) {
@@ -785,14 +809,14 @@ fn compress(state: &mut [u32; 8], chunk: &[u8; 64]) {
 }
 
 #[derive(Debug, PartialEq)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Text(String),
     Null,
     Other,
 }
 
 /// Parses a top-level JSON object into its members; nested values are validated and dropped.
-fn parse_object(text: &str) -> Result<Vec<(String, JsonValue)>, &'static str> {
+pub(crate) fn parse_object(text: &str) -> Result<Vec<(String, JsonValue)>, &'static str> {
     let bytes = text.as_bytes();
     let mut index = 0;
     skip_space(bytes, &mut index);
@@ -909,7 +933,7 @@ fn take_literal(bytes: &[u8], index: &mut usize, word: &str) -> bool {
 }
 
 /// Header-level validation of the verified archive, before anything is extracted.
-mod tar_check {
+pub(crate) mod tar_check {
     use super::*;
 
     const BLOCK: usize = 512;

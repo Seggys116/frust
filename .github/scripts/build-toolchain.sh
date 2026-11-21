@@ -278,8 +278,23 @@ fi
 
 # build-dir goes right after jobs, inside [build]. awk keeps this working with BSD tools.
 awk -v dir="$build" '{ print } /^jobs = / { printf "build-dir = \"%s\"\n", dir }' "$root/support/bootstrap.toml" > "$work/bootstrap.toml"
+# The shipped fRust toolchain carries clippy and rustfmt. They link the compiler's own crates
+# (rustc_private), so they can only be built here, against this exact compiler. Bootstrap builds
+# cargo-clippy, clippy-driver, rustfmt and cargo-fmt for these paths and puts them in
+# <stage2>/bin, with an rpath of @loader_path/../lib (macOS) or $ORIGIN/../lib so they find the
+# compiler's shared libraries. src/tools/rust-analyzer builds rust-analyzer and, beside it,
+# rust-analyzer-proc-macro-srv, which bootstrap installs in <stage2>/libexec, the directory where
+# rust-analyzer looks for it. Both link the compiler's driver library, so the official binaries
+# (which name the official driver) cannot be used. The unpatched control is only the baseline
+# compiler and Cargo.
+tool_targets=()
+if [[ $variant == frust ]]; then
+    tool_targets=(src/tools/clippy src/tools/rustfmt src/tools/rust-analyzer)
+fi
+# ${tool_targets[@]+...}: an empty array is an unbound variable for the bash 3.2 of macOS.
 (cd "$src" && env RUST_BACKTRACE=1 "${build_env[@]}" python3 x.py build --config "$work/bootstrap.toml" --stage 2 \
-    --jobs "$(getconf _NPROCESSORS_ONLN)" "${overrides[@]}" library compiler rustdoc cargo)
+    --jobs "$(getconf _NPROCESSORS_ONLN)" "${overrides[@]}" library compiler rustdoc cargo \
+    ${tool_targets[@]+"${tool_targets[@]}"})
 
 stage2=$build/$host/stage2
 cargo_bin=$build/$host/stage2-tools-bin/cargo

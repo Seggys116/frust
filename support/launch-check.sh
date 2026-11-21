@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run one ambient-free launch of a packaged toolchain.
+# Run one ambient-free launch of a packaged toolchain: version output of every tool, a build, a doc build,
+# clippy and rustfmt.
 # Arguments: <prefix> <work-dir> <log>
 set -euo pipefail
 prefix=$1
@@ -39,3 +40,15 @@ test "$got" = "frust-launch-ok"
 "$prefix/bin/frustdoc" --edition 2021 --crate-name frust_hello -o "$work/doc" "$src/src/main.rs" >> "$log" 2>&1
 test -s "$work/doc/frust_hello/index.html"
 echo "doc ok" >> "$log"
+# clippy and rustfmt link the compiler's own crates, so they are built with it and have to work next to
+# it. Each is run directly and through fcargo, the way a user reaches it.
+{
+    echo "clippy-driver $($prefix/bin/clippy-driver -V)"
+    echo "cargo-clippy $($prefix/bin/cargo-clippy -V)"
+    echo "rustfmt $($prefix/bin/rustfmt -V)"
+    echo "cargo-fmt $($prefix/bin/cargo-fmt -V)"
+} >> "$log"
+"$prefix/bin/fcargo" clippy --offline --manifest-path "$src/Cargo.toml" --target-dir "$target" -- -D warnings >> "$log" 2>&1
+echo "clippy ok" >> "$log"
+"$prefix/bin/fcargo" fmt --manifest-path "$src/Cargo.toml" -- --check >> "$log" 2>&1
+echo "fmt ok" >> "$log"

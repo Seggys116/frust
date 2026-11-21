@@ -13,6 +13,15 @@
 #   5. build.optimized-compiler-builtins and rust.lld are set explicitly.
 # Cargo is then rebuilt from the patched submodule like the uc4 package: official Rust as the
 # compiler, ThinLTO, one codegen unit, the merged rustc/cargo profile, static native deps.
+# Clippy (cargo-clippy, clippy-driver; PGO from the stored clippy profile) and rustfmt (rustfmt,
+# cargo-fmt) are built by the same x.py invocation, against the same compiler crates, and shipped
+# in bin/ next to rustc. They link librustc_driver dynamically with an rpath of $ORIGIN/../lib and
+# find their sysroot from that library, so the tree runs wherever it is unpacked. The package step
+# fails when any of the four is missing (support/package-tools.sh).
+# rust-analyzer and its proc-macro server (libexec/rust-analyzer-proc-macro-srv) are built from
+# source too, by the x.py target rust-analyzer: both link librustc_driver, and the official
+# binaries name the official driver's hash, which this compiler does not have. rust-analyzer looks
+# for the server in <sysroot>/libexec, where bootstrap installs it.
 #
 # Usage: optimize-linux-v2.sh RUST_SOURCE WORK LLVM_TOOLS PACKAGE_DEST LAUNCHER [PACKAGE_ID]
 #   RUST_SOURCE  isolated checkout from support/tools/prepare-rust-checkout.sh
@@ -275,7 +284,7 @@ if [[ -n ${FRUST_STORED_PROFILES:-} ]]; then
     if [[ ! -f $work/stored-build.done ]]; then
         step "build PGO-optimized stage 2 from stored profiles; log $work/stored-build.log"
         RUST_BACKTRACE=full python3 x.py build --target "$host" --host "$host" --stage 2 \
-            library rustdoc cargo clippy "${pgo_use[@]}" --enable-bolt-settings \
+            library rustdoc cargo clippy rustfmt rust-analyzer "${pgo_use[@]}" --enable-bolt-settings \
             > "$work/stored-build.log" 2>&1
         touch "$work/stored-build.done"
     fi
@@ -309,9 +318,24 @@ else
         --target-triple "$host" --checkout-dir "$source_dir" \
         --llvm-dir "$tools" --artifact-dir "$work/profiles" --build-dir "$work/build" \
         --python "$bootstrap_python" --build-llvm=false --use-bolt \
-        -- python3 x.py dist rustc rust-std cargo rust-src > "$work/opt-dist.log" 2>&1
+        -- python3 x.py dist rustc rust-std cargo rust-src clippy rustfmt rust-analyzer \
+        > "$work/opt-dist.log" 2>&1
     touch "$work/opt-dist.done"
     step "opt-dist finished"
+fi
+if [[ -z ${FRUST_STORED_PROFILES:-} && ! -f $work/opt-dist-ra-srv.done ]]; then
+    # x.py dist rust-analyzer builds the binary only; the proc-macro server is part of the rustc
+    # dist when it is a default tool, which build.tools = ["cargo"] rules out. Build it with the
+    # flags of the final dist (same profiles, stages kept), so no compiler crate is rebuilt.
+    step "build rust-analyzer-proc-macro-srv; log $work/opt-dist-ra-srv.log"
+    RUST_BACKTRACE=full python3 x.py build --target "$host" --host "$host" --stage 2 \
+        rust-analyzer-proc-macro-srv \
+        --set "pgo.rustc.use=\"$work/profiles/rustc-pgo.profdata\"" \
+        --set "pgo.cargo.use=\"$work/profiles/rustc-pgo.profdata\"" \
+        --set "pgo.rustdoc.use=\"$work/profiles/rustdoc-pgo.profdata\"" \
+        --set "pgo.clippy.use=\"$work/profiles/clippy-pgo.profdata\"" \
+        --keep-stage 0 --keep-stage 1 > "$work/opt-dist-ra-srv.log" 2>&1
+    touch "$work/opt-dist-ra-srv.done"
 fi
 profile=$work/profiles/rustc-pgo.profdata
 test -s "$profile"
@@ -349,6 +373,19 @@ package_toolchain() {
     mkdir -p "$host_dir"
     cp -al "$work/build/$host/stage2" "$staged"
     install -m 755 "$work/build/$host/stage2-tools-bin/rustdoc-tool-binary" "$staged/bin/rustdoc"
+    # clippy, rustfmt and rust-analyzer: bootstrap puts clippy and rustfmt in stage2/bin and the
+    # proc-macro server in stage2/libexec (copied above), and every one in stage2-tools-bin. Fail
+    # here, with their names, when the build did not produce all of them; package-toolchain.sh takes
+    # them from the staged sysroot and falls back to the staged tools-bin directory.
+    local tool
+    mkdir -p "$host_dir/stage2-tools-bin"
+    for tool in cargo-clippy clippy-driver rustfmt cargo-fmt rust-analyzer rust-analyzer-proc-macro-srv; do
+        [[ -x $work/build/$host/stage2-tools-bin/$tool ]] || {
+            step "ERROR $tool was not built (missing $work/build/$host/stage2-tools-bin/$tool)"
+            exit 1
+        }
+        cp -al "$work/build/$host/stage2-tools-bin/$tool" "$host_dir/stage2-tools-bin/$tool"
+    done
     # Target units (rlibs) and host units (proc-macro dylibs) have separate build roots.
     for sub in "stage2-rustc/$host/release/build" "stage2-rustc/release/build"; do
         [[ -d $work/build/$host/$sub ]] || continue
@@ -363,7 +400,11 @@ package_toolchain() {
         done
     done
     FRUST_RUST_SRC=$source_dir bash "$root/support/package-toolchain.sh" \
-        "$staged" "$cargo_bin" "$launcher" "$package" "$package_id" > "$work/package.log" 2>&1
+        "$staged" "$cargo_bin" "$launcher" "$package" "$package_id" > "$work/package.log" 2>&1 || {
+        cat "$work/package.log" >&2
+        step "ERROR package-toolchain.sh failed; log $work/package.log"
+        exit 1
+    }
 }
 package_toolchain
 driver=$(find "$package/lib" -maxdepth 1 -name 'librustc_driver-*.so' -print -quit)
@@ -373,8 +414,14 @@ driver=$(find "$package/lib" -maxdepth 1 -name 'librustc_driver-*.so' -print -qu
     readelf -p .comment "$driver" "$package/bin/rustc"
     readelf -d "$driver" | grep NEEDED
     readelf -n "$driver" | grep -A2 bolt_info
+    for tool in bin/cargo-clippy bin/clippy-driver bin/rustfmt bin/cargo-fmt bin/rust-analyzer \
+        libexec/rust-analyzer-proc-macro-srv; do
+        "$package/$tool" --version
+        readelf -d "$package/$tool" | grep -E 'NEEDED|RUNPATH|RPATH'
+    done
     sha256sum "$package/bin/rustc" "$driver" "$package"/lib/libLLVM* "$package/bin/cargo" \
-        "$work"/profiles/*.profdata
+        "$package"/bin/{cargo-clippy,clippy-driver,rustfmt,cargo-fmt,rust-analyzer} \
+        "$package/libexec/rust-analyzer-proc-macro-srv" "$work"/profiles/*.profdata
 } > "$work/package-provenance.txt" 2>&1
 if readelf -d "$driver" | grep -q 'libstdc++'; then
     step "ERROR rustc_driver still needs a shared libstdc++"

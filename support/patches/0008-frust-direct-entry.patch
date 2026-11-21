@@ -1,41 +1,133 @@
 diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
-index 77dd77c..ff2036e 100644
+index 3121f95..6230d36 100644
 --- a/src/bin/cargo/main.rs
 +++ b/src/bin/cargo/main.rs
 @@ -15,6 +15,8 @@ mod commands;
  use crate::command_prelude::*;
-
+ 
  fn main() {
 +    #[cfg(unix)]
-+    select_frust_entry();
++    let frust_where = select_frust_entry();
      let _guard = setup_logger();
-
+ 
      let mut gctx = match GlobalContext::default() {
-@@ -59,5 +61,70 @@ fn main() {
+@@ -25,6 +27,11 @@ fn main() {
+         }
+     };
+ 
++    #[cfg(unix)]
++    if let Some(request) = frust_where {
++        run_frust_where(&gctx, request);
++    }
++
+     let nightly_features_allowed = matches!(&*features::channel(), "nightly" | "dev");
+     if nightly_features_allowed {
+         let _span = tracing::span!(tracing::Level::TRACE, "completions").entered();
+@@ -59,6 +66,175 @@ fn main() {
      }
  }
-
+ 
++/// Executable names that run as fRust's Cargo. `fcargo` and `frust` are identical; `fclippy`
++/// is `fcargo clippy`.
 +#[cfg(unix)]
-+fn select_frust_entry() {
++const FRUST_ENTRIES: [&str; 3] = ["fcargo", "frust", "fclippy"];
++
++/// A `frust where` request: print the target directory of the workspace and exit.
++#[cfg(unix)]
++struct FrustWhere {
++    manifest_path: Option<PathBuf>,
++}
++
++/// Recognises exactly `where` or `where --manifest-path <path>` (also `--manifest-path=<path>`).
++/// Any other arguments belong to Cargo, so `frust where` never swallows a longer command line.
++#[cfg(unix)]
++fn frust_where_request(rest: &[std::ffi::OsString]) -> Option<FrustWhere> {
++    let (first, tail) = rest.split_first()?;
++    if first != "where" {
++        return None;
++    }
++    match tail {
++        [] => Some(FrustWhere { manifest_path: None }),
++        [flag, path] if flag == "--manifest-path" => {
++            Some(FrustWhere { manifest_path: Some(PathBuf::from(path)) })
++        }
++        [joined] => {
++            let text = joined.to_str()?;
++            let path = text.strip_prefix("--manifest-path=")?;
++            Some(FrustWhere { manifest_path: Some(PathBuf::from(path)) })
++        }
++        _ => None,
++    }
++}
++
++/// The Cargo subcommand named by `args`, skipping a leading `+toolchain` and global options.
++#[cfg(unix)]
++fn frust_subcommand(args: &[std::ffi::OsString]) -> Option<&str> {
++    const VALUE_OPTIONS: [&str; 10] = [
++        "-Z", "--config", "-C", "--color", "-j", "--jobs", "--manifest-path", "--lockfile-path",
++        "--target-dir", "--build-dir",
++    ];
++    let mut index = usize::from(args.first().is_some_and(|arg| arg.to_string_lossy().starts_with('+')));
++    while let Some(arg) = args.get(index) {
++        let arg = arg.to_str()?;
++        if arg == "--" {
++            return None;
++        }
++        if !arg.starts_with('-') {
++            return Some(arg);
++        }
++        index += if VALUE_OPTIONS.contains(&arg) { 2 } else { 1 };
++    }
++    None
++}
++
++/// Runs the fRust direct entry when this process was started as `fcargo`, `frust` or `fclippy`.
++///
++/// Returns `Some` for `frust where`, with the fRust environment already set, and `None` after
++/// configuring the environment for a normal Cargo run. Terminals and `+toolchain` invocations
++/// are handed to the `fcargo-ui` launcher. `fclippy` supplies the `clippy` subcommand:
++/// `fclippy [+toolchain] ARGS...` is `fcargo [+toolchain] clippy ARGS...`.
++#[cfg(unix)]
++fn select_frust_entry() -> Option<FrustWhere> {
 +    use std::io::IsTerminal;
 +    use std::os::unix::fs::MetadataExt;
 +    use std::os::unix::process::CommandExt;
 +    use std::process::Command;
 +
 +    let mut args = env::args_os();
-+    if args.next().as_deref().and_then(|arg| Path::new(arg).file_name())
-+        != Some(OsStr::new("fcargo"))
-+    {
-+        return;
-+    }
-+    let Ok(exe) = env::current_exe() else {
-+        return;
-+    };
-+    let Some(bin) = exe.parent() else {
-+        return;
-+    };
-+    let rustc = bin.join("frustc");
++    let arg0 = args.next();
++    let entry = arg0
++        .as_deref()
++        .and_then(|arg| Path::new(arg).file_name())
++        .and_then(OsStr::to_str)
++        .filter(|name| FRUST_ENTRIES.contains(name))?;
++    let clippy = entry == "fclippy";
++    let mut rest: Vec<std::ffi::OsString> = args.collect();
++    let exe = env::current_exe().ok()?;
++    let bin = exe.parent()?;
 +    let cargo = bin.join("cargo");
++    // clippy-driver runs as a workspace wrapper and only recognises the compiler path cargo
++    // hands it when the file stem is `rustc`, so clippy runs use `rustc` (the same binary as
++    // `frustc`) and give up only the behaviours keyed on the name `frustc`.
++    let rustc = bin.join(if clippy || frust_subcommand(&rest) == Some("clippy") { "rustc" } else { "frustc" });
++    // No application threads have started at the entry point.
++    let set_environment = || unsafe {
++        env::set_var("FRUST_INVOCATION", "fcargo");
++        env::set_var("CARGO", &cargo);
++        if env::var_os("RUSTC").is_none() && rustc.is_file() {
++            env::set_var("RUSTC", &rustc);
++        }
++        // The toolchain's own cargo-clippy, cargo-fmt and rustfmt win over rustup proxies.
++        let path = env::var_os("PATH").unwrap_or_default();
++        let others = env::split_paths(&path).filter(|entry| entry != bin);
++        if let Ok(joined) = env::join_paths(std::iter::once(bin.to_path_buf()).chain(others)) {
++            env::set_var("PATH", joined);
++        }
++    };
++    if !clippy && let Some(request) = frust_where_request(&rest) {
++        set_environment();
++        return Some(request);
++    }
 +    let progress = env::var("FRUST_PROGRESS").ok();
 +    let plain = env::var_os("TERM").as_deref() == Some(OsStr::new("dumb"))
 +        || matches!(progress.as_deref(), Some("plain" | "off"))
@@ -43,7 +135,10 @@ index 77dd77c..ff2036e 100644
 +            && !std::io::stderr().is_terminal());
 +    let explicit = env::var_os("FRUST_CARGO").filter(|value| !value.is_empty());
 +    if let Some(program) = explicit.as_deref().map(Path::new)
-+        && program.file_name() == Some(OsStr::new("fcargo"))
++        && program
++            .file_name()
++            .and_then(OsStr::to_str)
++            .is_some_and(|name| FRUST_ENTRIES.contains(&name))
 +    {
 +        let resolved = if program.components().count() > 1 {
 +            Some(program.to_path_buf())
@@ -57,28 +152,50 @@ index 77dd77c..ff2036e 100644
 +            && (target.dev(), target.ino()) == (source.dev(), source.ino())
 +        {
 +            eprintln!(
-+                "fRust: {} resolves to this fcargo; set FRUST_CARGO to the real cargo or install cargo next to fcargo",
++                "fRust: {} resolves to this {entry}; set FRUST_CARGO to the real cargo or install cargo next to {entry}",
 +                program.display()
 +            );
 +            std::process::exit(1);
 +        }
 +    }
-+    let toolchain = args.next().is_some_and(|argument| argument.to_string_lossy().starts_with('+'));
++    if clippy {
++        // A leading `+toolchain` stays first, as in `cargo +toolchain clippy`.
++        let at = usize::from(rest.first().is_some_and(|arg| arg.to_string_lossy().starts_with('+')));
++        rest.insert(at, "clippy".into());
++    }
++    let toolchain = rest.first().is_some_and(|argument| argument.to_string_lossy().starts_with('+'));
 +    if !plain || explicit.is_some() || toolchain {
-+        let error = Command::new(bin.join("fcargo-ui")).args(env::args_os().skip(1)).exec();
++        let error = Command::new(bin.join("fcargo-ui")).args(&rest).exec();
 +        eprintln!("fRust could not run its launcher: {error}");
 +        std::process::exit(101);
 +    }
++    set_environment();
++    if clippy {
++        // This process's own argument list cannot be rewritten, so start Cargo again with the
++        // subcommand inserted. The new argv[0] is `cargo`, which keeps this entry from
++        // running twice; the fRust environment above is inherited.
++        let error = Command::new(&exe).arg0("cargo").args(&rest).exec();
++        eprintln!("fRust could not run cargo: {error}");
++        std::process::exit(101);
++    }
++    None
++}
 +
-+    // No application threads have started at the entry point.
-+    unsafe {
-+        env::set_var("FRUST_INVOCATION", "fcargo");
-+        env::set_var("CARGO", cargo);
-+        if env::var_os("RUSTC").is_none() && rustc.is_file() {
-+            env::set_var("RUSTC", rustc);
-+        }
++/// Prints the target directory a build in this workspace would use, on one line.
++#[cfg(unix)]
++fn run_frust_where(gctx: &GlobalContext, request: FrustWhere) -> ! {
++    let result = (|| -> CargoResult<()> {
++        let manifest = root_manifest(request.manifest_path.as_deref(), gctx)?;
++        let ws = cargo::workspace::Workspace::new(&manifest, gctx)?;
++        println!("{}", ws.target_dir().as_path_unlocked().display());
++        Ok(())
++    })();
++    match result {
++        Ok(()) => std::process::exit(0),
++        Err(error) => cargo::exit_with_error(error.into(), &mut *gctx.shell()),
 +    }
 +}
 +
  fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
      use tracing_subscriber::prelude::*;
+ 
