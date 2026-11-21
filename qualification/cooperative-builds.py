@@ -132,7 +132,9 @@ def check_pair(root, args, cargo_options, second_packages, scenario=None,
     processes = {}
 
     def start(request, packages):
-        command = [str(args.cargo), *cargo_options, "check", "--offline", "-j", str(args.jobs)]
+        # Each request must leave a unit available for the other to lock.
+        jobs = 1 if scenario == "conflict" else args.jobs
+        command = [str(args.cargo), *cargo_options, "check", "--offline", "-j", str(jobs)]
         command.extend(["--target-dir", str(root / "target")])
         if scenario == "conflict":
             command.append("--message-format=json")
