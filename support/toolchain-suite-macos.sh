@@ -101,9 +101,19 @@ mac_macho_ok() {
     fi
 }
 
+# mac_codesign_verify <file>: strict signature check. Apple Silicon refuses unsigned code, so there a file
+# must be signed. On Intel the linker leaves programs unsigned and macOS runs them, so an unsigned file is
+# accepted there and a signed one must still verify.
+mac_codesign_verify() {
+    if [[ $mac_arch != arm64 ]] && codesign -d "$1" 2>&1 | grep -q "not signed at all"; then
+        return 0
+    fi
+    codesign --verify --strict "$@"
+}
+
 # mac_signed_ok <file>: the signature is valid and strict (what Apple Silicon checks at launch).
 mac_signed_ok() {
-    codesign --verify --strict --verbose=2 "$1" 2>&1 && codesign -dv "$1" 2>&1 | sed -n '/^Signature\|^Identifier\|^CodeDirectory/p'
+    mac_codesign_verify "$1" 2>&1 && codesign -dv "$1" 2>&1 | sed -n '/^Signature\|^Identifier\|^CodeDirectory/p'
 }
 
 # mac_toolchain_binary_ok <file> <max-minos or empty>: one program of the toolchain.
@@ -121,7 +131,7 @@ mac_dylibs_signed() {
     for dir in "$@"; do
         for f in "$dir"/*.dylib; do
             [[ -f $f ]] || continue
-            codesign --verify --strict "$f" || { echo "bad signature: $f"; return 1; }
+            mac_codesign_verify "$f" || { echo "bad signature: $f"; return 1; }
             n=$((n + 1))
         done
     done
@@ -135,7 +145,7 @@ mac_programs_signed() {
     for f in "$1"/*; do
         case $(file -b "$f") in
             *Mach-O*)
-                codesign --verify --strict "$f" || { echo "bad signature: $f"; return 1; }
+                mac_codesign_verify "$f" || { echo "bad signature: $f"; return 1; }
                 n=$((n + 1))
                 ;;
         esac
