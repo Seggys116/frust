@@ -84,6 +84,7 @@ step "training crates: $crates"
 
 awk -v dir="$build" '{ print } /^jobs = / { printf "build-dir = \"%s\"\n", dir }' "$root/support/bootstrap.toml" > "$work/bootstrap.toml"
 jobs=$(getconf _NPROCESSORS_ONLN)
+memory_gb=$(($(sysctl -n hw.memsize) / 1073741824))
 tool_targets=(src/tools/clippy src/tools/rustfmt src/tools/rust-analyzer)
 
 # -vv makes Cargo log every compiler command with its flags; -v alone does not.
@@ -91,7 +92,7 @@ xbuild() {
     local log=$1
     shift
     (cd "$src" && env RUST_BACKTRACE=1 "${build_env[@]}" python3 x.py build --config "$work/bootstrap.toml" \
-        --stage 2 --jobs "$jobs" -vv "${overrides[@]}" "$@") > "$log" 2>&1 || {
+        --stage 2 --jobs "${FRUST_PGO_BUILD_JOBS:-$jobs}" -vv "${overrides[@]}" "$@") > "$log" 2>&1 || {
         tail -n 200 "$log" >&2
         return 1
     }
@@ -116,14 +117,47 @@ driver() {
     printf '%s\n' "$found"
 }
 
-step "stage 1: instrumented stage-2 rustc; log $logs/instrumented-build.log"
-xbuild "$logs/instrumented-build.log" --set "pgo.rustc.generate=\"$pgo/build-raw\"" library compiler
+stage2=$build/$host/stage2
+probe_runtime() {
+    local file
+    for file in "$stage2/bin/rustc" "$stage2/lib/"librustc_driver-*.dylib; do
+        [[ -f $file ]] || continue
+        codesign --verify --verbose=2 "$file" || true
+        otool -L "$file" || true
+    done
+    vm_stat || true
+    python3 -I - "$stage2/bin/rustc" "$host" "$stage2/lib:$build/$host/ci-llvm/lib" "$deployment" <<'PY'
+import os
+import subprocess
+import sys
+
+env = dict(os.environ, RUSTC_BOOTSTRAP="1", DYLD_LIBRARY_PATH=sys.argv[3],
+           MACOSX_DEPLOYMENT_TARGET=sys.argv[4], MACOSX_STD_DEPLOYMENT_TARGET=sys.argv[4])
+status = 0
+for args in (["-vV"], ["--target", sys.argv[2], "-Zunstable-options", "--print=deployment-target"]):
+    result = subprocess.run([sys.argv[1], *args], env=env, capture_output=True, timeout=30)
+    print(f"rustc {args!r}: returncode={result.returncode}\nstdout={result.stdout!r}\nstderr={result.stderr!r}", flush=True)
+    status |= int(result.returncode != 0 or not result.stdout)
+sys.exit(status)
+PY
+}
+
+generate=(--set "pgo.rustc.generate=\"$pgo/build-raw\"")
+instrumented_jobs=$jobs
+if ((memory_gb < 8 && jobs > 2)); then instrumented_jobs=2; fi
+step "stage 1: instrumented stage-2 rustc using $instrumented_jobs jobs; log $logs/instrumented-build.log"
+instrumented_status=0
+FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-build.log" "${generate[@]}" compiler || instrumented_status=$?
+if [[ -x $stage2/bin/rustc ]]; then
+    probe_runtime 2>&1 | tee "$logs/instrumented-launch.log" || fail=1
+fi
+if ((instrumented_status != 0 || fail != 0)); then exit 1; fi
 check generate-flags "$logs/instrumented-build.log"
 check driver "$(driver)" --expect instrumented
 finish_if_failed
+FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-std.log" "${generate[@]}" library
 
 stage0=$build/$host/stage0
-stage2=$build/$host/stage2
 step "building the rustc-perf collector with the stage-0 toolchain"
 perf=$pgo/rustc-perf
 cp -R "$src/src/tools/rustc-perf" "$perf"
@@ -131,7 +165,6 @@ rm -rf "$perf/.git"
 (cd "$perf" && env RUSTC="$stage0/bin/rustc" RUSTC_BOOTSTRAP=1 "$stage0/bin/cargo" build -p collector) \
     > "$logs/collector-build.log" 2>&1 || { tail -n 100 "$logs/collector-build.log" >&2; exit 1; }
 
-memory_gb=$(($(sysctl -n hw.memsize) / 1073741824))
 train_jobs=$((memory_gb / 3))
 if ((train_jobs < 1)); then train_jobs=1; fi
 if ((train_jobs > jobs)); then train_jobs=$jobs; fi
