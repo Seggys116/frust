@@ -103,7 +103,10 @@ jobs:
           cmp "$RUNNER_TEMP/corpus.sha256" qualification/corpus.sha256
           grep -q "$(sha256sum qualification/corpus.sha256 | cut -d' ' -f1)" qualification/CORPUS.md
       - name: Benchmark scripts compile
-        run: python3 -I -m py_compile qualification/run-pairs.py qualification/run-runtime.py qualification/make_corpus.py qualification/ci-bench.py qualification/make-charts.py
+        run: |
+          python3 -I -m py_compile qualification/run-pairs.py qualification/run-runtime.py qualification/make_corpus.py \
+            qualification/ci-bench.py qualification/make-charts.py qualification/concurrent-builds.py \
+            qualification/memory-jobs-bench.py
 
   upstream:
     name: upstream pins and patches

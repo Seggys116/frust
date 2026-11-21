@@ -11,6 +11,9 @@ name: Benchmark
 #    rebuild, reported as fRust CPU as a percent of official CPU. The report job turns the raw
 #    results into a markdown table and SVG charts and uploads them. It commits nothing: numbers are
 #    published only from a completed run, by hand.
+#    The regex job of each platform also runs a short paired contention matrix after its comparison
+#    (qualification/concurrent-builds.py --preset ci) and uploads its machine-readable results beside
+#    the comparison results. It is not part of the table, so it needs regex among the cohorts.
 #
 # Both toolchains of the comparison are installed the way users get them. Official comes from
 # rustup. fRust is packed into the release archive format by .github/scripts/package-release.sh,
@@ -612,6 +615,37 @@ jobs:
             --cache-state "$CACHE_STATE" \
             --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --rounds "$ROUNDS" --noops "$NOOPS" \
             --time-budget-minutes 285 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
+      # Use the preceding fRust release as the control for resource changes. Both runs use the
+      # same fixture paths and cache diagnostics. The .ndjson file keeps this series out of the
+      # report's official CPU comparison, which reads *.jsonl.
+      - name: Measure contention
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        timeout-minutes: 20
+        env:
+          LABEL: ${{ matrix.label }}
+          CPU: ${{ matrix.cpu }}
+        run: |
+          baseline=$HOME/frust-bench-control
+          FRUST_VARIANT=${CPU:-auto} "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
+            --version 0.5.2 --prefix "$baseline"
+          out=$RUNNER_TEMP/out/contention
+          mkdir -p "$out"
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/current/bin/fcargo,$baseline/current/bin/frustc" \
+            --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --env FRUST_UNIT_CACHE=1 --env FRUST_UNIT_CACHE_DEBUG=1 \
+            --env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --env FRUST_EXPERIMENTAL_RELR=0 \
+            --preset ci --states cold,warm,cache,edit --count 3 --rounds 8 --jobs 2 \
+            --size 200 --timeout 600 --summary-only \
+            --work "$WORK/contention" --out "$out/concurrent-builds.ndjson" > "$out/summary.txt" 2>&1 || status=$?
+          {
+            echo "### Contention check, $LABEL (exit $status)"
+            echo '```'
+            cat "$out/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Stage results
         if: always() && steps.cpu.outputs.runnable != 'false'
         run: |
