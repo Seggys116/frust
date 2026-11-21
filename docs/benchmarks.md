@@ -56,6 +56,7 @@ Rows marked single sample are one build each, not gate results.
 | Share generics (`-Z share-generics=on`) on `frust-0ef1bc386-licmcap1` | One ripgrep release build on 2026-11-21. Not a paired judge. | Stripped 4054736/4024992 (1.00738983), over stock. `frust-gates` was not run. Not kept. |
 | No untried full-LTO change | Scan on 2026-11-21 of 31 saved reports and the default-off fat-LTO switches. Not compiled in. | No runtime upper is at or under 0.97. licmcap stays the best empty-`llvm_args` stack at upper 0.99615678 and size geomean 0.99720509. The 630-pair cohort was not started. |
 | Post-link BOLT after fat LTO | Runtime and stripped size on 2026-11-21. `--use-old-text`, no huge pages, 4096-byte text alignment. Not a new prefix. | Runtime upper 1.00621331. Ripgrep grew to 4110536/4024992. Size geomean 1.020932. `frust-gates` exited 1. The 630-pair cohort was not started. |
+| Sink common instructions (`-sink-common-insts`) | Runtime and stripped size on 2026-11-21. User flag on top of the licmcap layout flags. Not a new prefix. | Runtime upper 1.00902087. Ripgrep grew to 4082336/4024992. Size geomean 1.02965759. `frust-gates` exited 1. The 630-pair cohort was not started. |
 
 ### Interface-hash cutoff, 20 November
 
