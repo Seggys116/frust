@@ -5,7 +5,7 @@ No fRust compiler change has passed the frozen Linux budgets. Nothing here is a 
 ## Conditions
 
 - Host: Linux x86-64. The CPU model, kernel and linker versions are not recorded in the qualification files. macOS was not measured.
-- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge. The same day's Attributor screen is a ripgrep release build that crashed in LLVM, not a paired judge. The same day's NewGVN check is a bitcode comparison, not a paired judge. The same day's GVN-sink check is a bitcode comparison, not a paired judge. The 21 November fat-LTO simplification-gap check is a bitcode comparison, not a paired judge.
+- Dates: the candidate samples in the table below were taken on 2026-11-19, after the protocol was frozen that day (`qualification/PROTOCOL.md`). The 20 November full paired judges are the interface-hash cutoff and the prelink-span compiler, recorded after that table. The same day's x86-64-v3 preflight is a three-workload runtime and size check, not a paired build-time judge. The same day's outliner screen is one ripgrep stripped-size build, not a paired judge. The same day's loop-fusion check is a bitcode comparison, not a paired judge. The same day's Attributor screen is a ripgrep release build that crashed in LLVM, not a paired judge. The same day's NewGVN check is a bitcode comparison, not a paired judge. The same day's GVN-sink check is a bitcode comparison, not a paired judge. The 21 November fat-LTO simplification-gap check is a bitcode comparison, not a paired judge. The same day's joint-candidate check did not build a new compiler.
 - Stock: the unpatched stage-2 compiler built from the same recipe. Official Rust 1.100.0 is recorded separately in `qualification/BASELINES.md` because its binaries are PGO builds.
 - Toolchains: the default package `toolchains/frust` has a compiler, standard library and rustdoc identical to stock and a patched Cargo (`qualification/COMPAT.md`). Each candidate is a separate package whose compiler carries the candidate change.
 - Workloads: ripgrep 15.2.0, syn 3.0.10 and regex 1.13.2 are the primary cohort, and fd 10.5.2 is a holdout. The release profile is opt-level 3, fat LTO, one codegen unit, incremental, debug 0, no strip.
@@ -35,6 +35,7 @@ Rows marked single sample are one build each, not gate results.
 | NewGVN (`-enable-newgvn` on the packaged `opt`) | Bitcode comparison on 2026-11-20. Not a user `rustc` flag. | Ripgrep pre-LTO grew by 9856 bytes. `find_impl` unchanged. An earlier final-crate flag sample already missed runtime and size. Not kept. |
 | GVN sink (`-enable-gvn-sink` on the packaged `opt`) | Bitcode comparison on 2026-11-20. The pass is not in `lto<O3>`. | Frozen memchr `find_impl` stays at 695 instructions. Not kept. Gate not run. |
 | Fat-LTO simplification gap (O3 passes absent from `lto<O3>`) | Bitcode comparison on 2026-11-21. Not added to rustc. | Ripgrep instruction ratio 0.99040271. `find_impl` keeps its vector loop. Not kept. Gate not run. |
+| Joint runtime and size candidate | Decision on 2026-11-21 from the judged stacks and the oxipng `-o 4` profile. | hotbudget runtime upper 0.98418770, size geomean 1.03517556. No compiler packaged. Fresh gate not run. |
 
 ### Interface-hash cutoff, 20 November
 
@@ -75,6 +76,10 @@ The same driver built ripgrep once with `-enable-machine-outliner=always` and `-
 ### Fat-LTO simplification gap, 21 November
 
 `lto<O3>` does not run `correlated-propagation`, `reassociate`, `libcalls-shrinkwrap`, `adce`, `loop-rotate`, `loop-idiom`, `simple-loop-unswitch`, or `loop-interchange`. Appending them after `lto<O3>` shrinks the ripgrep pre-LTO module from 5211360 to 5176044 bytes and from 227981 to 225793 instruction lines (ratio 0.99040271). `find_impl` stays at 676 instruction lines and keeps its `<16 x i8>` compare. A second `default<O3>` grows that function to 696 lines. Carrying the whole 35316-byte bitcode delta into stripped ripgrep, with oxipng and rustfmt left at stock, leaves a three-file geomean of 0.99706668. No stage-2 rebuild was started and `frust-gates` was not run. The figures are repeated in `qualification/GATE-REPORT.md`.
+
+### Joint candidate, 21 November
+
+No new compiler was packaged. A rerun of shipped `frust-gates` on the prelink-span samples matched `target/compiler-rewrite/logs/prelinkspan-gate/gates.json` (sha256 `9ef47b85c6c72379cb74f4aecfacb16f91c3d67e21cdf591bdfa4d63a2896b74`, exit 1): disk 1.25765371, runtime geomean 1.00478501, runtime upper 1.01877364, stripped-size geomean 1.00000000. hotbudget remains the fastest judged full-LTO stack, at runtime upper 0.98418770 and size geomean 1.03517556. The oxipng `-o 4` samples put 31.8% in `deflate_compress_greedy`, whose matchfinder is the hash chain already covered by the `-march=haswell` median 0.977. RELR stays opt-in. The 630-pair cohort was not started. The figures are repeated in `qualification/GATE-REPORT.md`.
 
 ### Pre-optimization cache gate
 
