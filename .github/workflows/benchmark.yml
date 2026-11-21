@@ -688,6 +688,34 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: Trace Cargo lock holds
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        timeout-minutes: 10
+        run: |
+          library=$RUNNER_TEMP/bench-flock
+          if [[ $RUNNER_OS == macOS ]]; then
+            library+=.dylib
+            flags=(-dynamiclib)
+          else
+            library+=.so
+            flags=(-shared -ldl)
+          fi
+          cc -std=c11 -O2 -fPIC -Wall -Wextra qualification/bench-flock.c -o "$library" "${flags[@]}"
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --env FRUST_UNIT_CACHE=1 --preset ci --states cold,warm --count 3 --rounds 6 --jobs 2 --size 50 \
+            --timeout 60 --summary-only --lock-trace-library "$library" --work "$WORK/lock-trace" \
+            --out "$out/locks.ndjson" > "$out/locks.txt" 2>&1 || status=$?
+          {
+            echo "### Cargo lock timing (exit $status)"
+            echo '```'
+            sed -n '/^build-dev n=/,$p' "$out/locks.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Stage results
         if: always() && steps.cpu.outputs.runnable != 'false'
         run: |

@@ -81,6 +81,8 @@ The results file ends with one summary record (kind "summary") holding the per-c
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -115,6 +117,8 @@ PRESETS = {
         ("build-shared", "shared", ("build",)),
         ("check-storm-dev", "shared", ("check", "ra")),
         ("check-storm-release", "shared", ("check:release",)),
+        ("check-and-lint", "shared", ("check", "clippy", "ra")),
+        ("test-doc-fmt", "shared", ("test", "doc", "fmt")),
     ),
 }
 VENDORED = {"name": "cb_dep_a", "version": "1.0.0"}
@@ -150,8 +154,7 @@ LABELS = {
                    "The kernel charges bytes when pages are dirtied, including writes later cancelled. "
                    "Null on macOS. The scenario value sums the commands.",
     "oublock": "ru_oublock from wait4 summed like cpu; platform-dependent units, not bytes",
-    "lock_waits": "count of Cargo 'Blocking waiting for file lock on X' lines, total and by X; no lock hold "
-                  "duration is recorded because neither Cargo nor the unit cache reports one",
+    "lock_waits": "count of Cargo 'Blocking waiting for file lock on X' lines, total and by X",
     "cache_events": "counts of frust-unit-cache hit, miss, store, skip lines (script- prefix kept) with "
                     "FRUST_UNIT_CACHE_DEBUG=1; null without it",
     "cache_written_mib": "last cumulative written= of the unit cache stats line, MiB rounded to 0.1 by the "
@@ -524,6 +527,61 @@ def merge_counts(counts):
     return merged
 
 
+def flock_stats(trace):
+    fields = ("attempts", "try_conflicts", "waits", "wait_ns", "holds", "hold_ns", "unfinished")
+    stats = {}
+    held = {}
+    conflicts = {}
+
+    def counters(kind):
+        return stats.setdefault(kind, dict.fromkeys(fields, 0))
+
+    def finish(key, start):
+        if key in held:
+            kind, _, acquired = held.pop(key)
+            row = counters(kind)
+            row["holds"] += 1
+            row["hold_ns"] += start - acquired
+
+    records = []
+    for line in trace.read_text(encoding="ascii").splitlines():
+        pid, fd, op, flags, start, end, result, error, path = line.split("\t")
+        key = (int(pid), int(fd))
+        records.append((int(end), int(start), key, op, int(flags), int(result), int(error), path))
+    for end, start, key, op, flags, result, error, path in sorted(records):
+        if op == "C":
+            if result == 0:
+                finish(key, start)
+                conflicts.pop(key, None)
+            continue
+        if op != "F" or end < start:
+            raise ValueError("invalid flock trace record")
+        name = Path(os.fsdecode(bytes.fromhex(path))).name if path != "-" else "unknown"
+        if re.fullmatch(r"[a-f0-9]{64}\.lock", name):
+            name = "cache-entry"
+        elif name == ".lock":
+            name = "build-unit"
+        elif re.fullmatch(r"s-[a-z0-9]+-[a-z0-9]+\.lock", name):
+            name = "incremental-session"
+        row = counters(name)
+        row["attempts"] += 1
+        mode = flags & ~fcntl.LOCK_NB
+        if (mode == fcntl.LOCK_UN and result == 0) or (mode != fcntl.LOCK_UN and key in held and held[key][1] != mode):
+            finish(key, start)
+        if result == 0 and mode != fcntl.LOCK_UN:
+            if conflicts.get(key) == (path, mode) and not flags & fcntl.LOCK_NB:
+                row["waits"] += 1
+                row["wait_ns"] += end - start
+            held.setdefault(key, (name, mode, end))
+        conflicts.pop(key, None)
+        if result != 0 and flags & fcntl.LOCK_NB and error in (errno.EAGAIN, errno.EWOULDBLOCK):
+            row["try_conflicts"] += 1
+            conflicts[key] = (path, mode)
+    for kind, _, _ in held.values():
+        counters(kind)["unfinished"] += 1
+    return stats
+
+
 class Harness:
     def __init__(self, args, work, sides, pin):
         self.args, self.work, self.sides, self.pin = args, work, sides, pin
@@ -551,7 +609,12 @@ class Harness:
                    PATH=os.pathsep.join([str(side.cargo.parent), env.get("PATH", "")]))
         rustc = (lane.rustc.get(side.key) if lane else None) or side.rustc
         if rustc:
-            env["RUSTC"] = str(Path(rustc).absolute())
+            compiler = Path(rustc).absolute()
+            if lane and lane.mode == "clippy" and compiler.name == "frustc":
+                sibling = compiler.resolve().with_name("rustc")
+                if sibling.is_file() and compiler.samefile(sibling):
+                    compiler = sibling
+            env["RUSTC"] = str(compiler)
         env.update(self.extra[side.key])
         return env
 
@@ -674,6 +737,13 @@ class Harness:
         before = allocated(targets + stores)
         # Storage is read outside the timed region, after the last command has exited.
         jobs = [self.job(side, lane, self.logs / f"{tag}-lane{i}.log") for i, lane in enumerate(cell.lanes)]
+        traces = []
+        if self.args.lock_trace_library:
+            loader = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+            for job in jobs:
+                trace = job.log.with_suffix(".flock")
+                job.env.update({loader: self.args.lock_trace_library, "FRUST_BENCH_FLOCK_LOG": str(trace)})
+                traces.append(trace)
         results = run_commands(jobs, self.args.timeout)
         target_bytes = allocated(targets)
         store_bytes = allocated(stores)
@@ -703,6 +773,19 @@ class Harness:
                 "timed_out": result.get("timed_out", False), "compiling_lines": compiling,
                 "signature": signature, "log": str(job.log), "ok": ok,
             })
+            if traces:
+                try:
+                    trace = flock_stats(traces[index])
+                except FileNotFoundError as error:
+                    if lane.mode != "fmt":
+                        problems.append(f"lane{index} lock trace unavailable: {error}")
+                    lanes[-1]["flock"] = {}
+                except (OSError, ValueError) as error:
+                    problems.append(f"lane{index} lock trace unavailable: {error}")
+                else:
+                    if not trace:
+                        problems.append(f"lane{index} lock trace is empty")
+                    lanes[-1]["flock"] = trace
         # Commands must leave sources and the shared path crates exactly as they found them.
         for slot, digest in source_digests.items():
             if tree_digest(self.slot_dir(slot)) != digest:
@@ -850,6 +933,9 @@ class Harness:
         return {"kind": "summary", "a": a.label, "b": b.label, "cells": entries}
 
     def summary(self, cells):
+        if self.args.lock_trace_library:
+            self.lock_summary(cells)
+            return
         data = self.summary_data(cells)
         self.write_record(data)
         print(f"\nmedians over rounds; ratios are {data['b']}/{data['a']} paired by round, "
@@ -868,6 +954,33 @@ class Harness:
                 print(f"  ratio {metric:14} {ratio['median']:.3f} ({ratio['min']:.3f}..{ratio['max']:.3f}) "
                       f"[{ratio['pairs']}, {ratio['b_lower']}]")
 
+    def lock_summary(self, cells):
+        table = []
+        for cell in cells:
+            entry = {"scenario": cell.scenario, "count": cell.count, "state": cell.state, "sides": {}}
+            print(cell.name())
+            for side in self.sides:
+                rows = [r for r in self.records if r["ok"] and r["side"] == side.label
+                        and (r["scenario"], r["count"], r["state"]) == cell.key()]
+                rounds = []
+                for row in rows:
+                    traces = [lane.get("flock", {}) for lane in row["lanes"]]
+                    rounds.append({kind: merge_counts(trace.get(kind) for trace in traces)
+                                   for kind in set().union(*traces)})
+                locks = {}
+                for kind in sorted(set().union(*rounds)):
+                    fields = next(row[kind].keys() for row in rounds if kind in row)
+                    locks[kind] = {key: statistics.median(row.get(kind, {}).get(key, 0) for row in rounds)
+                                   for key in fields}
+                    counts = locks[kind]
+                    print(f"  {side.label:10} {kind:24} tries blocked={counts['try_conflicts']:g} "
+                          f"waits={counts['waits']:g} wait={counts['wait_ns'] / 1e6:.2f}ms "
+                          f"holds={counts['holds']:g} hold={counts['hold_ns'] / 1e6:.2f}ms "
+                          f"unfinished={counts['unfinished']:g}")
+                entry["sides"][side.label] = {"rounds": len(rounds), "locks": locks}
+            table.append(entry)
+        self.write_record({"kind": "lock-summary", "cells": table})
+
     def header(self, cells):
         def version(command, side):
             try:
@@ -880,6 +993,7 @@ class Harness:
         return {
             "kind": "run", "labels": LABELS, "argv": sys.argv, "rounds": self.args.rounds,
             "jobs": self.args.jobs, "size": self.args.size, "pin": self.pin,
+            "lock_trace": bool(self.args.lock_trace_library),
             "template_digest": self.template_digest, "deps_digest": self.deps_digest,
             "preset": self.args.preset, "states": self.args.states,
             "vendored": ({**VENDORED, "checksum": self.expected["vendor_checksum"]} if self.builtin else None),
@@ -968,6 +1082,8 @@ def parse_args():
     parser.add_argument("--out", help="JSON lines results file (required unless --dry-run)")
     parser.add_argument("--append", action="store_true", help="append to an existing --out")
     parser.add_argument("--summary-only", action="store_true", help="omit the per-command lines")
+    parser.add_argument("--lock-trace-library", type=lambda path: str(Path(path).resolve()),
+                        help="native bench-flock shared library for a separate lock diagnostic run")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and the fixture digest only")
     args = parser.parse_args()
     if args.preset and (args.scenarios or args.lane):
@@ -993,6 +1109,8 @@ def parse_args():
         parser.error("--out is required unless --dry-run")
     if args.out and Path(args.out).exists() and not args.append and not args.dry_run:
         parser.error(f"{args.out} exists; choose another file or pass --append")
+    if args.lock_trace_library and not Path(args.lock_trace_library).is_file():
+        parser.error("--lock-trace-library must be a compiled bench-flock library")
     if args.fixture_dir:
         if not (Path(args.fixture_dir) / "Cargo.toml").is_file():
             parser.error("--fixture-dir has no Cargo.toml")
