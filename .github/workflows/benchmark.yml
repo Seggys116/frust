@@ -676,10 +676,15 @@ jobs:
             --preset ci --states cold,warm,cache,edit --count 3 --rounds 8 --jobs 2 \
             --size 200 --timeout 600 --summary-only \
             --work "$WORK/contention" --out "$out/concurrent-builds.ndjson" > "$out/summary.txt" 2>&1 || status=$?
+          if [[ $status == 0 ]]; then
+            python3 -I qualification/tool-startup-bench.py --control "$baseline/current/bin" --frust "$FRUST_BIN" \
+              --out "$out/tool-startup.ndjson" > "$out/startup-summary.txt" 2>&1 || status=$?
+          fi
           {
             echo "### Contention check, $LABEL (exit $status)"
             echo '```'
             cat "$out/summary.txt"
+            if [[ -f $out/startup-summary.txt ]]; then cat "$out/startup-summary.txt"; fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"

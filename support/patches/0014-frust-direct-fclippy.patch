@@ -1,0 +1,140 @@
+diff --git a/src/bin/cargo/cli.rs b/src/bin/cargo/cli.rs
+index 3205bed..5aa9a94 100644
+--- a/src/bin/cargo/cli.rs
++++ b/src/bin/cargo/cli.rs
+@@ -20,12 +20,16 @@ use cargo::util::style;
+ use cargo_util_terminal::ColorChoice;
+ 
+ #[tracing::instrument(skip_all)]
+-pub fn main(gctx: &mut GlobalContext) -> CliResult {
++pub fn main(gctx: &mut GlobalContext, args: Option<Vec<OsString>>) -> CliResult {
+     // CAUTION: Be careful with using `config` until it is configured below.
+     // In general, try to avoid loading config values unless necessary (like
+     // the [alias] table).
+ 
+-    let args = cli(gctx).try_get_matches()?;
++    let command = cli(gctx);
++    let args = match args {
++        Some(args) => command.try_get_matches_from(args)?,
++        None => command.try_get_matches()?,
++    };
+ 
+     // Update the process-level notion of cwd
+     if let Some(new_cwd) = args.get_one::<std::path::PathBuf>("directory") {
+diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
+index 6230d36..95f521b 100644
+--- a/src/bin/cargo/main.rs
++++ b/src/bin/cargo/main.rs
+@@ -5,7 +5,7 @@ use cargo_util_schemas::manifest::StringOrVec;
+ use cargo_util_terminal::Shell;
+ use std::collections::BTreeMap;
+ use std::env;
+-use std::ffi::OsStr;
++use std::ffi::{OsStr, OsString};
+ use std::fs;
+ use std::path::{Path, PathBuf};
+ 
+@@ -16,7 +16,7 @@ use crate::command_prelude::*;
+ 
+ fn main() {
+     #[cfg(unix)]
+-    let frust_where = select_frust_entry();
++    let frust_entry = select_frust_entry();
+     let _guard = setup_logger();
+ 
+     let mut gctx = match GlobalContext::default() {
+@@ -28,14 +28,18 @@ fn main() {
+     };
+ 
+     #[cfg(unix)]
+-    if let Some(request) = frust_where {
+-        run_frust_where(&gctx, request);
+-    }
++    let args = match frust_entry {
++        Some(FrustEntry::Where(request)) => run_frust_where(&gctx, request),
++        Some(FrustEntry::Args(args)) => Some(args),
++        None => None,
++    };
++    #[cfg(not(unix))]
++    let args: Option<Vec<OsString>> = None;
+ 
+     let nightly_features_allowed = matches!(&*features::channel(), "nightly" | "dev");
+     if nightly_features_allowed {
+         let _span = tracing::span!(tracing::Level::TRACE, "completions").entered();
+-        let args = std::env::args_os();
++        let completion_args = args.clone().unwrap_or_else(|| env::args_os().collect());
+         let current_dir = std::env::current_dir().ok();
+         let completer = clap_complete::CompleteEnv::with_factory(|| {
+             let mut gctx = GlobalContext::default().expect("already loaded without errors");
+@@ -43,7 +47,7 @@ fn main() {
+         })
+         .var("CARGO_COMPLETE");
+         if completer
+-            .try_complete(args, current_dir.as_deref())
++            .try_complete(completion_args, current_dir.as_deref())
+             .unwrap_or_else(|e| {
+                 let mut shell = Shell::new();
+                 cargo::exit_with_error(e.into(), &mut shell)
+@@ -57,7 +61,7 @@ fn main() {
+         cargo::ops::fix_exec_rustc(&gctx, &lock_addr).map_err(|e| CliError::from(e))
+     } else {
+         let _token = cargo::util::job::setup();
+-        cli::main(&mut gctx)
++        cli::main(&mut gctx, args)
+     };
+ 
+     match result {
+@@ -77,6 +81,12 @@ struct FrustWhere {
+     manifest_path: Option<PathBuf>,
+ }
+ 
++#[cfg(unix)]
++enum FrustEntry {
++    Where(FrustWhere),
++    Args(Vec<OsString>),
++}
++
+ /// Recognises exactly `where` or `where --manifest-path <path>` (also `--manifest-path=<path>`).
+ /// Any other arguments belong to Cargo, so `frust where` never swallows a longer command line.
+ #[cfg(unix)]
+@@ -122,12 +132,12 @@ fn frust_subcommand(args: &[std::ffi::OsString]) -> Option<&str> {
+ 
+ /// Runs the fRust direct entry when this process was started as `fcargo`, `frust` or `fclippy`.
+ ///
+-/// Returns `Some` for `frust where`, with the fRust environment already set, and `None` after
+-/// configuring the environment for a normal Cargo run. Terminals and `+toolchain` invocations
+-/// are handed to the `fcargo-ui` launcher. `fclippy` supplies the `clippy` subcommand:
++/// Returns a request for `frust where` or the arguments for a plain `fclippy` invocation.
++/// Terminals and `+toolchain` invocations are handed to the `fcargo-ui` launcher.
++/// `fclippy` supplies the `clippy` subcommand:
+ /// `fclippy [+toolchain] ARGS...` is `fcargo [+toolchain] clippy ARGS...`.
+ #[cfg(unix)]
+-fn select_frust_entry() -> Option<FrustWhere> {
++fn select_frust_entry() -> Option<FrustEntry> {
+     use std::io::IsTerminal;
+     use std::os::unix::fs::MetadataExt;
+     use std::os::unix::process::CommandExt;
+@@ -165,7 +175,7 @@ fn select_frust_entry() -> Option<FrustWhere> {
+     };
+     if !clippy && let Some(request) = frust_where_request(&rest) {
+         set_environment();
+-        return Some(request);
++        return Some(FrustEntry::Where(request));
+     }
+     let progress = env::var("FRUST_PROGRESS").ok();
+     let plain = env::var_os("TERM").as_deref() == Some(OsStr::new("dumb"))
+@@ -210,12 +220,8 @@ fn select_frust_entry() -> Option<FrustWhere> {
+     }
+     set_environment();
+     if clippy {
+-        // This process's own argument list cannot be rewritten, so start Cargo again with the
+-        // subcommand inserted. The new argv[0] is `cargo`, which keeps this entry from
+-        // running twice; the fRust environment above is inherited.
+-        let error = Command::new(&exe).arg0("cargo").args(&rest).exec();
+-        eprintln!("fRust could not run cargo: {error}");
+-        std::process::exit(101);
++        rest.insert(0, "cargo".into());
++        return Some(FrustEntry::Args(rest));
+     }
+     None
+ }
