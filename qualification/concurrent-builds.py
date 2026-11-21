@@ -84,6 +84,7 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -139,6 +140,7 @@ CACHE_WRITTEN = re.compile(r"frust-unit-cache: stats [^\r\n]*?\bwritten=([0-9.]+
 SUMMARY_METRICS = ("cpu_total", "max_rss_bytes", "total_bytes", "target_bytes", "store_bytes", "write_bytes",
                    "lock_waits_total", "cache_written_mib")
 RATIO_METRICS = ("cpu_total", "max_rss_bytes", "total_bytes", "write_bytes")
+APFS_METRICS = ("apfs_write_bytes", "apfs_metadata_bytes", "apfs_footprint_bytes")
 LABELS = {
     "cpu": "ru_utime+ru_stime from wait4 for the command and the descendants it reaped; waiting on a "
            "peer's compilation costs nothing here, so compare cpu_total; detached processes are not counted; "
@@ -586,13 +588,46 @@ def flock_stats(trace):
     return stats
 
 
+class ApfsWrites:
+    def __init__(self, probe, root, mount, devices):
+        self.probe, self.root, self.mount, self.devices = probe, root, mount, devices
+        self.calibration = probe.calibrate_image(root, mount, devices)
+        calibrated = self.calibration["usable_devices"]
+        if len(calibrated) != 1:
+            raise probe.ProbeError(f"expected one calibrated APFS volume, found {calibrated}")
+        self.data_device = calibrated[0]
+        match = re.fullmatch(r"(/dev/disk[0-9]+)s[0-9]+", self.data_device)
+        if not match or match[1] not in devices:
+            raise probe.ProbeError(f"could not identify the container of {self.data_device}")
+        self.container = match[1]
+        self.initial_available = None
+
+    def header(self):
+        return {"calibration": self.calibration, "data_device": self.data_device, "container": self.container,
+                "write_scope": "completed virtual-volume writes plus container metadata, including the post-build sync",
+                "footprint_scope": "occupied APFS blocks above the fixture setup, with both stores cleared before seeding"}
+
+    def run(self, tag, jobs, timeout):
+        results = []
+        sample = self.probe.sample(self.root, self.mount, self.devices, tag,
+                                   lambda: results.extend(run_commands(jobs, timeout)))
+        devices = sample["write_bytes_by_device"]
+        metadata = devices[self.data_device]["WrMeta"] + devices[self.container]["WrMeta"]
+        write_bytes = devices[self.data_device]["WrData"] + devices[self.data_device]["PgOut"] + metadata
+        return results, {"apfs_write_bytes": write_bytes, "apfs_metadata_bytes": metadata,
+                         "apfs_footprint_bytes": self.initial_available - self.probe.available_bytes(self.mount),
+                         "apfs_allocated_bytes_delta": sample["allocated_bytes_delta"],
+                         "apfs_write_bytes_by_device": devices}
+
+
 class Harness:
-    def __init__(self, args, work, sides, pin):
+    def __init__(self, args, work, sides, pin, apfs=None):
         self.args, self.work, self.sides, self.pin = args, work, sides, pin
+        self.apfs = apfs
         self.template = work / "template"
         self.deps = work / "fixture-deps"
         self.vendor = work / "fixture-vendor"
-        self.logs = work / "logs"
+        self.logs = (apfs.root if apfs else work) / "logs"
         self.builtin = not args.fixture_dir
         self.cargo_home = (Path(args.cargo_home).absolute() if args.cargo_home else
                            work / "cargo-home" if self.builtin else Path.home() / ".cargo")
@@ -611,6 +646,8 @@ class Harness:
                    FRUST_PROGRESS="plain", FRUST_HOME=str(side.home), XDG_CACHE_HOME=str(side.xdg),
                    XDG_CONFIG_HOME=str(self.work / "xdg-config"),
                    PATH=os.pathsep.join([str(side.cargo.parent), env.get("PATH", "")]))
+        if self.apfs:
+            env["TMPDIR"] = str(self.work / "tmp")
         rustc = (lane.rustc.get(side.key) if lane else None) or side.rustc
         if rustc:
             compiler = Path(rustc).absolute()
@@ -658,6 +695,8 @@ class Harness:
     def prepare(self):
         self.logs.mkdir(parents=True, exist_ok=True)
         (self.work / "xdg-config").mkdir(exist_ok=True)
+        if self.apfs:
+            (self.work / "tmp").mkdir()
         if self.builtin:
             self.expected = write_builtin_fixture(self.template, self.deps, self.vendor,
                                                   self.args.size, self.args.wide_members)
@@ -679,6 +718,9 @@ class Harness:
                 sys.exit(f"the generated Cargo.lock does not pin {VENDORED['name']} by its checksum:\n{lock_text}")
         self.template_digest = tree_digest(self.template)
         self.deps_digest = self.shared_digest()
+        if self.apfs:
+            os.sync()
+            self.apfs.initial_available = self.apfs.probe.available_bytes(self.apfs.mount)
 
     def shared_digest(self):
         """Digest of the read-only crates every workspace uses, or None when the fixture has none."""
@@ -724,10 +766,16 @@ class Harness:
     def measure(self, cell, side, rnd, position):
         tag = f"r{rnd}-{side.label}-{self.cell_index[cell.key()]}"
         problems, warnings = [], []
+        if self.apfs:
+            for pattern in ("target-*", "ws[0-9]*", "tmp"):
+                for path in self.work.glob(pattern):
+                    rmtree(path)
+            (self.work / "tmp").mkdir()
         # Every measured run starts from sources, targets and store rebuilt for its state.
         self.reset_sources(cell, problems)
         self.wipe_targets(cell)
-        self.wipe_store(side)
+        for owner in self.sides if self.apfs else (side,):
+            self.wipe_store(owner)
         if cell.state != "cold":
             self.warm_up(cell, side, tag)
         if cell.state == "cache":
@@ -749,7 +797,12 @@ class Harness:
                 trace = job.log.with_suffix(".flock")
                 job.env.update({loader: self.args.lock_trace_library, "FRUST_BENCH_FLOCK_LOG": str(trace)})
                 traces.append(trace)
-        results = run_commands(jobs, self.args.timeout)
+        if self.apfs:
+            results, apfs_metrics = self.apfs.run(tag, jobs, self.args.timeout)
+            if cell.state == "cold" and not apfs_metrics["apfs_write_bytes"]:
+                problems.append("the cold build had no observed APFS writes")
+        else:
+            results, apfs_metrics = run_commands(jobs, self.args.timeout), {}
         target_bytes = allocated(targets)
         store_bytes = allocated(stores)
         total_bytes = allocated(targets + stores)
@@ -813,6 +866,7 @@ class Harness:
             "cache_events": merge_counts(lane["cache"]["events"] for lane in lanes if lane["cache"]) or None,
             "cache_written_mib": sum_optional(lane["cache"]["written_mib"] for lane in lanes if lane["cache"]),
             "problems": problems, "warnings": warnings, "ok": not problems,
+            **apfs_metrics,
         }
         self.problems += [f"{cell.name()} {side.label} round {rnd}: {p}" for p in problems]
         return record
@@ -897,6 +951,10 @@ class Harness:
     def emit(self, record):
         self.write_record(record)
         head = f"r{record['round']} {record['side']} {record['scenario']} n={record['count']} {record['state']}"
+        if self.apfs:
+            measures = " ".join(f"{key}={mib(record[key])}" for key in APFS_METRICS)
+            print(f"{head} {measures}{'' if record['ok'] else ' FAILED'}", flush=True)
+            return
         if not self.args.summary_only:
             for lane in record["lanes"]:
                 print(f"{head} lane{lane['index']} {lane['mode']}:{lane['profile']}@ws{lane['workspace']} "
@@ -915,6 +973,8 @@ class Harness:
     def summary_data(self, cells):
         """Medians per side and paired b/a ratios per cell, over the rounds both sides completed."""
         a, b = self.sides
+        metrics = APFS_METRICS if self.apfs else SUMMARY_METRICS
+        ratio_metrics = APFS_METRICS if self.apfs else RATIO_METRICS
         entries = []
         for cell in cells:
             ok = {s.label: {r["round"]: r for r in self.records
@@ -924,9 +984,9 @@ class Harness:
             for side in self.sides:
                 rows = list(ok[side.label].values())
                 entry["sides"][side.label] = {"ok_rounds": len(rows),
-                                              **{m: median_known(r[m] for r in rows) for m in SUMMARY_METRICS}}
+                                              **{m: median_known(r[m] for r in rows) for m in metrics}}
             shared = sorted(set(ok[a.label]) & set(ok[b.label]))
-            for metric in RATIO_METRICS:
+            for metric in ratio_metrics:
                 pairs = [(ok[a.label][r][metric], ok[b.label][r][metric]) for r in shared]
                 pairs = [(x, y) for x, y in pairs if x and y is not None]
                 if pairs:
@@ -949,6 +1009,10 @@ class Harness:
             print(f"{entry['scenario']} n={entry['count']} {entry['state']}")
             for label, row in entry["sides"].items():
                 if row["ok_rounds"]:
+                    if self.apfs:
+                        measures = " ".join(f"{key}={mib(row[key])}" for key in APFS_METRICS)
+                        print(f"  {label:10} {measures} [{row['ok_rounds']} ok]")
+                        continue
                     print(f"  {label:10} cpu_total={row['cpu_total']:8.3f}s max_rss={mib(row['max_rss_bytes'])} "
                           f"write={show(row['write_bytes'], mib)} "
                           f"lock_waits={show(row['lock_waits_total'], '{:g}'.format)} "
@@ -1000,6 +1064,7 @@ class Harness:
             "jobs": self.args.jobs, "size": self.args.size, "pin": self.pin,
             "wide_members": self.args.wide_members,
             "lock_trace": bool(self.args.lock_trace_library),
+            "apfs": self.apfs.header() if self.apfs else None,
             "template_digest": self.template_digest, "deps_digest": self.deps_digest,
             "preset": self.args.preset, "states": self.args.states,
             "vendored": ({**VENDORED, "checksum": self.expected["vendor_checksum"]} if self.builtin else None),
@@ -1091,6 +1156,8 @@ def parse_args():
     parser.add_argument("--summary-only", action="store_true", help="omit the per-command lines")
     parser.add_argument("--lock-trace-library", type=lambda path: str(Path(path).resolve()),
                         help="native bench-flock shared library for a separate lock diagnostic run")
+    parser.add_argument("--apfs-writes", action="store_true",
+                        help="calibrate and measure virtual APFS write bytes on macOS in a private image")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and the fixture digest only")
     args = parser.parse_args()
     if args.preset and (args.scenarios or args.lane):
@@ -1120,6 +1187,15 @@ def parse_args():
         parser.error(f"{args.out} exists; choose another file or pass --append")
     if args.lock_trace_library and not Path(args.lock_trace_library).is_file():
         parser.error("--lock-trace-library must be a compiled bench-flock library")
+    if args.apfs_writes:
+        if sys.platform != "darwin":
+            parser.error("--apfs-writes requires macOS")
+        if args.fixture_dir or args.cargo_home or args.keep or args.lock_trace_library:
+            parser.error("--apfs-writes needs a generated fixture and private Cargo home without persistent work files or lock tracing")
+        isolated = {"CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "FRUST_HOME", "TMPDIR",
+                    "XDG_CACHE_HOME", "XDG_CONFIG_HOME"}
+        if any(key in isolated for key, _ in args.env + args.env_a + args.env_b):
+            parser.error("--apfs-writes manages the writable benchmark paths on its own volume")
     if args.fixture_dir:
         if not (Path(args.fixture_dir) / "Cargo.toml").is_file():
             parser.error("--fixture-dir has no Cargo.toml")
@@ -1140,25 +1216,12 @@ def print_plan(args, harness, cells):
             print(f"  lane{index} {lane.describe()}: {' '.join(harness.command(harness.sides[0], lane))}")
 
 
-def main():
-    args = parse_args()
-    for _, cargo, rustc in (args.a, args.b):
-        for tool in (cargo, rustc):
-            if tool and not os.access(tool, os.X_OK):
-                sys.exit(f"{tool} is not an executable file")
-    if args.work:
-        work = Path(args.work).absolute()
-        if work.exists() and any(work.iterdir()):
-            sys.exit(f"{work} is not empty")
-        work.mkdir(parents=True, exist_ok=True)
-    else:
-        base = REPO / "target" / "concurrent-builds"
-        base.mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
+def run_harness(args, work, apfs=None):
+    work.mkdir(exist_ok=True)
     sides = []
     for key, spec in zip("ab", (args.a, args.b)):
         sides.append(Side(key, spec[0], spec[1], spec[2], work))
-    harness = Harness(args, work, sides, pinning(args.cpus))
+    harness = Harness(args, work, sides, pinning(args.cpus), apfs)
     try:
         harness.prepare()
         members = args.members.split(",") if args.members else list(OVERLAP_PACKAGES)
@@ -1181,6 +1244,40 @@ def main():
         with ACTIVE_LOCK:
             for pgid in ACTIVE:
                 kill_group(pgid)
+
+
+def main():
+    args = parse_args()
+    for _, cargo, rustc in (args.a, args.b):
+        for tool in (cargo, rustc):
+            if tool and not os.access(tool, os.X_OK):
+                sys.exit(f"{tool} is not an executable file")
+    if args.work:
+        work = Path(args.work).absolute()
+        if work.exists() and any(work.iterdir()):
+            sys.exit(f"{work} is not empty")
+        work.mkdir(parents=True, exist_ok=True)
+    else:
+        base = REPO / "target" / "concurrent-builds"
+        base.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
+    if args.apfs_writes and not args.dry_run:
+        spec = importlib.util.spec_from_file_location("darwin_writes", REPO / "qualification/darwin-write-probe.py")
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        try:
+            with probe.mounted_image(work, size="2g") as image:
+                apfs = ApfsWrites(probe, *image)
+                return run_harness(args, apfs.mount / "benchmark", apfs)
+        except probe.ProbeError as error:
+            print(f"APFS measurement failed: {error}", file=sys.stderr)
+            return 1
+        finally:
+            if not args.work and not any(work.iterdir()):
+                work.rmdir()
+    try:
+        return run_harness(args, work)
+    finally:
         if not args.keep:
             for child in work.iterdir():
                 rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()

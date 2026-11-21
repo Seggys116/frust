@@ -2,6 +2,7 @@
 """Calibrate fs_usage write accounting on an isolated macOS APFS image."""
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,18 @@ class ProbeError(Exception):
     pass
 
 
+class ImageCleanupError(ProbeError):
+    def __init__(self, error, root):
+        super().__init__(str(error))
+        self.retained_scratch = root
+
+
+class CalibrationError(ProbeError):
+    def __init__(self, error, result):
+        super().__init__(str(error) or type(error).__name__)
+        self.result = result
+
+
 def command(*args):
     done = subprocess.run(args, capture_output=True, timeout=45)
     if done.returncode:
@@ -51,12 +64,29 @@ def locate_image(image):
     listing = plistlib.loads(command("hdiutil", "info", "-plist"))
     for attached in listing["images"]:
         if Path(attached.get("image-path", "")).resolve() == image:
-            devices = image_entities(attached)
-            device = whole_device(devices)
-            if not device:
-                raise ProbeError(f"could not identify the whole device for attached image {image}")
-            return device
+            return attached
     return None
+
+
+def detach_image(image, device, mount):
+    try:
+        command("hdiutil", "detach", device)
+    except ProbeError as error:
+        if "resource busy" not in str(error).casefold():
+            raise
+        owned = locate_image(image)
+        if not owned or whole_device(image_entities(owned)) != device:
+            raise ProbeError(f"cannot confirm ownership of busy image device {device}") from error
+        volumes = [item["dev-entry"] for item in owned["system-entities"]
+                   if item.get("mount-point") == str(mount) and DEVICE.fullmatch(item.get("dev-entry", ""))]
+        if len(volumes) != 1:
+            raise ProbeError(f"cannot identify one owned volume at {mount}") from error
+        command("diskutil", "unmount", volumes[0])
+        owned = locate_image(image)
+        if owned:
+            if whole_device(image_entities(owned)) != device:
+                raise ProbeError(f"owned image device changed after unmounting {mount}") from error
+            command("hdiutil", "detach", device)
 
 
 def parse_bytes(path, devices):
@@ -132,15 +162,18 @@ def write_payload(path, mode, payload):
         os.fsync(stream.fileno())
 
 
-def calibrate(work, result):
+@contextmanager
+def mounted_image(work, size="512m"):
+    if sys.platform != "darwin":
+        raise ProbeError("calibration requires macOS")
     root = Path(tempfile.mkdtemp(prefix="frust-apfs-io-", dir=work)).resolve()
     mount = root / "volume"
     image = root / "probe.sparseimage"
-    mount.mkdir()
     attach_attempted = False
     device = None
     try:
-        command("hdiutil", "create", "-quiet", "-size", "512m", "-fs", "APFS", "-type", "SPARSE",
+        mount.mkdir()
+        command("hdiutil", "create", "-quiet", "-size", size, "-fs", "APFS", "-type", "SPARSE",
                 "-volname", "frust-write-probe", str(image))
         attach_attempted = True
         attached = plistlib.loads(command("hdiutil", "attach", "-plist", "-nobrowse", "-mountpoint",
@@ -149,14 +182,43 @@ def calibrate(work, result):
         device = whole_device(devices)
         if not device or not any(item.get("mount-point") == str(mount) for item in attached["system-entities"]):
             raise ProbeError("hdiutil did not report the requested APFS mount and whole device")
-        result["devices"] = devices
-        path = mount / "payload"
+        yield root, mount, devices
+    finally:
+        try:
+            # Detach or preserve the scratch tree so cleanup cannot traverse a live mount.
+            if attach_attempted and device is None:
+                owned = locate_image(image)
+                if owned:
+                    device = whole_device(image_entities(owned))
+                    if not device:
+                        raise ProbeError(f"could not identify the whole device for attached image {image}")
+            if device:
+                detach_image(image, device, mount)
+            if mount.is_mount():
+                raise ProbeError(f"image remains mounted at {mount}")
+            shutil.rmtree(root)
+        except (ProbeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+            raise ImageCleanupError(error, root) from error
+
+
+def calibration_result():
+    return {"probe": "macos-apfs-diskimage-writes", "payload_bytes": PAYLOAD_BYTES,
+            "metric": "completed writes on virtual disk-image devices",
+            "phases": {}, "usable_devices": []}
+
+
+def calibrate_image(root, mount, devices):
+    result = calibration_result()
+    result["devices"] = devices
+    path, clone = mount / "payload", mount / "clone"
+    if any(os.path.lexists(item) for item in (path, clone)):
+        raise CalibrationError(ProbeError("calibration payload paths already exist"), result)
+    try:
         first, second = os.urandom(PAYLOAD_BYTES), os.urandom(PAYLOAD_BYTES)
         phases = result["phases"]
         phases["idle"] = sample(root, mount, devices, "idle", lambda: None)
         phases["fresh"] = sample(root, mount, devices, "fresh", lambda: write_payload(path, "xb", first))
         phases["rewrite"] = sample(root, mount, devices, "rewrite", lambda: write_payload(path, "r+b", second))
-        clone = mount / "clone"
         phases["clone"] = sample(root, mount, devices, "clone",
                                  lambda: command("/bin/cp", "-c", str(path), str(clone)))
         if clone.samefile(path) or clone.read_bytes() != second:
@@ -171,19 +233,15 @@ def calibrate(work, result):
                 result["usable_devices"].append(candidate)
         if not result["usable_devices"]:
             raise ProbeError("no image device recorded the full fresh and rewrite payloads with lower idle and clone writes")
+    except (ProbeError, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        raise CalibrationError(error, result) from error
     finally:
         try:
-            # Detach or preserve the scratch tree so cleanup cannot traverse a live mount.
-            if attach_attempted:
-                device = device or locate_image(image)
-                if device:
-                    command("hdiutil", "detach", device)
-            if mount.is_mount():
-                raise ProbeError(f"image remains mounted at {mount}")
-            shutil.rmtree(root)
-        except BaseException:
-            result["retained_scratch"] = str(root)
-            raise
+            for payload in (path, clone):
+                payload.unlink(missing_ok=True)
+        except OSError as error:
+            raise CalibrationError(error, result) from error
+    return result
 
 
 def interrupted(_signum, _frame):
@@ -194,17 +252,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, required=True, help="existing directory for the temporary image")
     args = parser.parse_args()
-    result = {"probe": "macos-apfs-diskimage-writes", "payload_bytes": PAYLOAD_BYTES,
-              "metric": "completed writes on virtual disk-image devices",
-              "phases": {}, "usable_devices": []}
+    result = calibration_result()
     try:
-        if sys.platform != "darwin":
-            raise ProbeError("calibration requires macOS")
         signal.signal(signal.SIGTERM, interrupted)
-        calibrate(args.work, result)
+        with mounted_image(args.work) as (root, mount, devices):
+            try:
+                result = calibrate_image(root, mount, devices)
+            except CalibrationError as error:
+                result = error.result
+                raise
     except (ProbeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         result["error"] = str(error) or type(error).__name__
         result["usable_devices"].clear()
+        if isinstance(error, ImageCleanupError):
+            result["retained_scratch"] = str(error.retained_scratch)
     print(json.dumps(result, sort_keys=True))
     return int("error" in result)
 

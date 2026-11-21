@@ -244,11 +244,22 @@ jobs:
           python3 -I qualification/darwin-write-probe.py --work "$RUNNER_TEMP" > "$result" || status=$?
           cat "$result"
           exit "$status"
+      - name: Verify the paired APFS benchmark
+        run: |
+          rustup toolchain install "$OFFICIAL_RELEASE" --profile minimal --no-self-update
+          cargo=$(rustup which --toolchain "$OFFICIAL_RELEASE" cargo)
+          rustc=$(rustup which --toolchain "$OFFICIAL_RELEASE" rustc)
+          python3 -I qualification/concurrent-builds.py \
+            --a "first=$cargo,$rustc" --b "second=$cargo,$rustc" --scenarios same-workspace --states cold \
+            --count 1 --rounds 2 --jobs 1 --size 20 --timeout 60 --apfs-writes --summary-only \
+            --work "$RUNNER_TEMP/apfs-check" --out "$RUNNER_TEMP/paired-write-probe.ndjson"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: write-probe-${{ matrix.os }}
-          path: ${{ runner.temp }}/write-probe.json
+          path: |
+            ${{ runner.temp }}/write-probe.json
+            ${{ runner.temp }}/paired-write-probe.ndjson
 
   toolchains:
     needs: plan
@@ -760,6 +771,25 @@ jobs:
             echo "### Cooperative checks, 388 workspace members (exit $status)"
             echo '```'
             cat "$out/wide-check.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Measure APFS write bytes and allocated blocks
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex' && runner.os == 'macOS'
+        timeout-minutes: 10
+        run: |
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --env FRUST_UNIT_CACHE=1 --scenarios independent --states cold,warm,cache,edit \
+            --count 3 --rounds 6 --jobs 2 --size 50 --timeout 60 --apfs-writes --summary-only \
+            --work "$WORK/apfs-write" --out "$out/apfs.ndjson" > "$out/apfs.txt" 2>&1 || status=$?
+          {
+            echo "### Paired APFS storage (exit $status)"
+            echo '```'
+            cat "$out/apfs.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
