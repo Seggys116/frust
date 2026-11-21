@@ -132,6 +132,21 @@ fn profile_dir_of(path: &Path) -> Option<PathBuf> {
 
 /// Prune one profile directory after a successful build. See the module docs for the safety rules.
 pub fn collect_profile_dir(profile_dir: &Path, live: &LiveSet, cfg: &GcConfig, now: SystemTime) -> io::Result<GcReport> {
+    collect_profile(profile_dir, live, cfg, now, true)
+}
+
+/// Run the same collection without measuring `kept_bytes` unless a cap requires it.
+pub fn prune_profile_dir(profile_dir: &Path, live: &LiveSet, cfg: &GcConfig, now: SystemTime) -> io::Result<GcReport> {
+    collect_profile(profile_dir, live, cfg, now, false)
+}
+
+fn collect_profile(
+    profile_dir: &Path,
+    live: &LiveSet,
+    cfg: &GcConfig,
+    now: SystemTime,
+    measure: bool,
+) -> io::Result<GcReport> {
     let mut report = GcReport::default();
     if !is_real_dir(profile_dir) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "profile directory is missing or a symlink"));
@@ -173,16 +188,16 @@ pub fn collect_profile_dir(profile_dir: &Path, live: &LiveSet, cfg: &GcConfig, n
             .map(|secs| UNIX_EPOCH + Duration::from_secs(*secs));
         prune_old_siblings(&scan.incremental, cutoff, &mut tally);
     }
-    let mut total = measure_dir(profile_dir);
-    if let Some(cap) = cfg.max_bytes {
-        if trusted && total > cap {
+    if measure || cfg.max_bytes.is_some() {
+        let mut total = measure_dir(profile_dir);
+        if let Some(cap) = cfg.max_bytes.filter(|&cap| trusted && total > cap) {
             total = enforce_cap(cap, total, current, &ledger, &scan, &mut tally);
         }
+        report.kept_bytes = total;
     }
     report.removed_files = tally.files;
     report.removed_dirs = tally.dirs;
     report.freed_bytes = tally.freed;
-    report.kept_bytes = total;
     Ok(report)
 }
 
@@ -800,7 +815,15 @@ fn charge(meta: &fs::Metadata, seen: &mut HashSet<(u64, u64)>) -> u64 {
     allocated(meta)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-profile censuses taken on this thread, so tests can prove when none is made.
+    static CENSUSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn measure_dir(root: &Path) -> u64 {
+    #[cfg(test)]
+    CENSUSES.with(|count| count.set(count.get() + 1));
     measure_into(root, &mut HashSet::new())
 }
 
@@ -1166,6 +1189,27 @@ mod tests {
         assert!(unit_gone(&profile, "b", 2));
         assert!(unit_gone(&profile, "c", 3));
         assert!(report.kept_bytes > 1, "the cap cannot evict what the build just used");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pass_without_a_cap_does_not_walk_the_whole_profile() {
+        let root = scratch();
+        let profile = make_profile(&root);
+        add_unit(&profile, "a", 1);
+        add_unit(&profile, "b", 2);
+        let cfg = GcConfig { keep_generations: 1, max_bytes: None };
+        let before = CENSUSES.with(|count| count.get());
+        prune_profile_dir(&profile, &live(&profile, &[("a", 1), ("b", 2)]), &cfg, at(1)).unwrap();
+        let report = prune_profile_dir(&profile, &live(&profile, &[("a", 1)]), &cfg, at(2)).unwrap();
+        assert_eq!(CENSUSES.with(|count| count.get()), before, "an uncapped pass must not measure the profile");
+        assert_eq!(report.kept_bytes, 0);
+        assert!(unit_gone(&profile, "b", 2), "deletion does not depend on the census");
+        assert_eq!(ledger_generation(&profile), 2);
+        let capped = GcConfig { keep_generations: 1, max_bytes: Some(u64::MAX) };
+        let report = prune_profile_dir(&profile, &live(&profile, &[("a", 1)]), &capped, at(3)).unwrap();
+        assert_eq!(CENSUSES.with(|count| count.get()), before + 1, "a configured cap still measures once");
+        assert!(report.kept_bytes > 0);
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use frust_core::{
     GcConfig, GcReport, Header, HostOs, LiveSet, Phase, PhaseMark, ProgressMode, ResolvedRoots, canonical_workspace, central_due,
-    collect_central, collect_profile_dir, load_roots_from_host, mode_from_env, render, resolve_max_bytes, slot_root,
+    collect_central, load_roots_from_host, mode_from_env, prune_profile_dir, render, resolve_max_bytes, slot_root,
     touch_slot_marker, unescape_json_string,
 };
 
@@ -438,7 +438,7 @@ fn run_collection(live: &LiveSet, args: &[String]) -> (GcReport, Option<String>)
     };
     let profiles = live.profile_dirs();
     for profile in &profiles {
-        match collect_profile_dir(profile, live, &config, now) {
+        match prune_profile_dir(profile, live, &config, now) {
             Ok(report) => total.merge(&report),
             Err(err) => note(err),
         }
