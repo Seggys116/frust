@@ -55,6 +55,7 @@ Rows marked single sample are one build each, not gate results.
 | LICM MemorySSA caps at 10000 (`frust-0ef1bc386-licmcap1`) | Disk, runtime, and stripped size on 2026-11-21. Baked, empty `llvm_args`. | Disk 1.00010149. Runtime upper 0.99615678. Size geomean 0.99720509, every file under stock. `frust-gates` exited 1. Not kept. |
 | Share generics (`-Z share-generics=on`) on `frust-0ef1bc386-licmcap1` | One ripgrep release build on 2026-11-21. Not a paired judge. | Stripped 4054736/4024992 (1.00738983), over stock. `frust-gates` was not run. Not kept. |
 | No untried full-LTO change | Scan on 2026-11-21 of 31 saved reports and the default-off fat-LTO switches. Not compiled in. | No runtime upper is at or under 0.97. licmcap stays the best empty-`llvm_args` stack at upper 0.99615678 and size geomean 0.99720509. The 630-pair cohort was not started. |
+| Post-link BOLT after fat LTO | Runtime and stripped size on 2026-11-21. `--use-old-text`, no huge pages, 4096-byte text alignment. Not a new prefix. | Runtime upper 1.00621331. Ripgrep grew to 4110536/4024992. Size geomean 1.020932. `frust-gates` exited 1. The 630-pair cohort was not started. |
 
 ### Interface-hash cutoff, 20 November
 
