@@ -1,0 +1,148 @@
+diff --git a/src/compiler/fingerprint/mod.rs b/src/compiler/fingerprint/mod.rs
+index 18f1276..6e918a3 100644
+--- a/src/compiler/fingerprint/mod.rs
++++ b/src/compiler/fingerprint/mod.rs
+@@ -1682,8 +1682,9 @@ fn calculate_normal(
+         },
+     ));
+     let mut config = StableHasher::new();
+-    if build_runner.cooperative_check {
+-        // The record is valid only for checks of this workspace and compiler.
++    if build_runner.cooperative_check && unit.mode.is_check() {
++        // The record is valid only for checks of this workspace and compiler. A host unit built
++        // in full keeps Cargo's own identity so a later build reuses it instead of rebuilding.
+         "frust-cooperative-check-v1".hash(&mut config);
+         build_runner.bcx.ws.root().hash(&mut config);
+         let rustc = build_runner.bcx.rustc();
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 6e4e618..079e747 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -325,15 +325,16 @@ fn replay_and_link(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
+ 
+ /// Whether a dirty `unit` may be replaced by another process's finished build.
+ ///
+-/// Only `cargo check` qualifies: it uplifts nothing and takes no artifact
+-/// directory lock, so a unit's outputs live entirely in the shared build
+-/// directory. Forced units always run.
++/// Only `cargo check` qualifies: it takes no artifact directory lock, so a
++/// unit's outputs must live entirely in the shared build directory. The graph
++/// test in `unit_join::supports` admits only such units, and this repeats it
++/// against the planned outputs. Forced units always run.
+ fn joinable(build_runner: &BuildRunner<'_, '_>, unit: &Unit, force: bool) -> CargoResult<bool> {
+     Ok(!force
+         && build_runner
+             .outputs(unit)?
+             .iter()
+-            .all(|output| output.hardlink.is_none()))
++            .all(|output| output.hardlink.is_none() && output.export_path.is_none()))
+ }
+ 
+ /// Generates the warning message used when fallible doc-scrape units fail,
+diff --git a/src/compiler/unit_join.rs b/src/compiler/unit_join.rs
+index ff57929..9bf037b 100644
+--- a/src/compiler/unit_join.rs
++++ b/src/compiler/unit_join.rs
+@@ -3,13 +3,15 @@
+ //! An eligible `cargo check` defers contended units and replays the producer's
+ //! outputs when its completed fingerprint is fresh for this invocation.
+ //!
+-//! Checks with build scripts use the normal path.
++//! Checks with build scripts use the normal path. Host libraries and proc macros, which a
++//! check builds in full, join only when every output stays in the unit directory.
+ 
+ use super::build_context::BuildContext;
+ use super::locking::{LockKey, LockManager};
+-use super::{CompileMode, UserIntent};
++use super::{CompileMode, CrateType, Unit, UserIntent};
+ use crate::compiler::fingerprint::JoinProbe;
+ use crate::util::errors::CargoResult;
++use crate::workspace::TargetKind;
+ 
+ /// A cooperative check must release its reader locks before making progress.
+ #[derive(Debug, thiserror::Error)]
+@@ -24,13 +26,15 @@ pub(super) fn supports(bcx: &BuildContext<'_, '_>) -> bool {
+         _ => match gctx.get_env("FRUST_EXPERIMENTAL_UNIT_JOIN").as_deref() {
+             Ok("0") => false,
+             Ok("1") => cfg!(unix),
+-            _ => cfg!(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
++            _ => cfg!(any(
++                target_os = "macos",
++                all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")
++            ))
+                 && gctx.get_env("FRUST_INVOCATION").ok() == Some("fcargo"),
+         },
+     };
+     enabled
+-        && !bcx.ws.build_dir().as_path_unlocked().ancestors()
+-            .any(crate::util::flock::is_on_nfs_mount)
++        && supports_mount(bcx.ws.build_dir().as_path_unlocked())
+         && matches!(bcx.build_config.intent, UserIntent::Check { .. })
+         && !bcx.build_config.timing_report
+         && !bcx.build_config.keep_going
+@@ -39,10 +43,64 @@ pub(super) fn supports(bcx: &BuildContext<'_, '_>) -> bool {
+         && bcx.gctx.cli_unstable().build_dir_new_layout
+         && bcx.gctx.jobserver_from_env().is_none()
+         && bcx.unit_graph.keys().all(|unit| {
+-            matches!(unit.mode, CompileMode::Check { .. }) && !unit.artifact.is_true()
++            !unit.artifact.is_true()
++                && match unit.mode {
++                    CompileMode::Check { .. } => true,
++                    CompileMode::Build => is_unit_local_host_build(bcx, unit),
++                    _ => false,
++                }
+         })
+ }
+ 
++#[cfg(not(target_os = "macos"))]
++fn supports_mount(path: &std::path::Path) -> bool {
++    !path.ancestors().any(crate::util::flock::is_on_nfs_mount)
++}
++
++#[cfg(target_os = "macos")]
++fn supports_mount(path: &std::path::Path) -> bool {
++    use std::ffi::CString;
++    use std::mem::MaybeUninit;
++    use std::os::unix::ffi::OsStrExt;
++
++    // A new build directory may not exist. Query the nearest existing ancestor's mount.
++    for path in path.ancestors() {
++        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return false };
++        let mut stat = MaybeUninit::<libc::statfs>::uninit();
++        // SAFETY: statfs initializes the structure on success, and path is NUL terminated.
++        if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } == 0 {
++            // SAFETY: statfs returned success.
++            let stat = unsafe { stat.assume_init() };
++            return stat.f_flags & libc::MNT_LOCAL as u32 != 0;
++        }
++        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
++            return false;
++        }
++    }
++    false
++}
++
++/// A host library or proc macro that a check builds in full, such as a proc macro and the
++/// libraries it links.
++///
++/// Cargo promotes a build's binaries, dylibs, requested roots and build-script programs out
++/// of the unit directory and exports them on request. Only an rlib or proc-macro unit that
++/// is not a root keeps all of its outputs in the managed unit directory, which the unit lock
++/// covers. Build-script programs, their run units and standard-library units never qualify, so
++/// a graph that holds one uses the normal path.
++fn is_unit_local_host_build(bcx: &BuildContext<'_, '_>, unit: &Unit) -> bool {
++    unit.mode == CompileMode::Build
++        && unit.kind.is_host()
++        && !unit.is_std
++        && !bcx.roots.contains(unit)
++        && match unit.target.kind() {
++            TargetKind::Lib(types) => types
++                .iter()
++                .all(|ty| matches!(ty, CrateType::Lib | CrateType::Rlib | CrateType::ProcMacro)),
++            _ => false,
++        }
++}
++
+ pub(super) enum Readiness {
+     Waiting,
+     Reuse,

@@ -331,6 +331,18 @@ jobs:
           FRUST_EXPERIMENTAL_RELR: ${{ inputs.relr && '1' || '0' }}
           LABEL: ci-${{ steps.name.outputs.name }}
         run: qualification/prove-codegen.sh "$RUNNER_TEMP/unpacked/frust" "$LABEL"
+      - name: Verify cooperative check scheduling and recovery
+        if: matrix.variant == 'frust'
+        env:
+          FRUST_INVOCATION: fcargo
+        run: |
+          bin="$RUNNER_TEMP/unpacked/frust/bin"
+          python3 -I qualification/cooperative-builds.py --cargo "$bin/fcargo" --rustc "$bin/frustc" \
+            --recovery --jobs 2 --timeout 30 > "$RUNNER_TEMP/suite-output/cooperative.txt" 2>&1 || {
+              cat "$RUNNER_TEMP/suite-output/cooperative.txt"
+              exit 1
+            }
+          cat "$RUNNER_TEMP/suite-output/cooperative.txt"
       - uses: actions/upload-artifact@v7
         if: always() && matrix.variant == 'frust'
         with:
@@ -338,6 +350,7 @@ jobs:
           path: |
             ${{ runner.temp }}/launch/launch.log
             ${{ runner.temp }}/suite-output/suite.txt
+            ${{ runner.temp }}/suite-output/cooperative.txt
             ${{ runner.temp }}/suite/logs/**
             target/compiler-rewrite/parity/ci-${{ steps.name.outputs.name }}/prove.log
           if-no-files-found: ignore
