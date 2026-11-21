@@ -67,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo, off by default)
+        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe by itself for native storage instrumentation calibration.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ contains(inputs.platforms, '-pgo') && 'pgo' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -184,7 +184,10 @@ jobs:
           for name in ("ROUNDS", "NOOPS"):
               if not os.environ[name].isdigit() or int(os.environ[name]) < 1:
                   raise SystemExit(f"{name.lower()} must be a whole number of at least 1, got {os.environ[name]!r}")
-          platforms = choose("PLATFORMS", tuple(PLATFORMS), True)
+          write_probe = os.environ["PLATFORMS"] == "macos-write-probe"
+          if write_probe and os.environ["PROTOCOL"] == "true":
+              raise SystemExit("macos-write-probe needs protocol=false")
+          platforms = [] if write_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
           workloads = choose("COHORTS", WORKLOADS, bool(not platforms))
           matrix = [
               dict(PLATFORMS[platform], workload=workload) for platform in platforms for workload in workloads
@@ -221,6 +224,31 @@ jobs:
           print(f"mac-pgo-builds={dump(mac_pgo)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
           PY
+
+  macos-write-probe:
+    name: Calibrate storage measurement (${{ matrix.os }})
+    needs: plan
+    if: inputs.platforms == 'macos-write-probe'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Measure isolated APFS writes
+        run: |
+          result=$RUNNER_TEMP/write-probe.json
+          status=0
+          python3 -I qualification/darwin-write-probe.py --work "$RUNNER_TEMP" > "$result" || status=$?
+          cat "$result"
+          exit "$status"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: write-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/write-probe.json
 
   toolchains:
     needs: plan

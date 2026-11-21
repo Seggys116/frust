@@ -353,6 +353,8 @@ A separate diagnostic instruments `flock` and `close` in both toolchains. It cou
 
 The wide-graph check runs two concurrent warm checks of 388 workspace members. It enables cooperative checking in both toolchains and measures paired CPU time and peak process RSS over six rounds.
 
+Dispatch Benchmark with `protocol=false` and `platforms=macos-write-probe` to test write accounting on both macOS runners. The probe uses a private APFS disk image and checks fresh writes, rewrites, clones and idle activity. Its output reports completed writes to a virtual device and the APFS allocation delta for each phase.
+
 ## Results of the CI comparison
 
 Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.
