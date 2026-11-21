@@ -351,6 +351,8 @@ The same job captures thirty alternating pairs of version commands for `fcargo`,
 
 A separate diagnostic instruments `flock` and `close` in both toolchains. It counts nonblocking conflicts and records the duration of blocking calls after a conflict and of observed lock holds through unlock, conversion or close. Holds without a recorded end appear separately. The trace runs after the CPU and storage samples so the instrumentation overhead stays out of those comparisons.
 
+The wide-graph check runs two concurrent warm checks of 388 workspace members. It enables cooperative checking in both toolchains and measures paired CPU time and peak process RSS over six rounds.
+
 ## Results of the CI comparison
 
 Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.

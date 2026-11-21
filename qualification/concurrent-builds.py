@@ -323,7 +323,7 @@ def write_vendored_crate(vendor, size):
     return checksum
 
 
-def write_builtin_fixture(template, deps, vendor, size):
+def write_builtin_fixture(template, deps, vendor, size, wide_members):
     """Write the workspace template, the shared path crate and the vendored crate. Returns the expected values."""
     value_a = fold(SEED, size)
     value_b = fold(value_a, size)
@@ -337,7 +337,8 @@ def write_builtin_fixture(template, deps, vendor, size):
                '[source.cb-vendor]\ndirectory = "../fixture-vendor"\n')
     write_text(deps / "cb_dep_b" / "Cargo.toml", manifest("cb_dep_b", f'cb_dep_a = "{VENDORED["version"]}"'))
     write_text(deps / "cb_dep_b" / "src" / "lib.rs", crate_source("cb_dep_a", size, None))
-    members = ("cb_app", "cb_core", "cb_left", "cb_right")
+    extra = tuple(f"cb_extra_{index}" for index in range(wide_members))
+    members = ("cb_app", "cb_core", "cb_left", "cb_right") + extra
     write_text(template / "Cargo.toml", '[workspace]\nresolver = "2"\nmembers = [' +
                ", ".join(f'"{member}"' for member in members) + "]\n")
     write_text(template / "cb_core" / "Cargo.toml",
@@ -353,6 +354,9 @@ def write_builtin_fixture(template, deps, vendor, size):
                manifest("cb_app", 'cb_left = { path = "../cb_left" }\ncb_right = { path = "../cb_right" }'))
     write_text(template / "cb_app" / "src" / "main.rs",
                'fn main() {\n    println!("{}", cb_left::value() ^ cb_right::value());\n}\n')
+    for index, name in enumerate(extra):
+        write_text(template / name / "Cargo.toml", manifest(name))
+        write_text(template / name / "src" / "lib.rs", f"pub fn value() -> usize {{\n    {index}\n}}\n")
     normalize_mtimes(deps)
     normalize_mtimes(vendor)
     normalize_mtimes(template)
@@ -655,7 +659,8 @@ class Harness:
         self.logs.mkdir(parents=True, exist_ok=True)
         (self.work / "xdg-config").mkdir(exist_ok=True)
         if self.builtin:
-            self.expected = write_builtin_fixture(self.template, self.deps, self.vendor, self.args.size)
+            self.expected = write_builtin_fixture(self.template, self.deps, self.vendor,
+                                                  self.args.size, self.args.wide_members)
         else:
             shutil.copytree(self.args.fixture_dir, self.template, symlinks=True,
                             ignore=shutil.ignore_patterns(*SKIP_DIRS))
@@ -993,6 +998,7 @@ class Harness:
         return {
             "kind": "run", "labels": LABELS, "argv": sys.argv, "rounds": self.args.rounds,
             "jobs": self.args.jobs, "size": self.args.size, "pin": self.pin,
+            "wide_members": self.args.wide_members,
             "lock_trace": bool(self.args.lock_trace_library),
             "template_digest": self.template_digest, "deps_digest": self.deps_digest,
             "preset": self.args.preset, "states": self.args.states,
@@ -1069,6 +1075,7 @@ def parse_args():
                         "or an offline resolution, and a CARGO_HOME holding its dependencies)")
     parser.add_argument("--edit-file", help="file, relative to the workspace, that the edit state appends to")
     parser.add_argument("--size", type=int, default=400, help="generated functions per crate of the generated fixture")
+    parser.add_argument("--wide-members", type=int, default=0, help="extra library members in the generated workspace")
     parser.add_argument("--ra-target", choices=("shared", "separate"), default="shared",
                         help="ra lanes use the workspace's target directory or their own")
     parser.add_argument("--cpus", default="none", help="none, auto or a taskset list (Linux only)")
@@ -1099,6 +1106,8 @@ def parse_args():
         parser.error(str(error))
     if min(args.count) < 1 or args.rounds < 1 or args.jobs < 0 or args.size < 1 or args.timeout <= 0:
         parser.error("--count, --rounds and --size must be positive, --jobs not negative, --timeout positive")
+    if args.wide_members < 0 or (args.wide_members and args.fixture_dir):
+        parser.error("--wide-members is a nonnegative count for the generated fixture")
     if "custom" in args.scenarios and not args.lane:
         parser.error("the custom scenario needs --lane")
     if args.lane and "custom" not in args.scenarios:

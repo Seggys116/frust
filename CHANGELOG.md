@@ -49,6 +49,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 ### Changed
 
 * Cooperative checks run on local macOS volumes and can share eligible host proc macros and rlibs. Graphs with build scripts use ordinary Cargo scheduling.
+* Cooperative fingerprint probes share one process environment snapshot across the build graph.
 * Dependency restores verify the bytes while copying them or after cloning. On cache filesystems without reflinks, an unpacked debug object that matches an rlib member uses that verified byte range.
 * Cache writers batch size accounting and use a nonblocking maintenance lock for recounts. The recount timestamp tracks full scans so that active writers cannot postpone a recount indefinitely.
 * The legacy-layout launcher skips the profile size scan when there is no cap to enforce. Plain `fclippy` dispatches in the first Cargo process.

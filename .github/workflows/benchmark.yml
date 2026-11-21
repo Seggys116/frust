@@ -716,6 +716,25 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: Measure a wide cooperative check graph
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        timeout-minutes: 10
+        run: |
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --env FRUST_EXPERIMENTAL_UNIT_JOIN=1 --scenarios same-workspace --mode check --states warm \
+            --count 2 --rounds 6 --jobs 2 --size 20 --wide-members 384 --timeout 120 --summary-only \
+            --work "$WORK/wide-check" --out "$out/wide-check.ndjson" > "$out/wide-check.txt" 2>&1 || status=$?
+          {
+            echo "### Cooperative checks, 388 workspace members (exit $status)"
+            echo '```'
+            cat "$out/wide-check.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Stage results
         if: always() && steps.cpu.outputs.runnable != 'false'
         run: |

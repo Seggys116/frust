@@ -1,0 +1,87 @@
+diff --git a/src/compiler/fingerprint/join.rs b/src/compiler/fingerprint/join.rs
+index 43fb09c..c3d937e 100644
+--- a/src/compiler/fingerprint/join.rs
++++ b/src/compiler/fingerprint/join.rs
+@@ -22,7 +22,7 @@ use super::Unit;
+ use super::find_stale_file;
+ use super::parse_dep_info;
+ use crate::CARGO_ENV;
+-use crate::context::FingerprintMethod;
++use crate::context::{Env, FingerprintMethod};
+ use crate::util;
+ use crate::util::data_structures::HashMap;
+ use crate::util::errors::CargoResult;
+@@ -37,7 +37,7 @@ pub(crate) struct JoinProbe {
+     build_root: PathBuf,
+     cargo_exe: PathBuf,
+     env_config: Arc<HashMap<String, OsString>>,
+-    env: HashMap<String, String>,
++    env: Arc<Env>,
+ }
+ 
+ impl JoinProbe {
+@@ -73,10 +73,7 @@ impl JoinProbe {
+             build_root: super::build_root(build_runner),
+             cargo_exe: gctx.cargo_exe()?.to_path_buf(),
+             env_config: Arc::clone(gctx.env_config()?),
+-            env: gctx
+-                .env()
+-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+-                .collect(),
++            env: gctx.env_snapshot(),
+         }))
+     }
+ 
+@@ -204,7 +201,7 @@ impl JoinProbe {
+         } else if let Some(value) = self.env_config.get(key) {
+             value.to_str()
+         } else {
+-            self.env.get(key).map(String::as_str)
++            self.env.get_env_os(key).and_then(OsStr::to_str)
+         };
+         current != previous.as_deref()
+     }
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index 3696ced..bf83910 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -130,7 +130,7 @@ mod target;
+ pub use target::{TargetCfgConfig, TargetConfig};
+ 
+ mod environment;
+-use environment::Env;
++pub(crate) use environment::Env;
+ 
+ mod schema;
+ pub use schema::*;
+@@ -256,7 +256,7 @@ pub struct GlobalContext {
+     /// Target Directory via resolved Cli parameter
+     target_dir: Option<Filesystem>,
+     /// Environment variable snapshot.
+-    env: Env,
++    env: Arc<Env>,
+     /// Tracks which sources have been updated to avoid multiple updates.
+     updated_sources: Mutex<HashSet<SourceId>>,
+     /// Cache of credentials from configuration or credential providers.
+@@ -351,7 +351,7 @@ impl GlobalContext {
+             }
+         };
+ 
+-        let env = Env::new();
++        let env = Arc::new(Env::new());
+ 
+         let cache_key = "CARGO_CACHE_RUSTC_INFO";
+         let cache_rustc_info = match env.get_env_os(cache_key) {
+@@ -961,7 +961,11 @@ impl GlobalContext {
+ 
+     /// Helper primarily for testing.
+     pub fn set_env(&mut self, env: HashMap<String, String>) {
+-        self.env = Env::from_map(env);
++        self.env = Arc::new(Env::from_map(env));
++    }
++
++    pub(crate) fn env_snapshot(&self) -> Arc<Env> {
++        Arc::clone(&self.env)
+     }
+ 
+     /// Returns all environment variables as an iterator,
