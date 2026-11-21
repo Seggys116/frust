@@ -1,0 +1,482 @@
+diff --git a/src/frust_unit_cache.rs b/src/frust_unit_cache.rs
+index 144ef62..4f7ca53 100644
+--- a/src/frust_unit_cache.rs
++++ b/src/frust_unit_cache.rs
+@@ -231,6 +231,29 @@ enum Fail {
+     Corrupt(&'static str),
+ }
+ 
++/// Why one blob could not be staged: damage in the store, or trouble at the destination or while
++/// reading, which says nothing about the entry and must not cost it its place.
++#[derive(Debug)]
++enum StageError {
++    Corrupt(&'static str),
++    Io(io::Error),
++}
++
++impl From<io::Error> for StageError {
++    fn from(err: io::Error) -> StageError {
++        StageError::Io(err)
++    }
++}
++
++impl From<StageError> for Fail {
++    fn from(err: StageError) -> Fail {
++        match err {
++            StageError::Corrupt(reason) => Fail::Corrupt(reason),
++            StageError::Io(_) => Fail::Reason("restore-failed"),
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ struct ToolchainInputs {
+     verbose_version: String,
+@@ -600,12 +623,13 @@ impl UnitCache {
+             return Err(Fail::Reason("file-dep"));
+         }
+         let blobs = self.blobs_for_outputs(&entry, split).ok_or(Fail::Corrupt("output-set"))?;
+-        verify_blobs(&entry_dir, &entry)?;
+-        let messages = fs::read(entry_dir.join(&entry.messages.blake3))
+-            .ok()
+-            .and_then(|bytes| clean_messages(&bytes))
++        // The small blobs are read and verified as they are consumed; the outputs are verified
++        // in the pass that stages them, so no blob is read twice.
++        let dep_text = read_blob(&entry_dir, &entry.dep_info)?;
++        let dep_text = String::from_utf8(dep_text).map_err(|_| Fail::Corrupt("dep-info-invalid"))?;
++        let messages = clean_messages(&read_blob(&entry_dir, &entry.messages)?)
+             .ok_or(Fail::Corrupt("messages-invalid"))?;
+-        let rmeta = self.restore(&entry_dir, &entry, &blobs, stamp)?;
++        let rmeta = self.restore(&entry_dir, &dep_text, &blobs, stamp)?;
+         Ok(Restored { rmeta, messages })
+     }
+ 
+@@ -653,20 +677,20 @@ impl UnitCache {
+     }
+ 
+     /// All files are staged next to their destinations first so a failure never leaves a
+-    /// half-restored set behind.
++    /// half-restored set behind. Each output is verified against its blob while it is staged.
+     fn restore(
+         &self,
+         entry_dir: &Path,
+-        entry: &Entry,
++        dep_text: &str,
+         blobs: &[(PathBuf, &Blob, Option<FileTime>)],
+         stamp: FileTime,
+     ) -> Result<bool, Fail> {
+         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+-        if self.stage(entry_dir, entry, blobs, stamp, &mut staged).is_err() {
++        if let Err(err) = self.stage(entry_dir, dep_text, blobs, stamp, &mut staged) {
+             for (temp, _) in &staged {
+                 let _ = fs::remove_file(temp);
+             }
+-            return Err(Fail::Reason("restore-failed"));
++            return Err(err.into());
+         }
+         for (index, (temp, dest)) in staged.iter().enumerate() {
+             if fs::rename(temp, dest).is_err() {
+@@ -694,23 +718,29 @@ impl UnitCache {
+     fn stage(
+         &self,
+         entry_dir: &Path,
+-        entry: &Entry,
++        dep_text: &str,
+         blobs: &[(PathBuf, &Blob, Option<FileTime>)],
+         stamp: FileTime,
+         staged: &mut Vec<(PathBuf, PathBuf)>,
+-    ) -> io::Result<()> {
++    ) -> Result<(), StageError> {
+         fs::create_dir_all(&self.out_dir)?;
+         for (dest, blob, debug_stamp) in blobs {
+             let temp = restore_temp(dest);
+             staged.push((temp.clone(), dest.clone()));
+-            clone_or_copy(&entry_dir.join(&blob.blake3), &temp, &blob.blake3, debug_stamp.unwrap_or(stamp))?;
++            let spec = StageSpec {
++                hash: &blob.blake3,
++                size: Some(blob.size),
++                stamp: debug_stamp.unwrap_or(stamp),
++                check_clone: true,
++            };
++            stage_blob(&entry_dir.join(&blob.blake3), &temp, &spec)?;
+         }
+-        let text = fs::read_to_string(entry_dir.join(&entry.dep_info.blake3))?;
+         let out_dir = self.out_dir.to_str().ok_or_else(|| io::Error::other("out dir"))?;
+         let temp = restore_temp(&self.dep_info);
+         staged.push((temp.clone(), self.dep_info.clone()));
+-        fs::write(&temp, text.replace(OUT_TOKEN, out_dir))?;
+-        filetime::set_file_mtime(&temp, stamp)
++        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
++        file.write_all(dep_text.replace(OUT_TOKEN, out_dir).as_bytes())?;
++        Ok(filetime::set_file_handle_times(&file, None, Some(stamp))?)
+     }
+ 
+     fn record_deps(
+@@ -903,10 +933,6 @@ fn verify_file_deps(deps: &[FileDep]) -> bool {
+     })
+ }
+ 
+-fn verify_blobs(entry_dir: &Path, entry: &Entry) -> Result<(), Fail> {
+-    verify_blob_list(entry_dir, entry_blobs(entry))
+-}
+-
+ /// Every blob must exist with the recorded size and BLAKE3; identical content is checked once.
+ fn verify_blob_list<'a>(
+     entry_dir: &Path,
+@@ -1406,48 +1432,199 @@ fn restore_temp(dest: &Path) -> PathBuf {
+     dest.with_file_name(format!(".frust-restore-{}-{name}", temp_name("")))
+ }
+ 
++/// What a staged copy of a blob must be, and how the destination is finished.
++struct StageSpec<'a> {
++    /// BLAKE3 hex of the blob.
++    hash: &'a str,
++    /// The blob's recorded size, when the caller has it.
++    size: Option<u64>,
++    stamp: FileTime,
++    /// Whether a cloned destination is read back and checked. Callers that verified the blob
++    /// just before cloning it can skip the extra pass.
++    check_clone: bool,
++}
++
++/// Reflink, else copy; never a hard link. The result is a private, writable file stamped
++/// `spec.stamp`: a shared inode would keep the blob's old mtime (stale-looking to Cargo's
++/// dependency checks) and Cargo's mtime shifts would write through to the shared blob.
++///
++/// A blob can share its inode with the target file it was stored from, so the staged bytes are
++/// checked against `spec`: the copy hashes while it copies, and a clone is read back from the
++/// destination. A failure removes `dst`; `Corrupt` means the blob is not what was stored.
++fn stage_blob(src: &Path, dst: &Path, spec: &StageSpec<'_>) -> Result<(), StageError> {
++    let mut input = File::open(src).map_err(|err| match err.kind() {
++        io::ErrorKind::NotFound => StageError::Corrupt("blob-missing"),
++        _ => StageError::Io(err),
++    })?;
++    let len = input.metadata()?.len();
++    if spec.size.is_some_and(|size| size != len) {
++        return Err(StageError::Corrupt("blob-size"));
++    }
++    let (mut output, cloned) = create_clone_or_empty(&input, src, dst)?;
++    let staged = fill_staged(&mut input, &mut output, len, cloned, spec).and_then(|()| {
++        make_writable_file(&output, dst)?;
++        Ok(filetime::set_file_handle_times(&output, None, Some(spec.stamp))?)
++    });
++    if staged.is_err() {
++        drop(output);
++        let _ = fs::remove_file(dst);
++    }
++    staged
++}
++
++/// Leaves `output` holding exactly the blob and proves it matches `spec`. A cloned destination
++/// already has the blob's data and is hashed in place; an empty one is filled by a single pass
++/// that hashes what it copies.
++fn fill_staged(
++    input: &mut File,
++    output: &mut File,
++    len: u64,
++    cloned: bool,
++    spec: &StageSpec<'_>,
++) -> Result<(), StageError> {
++    use io::{Seek, SeekFrom};
++    let (size, hash) = if cloned {
++        if !spec.check_clone {
++            return Ok(());
++        }
++        output.seek(SeekFrom::Start(0))?;
++        let result = stream_blake3(output, len, None)?;
++        stat_bytes(&STATS.hashed_bytes, result.0);
++        result
++    } else {
++        let result = stream_blake3(input, len, Some(output))?;
++        stat_bytes(&STATS.hashed_bytes, result.0);
++        stat_bytes(&STATS.written_bytes, result.0);
++        result
++    };
++    if spec.size.is_some_and(|expected| expected != size) {
++        return Err(StageError::Corrupt("blob-size"));
++    }
++    if !same_hash(&hash, spec.hash) {
++        return Err(StageError::Corrupt("blob-hash"));
++    }
++    Ok(())
++}
++
++fn same_hash(hash: &[u8; 32], hex_text: &str) -> bool {
++    blake3::Hash::from_hex(hex_text).is_ok_and(|expected| expected.as_bytes() == hash)
++}
++
++/// Clone-or-copy for callers that checked the blob themselves just before: a clone is trusted
++/// and a copy still verifies its own bytes.
++fn clone_or_copy(src: &Path, dst: &Path, expected: &str, stamp: FileTime) -> io::Result<()> {
++    let spec = StageSpec { hash: expected, size: None, stamp, check_clone: false };
++    stage_blob(src, dst, &spec).map_err(|err| match err {
++        StageError::Io(err) => err,
++        StageError::Corrupt(reason) => io::Error::other(format!("blob changed while restoring: {reason}")),
++    })
++}
++
++/// Reads a small blob whole, checking its size and BLAKE3 before anything uses the bytes.
++fn read_blob(entry_dir: &Path, blob: &Blob) -> Result<Vec<u8>, Fail> {
++    let mut file = File::open(entry_dir.join(&blob.blake3)).map_err(|err| match err.kind() {
++        io::ErrorKind::NotFound => Fail::Corrupt("blob-missing"),
++        _ => Fail::Reason("restore-failed"),
++    })?;
++    let mut bytes = Vec::new();
++    if let Ok(len) = file.metadata().map(|meta| meta.len()) {
++        if len != blob.size {
++            return Err(Fail::Corrupt("blob-size"));
++        }
++        let len = usize::try_from(len).map_err(|_| Fail::Corrupt("blob-size"))?;
++        bytes.try_reserve_exact(len).map_err(|_| Fail::Reason("restore-failed"))?;
++    }
++    file.read_to_end(&mut bytes).map_err(|_| Fail::Reason("restore-failed"))?;
++    stat_bytes(&STATS.hashed_bytes, bytes.len() as u64);
++    if bytes.len() as u64 != blob.size {
++        return Err(Fail::Corrupt("blob-size"));
++    }
++    if !same_hash(blake3::hash(&bytes).as_bytes(), &blob.blake3) {
++        return Err(Fail::Corrupt("blob-hash"));
++    }
++    Ok(bytes)
++}
++
+ #[cfg(unix)]
+-fn make_writable(path: &Path) -> io::Result<()> {
++fn make_writable_file(file: &File, _path: &Path) -> io::Result<()> {
+     use std::os::unix::fs::PermissionsExt;
+-    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
++    file.set_permissions(fs::Permissions::from_mode(0o644))
+ }
+ 
+ #[cfg(not(unix))]
+-fn make_writable(path: &Path) -> io::Result<()> {
++fn make_writable_file(_file: &File, path: &Path) -> io::Result<()> {
+     let mut perms = fs::metadata(path)?.permissions();
+     perms.set_readonly(false);
+     fs::set_permissions(path, perms)
+ }
+ 
+-/// Reflink, else copy; never a hard link. The result is a private, writable file stamped
+-/// `stamp`: a shared inode would keep the blob's old mtime (stale-looking to Cargo's dependency
+-/// checks) and Cargo's mtime shifts would write through to the shared blob.
+-///
+-/// A blob can share its inode with the target file it was stored from, so the copy fallback
+-/// hashes while it copies and fails if the content is no longer `expected` (BLAKE3 hex).
+-fn clone_or_copy(src: &Path, dst: &Path, expected: &str, stamp: FileTime) -> io::Result<()> {
+-    if reflink(src, dst).is_err() {
+-        let _ = fs::remove_file(dst);
+-        copy_verified(src, dst, expected)?;
++/// Creates `dst` and, where the filesystem allows, makes it a clone of the open blob. Returns the
++/// destination handle and whether it now holds the blob's data; otherwise it is an empty file.
++#[cfg(all(
++    target_os = "linux",
++    any(
++        target_arch = "x86_64",
++        target_arch = "aarch64",
++        target_arch = "riscv64",
++        target_arch = "x86",
++        target_arch = "arm"
++    )
++))]
++fn create_clone_or_empty(input: &File, _src: &Path, dst: &Path) -> io::Result<(File, bool)> {
++    let output = OpenOptions::new().read(true).write(true).create_new(true).open(dst)?;
++    // A refused clone leaves the new file untouched, so the same handle takes the copy.
++    let cloned = ficlone(&output, input).is_ok();
++    Ok((output, cloned))
++}
++
++#[cfg(target_os = "macos")]
++fn create_clone_or_empty(_input: &File, src: &Path, dst: &Path) -> io::Result<(File, bool)> {
++    if reflink(src, dst).is_ok() {
++        return Ok((File::open(dst)?, true));
+     }
+-    make_writable(dst)?;
+-    filetime::set_file_mtime(dst, stamp)
++    Ok((OpenOptions::new().read(true).write(true).create_new(true).open(dst)?, false))
+ }
+ 
+-fn copy_verified(src: &Path, dst: &Path, expected: &str) -> io::Result<()> {
+-    let mut input = File::open(src)?;
+-    let len = input.metadata()?.len();
+-    let mut output = OpenOptions::new().write(true).create_new(true).open(dst)?;
+-    let (size, hash) = stream_blake3(&mut input, len, Some(&mut output))?;
+-    drop(output);
+-    stat_bytes(&STATS.written_bytes, size);
+-    if hex(&hash) != expected {
++#[cfg(not(any(
++    all(
++        target_os = "linux",
++        any(
++            target_arch = "x86_64",
++            target_arch = "aarch64",
++            target_arch = "riscv64",
++            target_arch = "x86",
++            target_arch = "arm"
++        )
++    ),
++    target_os = "macos"
++)))]
++fn create_clone_or_empty(_input: &File, _src: &Path, dst: &Path) -> io::Result<(File, bool)> {
++    Ok((OpenOptions::new().read(true).write(true).create_new(true).open(dst)?, false))
++}
++
++#[cfg(all(
++    target_os = "linux",
++    any(
++        target_arch = "x86_64",
++        target_arch = "aarch64",
++        target_arch = "riscv64",
++        target_arch = "x86",
++        target_arch = "arm"
++    )
++))]
++fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
++    let input = File::open(src)?;
++    let output = OpenOptions::new().write(true).create_new(true).open(dst)?;
++    if let Err(err) = ficlone(&output, &input) {
++        drop(output);
+         let _ = fs::remove_file(dst);
+-        return Err(io::Error::other("blob changed while restoring"));
++        return Err(err);
+     }
+     Ok(())
+ }
+ 
++/// Makes `output` share `input`'s data blocks; fails without touching `output` when the
++/// filesystem cannot.
+ #[cfg(all(
+     target_os = "linux",
+     any(
+@@ -1458,20 +1635,15 @@ fn copy_verified(src: &Path, dst: &Path, expected: &str) -> io::Result<()> {
+         target_arch = "arm"
+     )
+ ))]
+-fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
++fn ficlone(output: &File, input: &File) -> io::Result<()> {
+     use std::os::fd::AsRawFd;
+     const FICLONE: libc::c_ulong = 0x4004_9409;
+-    let input = File::open(src)?;
+-    let output = OpenOptions::new().write(true).create_new(true).open(dst)?;
+     // SAFETY: both descriptors stay open for the duration of the call.
+-    let rc = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE as _, input.as_raw_fd()) };
+-    if rc == 0 {
+-        return Ok(());
++    if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE as _, input.as_raw_fd()) } == 0 {
++        Ok(())
++    } else {
++        Err(io::Error::last_os_error())
+     }
+-    let err = io::Error::last_os_error();
+-    drop(output);
+-    let _ = fs::remove_file(dst);
+-    Err(err)
+ }
+ 
+ #[cfg(target_os = "macos")]
+@@ -3380,20 +3552,97 @@ mod tests {
+         assert!(!cache.outputs[0].exists(), "nothing is restored from a corrupt entry");
+     }
+ 
++    fn spec_for(data: &[u8]) -> (String, u64) {
++        (hex(blake3::hash(data).as_bytes()), data.len() as u64)
++    }
++
+     #[test]
+     fn restore_copy_fails_when_the_blob_changed() {
+         let tmp = tempdir().unwrap();
+         let src = tmp.path().join("blob");
+         fs::write(&src, b"original").unwrap();
+-        let good = hex(blake3::hash(b"original").as_bytes());
++        let (good, size) = spec_for(b"original");
+         let dst = tmp.path().join("restored");
+-        copy_verified(&src, &dst, &good).unwrap();
++        let spec = StageSpec { hash: &good, size: Some(size), stamp: FileTime::now(), check_clone: true };
++        assert!(stage_blob(&src, &dst, &spec).is_ok());
+         assert_eq!(fs::read(&dst).unwrap(), b"original");
+         fs::remove_file(&dst).unwrap();
+ 
++        // Same length, different bytes: only the hash can tell.
+         fs::write(&src, b"tampered").unwrap();
+-        assert!(copy_verified(&src, &dst, &good).is_err());
++        assert!(matches!(stage_blob(&src, &dst, &spec), Err(StageError::Corrupt("blob-hash"))));
+         assert!(!dst.exists(), "a failed copy leaves nothing behind");
++
++        fs::write(&src, b"short").unwrap();
++        assert!(matches!(stage_blob(&src, &dst, &spec), Err(StageError::Corrupt("blob-size"))));
++        assert!(!dst.exists());
++
++        fs::remove_file(&src).unwrap();
++        assert!(matches!(stage_blob(&src, &dst, &spec), Err(StageError::Corrupt("blob-missing"))));
++        assert!(!dst.exists());
++    }
++
++    #[test]
++    fn staging_is_stamped_writable_and_leaves_an_existing_destination_alone() {
++        let tmp = tempdir().unwrap();
++        let src = tmp.path().join("blob");
++        fs::write(&src, b"original").unwrap();
++        let (hash, size) = spec_for(b"original");
++        let stamp = FileTime::from_unix_time(1_000_000, 500);
++        let dst = tmp.path().join("restored");
++        let spec = StageSpec { hash: &hash, size: Some(size), stamp, check_clone: true };
++        stage_blob(&src, &dst, &spec).unwrap();
++        let meta = fs::metadata(&dst).unwrap();
++        assert_eq!(FileTime::from_last_modification_time(&meta), stamp);
++        assert!(!meta.permissions().readonly());
++
++        // A destination that is already there is an I/O error, never the blob's fault, and
++        // is not removed.
++        assert!(matches!(stage_blob(&src, &dst, &spec), Err(StageError::Io(_))));
++        assert_eq!(fs::read(&dst).unwrap(), b"original");
++    }
++
++    #[test]
++    fn damaged_dep_info_is_named_precisely() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = command(&cache);
++        let key = populate(&cache, &cmd, &[], &[]);
++        let entry = read_entry(&store, &key);
++        let dep = store.entry_dir(&key).join(&entry.dep_info.blake3);
++        let mut perms = fs::metadata(&dep).unwrap().permissions();
++        perms.set_readonly(false);
++        fs::set_permissions(&dep, perms).unwrap();
++        let original = fs::read(&dep).unwrap();
++
++        let mut flipped = original.clone();
++        flipped[0] ^= 1;
++        fs::write(&dep, &flipped).unwrap();
++        assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-hash"))));
++        fs::write(&dep, &original[..original.len() - 1]).unwrap();
++        assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-size"))));
++        fs::write(&dep, &original).unwrap();
++        remove_outputs(&cache);
++        assert!(cache.try_restore(&key, &cmd).is_ok());
++    }
++
++    #[test]
++    fn a_corrupt_output_stages_nothing() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = command(&cache);
++        let key = populate(&cache, &cmd, &[], &[]);
++        let entry = read_entry(&store, &key);
++        // The second output is the one that fails, after the first was already staged.
++        let blob = store.entry_dir(&key).join(&entry.outputs[1].blake3);
++        let mut perms = fs::metadata(&blob).unwrap().permissions();
++        perms.set_readonly(false);
++        fs::set_permissions(&blob, perms).unwrap();
++        fs::write(&blob, b"rmeta-bytez").unwrap();
++        remove_outputs(&cache);
++        assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-hash"))));
++        let left: Vec<_> = fs::read_dir(&cache.out_dir).unwrap().flatten().map(|item| item.file_name()).collect();
++        assert!(left.is_empty(), "no staged or restored file may remain: {left:?}");
+     }
+ 
+     /// Rewrites `path` in place with same-length bytes and puts the old mtime back, so only a
+@@ -3494,4 +3743,5 @@ mod tests {
+         // Statistics are off unless the store opened with debugging on, and then cost nothing.
+         assert!(stat_start().is_none());
+     }
++
+ }
