@@ -148,6 +148,9 @@ export PATH=$bin:/usr/bin:/bin
 export CARGO_TERM_COLOR=never
 export CARGO_NET_OFFLINE=true
 export CARGO_INCREMENTAL=0
+# Cargo's dev profile writes unpacked split debuginfo on macOS, and the unit cache does not store units
+# built that way ("skip ... split-debuginfo-unpacked"). The cache check below needs units it can store.
+[[ $(uname -s) == Darwin ]] && export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off
 export FRUST_PROGRESS=plain
 export TERM=dumb
 export RUST_BACKTRACE=0
