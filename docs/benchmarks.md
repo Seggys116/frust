@@ -359,6 +359,8 @@ Dispatch Benchmark with `protocol=false` and `platforms=macos-write-probe` to te
 
 The macOS regex jobs also run six paired storage trials on a private APFS image. Each run calibrates the image before measuring and keeps workspace files, targets, caches and Cargo temporary files on it. The report counts completed volume data writes and container metadata writes through the post-build sync. Occupied APFS blocks include shared extents once. CPU and RSS comparisons come from the separate untraced runs.
 
+The Linux regex jobs use a check graph with 97 checksummed dependencies to measure cache accounting writes. Six pairs start with an empty store and six rebuild a clean target from the warmed store. These checks disable incremental compilation.
+
 ## Results of the CI comparison
 
 Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.

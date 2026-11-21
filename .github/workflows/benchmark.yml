@@ -822,6 +822,26 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: Measure cache accounting on a wide dependency graph
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex' && runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --env FRUST_UNIT_CACHE=1 --env FRUST_UNIT_CACHE_DEBUG=1 --env CARGO_INCREMENTAL=0 \
+            --scenarios independent --mode check --states cold,cache --count 1 --rounds 6 --jobs 2 --size 8 \
+            --extra-vendored 96 --timeout 120 --summary-only --work "$WORK/cache-accounting" \
+            --out "$out/cache-accounting.ndjson" > "$out/cache-accounting.txt" 2>&1 || status=$?
+          {
+            echo "### Paired cache accounting (exit $status)"
+            echo '```'
+            cat "$out/cache-accounting.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Stage results
         if: always() && steps.cpu.outputs.runnable != 'false'
         run: |

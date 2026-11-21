@@ -309,9 +309,9 @@ def normalize_mtimes(root):
     os.utime(root, (FIXED_MTIME, FIXED_MTIME))
 
 
-def write_vendored_crate(vendor, size):
-    """Write cb_dep_a as a directory-source crate whose checksum Cargo.lock will pin. Returns that checksum."""
-    name, version = VENDORED["name"], VENDORED["version"]
+def write_vendored_crate(vendor, size, name):
+    """Write a checksummed directory-source crate that goes into Cargo.lock."""
+    version = VENDORED["version"]
     manifest_text = manifest(name, version=version)
     source_text = crate_source(None, size, None)
     # Stands in for the SHA-256 of a .crate file, which an offline harness has none of. Any stable value
@@ -327,7 +327,7 @@ def write_vendored_crate(vendor, size):
     return checksum
 
 
-def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro):
+def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro, extra_vendored):
     """Write the workspace template, the shared path crate and the vendored crate. Returns the expected values."""
     value_a = fold(SEED, size)
     value_b = fold(value_a, size)
@@ -335,7 +335,7 @@ def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro
     left, right = (value_core + 1) & MASK, (value_core + 2) & MASK
     # cb_dep_a is a checksummed registry crate served from a directory source, so workspaces at different
     # paths see one identical package that a unit cache can share. cb_dep_b stays a path crate under deps.
-    checksum = write_vendored_crate(vendor, size)
+    checksum = write_vendored_crate(vendor, size, VENDORED["name"])
     write_text(template / ".cargo" / "config.toml",
                '[source.crates-io]\nreplace-with = "cb-vendor"\n\n'
                '[source.cb-vendor]\ndirectory = "../fixture-vendor"\n')
@@ -352,8 +352,17 @@ def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro
                    "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n"
                    "#[proc_macro]\npub fn passthrough(input: TokenStream) -> TokenStream {\n    input\n}\n")
         core_deps += '\ncb_macro = { path = "../../fixture-deps/cb_macro" }'
+    vendor_checksums = {VENDORED["name"]: checksum}
+    core = crate_source("cb_dep_b", size, value_core, proc_macro)
+    if extra_vendored:
+        extra = [f"cb_registry_{index}" for index in range(extra_vendored)]
+        for name in extra:
+            vendor_checksums[name] = write_vendored_crate(vendor, size, name)
+        core_deps += "".join(f'\n{name} = "{VENDORED["version"]}"' for name in extra)
+        calls = "\n".join(f"    value ^= {name}::value();" for name in extra)
+        core += f"\npub fn registry_values() -> u64 {{\n    let mut value = 0;\n{calls}\n    value\n}}\n"
     write_text(template / "cb_core" / "Cargo.toml", manifest("cb_core", core_deps))
-    write_text(template / "cb_core" / "src" / "lib.rs", crate_source("cb_dep_b", size, value_core, proc_macro))
+    write_text(template / "cb_core" / "src" / "lib.rs", core)
     for name, delta, value in (("cb_left", 1, left), ("cb_right", 2, right)):
         write_text(template / name / "Cargo.toml", manifest(name, 'cb_core = { path = "../cb_core" }'))
         write_text(template / name / "src" / "lib.rs",
@@ -370,7 +379,7 @@ def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro
     normalize_mtimes(deps)
     normalize_mtimes(vendor)
     normalize_mtimes(template)
-    return {"app_output": str(left ^ right), "vendor_checksum": checksum}
+    return {"app_output": str(left ^ right), "vendor_checksums": vendor_checksums}
 
 
 def tree_digest(root):
@@ -709,7 +718,8 @@ class Harness:
             (self.work / "tmp").mkdir()
         if self.builtin:
             self.expected = write_builtin_fixture(self.template, self.deps, self.vendor,
-                                                  self.args.size, self.args.wide_members, self.args.proc_macro)
+                                                  self.args.size, self.args.wide_members, self.args.proc_macro,
+                                                  self.args.extra_vendored)
         else:
             shutil.copytree(self.args.fixture_dir, self.template, symlinks=True,
                             ignore=shutil.ignore_patterns(*SKIP_DIRS))
@@ -724,8 +734,9 @@ class Harness:
         self.locked = (self.template / "Cargo.lock").is_file() or (self.builtin and self.args.dry_run)
         if self.builtin and self.locked and not self.args.dry_run:
             lock_text = (self.template / "Cargo.lock").read_text()
-            if f'checksum = "{self.expected["vendor_checksum"]}"' not in lock_text:
-                sys.exit(f"the generated Cargo.lock does not pin {VENDORED['name']} by its checksum:\n{lock_text}")
+            for name, checksum in self.expected["vendor_checksums"].items():
+                if f'checksum = "{checksum}"' not in lock_text:
+                    sys.exit(f"the generated Cargo.lock does not pin {name} by its checksum")
         self.template_digest = tree_digest(self.template)
         self.deps_digest = self.shared_digest()
         if self.apfs:
@@ -1079,7 +1090,8 @@ class Harness:
             "apfs": self.apfs.header() if self.apfs else None,
             "template_digest": self.template_digest, "deps_digest": self.deps_digest,
             "preset": self.args.preset, "states": self.args.states,
-            "vendored": ({**VENDORED, "checksum": self.expected["vendor_checksum"]} if self.builtin else None),
+            "vendored": ({**VENDORED, "checksum": self.expected["vendor_checksums"][VENDORED["name"]],
+                          "count": len(self.expected["vendor_checksums"])} if self.builtin else None),
             "locked": self.locked, "cargo_home": str(self.cargo_home),
             "host": {"system": platform.system(), "machine": platform.machine(),
                      "uname": " ".join(platform.uname()), "python": platform.python_version(),
@@ -1154,6 +1166,7 @@ def parse_args():
     parser.add_argument("--size", type=int, default=400, help="generated functions per crate of the generated fixture")
     parser.add_argument("--wide-members", type=int, default=0, help="extra library members in the generated workspace")
     parser.add_argument("--proc-macro", action="store_true", help="include a shared host proc macro in the generated fixture")
+    parser.add_argument("--extra-vendored", type=int, default=0, help="extra checksummed dependencies in the generated fixture")
     parser.add_argument("--ra-target", choices=("shared", "separate"), default="shared",
                         help="ra lanes use the workspace's target directory or their own")
     parser.add_argument("--cpus", default="none", help="none, auto or a taskset list (Linux only)")
@@ -1190,6 +1203,8 @@ def parse_args():
         parser.error("--wide-members is a nonnegative count for the generated fixture")
     if args.proc_macro and args.fixture_dir:
         parser.error("--proc-macro needs the generated fixture")
+    if args.extra_vendored < 0 or (args.extra_vendored and args.fixture_dir):
+        parser.error("--extra-vendored is a nonnegative count for the generated fixture")
     if "custom" in args.scenarios and not args.lane:
         parser.error("the custom scenario needs --lane")
     if args.lane and "custom" not in args.scenarios:
