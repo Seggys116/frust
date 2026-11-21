@@ -1,0 +1,1098 @@
+diff --git a/src/frust_unit_cache.rs b/src/frust_unit_cache.rs
+index 4f7ca53..08aebab 100644
+--- a/src/frust_unit_cache.rs
++++ b/src/frust_unit_cache.rs
+@@ -34,6 +34,11 @@ use crate::workspace::{SourceKind, TargetKind};
+ #[path = "frust_script_cache.rs"]
+ pub(crate) mod script_cache;
+ 
++// Locates debug sidecars that are already exact bytes inside a stored rlib.
++#[path = "frust_archive_range.rs"]
++mod archive_range;
++use archive_range::Containers;
++
+ const SCHEMA: &str = "frust-unit-cache-v1";
+ const MANIFEST_SCHEMA: u32 = 1;
+ const MANIFEST: &str = "entry.json";
+@@ -147,6 +152,16 @@ struct DebugObject {
+     blob: Blob,
+     seconds: i64,
+     nanos: u32,
++    /// Set when the bytes are not stored on their own: they are the `blob.size` bytes at
++    /// `archive.offset` of the entry's output whose BLAKE3 is `archive.container`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    archive: Option<ArchiveRange>,
++}
++
++#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
++struct ArchiveRange {
++    container: String,
++    offset: u64,
+ }
+ 
+ #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+@@ -212,6 +227,16 @@ struct Restored {
+     messages: Vec<String>,
+ }
+ 
++/// One file a hit puts back: where it goes, the blob it must equal and how to produce it.
++struct RestoreItem<'a> {
++    dest: PathBuf,
++    blob: &'a Blob,
++    /// The recorded mtime of a debug object; outputs take the unit's stamp.
++    debug_stamp: Option<FileTime>,
++    /// For a debug object kept as a range: the range and the output that holds it.
++    range: Option<(&'a ArchiveRange, &'a Blob)>,
++}
++
+ enum StoreFail {
+     /// rustc printed something other than an unused-externs report.
+     Noisy,
+@@ -639,18 +664,19 @@ impl UnitCache {
+         &self,
+         entry: &'a Entry,
+         split: Option<&SplitOutputs>,
+-    ) -> Option<Vec<(PathBuf, &'a Blob, Option<FileTime>)>> {
++    ) -> Option<Vec<RestoreItem<'a>>> {
+         let find = |path: &PathBuf| {
+             let name = file_name(path)?;
+             entry.outputs.iter().find(|blob| blob.name == name)
+         };
+         let mut matched = Vec::with_capacity(entry.outputs.len());
++        let output = |dest: &PathBuf, blob: &'a Blob| RestoreItem { dest: dest.clone(), blob, debug_stamp: None, range: None };
+         for path in &self.outputs {
+-            matched.push((path.clone(), find(path)?, None));
++            matched.push(output(path, find(path)?));
+         }
+         for path in &self.optional_outputs {
+             if let Some(blob) = find(path) {
+-                matched.push((path.clone(), blob, None));
++                matched.push(output(path, blob));
+             }
+         }
+         let has_debug_objects = !entry.debug_objects.is_empty();
+@@ -666,11 +692,16 @@ impl UnitCache {
+                 {
+                     return None;
+                 }
+-                matched.push((
+-                    self.out_dir.join(&obj.blob.name),
+-                    &obj.blob,
+-                    Some(FileTime::from_unix_time(obj.seconds, obj.nanos)),
+-                ));
++                let range = match &obj.archive {
++                    Some(range) => Some((range, range_container(entry, obj, range)?)),
++                    None => None,
++                };
++                matched.push(RestoreItem {
++                    dest: self.out_dir.join(&obj.blob.name),
++                    blob: &obj.blob,
++                    debug_stamp: Some(FileTime::from_unix_time(obj.seconds, obj.nanos)),
++                    range,
++                });
+             }
+         }
+         Some(matched)
+@@ -682,7 +713,7 @@ impl UnitCache {
+         &self,
+         entry_dir: &Path,
+         dep_text: &str,
+-        blobs: &[(PathBuf, &Blob, Option<FileTime>)],
++        blobs: &[RestoreItem<'_>],
+         stamp: FileTime,
+     ) -> Result<bool, Fail> {
+         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+@@ -705,35 +736,41 @@ impl UnitCache {
+         }
+         // Dependents will hash these files as `--extern` inputs; the verified blob hash is
+         // already known for the files as they now stand.
+-        for (path, blob, debug_stamp) in blobs {
+-            if debug_stamp.is_none() {
+-                remember_written_hash(path, &blob.blake3);
++        for item in blobs {
++            if item.debug_stamp.is_none() {
++                remember_written_hash(&item.dest, &item.blob.blake3);
+             }
+         }
+         // GC recency lives on the manifest, which is never exposed outside the store.
+         let _ = filetime::set_file_mtime(entry_dir.join(MANIFEST), FileTime::now());
+-        Ok(blobs.iter().any(|(path, _, _)| path.extension() == Some(OsStr::new("rmeta"))))
++        Ok(blobs.iter().any(|item| item.dest.extension() == Some(OsStr::new("rmeta"))))
+     }
+ 
+     fn stage(
+         &self,
+         entry_dir: &Path,
+         dep_text: &str,
+-        blobs: &[(PathBuf, &Blob, Option<FileTime>)],
++        blobs: &[RestoreItem<'_>],
+         stamp: FileTime,
+         staged: &mut Vec<(PathBuf, PathBuf)>,
+     ) -> Result<(), StageError> {
+         fs::create_dir_all(&self.out_dir)?;
+-        for (dest, blob, debug_stamp) in blobs {
+-            let temp = restore_temp(dest);
+-            staged.push((temp.clone(), dest.clone()));
++        for item in blobs {
++            let temp = restore_temp(&item.dest);
++            staged.push((temp.clone(), item.dest.clone()));
+             let spec = StageSpec {
+-                hash: &blob.blake3,
+-                size: Some(blob.size),
+-                stamp: debug_stamp.unwrap_or(stamp),
++                hash: &item.blob.blake3,
++                size: Some(item.blob.size),
++                stamp: item.debug_stamp.unwrap_or(stamp),
+                 check_clone: true,
+             };
+-            stage_blob(&entry_dir.join(&blob.blake3), &temp, &spec)?;
++            match item.range {
++                Some((range, container)) => {
++                    let src = entry_dir.join(&container.blake3);
++                    archive_range::stage_range(&src, container.size, range.offset, &temp, &spec)?;
++                }
++                None => stage_blob(&entry_dir.join(&item.blob.blake3), &temp, &spec)?,
++            }
+         }
+         let out_dir = self.out_dir.to_str().ok_or_else(|| io::Error::other("out dir"))?;
+         let temp = restore_temp(&self.dep_info);
+@@ -890,11 +927,24 @@ fn clean_messages(bytes: &[u8]) -> Option<Vec<String>> {
+         .collect()
+ }
+ 
++/// The blobs that exist as files in the entry directory. A debug object kept as a range of an
++/// output has none, so it is neither verified, checked for existence nor counted as size.
+ fn entry_blobs(entry: &Entry) -> impl Iterator<Item = &Blob> {
+-    entry.outputs.iter().chain(entry.debug_objects.iter().map(|obj| &obj.blob))
++    entry.outputs.iter()
++        .chain(entry.debug_objects.iter().filter(|obj| obj.archive.is_none()).map(|obj| &obj.blob))
+         .chain([&entry.dep_info, &entry.messages])
+ }
+ 
++/// The output a ranged debug object lives in, when the range is well formed and inside it.
++fn range_container<'a>(entry: &'a Entry, obj: &DebugObject, range: &ArchiveRange) -> Option<&'a Blob> {
++    let end = range.offset.checked_add(obj.blob.size)?;
++    entry
++        .outputs
++        .iter()
++        .find(|out| out.blake3 == range.container)
++        .filter(|out| is_hex64(&range.container) && obj.blob.size > 0 && end <= out.size)
++}
++
+ /// Whether a file was written at or after `started`, allowing for coarse filesystem timestamps.
+ fn made_since(meta: &fs::Metadata, started: SystemTime) -> bool {
+     const SLACK: Duration = Duration::from_secs(2);
+@@ -965,7 +1015,11 @@ fn entry_names_valid(entry: &Entry) -> bool {
+             && blob.name != ".."
+             && !blob.name.contains(['/', '\\', '\0'])
+     };
+-    is_hex64(&entry.key) && entry_blobs(entry).all(blob_ok)
++    let ranges_ok = entry.debug_objects.iter().all(|obj| match &obj.archive {
++        None => true,
++        Some(range) => blob_ok(&obj.blob) && range_container(entry, obj, range).is_some(),
++    });
++    is_hex64(&entry.key) && entry_blobs(entry).all(blob_ok) && ranges_ok
+ }
+ 
+ fn is_hex64(text: &str) -> bool {
+@@ -1803,6 +1857,7 @@ struct Store {
+     budget: u64,
+     debug: bool,
+     gc_ran: AtomicBool,
++    clone_supported: OnceLock<bool>,
+ }
+ 
+ #[derive(Default, Debug)]
+@@ -1828,7 +1883,13 @@ enum Scan {
+ 
+ impl Store {
+     fn new(root: PathBuf, budget: u64, debug: bool) -> Store {
+-        Store { root, budget, debug, gc_ran: AtomicBool::new(false) }
++        Store {
++            root,
++            budget,
++            debug,
++            gc_ran: AtomicBool::new(false),
++            clone_supported: OnceLock::new(),
++        }
+     }
+ 
+     #[allow(clippy::print_stderr)]
+@@ -1916,12 +1977,22 @@ impl Store {
+             blobs.push(put_output_blob(entry_dir, name, path)?);
+         }
+         let mut objects = Vec::with_capacity(debug_objects.len());
++        let mut containers = if debug_objects.is_empty() || self.can_clone_blobs(entry_dir, &blobs) {
++            Containers::none()
++        } else {
++            Containers::open(entry_dir, &blobs)
++        };
+         for path in debug_objects {
+             let name = file_name(path).ok_or_else(|| io::Error::other("debug object name"))?;
+             let mtime = FileTime::from_last_modification_time(&fs::metadata(path)?);
+-            let blob = put_output_blob(entry_dir, name, path)?;
++            let (blob, archive) = put_debug_object(entry_dir, name, path, &mut containers)?;
+             // Darwin debug maps record object mtimes along with the path.
+-            objects.push(DebugObject { blob, seconds: mtime.unix_seconds(), nanos: mtime.nanoseconds() });
++            objects.push(DebugObject {
++                blob,
++                seconds: mtime.unix_seconds(),
++                nanos: mtime.nanoseconds(),
++                archive,
++            });
+         }
+         let manifest_timer = stat_start();
+         let dep_blob = put_blob(entry_dir, &dep_info.0, dep_info.1.as_slice())?;
+@@ -1950,6 +2021,26 @@ impl Store {
+         Ok(entry_size(&entry))
+     }
+ 
++    fn can_clone_blobs(&self, entry_dir: &Path, outputs: &[Blob]) -> bool {
++        let Some(rlib) = outputs.iter().find(|blob| blob.name.ends_with(".rlib")) else {
++            return true;
++        };
++        *self.clone_supported.get_or_init(|| {
++            let staged = entry_dir.join(temp_name("tmp-clone-"));
++            match reflink(&entry_dir.join(&rlib.blake3), &staged) {
++                Ok(()) => {
++                    let _ = fs::remove_file(staged);
++                    true
++                }
++                Err(error) => {
++                    // A range requires a copy. Keep the clone path on filesystems that can use it.
++                    error.kind() != io::ErrorKind::Unsupported
++                        && error.raw_os_error() != Some(libc::ENOTTY)
++                }
++            }
++        })
++    }
++
+     fn print_stats(&self) {
+         if self.debug {
+             self.log(format_args!("{}", STATS.line()));
+@@ -2261,6 +2352,24 @@ fn put_output_blob(entry_dir: &Path, name: &str, src: &Path) -> io::Result<Blob>
+     Ok(Blob { name: name.to_string(), size, blake3: digest })
+ }
+ 
++/// Stores a debug object as a range of an output archive when the archive holds exactly its
++/// bytes under its name, and as its own blob otherwise: any doubt about the member, the range
++/// or the bytes, or a blob of the same content already in the entry, keeps the standalone form.
++fn put_debug_object(
++    entry_dir: &Path,
++    name: &str,
++    path: &Path,
++    containers: &mut Containers,
++) -> io::Result<(Blob, Option<ArchiveRange>)> {
++    if let Ok(Some((blob, range))) = containers.locate(name, path) {
++        if entry_dir.join(&blob.blake3).exists() {
++            return Ok((blob, None));
++        }
++        return Ok((blob, Some(range)));
++    }
++    Ok((put_output_blob(entry_dir, name, path)?, None))
++}
++
+ /// Streams `input` once through BLAKE3, writing every chunk to `copy` in the same pass when
+ /// given. The buffer is sized to the expected length, up to `HASH_BUF`.
+ fn stream_blake3(
+@@ -3744,4 +3853,288 @@ mod tests {
+         assert!(stat_start().is_none());
+     }
+ 
++    const FIRST_SIDECAR: &str = "foo-abc.foo.cgu.0.rcgu.o";
++    const SECOND_SIDECAR: &str = "foo-abc.foo.cgu.1.rcgu.dwo";
++
++    fn split_command(cache: &UnitCache) -> ProcessBuilder {
++        let mut cmd = command(cache);
++        cmd.arg("-g").arg("-Csplit-debuginfo=unpacked");
++        cmd
++    }
++
++    fn sidecar_stamp(index: usize) -> FileTime {
++        FileTime::from_unix_time(1_700_000_000 + index as i64, 1_000 + index as u32)
++    }
++
++    /// Compiles and stores a unit whose rlib is `rlib` and whose debug sidecars are `sidecars`.
++    fn store_with_sidecars(cache: &UnitCache, cmd: &ProcessBuilder, rlib: &[u8], sidecars: &[(&str, &[u8])]) -> String {
++        let _ = cache.store.clone_supported.set(false);
++        let Lookup::Miss(pending) = cache.lookup(cmd) else { panic!("expected a miss") };
++        fake_compile(cache, &[], &[]);
++        fs::write(&cache.outputs[0], rlib).unwrap();
++        for (index, (name, bytes)) in sidecars.iter().enumerate() {
++            let path = cache.out_dir.join(name);
++            fs::write(&path, bytes).unwrap();
++            filetime::set_file_mtime(&path, sidecar_stamp(index)).unwrap();
++        }
++        cache.store(&pending);
++        pending.key
++    }
++
++    /// Removes every produced file, restores from the store and checks bytes and stamps.
++    fn assert_restores_sidecars(cache: &UnitCache, cmd: &ProcessBuilder, sidecars: &[(&str, &[u8])]) {
++        remove_outputs(cache);
++        for (name, _) in sidecars {
++            fs::remove_file(cache.out_dir.join(name)).unwrap();
++        }
++        assert!(is_hit(&cache.lookup(cmd)));
++        for (index, (name, bytes)) in sidecars.iter().enumerate() {
++            let path = cache.out_dir.join(name);
++            assert_eq!(&fs::read(&path).unwrap(), bytes, "{name}");
++            assert_eq!(FileTime::from_last_modification_time(&fs::metadata(&path).unwrap()), sidecar_stamp(index));
++        }
++    }
++
++    fn rewrite_manifest(store: &Store, key: &str, edit: impl FnOnce(&mut Entry)) {
++        let mut entry = read_entry(store, key);
++        edit(&mut entry);
++        fs::write(store.entry_dir(key).join(MANIFEST), serde_json::to_vec(&entry).unwrap()).unwrap();
++    }
++
++    fn stored_file_bytes(store: &Store, key: &str) -> u64 {
++        fs::read_dir(store.entry_dir(key))
++            .unwrap()
++            .flatten()
++            .filter(|item| item.file_name() != MANIFEST)
++            .map(|item| item.metadata().unwrap().len())
++            .sum()
++    }
++
++    fn leftover_staging(cache: &UnitCache) -> Vec<String> {
++        let names = fs::read_dir(&cache.out_dir).unwrap().flatten();
++        let names = names.map(|item| item.file_name().to_string_lossy().into_owned());
++        names.filter(|name| name.starts_with(".frust-restore-")).collect()
++    }
++
++    #[test]
++    fn debug_objects_found_in_the_rlib_are_stored_as_ranges() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = split_command(&cache);
++        let rlib = archive_range::fixtures::gnu();
++        let sidecars: [(&str, &[u8]); 2] = [
++            (FIRST_SIDECAR, archive_range::fixtures::FIRST),
++            (SECOND_SIDECAR, archive_range::fixtures::SECOND),
++        ];
++        let key = store_with_sidecars(&cache, &cmd, &rlib, &sidecars);
++
++        let entry = read_entry(&store, &key);
++        let dir = store.entry_dir(&key);
++        let rlib_blob = &entry.outputs[0];
++        assert_eq!(entry.debug_objects.len(), 2);
++        for (obj, (_, bytes)) in entry.debug_objects.iter().zip(&sidecars) {
++            let range = obj.archive.as_ref().expect("held as a range");
++            assert_eq!(range.container, rlib_blob.blake3);
++            let at = rlib.windows(bytes.len()).position(|window| window == *bytes).unwrap() as u64;
++            assert_eq!(range.offset, at);
++            assert_eq!(obj.blob.blake3, hex(blake3::hash(bytes).as_bytes()));
++            assert!(!dir.join(&obj.blob.blake3).exists(), "no second copy of the bytes");
++        }
++        // Only blob data counts: the ranges add nothing to the entry's size.
++        assert_eq!(entry_size(&entry), stored_file_bytes(&store, &key));
++        assert!(entry_names_valid(&entry));
++        let report = store.gc();
++        assert_eq!(report.total_before, entry_size(&entry));
++        assert!(report.evicted.is_empty() && report.garbage == 0);
++        assert!(dir.exists(), "a scan keeps a well formed ranged entry");
++
++        assert_restores_sidecars(&cache, &cmd, &sidecars);
++        assert!(leftover_staging(&cache).is_empty());
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::MetadataExt;
++            let stored: Vec<u64> = fs::read_dir(&dir).unwrap().flatten().map(|i| i.metadata().unwrap().ino()).collect();
++            for (name, _) in &sidecars {
++                let ino = fs::metadata(cache.out_dir.join(name)).unwrap().ino();
++                assert!(!stored.contains(&ino), "{name} is its own file, never a link into the store");
++            }
++        }
++    }
++
++    #[test]
++    fn darwin_archives_with_padded_members_hold_ranges_too() {
++        let (tmp, store) = fixture();
++        let mut cache = unit_cache(tmp.path(), "a", &store);
++        cache.apple_target = true;
++        let cmd = split_command(&cache);
++        let sidecars: [(&str, &[u8]); 1] = [(FIRST_SIDECAR, archive_range::fixtures::FIRST)];
++        let key = store_with_sidecars(&cache, &cmd, &archive_range::fixtures::darwin(), &sidecars);
++        assert!(read_entry(&store, &key).debug_objects[0].archive.is_some());
++        assert_restores_sidecars(&cache, &cmd, &sidecars);
++    }
++
++    #[test]
++    fn a_clone_capable_store_keeps_independent_debug_blobs() {
++        let (tmp, store) = fixture();
++        store.clone_supported.set(true).unwrap();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = split_command(&cache);
++        let sidecars: [(&str, &[u8]); 1] = [(SECOND_SIDECAR, archive_range::fixtures::SECOND)];
++        let key = store_with_sidecars(&cache, &cmd, &archive_range::fixtures::gnu(), &sidecars);
++        assert!(read_entry(&store, &key).debug_objects[0].archive.is_none());
++        assert_restores_sidecars(&cache, &cmd, &sidecars);
++    }
++
++    #[test]
++    fn damaged_ranges_are_rejected_before_or_while_staging() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = split_command(&cache);
++        let sidecars: [(&str, &[u8]); 1] = [(SECOND_SIDECAR, archive_range::fixtures::SECOND)];
++        let key = store_with_sidecars(&cache, &cmd, &archive_range::fixtures::gnu(), &sidecars);
++        let good = read_entry(&store, &key);
++        let container_size = good.outputs[0].size;
++        let check = |edit: &dyn Fn(&mut Entry), expected: &str| {
++            fs::write(store.entry_dir(&key).join(MANIFEST), serde_json::to_vec(&good).unwrap()).unwrap();
++            rewrite_manifest(&store, &key, |entry| edit(entry));
++            remove_outputs(&cache);
++            let _ = fs::remove_file(cache.out_dir.join(SECOND_SIDECAR));
++            match cache.try_restore(&key, &cmd) {
++                Err(Fail::Corrupt(reason)) => assert_eq!(reason, expected),
++                other => panic!("expected {expected}, got {:?}", other.map(|_| ())),
++            }
++            assert!(leftover_staging(&cache).is_empty());
++            assert!(!cache.out_dir.join(SECOND_SIDECAR).exists());
++        };
++        // In bounds but the wrong bytes: only the hash can tell.
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset += 1, "blob-hash");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset -= 1, "blob-hash");
++        // Out of bounds, overflowing, empty or pointing at nothing is a damaged manifest.
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset = container_size, "manifest-invalid");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset = container_size - 1, "manifest-invalid");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset = u64::MAX, "manifest-invalid");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().offset = u64::MAX - 5, "manifest-invalid");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().container = "0".repeat(64), "manifest-invalid");
++        check(&|e| e.debug_objects[0].archive.as_mut().unwrap().container = "not hex".to_string(), "manifest-invalid");
++        check(&|e| e.debug_objects[0].blob.size = 0, "manifest-invalid");
++        check(&|e| e.debug_objects[0].blob.size = container_size, "manifest-invalid");
++        check(&|e| e.debug_objects[0].blob.name = "../escape".to_string(), "manifest-invalid");
++        // A recorded size that is in bounds but not the sidecar's is caught by size and hash.
++        check(&|e| e.debug_objects[0].blob.size -= 1, "blob-hash");
++        // A range with no container blob on disk.
++        let container = store.entry_dir(&key).join(&good.outputs[0].blake3);
++        fs::remove_file(&container).unwrap();
++        fs::write(store.entry_dir(&key).join(MANIFEST), serde_json::to_vec(&good).unwrap()).unwrap();
++        remove_outputs(&cache);
++        assert!(matches!(
++            cache.try_restore(&key, &cmd),
++            Err(Fail::Corrupt("blob-missing"))
++        ));
++    }
++
++    #[test]
++    fn a_damaged_container_costs_the_entry_and_leaves_no_sidecars() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = split_command(&cache);
++        let rlib = archive_range::fixtures::gnu();
++        let sidecars: [(&str, &[u8]); 1] = [(SECOND_SIDECAR, archive_range::fixtures::SECOND)];
++        let key = store_with_sidecars(&cache, &cmd, &rlib, &sidecars);
++        let entry = read_entry(&store, &key);
++        let at = entry.debug_objects[0].archive.as_ref().unwrap().offset as usize;
++        remove_outputs(&cache);
++        fs::remove_file(cache.out_dir.join(SECOND_SIDECAR)).unwrap();
++        let blob = store.entry_dir(&key).join(&entry.outputs[0].blake3);
++        let mut damaged = rlib.clone();
++        damaged[at] ^= 0xff;
++        fs::write(&blob, &damaged).unwrap();
++        assert!(matches!(cache.lookup(&cmd), Lookup::Miss(_)));
++        assert!(!store.entry_dir(&key).exists(), "corrupt entries are removed");
++        assert!(!cache.out_dir.join(SECOND_SIDECAR).exists());
++        assert!(cache.outputs.iter().all(|path| !path.exists()));
++        assert!(leftover_staging(&cache).is_empty());
++    }
++
++    #[test]
++    fn uncertain_members_keep_independent_blobs() {
++        use archive_range::fixtures::{bsd_members, gnu, FIRST, SECOND};
++        let same_size_other_bytes = {
++            let mut bytes = SECOND.to_vec();
++            bytes[0] ^= 1;
++            bytes
++        };
++        let cases: Vec<(&str, Vec<u8>, Vec<(&str, Vec<u8>)>)> = vec![
++            ("not an archive", b"rlib-bytes".to_vec(), vec![(SECOND_SIDECAR, SECOND.to_vec())]),
++            ("different bytes", gnu(), vec![(SECOND_SIDECAR, same_size_other_bytes)]),
++            ("no such member", gnu(), vec![("foo-abc.other.rcgu.dwo", SECOND.to_vec())]),
++            ("truncated archive", gnu()[..gnu().len() - 4].to_vec(), vec![(SECOND_SIDECAR, SECOND.to_vec())]),
++            (
++                "repeated member name",
++                bsd_members(&[(SECOND_SIDECAR, SECOND), (SECOND_SIDECAR, SECOND)]),
++                vec![(SECOND_SIDECAR, SECOND.to_vec())],
++            ),
++            ("empty sidecar", gnu(), vec![(FIRST_SIDECAR, Vec::new())]),
++            ("sidecar longer than member", gnu(), vec![(FIRST_SIDECAR, [FIRST, b"extra bytes".as_slice()].concat())]),
++        ];
++        for (label, rlib, files) in cases {
++            let (tmp, store) = fixture();
++            let cache = unit_cache(tmp.path(), "a", &store);
++            let cmd = split_command(&cache);
++            let sidecars: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
++            let key = store_with_sidecars(&cache, &cmd, &rlib, &sidecars);
++            let entry = read_entry(&store, &key);
++            assert_eq!(entry.debug_objects.len(), sidecars.len(), "{label}");
++            for obj in &entry.debug_objects {
++                assert!(obj.archive.is_none(), "{label}");
++                assert!(store.entry_dir(&key).join(&obj.blob.blake3).is_file(), "{label}: stored on its own");
++            }
++            let json: serde_json::Value =
++                serde_json::from_slice(&fs::read(store.entry_dir(&key).join(MANIFEST)).unwrap()).unwrap();
++            assert!(json["debug_objects"][0].get("archive").is_none(), "{label}: format unchanged");
++            assert_restores_sidecars(&cache, &cmd, &sidecars);
++        }
++    }
++
++    #[test]
++    fn a_blob_already_in_the_entry_is_reused_in_either_order() {
++        use archive_range::fixtures::{bsd_members, SECOND};
++        // Sidecars restore in name order; the one outside the archive comes first, then last.
++        for (inside, outside) in [("foo-abc.b.rcgu.o", "foo-abc.a.rcgu.o"), ("foo-abc.a.rcgu.o", "foo-abc.b.rcgu.o")] {
++            let (tmp, store) = fixture();
++            let cache = unit_cache(tmp.path(), "a", &store);
++            let cmd = split_command(&cache);
++            let rlib = bsd_members(&[(inside, SECOND)]);
++            let mut sidecars: Vec<(&str, &[u8])> = vec![(inside, SECOND), (outside, SECOND)];
++            sidecars.sort();
++            let key = store_with_sidecars(&cache, &cmd, &rlib, &sidecars);
++            let entry = read_entry(&store, &key);
++            let mut by_name: Vec<_> = entry.debug_objects.iter().collect();
++            by_name.sort_by(|a, b| a.blob.name.cmp(&b.blob.name));
++            assert_eq!(by_name.len(), 2);
++            assert_eq!(by_name[0].blob.blake3, by_name[1].blob.blake3);
++            let blob_file = store.entry_dir(&key).join(&by_name[0].blob.blake3);
++            assert!(blob_file.is_file(), "the standalone copy exists once");
++            // The member inside the archive is not recorded as a range once a blob holds it.
++            let ranged = by_name.iter().filter(|obj| obj.archive.is_some()).count();
++            assert_eq!(ranged, usize::from(inside < outside));
++            assert_eq!(entry_size(&entry), stored_file_bytes(&store, &key));
++            assert_restores_sidecars(&cache, &cmd, &sidecars);
++        }
++    }
++
++    #[test]
++    fn entries_written_without_ranges_still_restore() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let cmd = split_command(&cache);
++        let sidecars: [(&str, &[u8]); 1] = [(SECOND_SIDECAR, b"debug symbols".as_slice())];
++        let key = store_with_sidecars(&cache, &cmd, b"rlib-bytes", &sidecars);
++        // A manifest from before ranges existed has no `archive` key and parses the same.
++        let path = store.entry_dir(&key).join(MANIFEST);
++        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
++        assert!(json["debug_objects"][0].get("archive").is_none());
++        let entry: Entry = serde_json::from_value(json).unwrap();
++        assert_eq!(entry.debug_objects[0].archive, None);
++        assert_restores_sidecars(&cache, &cmd, &sidecars);
++    }
+ }
+diff --git a/src/frust_archive_range.rs b/src/frust_archive_range.rs
+new file mode 100644
+index 0000000..fb12a2c
+--- /dev/null
++++ b/src/frust_archive_range.rs
+@@ -0,0 +1,506 @@
++//! Finds debug sidecars that are already exact bytes inside a stored `.rlib`.
++//!
++//! A locator, not an archive reader: it walks GNU or BSD `ar` member headers just far enough to
++//! name a candidate range, and anything unusual yields no candidate. The unit cache compares a
++//! candidate byte for byte before recording it and hashes the range again on every restore.
++
++use super::*;
++use std::io::{Seek, SeekFrom};
++
++const MAGIC: &[u8; 8] = b"!<arch>\n";
++const HEADER_LEN: u64 = 60;
++const HEADER_END: &[u8; 2] = b"`\n";
++/// Darwin `ar` pads a member to eight bytes inside the header's size, so a member may carry a
++/// few bytes after the object it holds.
++const MAX_PADDING: u64 = 7;
++const MAX_MEMBERS: usize = 1 << 20;
++const MAX_NAME_TABLE: u64 = 16 << 20;
++const MAX_INLINE_NAME: u64 = 4096;
++
++/// Where a member's data starts and how many bytes follow, or a name seen more than once.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Member {
++    Unique { offset: u64, len: u64 },
++    Ambiguous,
++}
++
++#[derive(Debug)]
++pub(super) struct ArchiveIndex {
++    members: HashMap<String, Member>,
++}
++
++impl ArchiveIndex {
++    /// Indexes an archive of `file_len` bytes, or returns `None` when it is not a plain
++    /// archive that parses cleanly to its end.
++    pub(super) fn read(file: &mut File, file_len: u64) -> io::Result<Option<ArchiveIndex>> {
++        let mut magic = [0u8; MAGIC.len()];
++        file.seek(SeekFrom::Start(0))?;
++        if file_len < MAGIC.len() as u64 || file.read_exact(&mut magic).is_err() || &magic != MAGIC {
++            return Ok(None);
++        }
++        let mut members: HashMap<String, Member> = HashMap::default();
++        let mut long_names: Option<Vec<u8>> = None;
++        let mut pos = MAGIC.len() as u64;
++        while pos < file_len {
++            let mut header = [0u8; HEADER_LEN as usize];
++            if file_len - pos < HEADER_LEN {
++                return Ok(None);
++            }
++            file.seek(SeekFrom::Start(pos))?;
++            file.read_exact(&mut header)?;
++            if &header[58..] != HEADER_END {
++                return Ok(None);
++            }
++            let Some(size) = parse_decimal(&header[48..58]) else { return Ok(None) };
++            let data = pos + HEADER_LEN;
++            let Some(end) = data.checked_add(size).filter(|end| *end <= file_len) else {
++                return Ok(None);
++            };
++            let raw = trim_end(&header[..16], b' ');
++            let name = if raw == b"/" || raw == b"/SYM64/" {
++                None
++            } else if raw == b"//" {
++                if long_names.is_some() || size > MAX_NAME_TABLE {
++                    return Ok(None);
++                }
++                file.seek(SeekFrom::Start(data))?;
++                let mut table = vec![0u8; size as usize];
++                file.read_exact(&mut table)?;
++                long_names = Some(table);
++                None
++            } else if let Some(digits) = raw.strip_prefix(b"/").filter(|d| !d.is_empty()) {
++                let table = long_names.as_deref();
++                match (parse_decimal(digits), table) {
++                    (Some(at), Some(table)) => match gnu_long_name(table, at) {
++                        Some(name) => Some((name.to_vec(), data, size)),
++                        None => return Ok(None),
++                    },
++                    _ => return Ok(None),
++                }
++            } else if let Some(digits) = raw.strip_prefix(b"#1/") {
++                let Some(inline) = parse_decimal(digits).filter(|n| *n <= size.min(MAX_INLINE_NAME)) else {
++                    return Ok(None);
++                };
++                file.seek(SeekFrom::Start(data))?;
++                let mut name = vec![0u8; inline as usize];
++                file.read_exact(&mut name)?;
++                Some((trim_end(&name, 0).to_vec(), data + inline, size - inline))
++            } else {
++                let short = raw.strip_suffix(b"/").unwrap_or(raw);
++                Some((short.to_vec(), data, size))
++            };
++            if let Some((name, offset, len)) = name {
++                if let Ok(name) = String::from_utf8(name) {
++                    if members.len() >= MAX_MEMBERS {
++                        return Ok(None);
++                    }
++                    let member = if members.contains_key(&name) {
++                        Member::Ambiguous
++                    } else {
++                        Member::Unique { offset, len }
++                    };
++                    members.insert(name, member);
++                }
++            }
++            // Members start on even offsets; the pad byte may be missing after the last one.
++            pos = end + (end & 1);
++        }
++        Ok(Some(ArchiveIndex { members }))
++    }
++
++    /// Offset of the data of the one member called `name` that can hold `size` bytes.
++    pub(super) fn find(&self, name: &str, size: u64) -> Option<u64> {
++        match self.members.get(name)? {
++            Member::Unique { offset, len } if *len >= size && *len - size <= MAX_PADDING => Some(*offset),
++            _ => None,
++        }
++    }
++}
++
++fn gnu_long_name(table: &[u8], at: u64) -> Option<&[u8]> {
++    let rest = table.get(usize::try_from(at).ok()?..)?;
++    let stop = rest.iter().position(|byte| *byte == b'\n')?;
++    let name = &rest[..stop];
++    name.strip_suffix(b"/").or(Some(name))
++}
++
++fn trim_end(bytes: &[u8], pad: u8) -> &[u8] {
++    let len = bytes.iter().rposition(|byte| *byte != pad).map_or(0, |last| last + 1);
++    &bytes[..len]
++}
++
++fn parse_decimal(field: &[u8]) -> Option<u64> {
++    let digits = trim_end(field, b' ');
++    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
++        return None;
++    }
++    std::str::from_utf8(digits).ok()?.parse().ok()
++}
++
++/// Hashes `path` while proving it equals `len` bytes of `container` at `offset`, else `Ok(None)`.
++pub(super) fn hash_if_range_equal(
++    path: &Path,
++    container: &mut File,
++    offset: u64,
++    len: u64,
++) -> io::Result<Option<[u8; 32]>> {
++    let mut sidecar = File::open(path)?;
++    if sidecar.metadata()?.len() != len {
++        return Ok(None);
++    }
++    container.seek(SeekFrom::Start(offset))?;
++    let chunk = usize::try_from(len.min(HASH_BUF as u64)).unwrap_or(HASH_BUF).max(1);
++    let (mut mine, mut theirs) = (vec![0u8; chunk], vec![0u8; chunk]);
++    let mut hasher = blake3::Hasher::new();
++    let mut left = len;
++    while left > 0 {
++        let take = usize::try_from(left.min(chunk as u64)).unwrap_or(chunk);
++        if sidecar.read_exact(&mut mine[..take]).is_err() {
++            return Ok(None);
++        }
++        match container.read_exact(&mut theirs[..take]) {
++            Ok(()) => {}
++            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
++            Err(err) => return Err(err),
++        }
++        if mine[..take] != theirs[..take] {
++            return Ok(None);
++        }
++        hasher.update(&mine[..take]);
++        left -= take as u64;
++    }
++    // The sidecar must end where the range does, even if it grew after the length check.
++    if sidecar.read(&mut mine[..1])? != 0 {
++        return Ok(None);
++    }
++    stat_bytes(&STATS.hashed_bytes, len);
++    Ok(Some(*hasher.finalize().as_bytes()))
++}
++
++/// The `.rlib` outputs of the entry being written, opened from the entry directory so a
++/// candidate is checked against the very bytes a restore will read.
++pub(super) struct Containers {
++    items: Vec<Container>,
++}
++
++struct Container {
++    blob: Blob,
++    file: File,
++    index: ArchiveIndex,
++}
++
++impl Containers {
++    pub(super) fn none() -> Containers {
++        Containers { items: Vec::new() }
++    }
++
++    /// Anything that cannot be opened or indexed is left out, which only costs the saving.
++    pub(super) fn open(entry_dir: &Path, outputs: &[Blob]) -> Containers {
++        let mut items = Vec::new();
++        for blob in outputs.iter().filter(|blob| blob.name.ends_with(".rlib")) {
++            let Ok(mut file) = File::open(entry_dir.join(&blob.blake3)) else { continue };
++            let Ok(meta) = file.metadata() else { continue };
++            if meta.len() != blob.size {
++                continue;
++            }
++            if let Ok(Some(index)) = ArchiveIndex::read(&mut file, blob.size) {
++                items.push(Container { blob: blob.clone(), file, index });
++            }
++        }
++        Containers { items }
++    }
++
++    /// The range of a container that holds exactly the bytes of the file at `path`, with the
++    /// hash those bytes were proven to have.
++    pub(super) fn locate(&mut self, name: &str, path: &Path) -> io::Result<Option<(Blob, ArchiveRange)>> {
++        let meta = fs::metadata(path)?;
++        let size = meta.len();
++        if !meta.is_file() || size == 0 {
++            return Ok(None);
++        }
++        for container in &mut self.items {
++            let Some(offset) = container.index.find(name, size) else { continue };
++            let Some(hash) = hash_if_range_equal(path, &mut container.file, offset, size)? else {
++                continue;
++            };
++            let blob = Blob { name: name.to_string(), size, blake3: hex(&hash) };
++            let range = ArchiveRange { container: container.blob.blake3.clone(), offset };
++            return Ok(Some((blob, range)));
++        }
++        Ok(None)
++    }
++}
++
++/// Copies one recorded range of a stored archive into a new private file, proving the bytes
++/// are the sidecar that was recorded. Never a link or a clone: the result is its own file.
++pub(super) fn stage_range(
++    src: &Path,
++    container_size: u64,
++    offset: u64,
++    dst: &Path,
++    spec: &StageSpec<'_>,
++) -> Result<(), StageError> {
++    let size = spec.size.ok_or(StageError::Corrupt("blob-size"))?;
++    if offset.checked_add(size).is_none_or(|end| end > container_size) {
++        return Err(StageError::Corrupt("range-bounds"));
++    }
++    let mut input = File::open(src).map_err(|err| match err.kind() {
++        io::ErrorKind::NotFound => StageError::Corrupt("blob-missing"),
++        _ => StageError::Io(err),
++    })?;
++    if input.metadata()?.len() != container_size {
++        return Err(StageError::Corrupt("blob-size"));
++    }
++    input.seek(SeekFrom::Start(offset))?;
++    let mut output = OpenOptions::new().write(true).create_new(true).open(dst)?;
++    let staged = copy_range(&mut input.take(size), &mut output, size, spec).and_then(|()| {
++        make_writable_file(&output, dst)?;
++        Ok(filetime::set_file_handle_times(&output, None, Some(spec.stamp))?)
++    });
++    if staged.is_err() {
++        drop(output);
++        let _ = fs::remove_file(dst);
++    }
++    staged
++}
++
++fn copy_range(input: &mut impl Read, output: &mut File, size: u64, spec: &StageSpec<'_>) -> Result<(), StageError> {
++    let (copied, hash) = stream_blake3(input, size, Some(output))?;
++    stat_bytes(&STATS.hashed_bytes, copied);
++    stat_bytes(&STATS.written_bytes, copied);
++    if copied != size {
++        return Err(StageError::Corrupt("blob-size"));
++    }
++    if !same_hash(&hash, spec.hash) {
++        return Err(StageError::Corrupt("blob-hash"));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++pub(super) mod fixtures {
++    /// Captured `llvm-ar` output in GNU, BSD and Darwin formats holding these three members.
++    pub(crate) const FIRST: &[u8] = b"AAAA-first-member\n";
++    pub(crate) const TINY: &[u8] = b"tiny";
++    pub(crate) const SECOND: &[u8] = b"second member bytes!!";
++
++    const GNU: &str = "
++        213c617263683e0a2f2f2020202020202020202020202020202020202020
++        202020202020202020202020202020202020202020202020202035342020
++        202020202020600a666f6f2d6162632e666f6f2e6367752e302e72636775
++        2e6f2f0a666f6f2d6162632e666f6f2e6367752e312e726367752e64776f
++        2f0a2f302020202020202020202020202020302020202020202020202020
++        302020202020302020202020363434202020202031382020202020202020
++        600a414141412d66697273742d6d656d6265720a742e6f2f202020202020
++        202020202020302020202020202020202020302020202020302020202020
++        363434202020202034202020202020202020600a74696e792f3236202020
++        202020202020202020203020202020202020202020203020202020203020
++        20202020363434202020202032312020202020202020600a7365636f6e64
++        206d656d62657220627974657321210a";
++    const BSD: &str = "
++        213c617263683e0a23312f32382020202020202020202020302020202020
++        202020202020302020202020302020202020363434202020202034362020
++        202020202020600a666f6f2d6162632e666f6f2e6367752e302e72636775
++        2e6f00000000414141412d66697273742d6d656d6265720a23312f313020
++        202020202020202020203020202020202020202020203020202020203020
++        20202020363434202020202031342020202020202020600a742e6f000000
++        0000000074696e7923312f33322020202020202020202020302020202020
++        202020202020302020202020302020202020363434202020202035332020
++        202020202020600a666f6f2d6162632e666f6f2e6367752e312e72636775
++        2e64776f0000000000007365636f6e64206d656d62657220627974657321
++        210a";
++    const DARWIN: &str = "
++        213c617263683e0a23312f31322020202020202020202020302020202020
++        202020202020302020202020302020202020302020202020202032302020
++        202020202020600a5f5f2e53594d44454600000000000000000000002331
++        2f3238202020202020202020202030202020202020202020202030202020
++        2020302020202020363434202020202035322020202020202020600a666f
++        6f2d6162632e666f6f2e6367752e302e726367752e6f0000000041414141
++        2d66697273742d6d656d6265720a0a0a0a0a0a0a23312f34202020202020
++        202020202020302020202020202020202020302020202020302020202020
++        363434202020202031322020202020202020600a742e6f0074696e790a0a
++        0a0a23312f32382020202020202020202020302020202020202020202020
++        302020202020302020202020363434202020202035322020202020202020
++        600a666f6f2d6162632e666f6f2e6367752e312e726367752e64776f0000
++        7365636f6e64206d656d62657220627974657321210a0a0a";
++
++    pub(crate) fn unhex(text: &str) -> Vec<u8> {
++        let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
++        assert!(digits.len() % 2 == 0, "odd number of hex digits");
++        digits
++            .chunks(2)
++            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
++            .collect()
++    }
++
++    pub(crate) fn gnu() -> Vec<u8> {
++        unhex(GNU)
++    }
++
++    pub(crate) fn bsd() -> Vec<u8> {
++        unhex(BSD)
++    }
++
++    pub(crate) fn darwin() -> Vec<u8> {
++        unhex(DARWIN)
++    }
++
++    /// A BSD-style archive with inline names, which may repeat.
++    pub(crate) fn bsd_members(members: &[(&str, &[u8])]) -> Vec<u8> {
++        let mut out = b"!<arch>\n".to_vec();
++        for (name, data) in members {
++            let size = name.len() + data.len();
++            let header = format!("#1/{:<13}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", name.len(), 0, 0, 0, "644", size);
++            assert_eq!(header.len(), 60);
++            out.extend(header.as_bytes());
++            out.extend(name.as_bytes());
++            out.extend(*data);
++            if size % 2 == 1 {
++                out.push(b'\n');
++            }
++        }
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::fixtures::*;
++    use super::*;
++    use tempfile::tempdir;
++
++    const FIRST_NAME: &str = "foo-abc.foo.cgu.0.rcgu.o";
++    const SECOND_NAME: &str = "foo-abc.foo.cgu.1.rcgu.dwo";
++
++    fn position(haystack: &[u8], needle: &[u8]) -> u64 {
++        haystack.windows(needle.len()).position(|window| window == needle).unwrap() as u64
++    }
++
++    fn index_of(bytes: &[u8]) -> Option<ArchiveIndex> {
++        let dir = tempdir().unwrap();
++        let path = dir.path().join("a.rlib");
++        fs::write(&path, bytes).unwrap();
++        let mut file = File::open(&path).unwrap();
++        ArchiveIndex::read(&mut file, bytes.len() as u64).unwrap()
++    }
++
++    #[test]
++    fn members_of_llvm_ar_archives_are_found_in_every_format() {
++        for (format, bytes) in [("gnu", gnu()), ("bsd", bsd()), ("darwin", darwin())] {
++            let index = index_of(&bytes).unwrap_or_else(|| panic!("{format} archive indexed"));
++            for (name, data) in [(FIRST_NAME, FIRST), ("t.o", TINY), (SECOND_NAME, SECOND)] {
++                let at = index.find(name, data.len() as u64);
++                assert_eq!(at, Some(position(&bytes, data)), "{format} {name}");
++            }
++            assert_eq!(index.find("absent.o", 4), None, "{format}");
++            assert_eq!(index.find(SECOND_NAME, SECOND.len() as u64 + 8), None, "{format}: too large");
++            assert_eq!(index.find(SECOND_NAME, 4), None, "{format}: too much left over");
++        }
++    }
++
++    #[test]
++    fn darwin_alignment_padding_belongs_to_the_member() {
++        let bytes = darwin();
++        let index = index_of(&bytes).unwrap();
++        assert_eq!(index.find(FIRST_NAME, FIRST.len() as u64 + 6), Some(position(&bytes, FIRST)));
++        assert_eq!(index.find(FIRST_NAME, FIRST.len() as u64 + 7), None);
++        assert!(index_of(b"!<arch>\n").unwrap().find("a.o", 1).is_none());
++    }
++
++    #[test]
++    fn repeated_names_have_no_candidate() {
++        let bytes = bsd_members(&[("foo-abc.x.rcgu.o", b"one"), ("foo-abc.y.rcgu.o", b"two"), ("foo-abc.x.rcgu.o", b"1")]);
++        let index = index_of(&bytes).unwrap();
++        assert_eq!(index.find("foo-abc.x.rcgu.o", 3), None);
++        assert_eq!(index.find("foo-abc.x.rcgu.o", 1), None);
++        assert_eq!(index.find("foo-abc.y.rcgu.o", 3), Some(position(&bytes, b"two")));
++    }
++
++    #[test]
++    fn malformed_archives_are_not_indexed() {
++        let good = gnu();
++        let corrupt = |at: &[u8], with: &[u8]| {
++            let mut bytes = good.clone();
++            let start = position(&bytes, at) as usize;
++            bytes[start..start + with.len()].copy_from_slice(with);
++            bytes
++        };
++        assert!(index_of(&good).is_some());
++        assert!(index_of(b"").is_none());
++        assert!(index_of(b"!<thin>\n").is_none());
++        assert!(index_of(&good[..good.len() - 3]).is_none(), "member runs past the end");
++        assert!(index_of(&good[..70]).is_none(), "name table runs past the end");
++        assert!(index_of(&good[..150]).is_none(), "cut inside a header");
++        assert!(index_of(&corrupt(b"`\n", b"~\n")).is_none(), "bad header terminator");
++        assert!(index_of(&corrupt(b"/0   ", b"/99  ")).is_none(), "long name outside the table");
++        assert!(index_of(&corrupt(b"18   ", b"+8   ")).is_none(), "signed size");
++        assert!(index_of(&corrupt(b"18   ", b"     ")).is_none(), "empty size");
++        assert!(index_of(&corrupt(b"18   ", b"99999")).is_none(), "size past the end");
++        let mut huge = good.clone();
++        let size_field = position(&good, b"18   ") as usize;
++        huge[size_field..size_field + 10].copy_from_slice(b"9999999999");
++        assert!(index_of(&huge).is_none(), "size near the field's maximum");
++        let inline = bsd();
++        let mut bytes = inline.clone();
++        let at = position(&inline, b"#1/28") as usize;
++        bytes[at..at + 5].copy_from_slice(b"#1/99");
++        assert!(index_of(&bytes).is_none(), "inline name longer than the member");
++    }
++
++    #[test]
++    fn comparison_hashes_only_exactly_equal_bytes() {
++        let dir = tempdir().unwrap();
++        let container_bytes: Vec<u8> = (0..3 * HASH_BUF + 11).map(|i| (i * 7 % 253) as u8).collect();
++        let container_path = dir.path().join("container");
++        fs::write(&container_path, &container_bytes).unwrap();
++        let sidecar_path = dir.path().join("sidecar");
++        let (offset, len) = (5usize, 2 * HASH_BUF + 3);
++        let range = &container_bytes[offset..offset + len];
++        let check = |bytes: &[u8], at: u64, len: u64| {
++            fs::write(&sidecar_path, bytes).unwrap();
++            let mut container = File::open(&container_path).unwrap();
++            hash_if_range_equal(&sidecar_path, &mut container, at, len).unwrap()
++        };
++        assert_eq!(check(range, offset as u64, len as u64), Some(*blake3::hash(range).as_bytes()));
++        let mut last = range.to_vec();
++        *last.last_mut().unwrap() ^= 1;
++        assert_eq!(check(&last, offset as u64, len as u64), None, "last byte differs");
++        let mut first = range.to_vec();
++        first[0] ^= 1;
++        assert_eq!(check(&first, offset as u64, len as u64), None, "first byte differs");
++        assert_eq!(check(range, offset as u64, len as u64 - 1), None, "length disagrees");
++        assert_eq!(check(&range[..len - 1], offset as u64, len as u64 - 1), Some(*blake3::hash(&range[..len - 1]).as_bytes()));
++        let tail = container_bytes.len() as u64 - 4;
++        assert_eq!(check(&container_bytes[tail as usize..], tail, 4), Some(*blake3::hash(&container_bytes[tail as usize..]).as_bytes()));
++        assert_eq!(check(&[0; 8], tail, 8), None, "range runs past the container");
++    }
++
++    #[test]
++    fn containers_only_offer_proven_ranges_of_rlibs() {
++        let dir = tempdir().unwrap();
++        let bytes = gnu();
++        let hash = hex(blake3::hash(&bytes).as_bytes());
++        fs::write(dir.path().join(&hash), &bytes).unwrap();
++        let rlib = Blob { name: "libfoo-abc.rlib".to_string(), size: bytes.len() as u64, blake3: hash.clone() };
++        let sidecar = dir.path().join("sidecar");
++        fs::write(&sidecar, SECOND).unwrap();
++
++        let mut containers = Containers::open(dir.path(), std::slice::from_ref(&rlib));
++        let (blob, range) = containers.locate(SECOND_NAME, &sidecar).unwrap().unwrap();
++        assert_eq!((blob.size, blob.blake3.as_str()), (SECOND.len() as u64, hex(blake3::hash(SECOND).as_bytes()).as_str()));
++        assert_eq!((range.container.as_str(), range.offset), (hash.as_str(), position(&bytes, SECOND)));
++        assert_eq!(containers.locate("other.o", &sidecar).unwrap(), None, "name not in the archive");
++        fs::write(&sidecar, b"second member bytes!?").unwrap();
++        assert_eq!(containers.locate(SECOND_NAME, &sidecar).unwrap(), None, "same size, other bytes");
++        fs::write(&sidecar, b"").unwrap();
++        assert_eq!(containers.locate(SECOND_NAME, &sidecar).unwrap(), None, "empty sidecar");
++
++        fs::write(&sidecar, SECOND).unwrap();
++        let rmeta = Blob { name: "libfoo-abc.rmeta".to_string(), ..rlib.clone() };
++        assert_eq!(Containers::open(dir.path(), &[rmeta]).locate(SECOND_NAME, &sidecar).unwrap(), None);
++        let wrong_size = Blob { size: rlib.size + 1, ..rlib.clone() };
++        assert_eq!(Containers::open(dir.path(), &[wrong_size]).locate(SECOND_NAME, &sidecar).unwrap(), None);
++        let missing = Blob { blake3: "0".repeat(64), ..rlib };
++        assert_eq!(Containers::open(dir.path(), &[missing]).locate(SECOND_NAME, &sidecar).unwrap(), None);
++    }
++}
