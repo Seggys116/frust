@@ -361,93 +361,57 @@ Dispatch Benchmark with `protocol=false` and `platforms=macos-write-probe` to te
 
 The macOS regex jobs also run six paired storage trials on a private APFS image. Each run calibrates the image before measuring and keeps workspace files, targets, caches and Cargo temporary files on it. The report counts completed volume data writes and container metadata writes through the post-build sync. Occupied APFS blocks include shared extents once. CPU and RSS comparisons come from the separate untraced runs.
 
+Dispatch Benchmark with `protocol=false` and `platforms=macos-arm64-apfs` or `platforms=macos-x86_64-apfs` to run only the paired storage trials on that architecture. If a completed calibration misses the required payload or records too much idle or clone activity, it logs the phase counters and repeats calibration up to twice before failing the job.
+
 The Linux regex jobs use a check graph with 97 checksummed dependencies to measure cache accounting writes. Six pairs start with an empty store and six rebuild a clean target from the warmed store. These checks disable incremental compilation.
 
 ## Results of the CI comparison
 
-Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.
+Benchmark CI compared fRust at `080a6a26b52e9aabc8b765755752147a1e66661d` with official Rust 1.100.0 (`0ef1bc386`) on 21 November 2026. The build uses the Cargo and compiler sources for 0.6.0. Each of the 16 platform and workload jobs completed eight alternating CPU-time pairs per applicable scenario. The independent Apple Silicon lock diagnostic failed because its probe was inherited by Xcode's linker. The CPU measurements had already finished, and the corrected trace was tested in a separate run. The raw samples, chart and report are attached to their runs. [CPU comparison](https://github.com/Seggys116/frust/actions/runs/44939285650) · [Corrected Apple Silicon trace](https://github.com/Seggys116/frust/actions/runs/44948421455)
 
-Scope: official Rust 1.100.0 (rustc 0ef1bc386, 2026-11-09) against fRust with the unit cache on, release profile, 8 pairs per scenario and workload. The workloads are ripgrep, syn, regex and fd. The platforms are `linux-x86_64` (baseline build), `linux-x86_64-v3`, `macos-arm64` and `macos-x86_64`. Each figure is fRust CPU as a percent of official CPU, the median of the per-pair ratios. Lower is better and 100% is equal. The `all workloads` rows are the geometric mean of the per-workload medians, and their pair count is the total over workloads. The method is in [CI measurement method](#ci-measurement-method).
+The workloads are ripgrep, syn, regex and fd in the same release profile. The unit cache starts empty for each cold pair. Clean rebuilds follow that round's cold build. Each cell is fRust CPU as a percent of official, measured on the same runner. The table gives the geometric mean over workload medians. The report lists the hardware and individual paired ranges. [Measurement method](#ci-measurement-method)
 
-The candidate tables and single samples earlier in this file, and the local measurements in `qualification/OPTIMIZED-LINUX.md`, are earlier local measurements. They are not release claims. The figures in this section are the ones to cite for a comparison with official Rust.
-
-Runners are shared and their hardware differs from job to job. Within one platform the jobs ran on these CPUs: `linux-x86_64`, AMD EPYC 9V74 and Intel Xeon 6975P-C; `linux-x86_64-v3`, Intel Xeon 6975P-C; `macos-arm64`, Apple M1 (Virtual) and Apple M2 Pro (Virtual); `macos-x86_64`, Intel Core i7-8700B. Each ratio compares two builds taken one after the other on the same runner. The two Linux columns are each a percent of the official toolchain on their own runners, so they are not CPU times to set against each other.
-
-### All workloads, per platform
-
-`linux-x86_64`:
-
-| Scenario | fRust CPU as % of official | Pairs |
-| --- | --- | --- |
-| cold build | 100.5% | 32 |
-| clean rebuild | 45.5% | 32 |
-| no-op rebuild | 89.3% | 32 |
-| edit rebuild, leaf | 100.1% | 24 |
-| edit rebuild, wide | 99.8% | 24 |
-
-`linux-x86_64-v3`:
-
-| Scenario | fRust CPU as % of official | Pairs |
-| --- | --- | --- |
-| cold build | 100.2% | 32 |
-| clean rebuild | 45.3% | 32 |
-| no-op rebuild | 88.8% | 32 |
-| edit rebuild, leaf | 99.8% | 24 |
-| edit rebuild, wide | 99.5% | 24 |
-
-`macos-arm64`:
-
-| Scenario | fRust CPU as % of official | Pairs |
-| --- | --- | --- |
-| cold build | 100.1% | 32 |
-| clean rebuild | 62.3% | 32 |
-| no-op rebuild | 105.5% | 32 |
-| edit rebuild, leaf | 104.6% | 24 |
-| edit rebuild, wide | 104.1% | 24 |
-
-`macos-x86_64`:
-
-| Scenario | fRust CPU as % of official | Pairs |
-| --- | --- | --- |
-| cold build | 101.5% | 32 |
-| clean rebuild | 59.3% | 32 |
-| no-op rebuild | 103.3% | 32 |
-| edit rebuild, leaf | 100.0% | 24 |
-| edit rebuild, wide | 98.9% | 24 |
+| Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 | Pairs per platform |
+| --- | --- | --- | --- | --- | --- |
+| Cold build | 100.0% | 100.1% | 100.1% | 100.6% | 32 |
+| Clean rebuild | 45.2% | 43.0% | 63.2% | 55.5% | 32 |
+| No-op rebuild | 89.4% | 90.8% | 107.8% | 95.3% | 32 |
+| Edit rebuild, leaf | 99.4% | 98.6% | 101.8% | 94.7% | 24 |
+| Edit rebuild, wide | 99.7% | 100.1% | 97.4% | 99.6% | 24 |
 
 ### Linux, per workload
 
-fRust CPU as a percent of official, 8 pairs in every cell. The edit rebuilds are only in the all-workloads tables above.
-
 | Workload | Cold, x86-64 | Cold, v3 | Clean, x86-64 | Clean, v3 | No-op, x86-64 | No-op, v3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| ripgrep | 99.8% | 100.1% | 58.4% | 58.2% | 85.2% | 87.3% |
-| syn | 100.6% | 99.7% | 75.4% | 75.1% | 94.0% | 92.8% |
-| regex | 100.4% | 101.1% | 68.7% | 68.6% | 87.7% | 86.2% |
-| fd | 101.0% | 100.1% | 14.2% | 14.1% | 90.7% | 89.2% |
+| ripgrep | 100.0% | 99.9% | 57.8% | 55.5% | 90.1% | 90.0% |
+| syn | 99.2% | 100.2% | 74.7% | 75.9% | 93.8% | 92.9% |
+| regex | 100.5% | 100.3% | 68.1% | 69.1% | 84.5% | 86.7% |
+| fd | 100.2% | 100.0% | 14.2% | 11.8% | 89.4% | 93.7% |
 
 ### Reading the results
 
-What wins:
+- Clean rebuilds used less CPU in all 32 pairs on each Linux variant and in 31 of 32 pairs on each Mac architecture. The unit cache restored outputs from the preceding cold build.
+- Linux no-op rebuilds used less CPU in 31 of 32 baseline pairs and all 32 v3 pairs. Mac no-op pairs varied widely, with ratios from 66.0% to 265.4% on Apple Silicon and 62.3% to 147.3% on Intel.
+- Cold builds were near parity with official Rust. The edit trials showed no consistent CPU win. The Mac samples had wide pair-to-pair spreads in both scenarios.
+- Both Linux toolchains ran with the page-cache state from installation. The report's probes found 48 MiB of `librustc_driver` and 48 MiB of `libLLVM` text mapped with 2 MiB pages for official Rust and the baseline fRust archive. The v3 archive mapped 52 MiB and 48 MiB respectively.
 
-- Clean rebuild. fRust used 45.5% and 45.3% of official CPU on Linux and 62.3% and 59.3% on macOS. On Linux it was faster in every one of the 8 pairs of every workload. On macOS it was faster in every pair but one (a regex pair on `macos-x86_64`), although the per-pair ranges there are wide. The effect differs by workload: on `linux-x86_64`, fd is at 14.2% and syn at 75.4%.
-- No-op rebuild on Linux. 89.3% and 88.8%, faster in all four workloads. In 7 of 8 pairs for fd and in all 8 for the others. These builds are short: the official CPU is 15.2 to 44.1 ms on the baseline runners and 17.0 to 37.1 ms on the v3 runners.
+Earlier local results in this file and in `qualification/OPTIMIZED-LINUX.md` cover experimental builds.
 
-What ties:
+### Changes from fRust 0.5.2
 
-- Cold builds on Linux. 100.5% and 100.2%. fRust does not beat official on cold builds: it was faster in only 1 of 4 workloads on each Linux platform.
-- Edit rebuilds on Linux. Leaf 100.1% and 99.8%, wide 99.8% and 99.5%. Everything is within about half a percent of official, either way. The v3 build is slightly ahead of official on edit rebuilds, faster in all three workloads for both edits, by less than one percentage point.
+The resource comparisons use the published 0.5.2 archive matching each runner. In the 388-member fixture, two warm check invocations used 181.65 → 158.84 ms of process-tree CPU and 42.99 → 34.64 MiB of peak process RSS on Linux x86-64. The v3 archive used 176.41 → 156.08 ms and 43.05 → 34.72 MiB. All six pairs improved in both metrics on each Linux variant. Both sides enabled cooperative checking for this fixture. [Linux resource run](https://github.com/Seggys116/frust/actions/runs/44943707379)
 
-What this run cannot resolve:
+In a cold overlap of three checks with a shared proc macro, the Linux baseline and v3 archives both went from two blocking `.cargo-build-lock` waits to zero. Median summed wait time fell from 174.3 and 171.2 ms respectively to zero in the separate traced runs. The new toolchains held shared locks while the processes overlapped. The small warm proc-macro case on v3 used about 1 ms more CPU per set of checks (18.10 → 19.06 ms, with every pair slower). [Linux resource run](https://github.com/Seggys116/frust/actions/runs/44943707379)
 
-- macOS cold, no-op and edit rebuilds. The macOS runners are virtual machines on shared hosts and nothing is pinned. The per-pair ranges are wide, for example ripgrep cold 70.8% to 124.3% and regex no-op 79.1% to 176.8% on `macos-arm64`, and regex cold 79.1% to 147.0% on `macos-x86_64`. A difference of a few percent cannot be told from noise, so none of these numbers is reported as a win or a loss.
+With 97 cacheable dependencies, cold checks wrote 4.36 → 4.00 MiB on both Linux variants, an 8.4% reduction that held in all six pairs. Checks from a clean target and warmed store used 95.0% and 95.1% of 0.5.2 CPU on baseline and v3 respectively, with all six pairs faster on each. Peak RSS and allocated footprint were effectively equal in this fixture. [Linux cache-accounting run](https://github.com/Seggys116/frust/actions/runs/44945401411)
 
-Why the numbers look like this:
+`fclippy --version` used 80.6% and 81.6% of 0.5.2 CPU on Linux baseline and v3, and 77.3% and 71.5% on Apple Silicon and Intel macOS. It used less CPU in all 30 pairs on each platform and reported the same version strings. [Linux resource run](https://github.com/Seggys116/frust/actions/runs/44943707379) · [macOS startup results](https://github.com/Seggys116/frust/actions/runs/44939285650)
 
-- The clean rebuild result comes from the unit cache. The fRust clean rebuild restores dependency outputs from the store that the same round's cold build filled (for example 59 hits and 0 misses for fd on Linux), and official Rust has no store, so it compiles everything again.
-- Cold builds start with an empty store. The median number of store hits per fRust cold build is 0 for every workload, so there is nothing to restore, and the build also pays for writing the entries.
-- The Linux x86-64-v3 build has its compiler and tools built for x86-64-v3, so it requires a CPU with AVX2, BMI1, BMI2, FMA, MOVBE and the other extensions listed in [Installer variants](configuration.md#installer-variants). `frust-install` picks it automatically on a supporting CPU and falls back to the baseline build otherwise.
-- The toolchains were compared in the page-cache state that their installers leave, which is the state a user gets. The page-cache table of the report (MiB of `librustc_driver` and `libLLVM` text mapped with 2 MiB pages, before and after the builds) reads 48 / 48 for the official toolchain in every Linux job. For fRust it reads 48 / 48 on `linux-x86_64` and 52 / 48 on `linux-x86_64-v3`. Both installers therefore leave large pages, and neither toolchain ran with 4 KiB pages (0 in that table). The probe runs on Linux only, so macOS has no such record.
+On Apple Silicon, the 388-member warm check used 53.76 → 45.76 MiB of peak process RSS, with every pair improving. The cold proc-macro overlap went from two build-directory lock waits to zero, with summed wait time of 458.9 → 0 ms in the traced run. On the APFS clean-rebuild trial, writes fell by 8.8% across the six pairs (3.23 → 2.95 MiB). Allocated footprint grew by 1.9% with the default dev artifacts cached. Cold and edited builds showed no consistent reduction in write volume. [macOS resource run](https://github.com/Seggys116/frust/actions/runs/44948421455)
+
+On Intel macOS, peak process RSS in the wide warm check fell from 36.09 to 30.33 MiB, improving in all six pairs. The cold proc-macro overlap also went from two build-directory lock waits to zero, with summed wait time of 987.0 → 0 ms. The small warm proc-macro case used 92.82 → 102.10 ms of CPU, with every pair slower. [Intel resource run](https://github.com/Seggys116/frust/actions/runs/44956439829)
+
+The Intel APFS run captured the full calibration payload. During the build series, one cold build timed out and several cold and clean-rebuild traces missed write events. Intel write volume remains unresolved. The six clean-rebuild pairs recorded 2.0% higher occupied APFS space by the median paired ratio, with all six pairs using more space. [Intel APFS run](https://github.com/Seggys116/frust/actions/runs/44961162136)
 
 ## Rules for new measurements
 

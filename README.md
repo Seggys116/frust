@@ -84,22 +84,24 @@ Every archive carries the standard library for these targets besides the host. L
 
 ## Builds that overlap
 
-Identical `fcargo check` runs in one workspace share a single compile of each unit instead of queueing behind each other. Independent crates keep building while another request holds a shared dependency, and a failed or cancelled producer releases its claim so waiting builds recover.
+Eligible `fcargo check` runs in one workspace share compiled units on Linux and macOS, including host proc macros in graphs without build scripts. Independent crates keep building while another request holds a shared dependency, and a failed or cancelled producer releases its claim so waiting builds recover. [Cooperative checks](docs/configuration.md#cooperative-checks)
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 
 ## Results
 
-The 20 November CI comparison measured fRust at `92558c5` against official Rust 1.100.0 for release builds of ripgrep, syn, regex and fd. The table uses the median of 8 CPU-time pairs per scenario and workload, then the geometric mean over workloads. Lower is better and 100% is equal.
+The 21 November Benchmark CI run measured the fRust 0.6.0 toolchain against official Rust 1.100.0 for release builds of ripgrep, syn, regex and fd. The table uses the median of eight CPU-time pairs per scenario and workload, then the geometric mean over workloads. Lower is better and 100% is equal. [Benchmark results and method](docs/benchmarks.md#results-of-the-ci-comparison)
 
 | Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
 |---|---|---|---|---|
-| Clean rebuild | 45.5% | 45.3% | 62.3% | 59.3% |
-| No-op rebuild | 89.3% | 88.8% | 105.5% | 103.3% |
-| Cold build | 100.5% | 100.2% | 100.1% | 101.5% |
-| Edit rebuild | 100.1% | 99.8% | 104.6% | 100.0% |
+| Clean rebuild | 45.2% | 43.0% | 63.2% | 55.5% |
+| No-op rebuild | 89.4% | 90.8% | 107.8% | 95.3% |
+| Cold build | 100.0% | 100.1% | 100.1% | 100.6% |
+| Edit rebuild | 99.4% | 98.6% | 101.8% | 94.7% |
 
-The largest effect is on clean rebuilds, where the unit cache restores dependencies. Cold builds start with an empty cache. On Linux, cold builds and edit rebuilds are at parity with official Rust. The CI runners are shared virtual machines, and the macOS cold, no-op and edit figures vary too much between pairs to separate from noise. The method, the per-workload numbers and the run are in [docs/benchmarks.md](docs/benchmarks.md#results-of-the-ci-comparison).
+Clean rebuilds restore dependencies from the unit cache, including unpacked debug objects in the default macOS dev profile. The comparison found no consistent CPU improvement for cold builds or edits. On macOS, no-op results also varied too widely to establish a win. The edit row uses the leaf edit.
+
+Against fRust 0.5.2, wide cooperative checks used less peak RSS on all four platforms. Eligible overlapping proc-macro checks avoided the build-directory wait. Disk write gains depend on the workload, and Intel macOS write volume remains unresolved. CI showed no general reduction in allocated footprint. Caching the default macOS dev artifacts uses additional space. [Resource comparisons](docs/benchmarks.md#changes-from-frust-052)
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 

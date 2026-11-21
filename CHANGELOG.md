@@ -38,12 +38,12 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 21 November 2026: `-sink-common-insts` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Stripped sizes grew to 4082336/4024992, 1382560/1338440, and 3996104/3835192. Shipped `frust-gates` exited 1: runtime geomean 1.00555891, upper 1.00902087, size geomean 1.02965759. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: `-enable-knowledge-retention` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Every stripped file stayed under stock (4019392/4024992, 1336456/1338440, 3827128/3835192). Shipped `frust-gates` exited 1: runtime geomean 0.99701744, upper 1.00079480, size geomean 0.99834120. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
-## [0.6.0] - 2026-11-21
+## [0.6.0] - 2026-11-22
 
 ### Added
 
 * The unit cache restores unpacked debug objects with dependency outputs, including the default macOS dev profile. The release suite compares restored Darwin objects byte for byte against an uncached build.
-* Benchmark CI compares concurrent builds and command startup against the matching fRust 0.5.2 archives. It records paired CPU time, peak RSS, lock wait counts, allocated bytes and Linux write volume.
+* Benchmark CI compares concurrent builds and command startup against the matching fRust 0.5.2 archives. It records paired CPU time, peak RSS, lock waits and hold durations, allocated bytes and write volume on Linux and APFS.
 * Benchmark CI adds experimental native rustc PGO jobs on both macOS architectures. The instrumented compiler failed at startup before training in the attempted runs. The release uses the plain macOS recipe. [PGO experiment](docs/benchmarks.md#native-rustc-pgo-candidate-on-macos)
 
 ### Changed
@@ -54,6 +54,11 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Cache writers batch size accounting and use a nonblocking maintenance lock for recounts. The recount timestamp tracks full scans so that active writers cannot postpone a recount indefinitely.
 * The legacy-layout launcher skips the profile size scan when there is no cap to enforce. Plain `fclippy` dispatches in the first Cargo process.
 * Implicit Cargo parallelism on Linux takes available memory and cgroup v2 headroom into account. Explicit job limits and inherited jobservers still take precedence.
+
+### Performance
+
+* Clean release rebuilds used 43.0% to 63.2% of official Rust 1.100.0 CPU across the four archives. Linux no-op rebuilds used 89.4% to 90.8%. Cold builds and edit rebuilds showed no consistent CPU win, and macOS no-op results were within run-to-run variation. [CPU comparison](docs/benchmarks.md#results-of-the-ci-comparison)
+* Compared with 0.5.2, the wide warm check used less peak RSS on all four platforms. The eligible proc-macro fixture went from two build-directory lock waits to zero. Some small warm checks used more CPU. Storage gains were workload-specific, and the paired trials found no general reduction in allocated footprint. Intel macOS write volume remains unresolved because of incomplete traces. [Resource comparisons](docs/benchmarks.md#changes-from-frust-052)
 
 ## [0.5.2] - 2026-11-21
 

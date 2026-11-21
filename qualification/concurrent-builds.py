@@ -820,8 +820,8 @@ class Harness:
                 traces.append(trace)
         if self.apfs:
             results, apfs_metrics = self.apfs.run(tag, jobs, self.args.timeout)
-            if cell.state == "cold" and not apfs_metrics["apfs_write_bytes"]:
-                problems.append("the cold build had no observed APFS writes")
+            if cell.state in ("cold", "cache") and not apfs_metrics["apfs_write_bytes"]:
+                problems.append(f"the {cell.state} build had no observed APFS writes")
         else:
             results, apfs_metrics = run_commands(jobs, self.args.timeout), {}
         target_bytes = allocated(targets)

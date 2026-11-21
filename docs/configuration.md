@@ -149,7 +149,7 @@ When neither `-j`/`--jobs` nor `build.jobs` (including `CARGO_BUILD_JOBS`) is se
 
 An explicit count (positive, negative or `default`), an external jobserver in the environment, and any platform other than Linux keep Cargo's behavior. cgroup v1 limits are not read. `-v` prints a note when the default is lowered. Codegen, LTO and profile settings are not touched.
 
-The 1 GiB figure is about twice the largest single-process peak resident set recorded in `qualification/BASELINES.md` (537024 kB, release builds at fat LTO of four crate graphs on one Linux x86-64 host). Those figures are per process, not concurrent, and no build under a memory limit is recorded yet. `qualification/memory-jobs-bench.py` records CPU, wall time, `ru_maxrss` from `wait4`, the scope's `memory.peak` and OOM kills for one build under a limit.
+The 1 GiB estimate is based on the single-process peak RSS measurements in `qualification/BASELINES.md`. A build's actual memory use depends on the crates, profile and work running alongside it. `qualification/memory-jobs-bench.py` records CPU time and peak process RSS from `wait4` along with the cgroup's peak memory and OOM kills under a specified limit.
 
 ## Native fat-LTO defaults
 
