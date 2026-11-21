@@ -416,7 +416,8 @@ driver=$(find "$package/lib" -maxdepth 1 -name 'librustc_driver-*.so' -print -qu
     readelf -n "$driver" | grep -A2 bolt_info
     for tool in bin/cargo-clippy bin/clippy-driver bin/rustfmt bin/cargo-fmt bin/rust-analyzer \
         libexec/rust-analyzer-proc-macro-srv; do
-        "$package/$tool" --version
+        # The proc-macro server refuses to run without this variable, even for --version.
+        RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 "$package/$tool" --version
         readelf -d "$package/$tool" | grep -E 'NEEDED|RUNPATH|RPATH'
     done
     sha256sum "$package/bin/rustc" "$driver" "$package"/lib/libLLVM* "$package/bin/cargo" \
