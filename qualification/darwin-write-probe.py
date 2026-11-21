@@ -16,7 +16,7 @@ import tempfile
 import time
 
 
-TRACE_SECONDS = 6
+TRACE_SECONDS = 90
 PAYLOAD_BYTES = 8 << 20
 WHOLE_DEVICE = re.compile(r"/dev/disk[0-9]+\Z")
 DEVICE = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
@@ -134,18 +134,17 @@ def sample(root, mount, devices, name, action):
                 raise ProbeError(f"fs_usage exited before the {name} phase: {trace_detail(trace_path)}")
             action()
             os.sync()
+            time.sleep(1)
             if trace.poll() is not None:
                 raise ProbeError(f"fs_usage stopped before the {name} phase was flushed")
         finally:
-            try:
-                status = trace.wait(timeout=TRACE_SECONDS + 3)
-            except subprocess.TimeoutExpired:
+            if trace.poll() is None:
                 trace.terminate()
-                try:
-                    trace.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    trace.kill()
-                    trace.wait()
+            try:
+                status = trace.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                trace.kill()
+                trace.wait()
                 raise ProbeError(f"fs_usage did not stop after the {name} phase")
     if status:
         raise ProbeError(f"fs_usage exited {status} in {name}: {trace_detail(trace_path)}")
