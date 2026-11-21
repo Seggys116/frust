@@ -18,6 +18,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 21 November 2026: span-cache relocation plus `.rodata` dedup was preflighted and not compiled in. Removing the measured 26820608 cache bytes from the ripgrep trace leaves disk ratio 1.10520802. Folding every repeated 32-byte `.rodata` window leaves a stripped-size geomean of 0.98749874. No fresh full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: no full-LTO change without RELR was compiled in. Replacing every dynamic relocation with a 4-byte relative pointer would leave a stripped-size geomean of 0.93815212. The measured static-relocation stack reaches 0.93980369 and misses the runtime upper at 0.99106385. No fresh full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: no full-LTO compiler was packaged for the four remaining budgets. None of the 23 saved judges has a runtime upper and a stripped-size geomean both at or under 0.97. The prelink-span compiler passes the leaf budgets at 0.38807512 / 0.38955465 and fails disk, runtime, and stripped size. No fresh full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
+* 21 November 2026: forcing MIR inlining on the frozen incremental profile was preflighted and not compiled in. Stripped ripgrep grew to 4030752/4024992 (1.00143106). Thirty pairs had median 0.99684879, and the interquartile range crossed 1. No fresh full judge. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
 ## [0.5.0] - 2026-11-20
 
