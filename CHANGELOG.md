@@ -24,6 +24,22 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 21 November 2026: the 630-pair cohort was not started. The MIR opt level 3 runtime geomean is 0.99079798, and the shipped upper-bound tests show that the upper is at least the geomean. Subtracting the 26050560 span-cache bytes from the ripgrep trace leaves disk ratio 1.05533956 and does not change the binaries. No compiler was packaged. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: no new full-LTO compiler was built for a joint preflight of build-time at or under 0.80, a runtime upper at or under 0.97, and every stripped file at or under stock. Shipped `frust-gates` on the hotbudget samples exited 1 and matched `logs/hotbudget-gates.json`: runtime geomean 0.97299293, upper 0.98418770, and ripgrep grew from 4024992 to 4030408. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 
+## [0.5.1] - 2026-11-21
+
+### Added
+
+* A second Linux x86-64 archive, built for x86-64-v3. `frust-install` selects it automatically on a CPU that supports it and installs the baseline build otherwise. `FRUST_VARIANT=auto`, `baseline` or `v3` overrides the choice, and `update` keeps the installed variant. See [Installer variants](docs/configuration.md#installer-variants).
+* Benchmark CI with unit-cache-aware cold, clean rebuild, no-op rebuild and edit rebuild series on Linux and macOS. It records the page-cache state of both toolchains. The first published run is in [docs/benchmarks.md](docs/benchmarks.md#results-of-the-ci-comparison); no CPU numbers are repeated here.
+
+### Changed
+
+* The release toolchains are built with the optimizations that upstream's own dist builds use. On all platforms: one codegen unit, jemalloc, and ThinLTO for the C and C++ parts. On Linux: clang, lld and a static libstdc++. On Linux x86-64 also PGO and BOLT from stored profiles. The profile and tool assets are the `build-assets-1` release, pinned by sha256 in [support/build-assets.lock](support/build-assets.lock); see [docs/build-assets.md](docs/build-assets.md).
+* On Linux, `frust-install` rewrites large files with large writes after extraction, so the installed compiler's code is mapped with 2 MiB pages.
+
+### Fixed
+
+* The 0.5.0 toolchains were built without the optimizations listed above and used more CPU than official Rust on cold builds.
+
 ## [0.5.0] - 2026-11-20
 
 * Native Linux x86-64 fCargo builds now default to incremental compilation with 16 codegen units for local packages using fat LTO at opt level 3. Explicit Cargo profile and incremental settings take precedence.

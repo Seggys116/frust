@@ -74,6 +74,21 @@ Identical `fcargo check` runs in one workspace share a single compile of each un
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 
+## Results
+
+fRust CPU time as a percent of official Rust 1.100.0, release builds of ripgrep, syn, regex and fd, median of 8 pairs per scenario and workload, geometric mean over the workloads. Lower is better and 100% is equal.
+
+| Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
+|---|---|---|---|---|
+| Clean rebuild | 45.5% | 45.3% | 62.3% | 59.3% |
+| No-op rebuild | 89.3% | 88.8% | 105.5% | 103.3% |
+| Cold build | 100.5% | 100.2% | 100.1% | 101.5% |
+| Edit rebuild | 100.1% | 99.8% | 104.6% | 100.0% |
+
+The largest effect is on clean rebuilds, where the unit cache restores dependencies. Cold builds start with an empty cache. On Linux, cold builds and edit rebuilds are at parity with official Rust. The CI runners are shared virtual machines, and the macOS cold, no-op and edit figures vary too much between pairs to separate from noise. The method, the per-workload numbers and the run are in [docs/benchmarks.md](docs/benchmarks.md#results-of-the-ci-comparison).
+
+<p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
+
 ## Learn more
 
 [How it works](https://github.com/Seggys116/frust/blob/main/docs/how-it-works.md) &middot; [Configuration](https://github.com/Seggys116/frust/blob/main/docs/configuration.md) &middot; [Benchmarks](https://github.com/Seggys116/frust/blob/main/docs/benchmarks.md) &middot; [Changelog](https://github.com/Seggys116/frust/blob/main/CHANGELOG.md) &middot; [Contributing](https://github.com/Seggys116/frust/blob/main/CONTRIBUTING.md) &middot; [Security](https://github.com/Seggys116/frust/blob/main/SECURITY.md)

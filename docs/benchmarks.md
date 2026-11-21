@@ -177,7 +177,7 @@ Stock-compiler characterizations on ripgrep, with oxipng added for the x86-64-v3
 
 ### Cargo unit cache and no-op overhead
 
-These results come from the Benchmark workflow (the official comparison described in [CI measurement method](#ci-measurement-method)). No workflow run is recorded here yet; each recorded result will name its run and commit and contain no local-host numbers. Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are not release claims. A first build with an empty store also pays for writing cache entries.
+The published results come from the Benchmark workflow (the official comparison described in [CI measurement method](#ci-measurement-method)). The first recorded run is in [Results of the CI comparison](#results-of-the-ci-comparison). Local-host development measurements, taken on one machine with pinned cores, are in `qualification/OPTIMIZED-LINUX.md` and are earlier local measurements, not release claims. A first build with an empty store also pays for writing cache entries.
 
 ## CI measurement method
 
@@ -262,6 +262,92 @@ Every `compare` job uploads its raw JSON lines (samples and page-cache records) 
 - The edit scenarios use the frozen edits, which sit inside the inlining cone of their callers (see below). They are not a general edit workload.
 - The official comparison does not use `qualification/time-build.sh`, whose empty-target check uses `find -quit`, which is GNU specific, and which always runs plain `cargo` rather than `fcargo`. The protocol jobs still use it, turn the unit cache on with `FRUST_UNIT_CACHE=1`, and stay on Linux x86-64.
 - The runtime and stripped size gates are not part of the official comparison.
+
+## Results of the CI comparison
+
+Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.
+
+Scope: official Rust 1.100.0 (rustc 0ef1bc386, 2026-11-09) against fRust with the unit cache on, release profile, 8 pairs per scenario and workload. The workloads are ripgrep, syn, regex and fd. The platforms are `linux-x86_64` (baseline build), `linux-x86_64-v3`, `macos-arm64` and `macos-x86_64`. Each figure is fRust CPU as a percent of official CPU, the median of the per-pair ratios. Lower is better and 100% is equal. The `all workloads` rows are the geometric mean of the per-workload medians, and their pair count is the total over workloads. The method is in [CI measurement method](#ci-measurement-method).
+
+The candidate tables and single samples earlier in this file, and the local measurements in `qualification/OPTIMIZED-LINUX.md`, are earlier local measurements. They are not release claims. The figures in this section are the ones to cite for a comparison with official Rust.
+
+Runners are shared and their hardware differs from job to job. Within one platform the jobs ran on these CPUs: `linux-x86_64`, AMD EPYC 9V74 and Intel Xeon 6975P-C; `linux-x86_64-v3`, Intel Xeon 6975P-C; `macos-arm64`, Apple M1 (Virtual) and Apple M2 Pro (Virtual); `macos-x86_64`, Intel Core i7-8700B. Each ratio compares two builds taken one after the other on the same runner. The two Linux columns are each a percent of the official toolchain on their own runners, so they are not CPU times to set against each other.
+
+### All workloads, per platform
+
+`linux-x86_64`:
+
+| Scenario | fRust CPU as % of official | Pairs |
+| --- | --- | --- |
+| cold build | 100.5% | 32 |
+| clean rebuild | 45.5% | 32 |
+| no-op rebuild | 89.3% | 32 |
+| edit rebuild, leaf | 100.1% | 24 |
+| edit rebuild, wide | 99.8% | 24 |
+
+`linux-x86_64-v3`:
+
+| Scenario | fRust CPU as % of official | Pairs |
+| --- | --- | --- |
+| cold build | 100.2% | 32 |
+| clean rebuild | 45.3% | 32 |
+| no-op rebuild | 88.8% | 32 |
+| edit rebuild, leaf | 99.8% | 24 |
+| edit rebuild, wide | 99.5% | 24 |
+
+`macos-arm64`:
+
+| Scenario | fRust CPU as % of official | Pairs |
+| --- | --- | --- |
+| cold build | 100.1% | 32 |
+| clean rebuild | 62.3% | 32 |
+| no-op rebuild | 105.5% | 32 |
+| edit rebuild, leaf | 104.6% | 24 |
+| edit rebuild, wide | 104.1% | 24 |
+
+`macos-x86_64`:
+
+| Scenario | fRust CPU as % of official | Pairs |
+| --- | --- | --- |
+| cold build | 101.5% | 32 |
+| clean rebuild | 59.3% | 32 |
+| no-op rebuild | 103.3% | 32 |
+| edit rebuild, leaf | 100.0% | 24 |
+| edit rebuild, wide | 98.9% | 24 |
+
+### Linux, per workload
+
+fRust CPU as a percent of official, 8 pairs in every cell. The edit rebuilds are only in the all-workloads tables above.
+
+| Workload | Cold, x86-64 | Cold, v3 | Clean, x86-64 | Clean, v3 | No-op, x86-64 | No-op, v3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| ripgrep | 99.8% | 100.1% | 58.4% | 58.2% | 85.2% | 87.3% |
+| syn | 100.6% | 99.7% | 75.4% | 75.1% | 94.0% | 92.8% |
+| regex | 100.4% | 101.1% | 68.7% | 68.6% | 87.7% | 86.2% |
+| fd | 101.0% | 100.1% | 14.2% | 14.1% | 90.7% | 89.2% |
+
+### Reading the results
+
+What wins:
+
+- Clean rebuild. fRust used 45.5% and 45.3% of official CPU on Linux and 62.3% and 59.3% on macOS. On Linux it was faster in every one of the 8 pairs of every workload. On macOS it was faster in every pair but one (a regex pair on `macos-x86_64`), although the per-pair ranges there are wide. The effect differs by workload: on `linux-x86_64`, fd is at 14.2% and syn at 75.4%.
+- No-op rebuild on Linux. 89.3% and 88.8%, faster in all four workloads. In 7 of 8 pairs for fd and in all 8 for the others. These builds are short: the official CPU is 15.2 to 44.1 ms on the baseline runners and 17.0 to 37.1 ms on the v3 runners.
+
+What ties:
+
+- Cold builds on Linux. 100.5% and 100.2%. fRust does not beat official on cold builds: it was faster in only 1 of 4 workloads on each Linux platform.
+- Edit rebuilds on Linux. Leaf 100.1% and 99.8%, wide 99.8% and 99.5%. Everything is within about half a percent of official, either way. The v3 build is slightly ahead of official on edit rebuilds, faster in all three workloads for both edits, by less than one percentage point.
+
+What this run cannot resolve:
+
+- macOS cold, no-op and edit rebuilds. The macOS runners are virtual machines on shared hosts and nothing is pinned. The per-pair ranges are wide, for example ripgrep cold 70.8% to 124.3% and regex no-op 79.1% to 176.8% on `macos-arm64`, and regex cold 79.1% to 147.0% on `macos-x86_64`. A difference of a few percent cannot be told from noise, so none of these numbers is reported as a win or a loss.
+
+Why the numbers look like this:
+
+- The clean rebuild result comes from the unit cache. The fRust clean rebuild restores dependency outputs from the store that the same round's cold build filled (for example 59 hits and 0 misses for fd on Linux), and official Rust has no store, so it compiles everything again.
+- Cold builds start with an empty store. The median number of store hits per fRust cold build is 0 for every workload, so there is nothing to restore, and the build also pays for writing the entries.
+- The Linux x86-64-v3 build has its compiler and tools built for x86-64-v3, so it requires a CPU with AVX2, BMI1, BMI2, FMA, MOVBE and the other extensions listed in [Installer variants](configuration.md#installer-variants). `frust-install` picks it automatically on a supporting CPU and falls back to the baseline build otherwise.
+- The toolchains were compared in the page-cache state that their installers leave, which is the state a user gets. The page-cache table of the report (MiB of `librustc_driver` and `libLLVM` text mapped with 2 MiB pages, before and after the builds) reads 48 / 48 for the official toolchain in every Linux job. For fRust it reads 48 / 48 on `linux-x86_64` and 52 / 48 on `linux-x86_64-v3`. Both installers therefore leave large pages, and neither toolchain ran with 4 KiB pages (0 in that table). The probe runs on Linux only, so macOS has no such record.
 
 ## Rules for new measurements
 
