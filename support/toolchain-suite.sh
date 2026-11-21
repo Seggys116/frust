@@ -148,9 +148,6 @@ export PATH=$bin:/usr/bin:/bin
 export CARGO_TERM_COLOR=never
 export CARGO_NET_OFFLINE=true
 export CARGO_INCREMENTAL=0
-# Cargo's dev profile writes unpacked split debuginfo on macOS, and the unit cache does not store units
-# built that way ("skip ... split-debuginfo-unpacked"). The cache check below needs units it can store.
-[[ $(uname -s) == Darwin ]] && export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off
 export FRUST_PROGRESS=plain
 export TERM=dumb
 export RUST_BACKTRACE=0
@@ -836,6 +833,27 @@ fi
 check_true "the second workspace has its own central target directory" "ws2 target is $(cd "$ws2" && "$bin/frust" where 2> /dev/null)" \
     test "$(cd "$ws2" && "$bin/frust" where 2> /dev/null)" != "$where_dir"
 check_match "the restored build runs" 'suite-app-ok 30 vendored-ok' in_dir "$ws2" tcmd "$bin/fcargo" run -p suite_app
+
+compare_unpacked_objects() {
+    local fresh=$1 restored=$2 object match count=0
+    while IFS= read -r -d '' object; do
+        match=$(find "$restored/debug" -type f -name "${object##*/}" -print)
+        [[ -n $match ]] && cmp "$object" "$match" || return 1
+        count=$((count + 1))
+    done < <(find "$fresh/debug" -type f -name 'suite_vend-*.rcgu.o' -print0)
+    [[ $count -gt 0 ]]
+}
+
+if [[ $(uname -s) == Darwin ]]; then
+    ws3=$work/ws3
+    make_workspace "$ws3"
+    check "uncached build with the default dev profile" in_dir "$ws3" env FRUST_UNIT_CACHE=0 \
+        "$bin/fcargo" build --workspace
+    reference_dir=$(cd "$ws3" && "$bin/frust" where)
+    restored_dir=$(cd "$ws2" && "$bin/frust" where)
+    check "restored unpacked debug objects match a fresh compile" \
+        compare_unpacked_objects "$reference_dir" "$restored_dir"
+fi
 
 # ---------------------------------------------------------------------------------------------------
 # 7. rust-analyzer.

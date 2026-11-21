@@ -1,0 +1,584 @@
+diff --git a/src/frust_unit_cache.rs b/src/frust_unit_cache.rs
+index a47da01..144ef62 100644
+--- a/src/frust_unit_cache.rs
++++ b/src/frust_unit_cache.rs
+@@ -142,6 +142,13 @@ struct FileDep {
+     blake3: String,
+ }
+ 
++#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
++struct DebugObject {
++    blob: Blob,
++    seconds: i64,
++    nanos: u32,
++}
++
+ #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+ struct Entry {
+     schema: u32,
+@@ -151,6 +158,8 @@ struct Entry {
+     key: String,
+     toolchain_id: String,
+     outputs: Vec<Blob>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    debug_objects: Vec<DebugObject>,
+     dep_info: Blob,
+     /// Cargo's message-cache lines (only `unused_extern_names` reports); empty when none.
+     messages: Blob,
+@@ -193,6 +202,7 @@ pub(crate) enum Lookup {
+ #[derive(Debug)]
+ pub(crate) struct Pending {
+     key: String,
++    split: Option<SplitOutputs>,
+     /// When the miss was decided; optional outputs older than this were not made by this compile.
+     started: SystemTime,
+ }
+@@ -241,6 +251,7 @@ pub(crate) struct UnitCache {
+     cwd: PathBuf,
+     /// Files every compile must leave in `out_dir`.
+     outputs: Vec<PathBuf>,
++    apple_target: bool,
+     /// Files rustc may or may not emit (split debuginfo); restored only if stored.
+     optional_outputs: Vec<PathBuf>,
+     dep_info: PathBuf,
+@@ -311,6 +322,10 @@ impl UnitCache {
+             Err(reason) => return skip(reason),
+         };
+         let pkg_root = unit.pkg.root().to_path_buf();
++        let target = match unit.kind {
++            CompileKind::Host => bcx.rustc().host.as_str(),
++            CompileKind::Target(target) => target.rustc_target().as_str(),
++        };
+         Some(UnitCache {
+             store: Arc::clone(&store),
+             crate_name: crate_name.clone(),
+@@ -323,6 +338,7 @@ impl UnitCache {
+             out_dir: out_dir.to_path_buf(),
+             cwd: rustc.get_cwd().unwrap_or_else(|| bcx.gctx.cwd()).to_path_buf(),
+             outputs: required,
++            apple_target: target.contains("-apple-") && !target.ends_with(".json"),
+             optional_outputs: optional,
+             dep_info: dep_info.to_path_buf(),
+             messages: message_cache.to_path_buf(),
+@@ -338,9 +354,9 @@ impl UnitCache {
+     /// then call the dependent stale forever. Equal mtimes count as fresh in Cargo's checks.
+     pub(crate) fn lookup_at(&self, rustc: &ProcessBuilder, stamp: FileTime) -> Lookup {
+         let timer = stat_start();
+-        let key = self.compute_key(rustc);
++        let key = self.key_and_split_outputs(rustc);
+         stat_add(&STATS.key_ns, timer);
+-        let key = match key {
++        let (key, split) = match key {
+             Ok(key) => key,
+             Err(reason) => {
+                 self.store.log(format_args!("skip {} {reason}", self.crate_name));
+@@ -349,7 +365,7 @@ impl UnitCache {
+             }
+         };
+         let timer = stat_start();
+-        match self.try_restore_at(&key, rustc, stamp) {
++        match self.try_restore_at(&key, rustc, stamp, split.as_ref()) {
+             Ok(restored) => {
+                 stat_add(&STATS.restore_ns, timer);
+                 self.store.log(format_args!("hit {} {}", short(&key), self.crate_name));
+@@ -370,7 +386,13 @@ impl UnitCache {
+                 for path in &self.optional_outputs {
+                     let _ = fs::remove_file(path);
+                 }
+-                Lookup::Miss(Pending { key, started: SystemTime::now() })
++                if let Some(split) = &split {
++                    if let Err(err) = split.clear(&self.out_dir) {
++                        self.store.log(format_args!("skip {} debug-outputs: {err}", self.crate_name));
++                        return Lookup::Skip;
++                    }
++                }
++                Lookup::Miss(Pending { key, split, started: SystemTime::now() })
+             }
+         }
+     }
+@@ -383,7 +405,8 @@ impl UnitCache {
+ 
+     #[cfg(test)]
+     fn try_restore(&self, key: &str, rustc: &ProcessBuilder) -> Result<Restored, Fail> {
+-        self.try_restore_at(key, rustc, FileTime::now())
++        let (_, split) = self.key_and_split_outputs(rustc).map_err(Fail::Reason)?;
++        self.try_restore_at(key, rustc, FileTime::now(), split.as_ref())
+     }
+ 
+     /// Best effort: failures are logged at debug level and never fail the build.
+@@ -441,6 +464,15 @@ impl UnitCache {
+         let normalized = normalize_dep_info(&dep_text, &self.out_dir).map_err(io::Error::other)?;
+         let toolchain = toolchain_id(&self.toolchain);
+         let dep_info = (dep_name.to_string(), normalized.into_bytes());
++        let debug_objects = if let Some(split) = &pending.split {
++            let paths = split.list(&self.out_dir)?;
++            if paths.is_empty() {
++                return Err(io::Error::other("no unpacked debug objects").into());
++            }
++            paths
++        } else {
++            Vec::new()
++        };
+         if let Some(bytes) = self.store.write_entry(
+             &pending.key,
+             &toolchain,
+@@ -448,6 +480,7 @@ impl UnitCache {
+             dep_info,
+             messages,
+             recorded,
++            &debug_objects,
+         )? {
+             self.store.log(format_args!("store {} {}", short(&pending.key), self.crate_name));
+             self.store.note_stored(bytes);
+@@ -455,9 +488,22 @@ impl UnitCache {
+         Ok(())
+     }
+ 
++    #[cfg(test)]
+     fn compute_key(&self, rustc: &ProcessBuilder) -> Result<String, &'static str> {
++        self.key_and_split_outputs(rustc).map(|(key, _)| key)
++    }
++
++    fn key_and_split_outputs(
++        &self,
++        rustc: &ProcessBuilder,
++    ) -> Result<(String, Option<SplitOutputs>), &'static str> {
+         let args: Vec<&OsStr> = rustc.get_args().map(|arg| arg.as_os_str()).collect();
+         let normalized = normalize_args(&args, &self.dirs, &self.build_paths, &self.cwd)?;
++        let split = if normalized.debuginfo && normalized.split_unpacked {
++            SplitOutputs::from_rustc(&args, &self.dep_info, self.apple_target)?
++        } else {
++            None
++        };
+         let mut hasher = KeyHasher::new();
+         hasher.field("schema", SCHEMA.as_bytes());
+         hasher.field("toolchain", toolchain_id(&self.toolchain).as_bytes());
+@@ -484,7 +530,18 @@ impl UnitCache {
+         if normalized.debuginfo {
+             hasher.field("cwd", self.cwd.as_os_str().as_encoded_bytes());
+         }
+-        Ok(hasher.finish())
++        if let Some(split) = &split {
++            hasher.field("debug-objects", split.prefix.as_bytes());
++            // ELF DWARF and Mach-O dylib debug maps can refer to the object by absolute path.
++            let darwin_rlib = self.apple_target
++                && self.outputs.iter().all(|path| {
++                    matches!(path.extension().and_then(OsStr::to_str), Some("rlib" | "rmeta"))
++                });
++            if !darwin_rlib {
++                hasher.field("debug-out-dir", self.out_dir.as_os_str().as_encoded_bytes());
++            }
++        }
++        Ok((hasher.finish(), split))
+     }
+ 
+     fn environment(&self, rustc: &ProcessBuilder) -> BTreeMap<String, Option<Vec<u8>>> {
+@@ -510,6 +567,7 @@ impl UnitCache {
+         key: &str,
+         rustc: &ProcessBuilder,
+         stamp: FileTime,
++        split: Option<&SplitOutputs>,
+     ) -> Result<Restored, Fail> {
+         let entry_dir = self.store.entry_dir(key);
+         let manifest_path = entry_dir.join(MANIFEST);
+@@ -541,7 +599,7 @@ impl UnitCache {
+         if !verify_file_deps(&entry.file_deps) {
+             return Err(Fail::Reason("file-dep"));
+         }
+-        let blobs = self.blobs_for_outputs(&entry).ok_or(Fail::Reason("output-set"))?;
++        let blobs = self.blobs_for_outputs(&entry, split).ok_or(Fail::Corrupt("output-set"))?;
+         verify_blobs(&entry_dir, &entry)?;
+         let messages = fs::read(entry_dir.join(&entry.messages.blake3))
+             .ok()
+@@ -553,21 +611,45 @@ impl UnitCache {
+ 
+     /// Pairs each output path with its stored blob. Required outputs must be present, optional
+     /// ones only if stored, and the entry must hold nothing else.
+-    fn blobs_for_outputs<'a>(&self, entry: &'a Entry) -> Option<Vec<(&PathBuf, &'a Blob)>> {
++    fn blobs_for_outputs<'a>(
++        &self,
++        entry: &'a Entry,
++        split: Option<&SplitOutputs>,
++    ) -> Option<Vec<(PathBuf, &'a Blob, Option<FileTime>)>> {
+         let find = |path: &PathBuf| {
+             let name = file_name(path)?;
+             entry.outputs.iter().find(|blob| blob.name == name)
+         };
+         let mut matched = Vec::with_capacity(entry.outputs.len());
+         for path in &self.outputs {
+-            matched.push((path, find(path)?));
++            matched.push((path.clone(), find(path)?, None));
+         }
+         for path in &self.optional_outputs {
+             if let Some(blob) = find(path) {
+-                matched.push((path, blob));
++                matched.push((path.clone(), blob, None));
++            }
++        }
++        let has_debug_objects = !entry.debug_objects.is_empty();
++        if matched.len() != entry.outputs.len() || split.is_some() != has_debug_objects {
++            return None;
++        }
++        if let Some(split) = split {
++            let mut seen = HashSet::default();
++            for obj in &entry.debug_objects {
++                if !split.matches(&obj.blob.name)
++                    || !seen.insert(obj.blob.name.as_str())
++                    || obj.nanos >= 1_000_000_000
++                {
++                    return None;
++                }
++                matched.push((
++                    self.out_dir.join(&obj.blob.name),
++                    &obj.blob,
++                    Some(FileTime::from_unix_time(obj.seconds, obj.nanos)),
++                ));
+             }
+         }
+-        (matched.len() == entry.outputs.len()).then_some(matched)
++        Some(matched)
+     }
+ 
+     /// All files are staged next to their destinations first so a failure never leaves a
+@@ -576,7 +658,7 @@ impl UnitCache {
+         &self,
+         entry_dir: &Path,
+         entry: &Entry,
+-        blobs: &[(&PathBuf, &Blob)],
++        blobs: &[(PathBuf, &Blob, Option<FileTime>)],
+         stamp: FileTime,
+     ) -> Result<bool, Fail> {
+         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+@@ -599,27 +681,29 @@ impl UnitCache {
+         }
+         // Dependents will hash these files as `--extern` inputs; the verified blob hash is
+         // already known for the files as they now stand.
+-        for (path, blob) in blobs {
+-            remember_written_hash(path, &blob.blake3);
++        for (path, blob, debug_stamp) in blobs {
++            if debug_stamp.is_none() {
++                remember_written_hash(path, &blob.blake3);
++            }
+         }
+         // GC recency lives on the manifest, which is never exposed outside the store.
+         let _ = filetime::set_file_mtime(entry_dir.join(MANIFEST), FileTime::now());
+-        Ok(blobs.iter().any(|(path, _)| path.extension() == Some(OsStr::new("rmeta"))))
++        Ok(blobs.iter().any(|(path, _, _)| path.extension() == Some(OsStr::new("rmeta"))))
+     }
+ 
+     fn stage(
+         &self,
+         entry_dir: &Path,
+         entry: &Entry,
+-        blobs: &[(&PathBuf, &Blob)],
++        blobs: &[(PathBuf, &Blob, Option<FileTime>)],
+         stamp: FileTime,
+         staged: &mut Vec<(PathBuf, PathBuf)>,
+     ) -> io::Result<()> {
+         fs::create_dir_all(&self.out_dir)?;
+-        for (dest, blob) in blobs {
++        for (dest, blob, debug_stamp) in blobs {
+             let temp = restore_temp(dest);
+-            staged.push((temp.clone(), (*dest).clone()));
+-            clone_or_copy(&entry_dir.join(&blob.blake3), &temp, &blob.blake3, stamp)?;
++            staged.push((temp.clone(), dest.clone()));
++            clone_or_copy(&entry_dir.join(&blob.blake3), &temp, &blob.blake3, debug_stamp.unwrap_or(stamp))?;
+         }
+         let text = fs::read_to_string(entry_dir.join(&entry.dep_info.blake3))?;
+         let out_dir = self.out_dir.to_str().ok_or_else(|| io::Error::other("out dir"))?;
+@@ -777,7 +861,8 @@ fn clean_messages(bytes: &[u8]) -> Option<Vec<String>> {
+ }
+ 
+ fn entry_blobs(entry: &Entry) -> impl Iterator<Item = &Blob> {
+-    entry.outputs.iter().chain([&entry.dep_info, &entry.messages])
++    entry.outputs.iter().chain(entry.debug_objects.iter().map(|obj| &obj.blob))
++        .chain([&entry.dep_info, &entry.messages])
+ }
+ 
+ /// Whether a file was written at or after `started`, allowing for coarse filesystem timestamps.
+@@ -895,6 +980,88 @@ struct Normalized {
+     split_unpacked: bool,
+ }
+ 
++#[derive(Debug)]
++struct SplitOutputs {
++    prefix: String,
++    apple_target: bool,
++}
++
++impl SplitOutputs {
++    fn from_rustc(
++        args: &[&OsStr],
++        dep_info: &Path,
++        apple_target: bool,
++    ) -> Result<Option<Self>, &'static str> {
++        const UNSUPPORTED: &str = "split-debuginfo-custom-outputs";
++        let mut emits = args.iter().filter(|arg| {
++            let arg = arg.as_encoded_bytes();
++            arg == b"--emit" || arg.starts_with(b"--emit=")
++        });
++        let emit = emits.next().ok_or(UNSUPPORTED)?.as_encoded_bytes();
++        if emits.next().is_some() {
++            return Err(UNSUPPORTED);
++        }
++        if emit == b"--emit=dep-info,metadata" {
++            return Ok(None);
++        }
++        if !matches!(emit, b"--emit=dep-info,metadata,link" | b"--emit=dep-info,link") {
++            return Err(UNSUPPORTED);
++        }
++        let custom = args.iter().any(|arg| {
++            let arg = arg.as_encoded_bytes();
++            let option = arg.strip_prefix(b"-C").or_else(|| arg.strip_prefix(b"-Z")).unwrap_or(arg);
++            arg.starts_with(b"-o") || [
++                b"temps-dir".as_slice(),
++                b"dwarf-out-dir",
++                b"dwo-out-dir",
++                b"codegen-backend",
++                b"save-temps",
++            ].into_iter().any(|name| option == name ||
++                option.strip_prefix(name).is_some_and(|tail| tail.starts_with(b"=")))
++        });
++        if custom {
++            return Err(UNSUPPORTED);
++        }
++        let stem = dep_info.file_stem().and_then(OsStr::to_str).ok_or(UNSUPPORTED)?;
++        Ok(Some(Self { prefix: format!("{stem}."), apple_target }))
++    }
++
++    fn matches(&self, name: &str) -> bool {
++        let Some(cgu) = name.strip_prefix(&self.prefix) else { return false };
++        cgu.ends_with(".rcgu.o")
++            || cgu.ends_with(".rcgu.asm.o")
++            || (!self.apple_target && cgu.ends_with(".rcgu.dwo"))
++    }
++
++    fn list(&self, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
++        let entries = match fs::read_dir(out_dir) {
++            Ok(entries) => entries,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
++            Err(err) => return Err(err),
++        };
++        let mut paths = Vec::new();
++        for entry in entries {
++            let entry = entry?;
++            if entry.file_name().to_str().is_some_and(|name| self.matches(name)) {
++                if !entry.file_type()?.is_file() {
++                    return Err(io::Error::other("debug companion is not a regular file"));
++                }
++                paths.push(entry.path());
++            }
++        }
++        paths.sort_unstable();
++        Ok(paths)
++    }
++
++    fn clear(&self, out_dir: &Path) -> io::Result<()> {
++        // Called only on a miss under Cargo's build locks, before rustc starts.
++        for path in self.list(out_dir)? {
++            fs::remove_file(path)?;
++        }
++        Ok(())
++    }
++}
++
+ /// Replaces build-directory paths and extern file paths by values that do not depend on where
+ /// the target directory lives. Relative paths in arguments resolve against `cwd`.
+ fn normalize_args(
+@@ -963,10 +1130,6 @@ fn normalize_args(
+             _ => out.args.push(plain(bytes)),
+         }
+     }
+-    // Unpacked split debuginfo writes `.dwo` files that the store does not keep.
+-    if out.debuginfo && out.split_unpacked {
+-        return Err("split-debuginfo-unpacked");
+-    }
+     Ok(out)
+ }
+ 
+@@ -1525,9 +1688,10 @@ impl Store {
+         dep_info: (String, Vec<u8>),
+         messages: Vec<u8>,
+         recorded: Recorded,
++        debug_objects: &[PathBuf],
+     ) -> io::Result<Option<u64>> {
+         self.commit_entry(key, |entry_dir| {
+-            self.fill_entry(entry_dir, key, toolchain_id, outputs, dep_info, messages, recorded)
++            self.fill_entry(entry_dir, key, toolchain_id, outputs, dep_info, messages, recorded, debug_objects)
+         })
+     }
+ 
+@@ -1573,11 +1737,20 @@ impl Store {
+         dep_info: (String, Vec<u8>),
+         messages: Vec<u8>,
+         recorded: Recorded,
++        debug_objects: &[PathBuf],
+     ) -> io::Result<u64> {
+         let mut blobs = Vec::with_capacity(outputs.len());
+         for (name, path) in outputs {
+             blobs.push(put_output_blob(entry_dir, name, path)?);
+         }
++        let mut objects = Vec::with_capacity(debug_objects.len());
++        for path in debug_objects {
++            let name = file_name(path).ok_or_else(|| io::Error::other("debug object name"))?;
++            let mtime = FileTime::from_last_modification_time(&fs::metadata(path)?);
++            let blob = put_output_blob(entry_dir, name, path)?;
++            // Darwin debug maps record object mtimes along with the path.
++            objects.push(DebugObject { blob, seconds: mtime.unix_seconds(), nanos: mtime.nanoseconds() });
++        }
+         let manifest_timer = stat_start();
+         let dep_blob = put_blob(entry_dir, &dep_info.0, dep_info.1.as_slice())?;
+         let messages_blob = put_blob(entry_dir, "messages", messages.as_slice())?;
+@@ -1587,6 +1760,7 @@ impl Store {
+             key: key.to_string(),
+             toolchain_id: toolchain_id.to_string(),
+             outputs: blobs,
++            debug_objects: objects,
+             dep_info: dep_blob,
+             messages: messages_blob,
+             env_deps: recorded.env_deps,
+@@ -1970,6 +2144,7 @@ mod tests {
+             build_paths: vec![build],
+             cwd: tmp.join(project),
+             outputs: vec![out.join("libfoo-abc.rlib"), out.join("libfoo-abc.rmeta")],
++            apple_target: false,
+             optional_outputs: Vec::new(),
+             dep_info: out.join("foo-abc.d"),
+             messages: tmp.join(project).join("messages.json"),
+@@ -2388,13 +2563,13 @@ mod tests {
+         let outputs = vec![("one".to_string(), src.clone()), ("two".to_string(), src)];
+         let dep_info = || ("x.d".to_string(), b"dep".to_vec());
+         let size = store
+-            .write_entry(&key, "tc", &outputs, dep_info(), Vec::new(), Recorded::default())
++            .write_entry(&key, "tc", &outputs, dep_info(), Vec::new(), Recorded::default(), &[])
+             .unwrap()
+             .unwrap();
+         assert_eq!(size, 9 + 3);
+         let blobs = fs::read_dir(store.entry_dir(&key)).unwrap().count();
+         assert_eq!(blobs, 4, "manifest, one shared output blob, dep-info and empty messages");
+-        let again = store.write_entry(&key, "tc", &outputs, dep_info(), Vec::new(), Recorded::default());
++        let again = store.write_entry(&key, "tc", &outputs, dep_info(), Vec::new(), Recorded::default(), &[]);
+         assert!(again.unwrap().is_none(), "an existing entry is never rewritten");
+     }
+ 
+@@ -2495,7 +2670,7 @@ mod tests {
+         fs::write(&src, vec![seed; size]).unwrap();
+         let dep_info = ("x.d".to_string(), vec![b'd'; 20]);
+         store
+-            .write_entry(&key, "tc", &[("libx.rlib".to_string(), src)], dep_info, Vec::new(), Recorded::default())
++            .write_entry(&key, "tc", &[("libx.rlib".to_string(), src)], dep_info, Vec::new(), Recorded::default(), &[])
+             .unwrap()
+             .unwrap();
+         let when = FileTime::from_unix_time(now_unix() as i64 - age_secs as i64, 0);
+@@ -2905,11 +3080,6 @@ mod tests {
+         assert_eq!(read_entry(&store, &pending.key).outputs.len(), 3);
+     }
+ 
+-    fn args_of(cache: &UnitCache, cmd: &ProcessBuilder) -> Result<Normalized, &'static str> {
+-        let args: Vec<&OsStr> = cmd.get_args().map(|arg| arg.as_os_str()).collect();
+-        normalize_args(&args, &cache.dirs, &cache.build_paths, &cache.cwd)
+-    }
+-
+     #[test]
+     fn static_links_hash_archives_in_every_native_dir() {
+         let (tmp, store) = fixture();
+@@ -2983,34 +3153,84 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn unpacked_split_debuginfo_is_skipped_only_with_debuginfo() {
++    fn unpacked_split_debuginfo_uses_effective_flags() {
+         let (tmp, store) = fixture();
+         let cache = unit_cache(tmp.path(), "a", &store);
+-        let skipped = |flags: &[&str]| {
++        let has_objects = |flags: &[&str]| {
+             let mut cmd = command(&cache);
+             for flag in flags {
+                 cmd.arg(flag);
+             }
+-            args_of(&cache, &cmd).err()
++            cache.key_and_split_outputs(&cmd).unwrap().1.is_some()
+         };
+         let unpacked = "split-debuginfo=unpacked";
+-        assert_eq!(skipped(&["-C", "debuginfo=2", "-C", unpacked]), Some("split-debuginfo-unpacked"));
+-        assert_eq!(skipped(&["-C", unpacked, "-C", "debuginfo=1"]), Some("split-debuginfo-unpacked"));
+-        assert_eq!(skipped(&["-g", "-C", unpacked]), Some("split-debuginfo-unpacked"));
+-        assert_eq!(skipped(&["-C", unpacked]), None, "no debuginfo, no .dwo files");
+-        assert_eq!(skipped(&["-C", "debuginfo=0", "-C", unpacked]), None);
+-        assert_eq!(skipped(&["-C", "debuginfo=2", "-C", "split-debuginfo=packed"]), None);
+-        assert_eq!(
+-            skipped(&["-C", "debuginfo=2", "-C", unpacked, "-C", "split-debuginfo=off"]),
+-            None,
+-            "the last setting wins"
+-        );
++        assert!(has_objects(&["-C", "debuginfo=2", "-C", unpacked]));
++        assert!(has_objects(&["-C", unpacked, "-C", "debuginfo=1"]));
++        assert!(has_objects(&["-g", "-C", unpacked]));
++        assert!(!has_objects(&["-C", unpacked]));
++        assert!(!has_objects(&["-C", "debuginfo=0", "-C", unpacked]));
++        assert!(!has_objects(&["-C", "debuginfo=2", "-C", "split-debuginfo=packed"]));
++        assert!(!has_objects(&["-C", "debuginfo=2", "-C", unpacked, "-C", "split-debuginfo=off"]));
++        assert!(SplitOutputs::from_rustc(&[OsStr::new("--emit=dep-info,metadata")],
++            &cache.dep_info, true).unwrap().is_none());
+ 
+         let mut cmd = command(&cache);
+-        cmd.arg("-Cdebuginfo=2").arg("-Csplit-debuginfo=unpacked");
++        cmd.arg("-Cdebuginfo=2").arg("-Csplit-debuginfo=unpacked").arg("-Ztemps-dir=other");
+         assert!(matches!(cache.lookup(&cmd), Lookup::Skip));
+     }
+ 
++    #[test]
++    fn unpacked_debug_companions_are_verified_and_restored() {
++        let (tmp, store) = fixture();
++        let cache = unit_cache(tmp.path(), "a", &store);
++        let mut cmd = command(&cache);
++        cmd.arg("-g").arg("-Csplit-debuginfo=unpacked");
++        let object = cache.out_dir.join("foo-abc.foo.cgu.0.rcgu.dwo");
++        let stale = cache.out_dir.join("foo-abc.foo.cgu.1.rcgu.dwo");
++        let other_unit = cache.out_dir.join("foo-def.foo.cgu.0.rcgu.dwo");
++        fs::write(&stale, b"stale").unwrap();
++        fs::write(&other_unit, b"other unit").unwrap();
++        let Lookup::Miss(pending) = cache.lookup(&cmd) else { panic!("expected cold miss") };
++        assert!(!stale.exists());
++        assert!(other_unit.exists());
++        fake_compile(&cache, &[], &[]);
++        fs::write(&object, b"debug symbols").unwrap();
++        let stamp = FileTime::from_unix_time(1_700_000_000, 123_456);
++        filetime::set_file_mtime(&object, stamp).unwrap();
++        cache.store(&pending);
++        let entry = read_entry(&store, &pending.key);
++        assert_eq!(entry.debug_objects.len(), 1);
++        fs::remove_file(&object).unwrap();
++        remove_outputs(&cache);
++        assert!(is_hit(&cache.lookup(&cmd)));
++        assert_eq!(fs::read(&object).unwrap(), b"debug symbols");
++        assert_eq!(FileTime::from_last_modification_time(&fs::metadata(&object).unwrap()), stamp);
++        fs::write(store.entry_dir(&pending.key).join(&entry.debug_objects[0].blob.blake3), b"corrupted").unwrap();
++        remove_outputs(&cache);
++        assert!(matches!(cache.lookup(&cmd), Lookup::Miss(_)));
++        assert!(!object.exists());
++        assert!(cache.outputs.iter().all(|path| !path.exists()));
++    }
++
++    #[test]
++    fn only_apple_rlib_debug_objects_can_change_build_directories() {
++        let (tmp, store) = fixture();
++        let mut a = unit_cache(tmp.path(), "a", &store);
++        let mut b = unit_cache(tmp.path(), "b", &store);
++        b.cwd = a.cwd.clone();
++        let key = |cache: &UnitCache| {
++            let mut cmd = command(cache);
++            cmd.arg("-g").arg("-Csplit-debuginfo=unpacked");
++            key_of(cache, &cmd)
++        };
++        assert_ne!(key(&a), key(&b));
++        a.apple_target = true;
++        b.apple_target = true;
++        assert_eq!(key(&a), key(&b));
++        a.outputs[0].set_extension("dylib");
++        b.outputs[0].set_extension("dylib");
++        assert_ne!(key(&a), key(&b));
++    }
+     #[test]
+     fn entries_without_a_kind_are_unit_entries() {
+         let (tmp, store) = fixture();
