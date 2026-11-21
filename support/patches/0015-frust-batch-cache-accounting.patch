@@ -1,0 +1,260 @@
+diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
+index 68c6efa..97ec05b 100644
+--- a/src/compiler/build_runner/mod.rs
++++ b/src/compiler/build_runner/mod.rs
+@@ -213,7 +213,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+         }
+ 
+         // Now that we've figured out everything that we're going to do, do it!
+-        queue.execute(&mut self)?;
++        let executed = queue.execute(&mut self);
++        crate::frust_unit_cache::flush_accounting();
++        executed?;
+ 
+         // Add `OUT_DIR` to env vars if unit has a build script.
+         let units_with_build_script = &self
+diff --git a/src/frust_unit_cache.rs b/src/frust_unit_cache.rs
+index 08aebab..170baac 100644
+--- a/src/frust_unit_cache.rs
++++ b/src/frust_unit_cache.rs
+@@ -48,6 +48,8 @@ const DEFAULT_BUDGET: u64 = 8 << 30;
+ const EVICT_TO_PERCENT: u128 = 80;
+ const GARBAGE_AGE: Duration = Duration::from_secs(60 * 60);
+ const COUNTER_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
++/// Upper bound on stored bytes held back from `.size`; smaller budgets flush proportionally sooner.
++const FLUSH_BYTES: u64 = 64 << 20;
+ const COPY_BUF: usize = 256 * 1024;
+ /// Streaming buffer for hashing and copying files in one pass.
+ const HASH_BUF: usize = 1024 * 1024;
+@@ -1825,6 +1827,17 @@ fn shared_store() -> Option<Arc<Store>> {
+     SHARED.get_or_init(open_from_env).clone()
+ }
+ 
++/// Writes the size accounting held back by this invocation. Never waits and never opens the store.
++pub(crate) fn flush_accounting() {
++    if let Some(Some(store)) = SHARED.get() {
++        store.flush();
++        if store.pending_bytes.load(Ordering::Relaxed) != 0 {
++            // The other maintainer may have scanned before this invocation finished storing.
++            let _ = fs::remove_file(store.recount_path());
++        }
++    }
++}
++
+ fn open_from_env() -> Option<Arc<Store>> {
+     if !enabled_by_env() {
+         return None;
+@@ -1857,6 +1870,8 @@ struct Store {
+     budget: u64,
+     debug: bool,
+     gc_ran: AtomicBool,
++    /// Stored bytes not yet added to `.size`; flushed by threshold, budget pressure or at exit.
++    pending_bytes: AtomicU64,
+     clone_supported: OnceLock<bool>,
+ }
+ 
+@@ -1888,6 +1903,7 @@ impl Store {
+             budget,
+             debug,
+             gc_ran: AtomicBool::new(false),
++            pending_bytes: AtomicU64::new(0),
+             clone_supported: OnceLock::new(),
+         }
+     }
+@@ -2065,10 +2081,18 @@ impl Store {
+         self.root.join(".size")
+     }
+ 
+-    fn read_counter(&self) -> Option<(u64, Duration)> {
+-        let path = self.counter_path();
+-        let total = fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok()?;
+-        Some((total, age(&path)))
++    /// Records when the last full recount finished; `.size` itself keeps its plain-number format.
++    fn recount_path(&self) -> PathBuf {
++        self.root.join(".size-recount")
++    }
++
++    /// Serializes counter updates and full scans across processes; never waited on.
++    fn maintenance_path(&self) -> PathBuf {
++        self.root.join(".maintenance.lock")
++    }
++
++    fn read_counter(&self) -> Option<u64> {
++        fs::read_to_string(self.counter_path()).ok()?.trim().parse::<u64>().ok()
+     }
+ 
+     fn write_counter(&self, total: u64) {
+@@ -2078,18 +2102,53 @@ impl Store {
+         }
+     }
+ 
+-    /// Keeps a best-effort size counter and runs at most one full scan per process, only when
+-    /// the counter is missing, stale or over budget.
++    /// Counter writes never refresh this, so a busy store still gets its periodic recount.
++    fn recount_due(&self) -> bool {
++        match fs::metadata(self.recount_path()).and_then(|meta| meta.modified()) {
++            Ok(time) => SystemTime::now()
++                .duration_since(time)
++                .map_or(true, |elapsed| elapsed > COUNTER_MAX_AGE),
++            Err(_) => true,
++        }
++    }
++
++    fn flush_threshold(&self) -> u64 {
++        (self.budget / 32).clamp(1, FLUSH_BYTES)
++    }
++
++    /// Adds to the pending byte count and writes `.size` only on budget pressure, a missing
++    /// counter or once the pending bytes reach the threshold; `flush_accounting` writes the rest.
+     fn note_stored(&self, bytes: u64) {
+-        let counter = self.read_counter();
+-        let total = counter.map(|(total, _)| total.saturating_add(bytes));
+-        let needs_scan = match counter {
+-            None => true,
+-            Some((total, counter_age)) => {
+-                total.saturating_add(bytes) > self.budget || counter_age > COUNTER_MAX_AGE
++        let pending = self.pending_bytes.fetch_add(bytes, Ordering::SeqCst).saturating_add(bytes);
++        let pressure = !self.gc_ran.load(Ordering::SeqCst)
++            && self.read_counter().is_none_or(|total| total.saturating_add(pending) > self.budget);
++        if pressure || pending >= self.flush_threshold() {
++            self.flush();
++        }
++    }
++
++    /// Folds pending bytes into `.size`, or runs the one full scan this process may need.
++    /// Skips quietly when another process holds the maintenance lock; the bytes stay pending.
++    fn flush(&self) {
++        if self.pending_bytes.load(Ordering::SeqCst) == 0 {
++            return;
++        }
++        let _lock = match try_lock(&self.maintenance_path(), LockMode::Exclusive) {
++            Ok(Some(lock)) => lock,
++            Ok(None) => return,
++            // Accounting is unavailable here; a later recount repairs the drift.
++            Err(_) => {
++                self.pending_bytes.store(0, Ordering::SeqCst);
++                return;
+             }
+         };
+-        if needs_scan && !self.gc_ran.swap(true, Ordering::SeqCst) {
++        let pending = self.pending_bytes.swap(0, Ordering::SeqCst);
++        if pending == 0 {
++            return;
++        }
++        let total = self.read_counter().map(|total| total.saturating_add(pending));
++        let scan = total.is_none_or(|total| total > self.budget || self.recount_due());
++        if scan && !self.gc_ran.swap(true, Ordering::SeqCst) {
+             self.gc();
+         } else if let Some(total) = total {
+             self.write_counter(total);
+@@ -2118,6 +2177,7 @@ impl Store {
+         }
+         report.total_after = total;
+         self.write_counter(total);
++        let _ = fs::write(self.recount_path(), total.to_string());
+         report
+     }
+ 
+@@ -2975,7 +3035,7 @@ mod tests {
+         assert!(!store.entry_dir(&oldest).exists());
+         assert!(store.entry_dir(&middle).exists());
+         assert!(store.entry_dir(&newest).exists());
+-        assert_eq!(store.read_counter().map(|(total, _)| total), Some(240));
++        assert_eq!(store.read_counter(), Some(240));
+     }
+ 
+     #[test]
+@@ -3054,15 +3114,89 @@ mod tests {
+     #[test]
+     fn counter_triggers_one_scan_only_when_needed() {
+         let tmp = tempdir().unwrap();
+-        let store = Store::new(tmp.path().join("store"), 1000, false);
++        let store = Store::new(tmp.path().join("store"), 100_000, false);
+         put_entry(&store, tmp.path(), 1, 100, 10);
+         assert!(store.read_counter().is_none());
+         store.note_stored(120);
+         assert!(store.gc_ran.load(Ordering::SeqCst));
+-        assert_eq!(store.read_counter().map(|(total, _)| total), Some(120));
+-        // Under budget with a fresh counter: updated arithmetically, no further scan.
++        assert_eq!(store.read_counter(), Some(120));
++        assert!(!store.recount_due());
++        // Under budget with a fresh counter: bytes are held back, then folded in by one write.
+         store.note_stored(50);
+-        assert_eq!(store.read_counter().map(|(total, _)| total), Some(170));
++        assert_eq!(store.read_counter(), Some(120));
++        assert_eq!(store.pending_bytes.load(Ordering::SeqCst), 50);
++        store.flush();
++        assert_eq!(store.read_counter(), Some(170));
++        assert_eq!(store.pending_bytes.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn pending_bytes_flush_at_the_threshold_and_wait_out_a_busy_lock() {
++        let tmp = tempdir().unwrap();
++        let store = Store::new(tmp.path().join("store"), 64_000, false);
++        put_entry(&store, tmp.path(), 1, 100, 10);
++        store.note_stored(120);
++        assert_eq!(store.flush_threshold(), 2_000);
++        store.note_stored(1_000);
++        assert_eq!(store.read_counter(), Some(120));
++        let held = try_lock(&store.maintenance_path(), LockMode::Exclusive).unwrap().unwrap();
++        store.note_stored(1_500);
++        assert_eq!(store.read_counter(), Some(120));
++        assert_eq!(store.pending_bytes.load(Ordering::SeqCst), 2_500);
++        drop(held);
++        store.flush();
++        assert_eq!(store.read_counter(), Some(2_620));
++        assert_eq!(store.pending_bytes.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn budget_pressure_scans_without_waiting_for_the_threshold() {
++        let tmp = tempdir().unwrap();
++        let store = Store::new(tmp.path().join("store"), 9_000, false);
++        let oldest = put_entry(&store, tmp.path(), 1, 3_000, 3000);
++        put_entry(&store, tmp.path(), 2, 3_000, 2000);
++        put_entry(&store, tmp.path(), 3, 3_000, 1000);
++        store.write_counter(8_900);
++        // Fewer pending bytes than the 281 byte threshold, but the total crosses the budget.
++        store.note_stored(120);
++        assert!(store.gc_ran.load(Ordering::SeqCst));
++        assert!(!store.entry_dir(&oldest).exists());
++        assert_eq!(store.read_counter(), Some(6_040));
++    }
++
++    #[test]
++    fn stale_recount_corrects_drift_even_when_the_counter_is_rewritten() {
++        let tmp = tempdir().unwrap();
++        let first = Store::new(tmp.path().join("store"), 100_000, false);
++        put_entry(&first, tmp.path(), 1, 100, 10);
++        first.note_stored(120);
++        let old = FileTime::from_unix_time(now_unix() as i64 - 2 * 24 * 60 * 60, 0);
++        filetime::set_file_mtime(first.recount_path(), old).unwrap();
++        // Counter writes must not refresh the recount stamp.
++        first.write_counter(5);
++        assert!(first.recount_due());
++        // An entry the counter never saw; a later process recounts and corrects the drift.
++        put_entry(&first, tmp.path(), 2, 100, 10);
++        let second = Store::new(tmp.path().join("store"), 100_000, false);
++        second.note_stored(10);
++        second.flush();
++        assert!(second.gc_ran.load(Ordering::SeqCst));
++        assert_eq!(second.read_counter(), Some(240));
++        assert!(!second.recount_due());
++    }
++
++    #[test]
++    fn a_plain_number_counter_without_a_recount_stamp_is_read_then_recounted() {
++        let tmp = tempdir().unwrap();
++        let store = Store::new(tmp.path().join("store"), 100_000, false);
++        put_entry(&store, tmp.path(), 1, 100, 10);
++        fs::write(store.counter_path(), "500").unwrap();
++        assert_eq!(store.read_counter(), Some(500));
++        assert!(store.recount_due());
++        store.note_stored(10);
++        store.flush();
++        assert_eq!(store.read_counter(), Some(120));
++        assert!(!store.recount_due());
+     }
+ 
+     #[test]
