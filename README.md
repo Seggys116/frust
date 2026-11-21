@@ -90,7 +90,7 @@ Identical `fcargo check` runs in one workspace share a single compile of each un
 
 ## Results
 
-fRust CPU time as a percent of official Rust 1.100.0, release builds of ripgrep, syn, regex and fd, median of 8 pairs per scenario and workload, geometric mean over the workloads. Lower is better and 100% is equal.
+The 20 November CI comparison measured fRust at `92558c5` against official Rust 1.100.0 for release builds of ripgrep, syn, regex and fd. The table uses the median of 8 CPU-time pairs per scenario and workload, then the geometric mean over workloads. Lower is better and 100% is equal.
 
 | Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
 |---|---|---|---|---|

@@ -343,6 +343,12 @@ Every `compare` job uploads its raw JSON lines (samples and page-cache records) 
 - The official comparison does not use `qualification/time-build.sh`, whose empty-target check uses `find -quit`, which is GNU specific, and which always runs plain `cargo` rather than `fcargo`. The protocol jobs still use it, turn the unit cache on with `FRUST_UNIT_CACHE=1`, and stay on Linux x86-64.
 - The runtime and stripped size gates are not part of the official comparison.
 
+### Contention and tool startup
+
+The Benchmark workflow's regex job on each platform also compares overlapping commands against the corresponding fRust 0.5.2 archive. It alternates eight pairs at the same workspace paths and records process-tree CPU, peak process RSS, lock wait messages and the allocated footprint of targets and caches. Linux records write bytes from `wait4` in 512-byte units. Both platforms report the unit-cache write counter separately. The matrix includes dev and release builds, check storms, and cold, warm, restored and edited targets.
+
+The same job captures thirty alternating pairs of version commands for `fcargo`, `frustc`, `fclippy`, `frustdoc`, `frustfmt` and `rust-analyzer`, with output parity checked on every pair. The contention and startup data are attached to the runner artifact separately from the official Rust release comparison.
+
 ## Results of the CI comparison
 
 Source: [Actions run 44836473809](https://github.com/Seggys116/frust/actions/runs/44836473809), 2026-11-21, repository commit `92558c5cabcbc3e3ee35edfd62d8b1db9630717f`. Every number below is copied from the report of that run. The report and the raw samples are artifacts of the run (`benchmark-report` and `compare-<platform>-<workload>`). They are not committed to this repository.

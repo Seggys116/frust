@@ -3,7 +3,7 @@ members = ["frust-core", "frust-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["Zak Noble-Clarke"]
@@ -12,4 +12,4 @@ rust-version = "1.100"
 
 # The library keeps its crate name frust_core. Its package is frust-rs-core because frust-core is taken on crates.io.
 [workspace.dependencies]
-frust-core = { package = "frust-rs-core", path = "frust-core", version = "=0.5.2" }
+frust-core = { package = "frust-rs-core", path = "frust-core", version = "=0.6.0" }

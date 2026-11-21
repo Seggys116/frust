@@ -53,7 +53,7 @@ The cache is on when Cargo was started by `fcargo`, `frust` or `fclippy` (`FRUST
 | `FRUST_UNIT_CACHE_SCRIPT_MIN_MS` | Shortest build script run, in milliseconds, that is stored. Default 3000. `0` stores every eligible run. An unparsable value means the default. |
 | `FRUST_UNIT_CACHE_DEBUG` | `1` prints one line per decision to stderr, prefixed `frust-unit-cache:`. Units log `hit`, `miss` with a reason, `store` and `skip` with a reason. Build scripts log `script-hit`, `script-miss`, `script-store` and `script-skip`. |
 
-After a store, a size scan runs at most once per process, and only when the size counter is missing, older than a day or over the budget. If the scan finds the total over the budget, entries are evicted least recently used first until the store is at 80 percent of it. The same scan removes temporary files and incomplete entries more than an hour old. The `FRUST_UNIT_CACHE*` variables are not part of the build script key.
+The store batches size updates and flushes them when the build finishes. Budget pressure can trigger a scan during the build. At most one full scan runs per process, and it uses a nonblocking maintenance lock shared by all writers. A missing counter or a recount older than a day also triggers a scan. If the total is over budget, the scan evicts least recently used entries until the store reaches 80 percent of the budget. It also removes temporary files and incomplete entries more than an hour old. The `FRUST_UNIT_CACHE*` variables are excluded from the build-script key.
 
 ## Direct entry
 
@@ -71,7 +71,7 @@ On Linux and macOS these names run Cargo directly, with `FRUST_INVOCATION=fcargo
 - `FRUST_CARGO` is set and not empty.
 - The first argument starts with `+`.
 
-A plain `fclippy` cannot change its own argument list, so it starts the same executable again as `cargo` with `clippy` inserted; the environment above is inherited and the second start does not enter this logic again.
+A plain `fclippy` supplies `clippy` to Cargo's argument parser in the initial process.
 
 If `FRUST_CARGO` names an `fcargo`, `frust` or `fclippy` that is the same file as this executable, it exits with an error naming the problem. On other hosts these names are still the patched Cargo, but the direct entry code is not compiled.
 
@@ -135,11 +135,11 @@ Explicit Cargo directory controls take precedence over the central default. Tool
 
 ## Cooperative checks
 
-On x86-64 GNU/Linux, eligible `fcargo check` invocations share check units by default when they use the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler checks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics. Set `FRUST_UNIT_JOIN=off` to use ordinary Cargo scheduling.
+On x86-64 GNU/Linux and macOS, eligible `fcargo check` invocations share check units by default when they use the same workspace and build directory. Cargo prepares the graph without waiting for another process's unit locks. Once a unit's dependencies are ready, the scheduler checks the fingerprint and tracked inputs under the unit lock before reusing the outputs and replaying diagnostics. Set `FRUST_UNIT_JOIN=off` to use ordinary Cargo scheduling.
 
-Joining uses the current Cargo build-directory layout, local storage, and the invocation's own jobserver. Graphs with build scripts, proc macros or artifact dependencies use ordinary Cargo scheduling, as do checks with `--keep-going`, `--timings`, or Cargo's explicit fine-grained locking flag. Contended units defer before taking a job slot, so independent work can proceed even with `-j1`. If a check stalls while retaining reader locks, Cargo releases them and retries serially. That retry can repeat unit progress messages. Switching between modes can cause a rebuild because their fingerprint identities differ.
+Joining uses the current Cargo build-directory layout, local storage, and the invocation's own jobserver. A check also joins a host proc macro and the libraries it links when the graph has no build script and each such unit keeps all of its outputs in its unit directory; that unit keeps Cargo's own fingerprint, so a later build reuses it. Graphs with build scripts, artifact dependencies or host units that publish an output elsewhere use ordinary Cargo scheduling, as do checks with `--keep-going`, `--timings`, or Cargo's explicit fine-grained locking flag. Contended units defer before taking a job slot, so independent work can proceed even with `-j1`. If a check stalls while retaining reader locks, Cargo releases them and retries serially. That retry can repeat unit progress messages. Switching between modes can cause a rebuild because their fingerprint identities differ.
 
-Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks. The native qualification covers Linux x86-64. The legacy `FRUST_EXPERIMENTAL_UNIT_JOIN=1` opt-in remains available on macOS for qualification. [Concurrent check probe](../qualification/cooperative-builds.py)
+Run a full `cargo clean` after active invocations finish, as Cargo can remove the whole build directory without taking its locks. macOS uses ordinary scheduling on network mounts. The toolchain workflow runs the concurrent check probe with interruption, edit and build-script fallback cases. [Concurrent check probe](../qualification/cooperative-builds.py)
 
 In the 19 November 2026 Linux check, all five regex metadata artifacts matched the ordinary Cargo path byte for byte. Twelve alternating warm checks per mode reported every artifact fresh. The syn workspace exercised ordinary scheduling for a graph with build-time dependencies and produced identical metadata with either setting.
 
