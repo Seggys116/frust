@@ -632,6 +632,7 @@ jobs:
       # The prefix is under the home directory, on the file system rustup uses for the official
       # toolchain. Its current/bin is the fRust toolchain that the driver measures.
       - name: Install the fRust toolchain with frust-install
+        id: install-frust
         if: steps.cpu.outputs.runnable != 'false'
         env:
           CPU: ${{ matrix.cpu }}
@@ -706,18 +707,23 @@ jobs:
       # Use the preceding fRust release as the control for resource changes. Both runs use the
       # same fixture paths and cache diagnostics. The .ndjson file keeps this series out of the
       # report's official CPU comparison, which reads *.jsonl.
-      - name: Measure contention
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
-        timeout-minutes: 20
+      - name: Install the control release for resource measurements
+        id: resource-control
+        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && matrix.workload == 'regex' }}
         env:
-          LABEL: ${{ matrix.label }}
           CPU: ${{ matrix.cpu }}
         run: |
-          baseline=$HOME/frust-bench-control
           FRUST_VARIANT=${CPU:-auto} "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
-            --version 0.5.2 --prefix "$baseline"
+            --version 0.5.2 --prefix "$HOME/frust-bench-control"
+          mkdir -p "$RUNNER_TEMP/out/contention"
+      - name: Measure contention
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
+        timeout-minutes: 30
+        env:
+          LABEL: ${{ matrix.label }}
+        run: |
+          baseline=$HOME/frust-bench-control
           out=$RUNNER_TEMP/out/contention
-          mkdir -p "$out"
           status=0
           python3 -I qualification/concurrent-builds.py \
             --a "control=$baseline/current/bin/fcargo,$baseline/current/bin/frustc" \
@@ -740,7 +746,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Trace Cargo lock holds
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           library=$RUNNER_TEMP/bench-flock
@@ -769,7 +775,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure overlapping proc-macro checks
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           baseline=$HOME/frust-bench-control/current/bin
@@ -783,7 +789,7 @@ jobs:
           status=0
           python3 -I qualification/concurrent-builds.py "${flags[@]}" --work "$WORK/proc-macro" \
             --out "$out/proc-macro.ndjson" > "$out/proc-macro.txt" 2>&1 || status=$?
-          if [[ $status == 0 ]]; then
+          if [[ $status == 0 && -n ${BENCH_FLOCK_LIBRARY:-} ]]; then
             python3 -I qualification/concurrent-builds.py "${flags[@]}" --lock-trace-library "$BENCH_FLOCK_LIBRARY" \
               --work "$WORK/proc-macro-locks" --out "$out/proc-macro-locks.ndjson" \
               > "$out/proc-macro-locks.txt" 2>&1 || status=$?
@@ -797,7 +803,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure a wide cooperative check graph
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           baseline=$HOME/frust-bench-control/current/bin
@@ -816,8 +822,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure APFS write bytes and allocated blocks
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex' && runner.os == 'macOS'
-        timeout-minutes: 10
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && runner.os == 'macOS' }}
+        timeout-minutes: 18
         run: |
           baseline=$HOME/frust-bench-control/current/bin
           out=$RUNNER_TEMP/out/contention
@@ -835,7 +841,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure cache accounting on a wide dependency graph
-        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex' && runner.os == 'Linux'
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 10
         run: |
           baseline=$HOME/frust-bench-control/current/bin
