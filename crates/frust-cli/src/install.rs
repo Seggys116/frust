@@ -10,7 +10,7 @@
 //! as, taken from the optional `variant` member of their `manifest.json`.
 //! On Linux the large files of the extracted tree are rewritten with large
 //! writes before activation, so the page cache holds them in large folios (see
-//! [`relayout`]).
+//! `relayout`).
 
 use std::collections::HashSet;
 use std::fmt::Display;
