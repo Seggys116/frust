@@ -206,7 +206,7 @@ def calibration_result():
             "phases": {}, "usable_devices": []}
 
 
-def calibrate_image(root, mount, devices):
+def sample_calibration(root, mount, devices):
     result = calibration_result()
     result["devices"] = devices
     path, clone = mount / "payload", mount / "clone"
@@ -230,8 +230,6 @@ def calibrate_image(root, mount, devices):
             if required >= PAYLOAD_BYTES and all(sum(writes[name].values()) <= minimum // 4
                                                  for name in ("idle", "clone")):
                 result["usable_devices"].append(candidate)
-        if not result["usable_devices"]:
-            raise ProbeError("no image device recorded the full fresh and rewrite payloads with lower idle and clone writes")
     except (ProbeError, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         raise CalibrationError(error, result) from error
     finally:
@@ -241,6 +239,16 @@ def calibrate_image(root, mount, devices):
         except OSError as error:
             raise CalibrationError(error, result) from error
     return result
+
+
+def calibrate_image(root, mount, devices):
+    for attempt in range(1, 4):
+        result = sample_calibration(root, mount, devices)
+        if result["usable_devices"]:
+            return result
+        print(f"APFS calibration attempt {attempt}: {json.dumps(result, sort_keys=True)}", file=sys.stderr)
+    raise CalibrationError("no image device recorded the full fresh and rewrite payloads with lower idle and clone writes",
+                           result)
 
 
 def interrupted(_signum, _frame):

@@ -67,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe by itself for native storage instrumentation calibration.
+        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe for calibration or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || !inputs.protocol && inputs.cohorts == 'regex' && 'resources' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -119,6 +119,7 @@ jobs:
       mac-builds: ${{ steps.plan.outputs.mac-builds }}
       mac-pgo-builds: ${{ steps.plan.outputs.mac-pgo-builds }}
       run-linux: ${{ steps.plan.outputs.run-linux }}
+      apfs-only: ${{ steps.plan.outputs.apfs-only }}
     steps:
       - id: plan
         env:
@@ -184,11 +185,17 @@ jobs:
           for name in ("ROUNDS", "NOOPS"):
               if not os.environ[name].isdigit() or int(os.environ[name]) < 1:
                   raise SystemExit(f"{name.lower()} must be a whole number of at least 1, got {os.environ[name]!r}")
-          write_probe = os.environ["PLATFORMS"] == "macos-write-probe"
-          if write_probe and os.environ["PROTOCOL"] == "true":
-              raise SystemExit("macos-write-probe needs protocol=false")
-          platforms = [] if write_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
-          workloads = choose("COHORTS", WORKLOADS, bool(not platforms))
+          selection = os.environ["PLATFORMS"].strip()
+          write_probe = selection == "macos-write-probe"
+          apfs_only = selection in ("macos-arm64-apfs", "macos-x86_64-apfs")
+          if (write_probe or apfs_only) and os.environ["PROTOCOL"] == "true":
+              raise SystemExit(f"{selection} needs protocol=false")
+          if apfs_only:
+              platforms = [selection.removesuffix("-apfs")]
+              workloads = ["regex"]
+          else:
+              platforms = [] if write_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
+              workloads = choose("COHORTS", WORKLOADS, not platforms)
           matrix = [
               dict(PLATFORMS[platform], workload=workload) for platform in platforms for workload in workloads
           ]
@@ -223,6 +230,7 @@ jobs:
           print(f"mac-builds={dump(mac)}")
           print(f"mac-pgo-builds={dump(mac_pgo)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
+          print(f"apfs-only={dump(apfs_only)}")
           PY
 
   macos-write-probe:
@@ -649,7 +657,7 @@ jobs:
           "$prefix/current/bin/fcargo" -V
           "$prefix/current/bin/frustc" -Vv
       - name: Install the official toolchain
-        if: steps.cpu.outputs.runnable != 'false'
+        if: steps.cpu.outputs.runnable != 'false' && needs.plan.outputs.apfs-only != 'true'
         run: |
           rustup toolchain install "$OFFICIAL_RELEASE" --profile minimal --no-self-update
           cargo_path=$(rustup which --toolchain "$OFFICIAL_RELEASE" cargo)
@@ -659,7 +667,7 @@ jobs:
           "$bin/rustc" -Vv
       # fetch-cohort.sh calls sha256sum, which macOS does not ship.
       - name: Provide sha256sum
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.plan.outputs.apfs-only != 'true'
         run: |
           if ! command -v sha256sum > /dev/null; then
             mkdir -p "$RUNNER_TEMP/shims"
@@ -673,7 +681,7 @@ jobs:
       # The registry is fetched with each toolchain's own Cargo, so both builds run --offline
       # against sources their Cargo can find.
       - name: Fetch the frozen cohort
-        if: steps.cpu.outputs.runnable != 'false'
+        if: steps.cpu.outputs.runnable != 'false' && needs.plan.outputs.apfs-only != 'true'
         env:
           WORKLOAD: ${{ matrix.workload }}
         run: |
@@ -683,7 +691,7 @@ jobs:
       # records the page-cache state of both toolchains before the first timed build and after the
       # last, and under cache-state evicted drops both toolchains' library pages before every build.
       - name: Measure
-        if: steps.cpu.outputs.runnable != 'false'
+        if: steps.cpu.outputs.runnable != 'false' && needs.plan.outputs.apfs-only != 'true'
         env:
           WORKLOAD: ${{ matrix.workload }}
           LABEL: ${{ matrix.label }}
@@ -717,7 +725,7 @@ jobs:
             --version 0.5.2 --prefix "$HOME/frust-bench-control"
           mkdir -p "$RUNNER_TEMP/out/contention"
       - name: Measure contention
-        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
         timeout-minutes: 30
         env:
           LABEL: ${{ matrix.label }}
@@ -746,7 +754,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Trace Cargo lock holds
-        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
         timeout-minutes: 10
         run: |
           library=$RUNNER_TEMP/bench-flock
@@ -775,7 +783,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure overlapping proc-macro checks
-        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
         timeout-minutes: 10
         run: |
           baseline=$HOME/frust-bench-control/current/bin
@@ -803,7 +811,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure a wide cooperative check graph
-        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
         timeout-minutes: 10
         run: |
           baseline=$HOME/frust-bench-control/current/bin
@@ -861,7 +869,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Stage results
-        if: always() && steps.cpu.outputs.runnable != 'false'
+        if: always() && steps.cpu.outputs.runnable != 'false' && needs.plan.outputs.apfs-only != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/out/logs"
           cp -R "$WORK/run/logs/." "$RUNNER_TEMP/out/logs/" || true
@@ -875,8 +883,8 @@ jobs:
   # Aggregates every compare job into one table and one chart per platform. Nothing is committed.
   report:
     name: report
-    needs: compare
-    if: ${{ !cancelled() && needs.compare.result != 'skipped' }}
+    needs: [plan, compare]
+    if: ${{ !cancelled() && needs.compare.result != 'skipped' && needs.plan.outputs.apfs-only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
