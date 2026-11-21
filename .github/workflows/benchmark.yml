@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || !inputs.protocol && inputs.cohorts == 'regex' && 'resources' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -740,6 +740,7 @@ jobs:
             flags=(-shared -ldl)
           fi
           cc -std=c11 -O2 -fPIC -Wall -Wextra qualification/bench-flock.c -o "$library" "${flags[@]}"
+          echo "BENCH_FLOCK_LIBRARY=$library" >> "$GITHUB_ENV"
           baseline=$HOME/frust-bench-control/current/bin
           out=$RUNNER_TEMP/out/contention
           status=0
@@ -752,6 +753,34 @@ jobs:
             echo "### Cargo lock timing (exit $status)"
             echo '```'
             sed -n '/^build-dev n=/,$p' "$out/locks.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Measure overlapping proc-macro checks
+        if: steps.cpu.outputs.runnable != 'false' && matrix.workload == 'regex'
+        timeout-minutes: 10
+        run: |
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          control=control=$baseline/fcargo,$baseline/frustc
+          candidate=frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc
+          states=cold,warm,edit
+          flags=(--a "$control" --b "$candidate"
+                 --proc-macro --scenarios overlap --mode check --states "$states" --count 3 --rounds 6
+                 --jobs 2 --size 50 --timeout 60 --summary-only)
+          status=0
+          python3 -I qualification/concurrent-builds.py "${flags[@]}" --work "$WORK/proc-macro" \
+            --out "$out/proc-macro.ndjson" > "$out/proc-macro.txt" 2>&1 || status=$?
+          if [[ $status == 0 ]]; then
+            python3 -I qualification/concurrent-builds.py "${flags[@]}" --lock-trace-library "$BENCH_FLOCK_LIBRARY" \
+              --work "$WORK/proc-macro-locks" --out "$out/proc-macro-locks.ndjson" \
+              > "$out/proc-macro-locks.txt" 2>&1 || status=$?
+          fi
+          {
+            echo "### Overlapping proc-macro checks (exit $status)"
+            echo '```'
+            cat "$out/proc-macro.txt"
+            if [[ -f $out/proc-macro-locks.txt ]]; then sed -n '/^overlap n=/,$p' "$out/proc-macro-locks.txt"; fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"

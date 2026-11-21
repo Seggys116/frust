@@ -351,6 +351,8 @@ The same job captures thirty alternating pairs of version commands for `fcargo`,
 
 A separate diagnostic instruments `flock` and `close` in both toolchains. It counts nonblocking conflicts and records the duration of blocking calls after a conflict and of observed lock holds through unlock, conversion or close. Holds without a recorded end appear separately. The trace runs after the CPU and storage samples so the instrumentation overhead stays out of those comparisons.
 
+Overlapping checks of packages with a shared host proc macro have their own paired CPU and lock traces. The graph has no build scripts, so this exercises the units eligible for cooperative reuse in 0.6.0.
+
 The wide-graph check runs two concurrent warm checks of 388 workspace members. It enables cooperative checking in both toolchains and measures paired CPU time and peak process RSS over six rounds.
 
 Dispatch Benchmark with `protocol=false` and `platforms=macos-write-probe` to test write accounting on both macOS runners. The probe uses a private APFS disk image and checks fresh writes, rewrites, clones and idle activity. Its output reports completed writes to a virtual device and the APFS allocation delta for each phase.

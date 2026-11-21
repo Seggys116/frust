@@ -269,7 +269,7 @@ def fold(seed, size):
 
 
 # Generated text is rustfmt-clean so a concurrent cargo fmt --check lane passes.
-def crate_source(upstream, size, test_value):
+def crate_source(upstream, size, test_value, proc_macro=False):
     """Formatted Rust whose value() folds size generated functions over its upstream value."""
     out = [f"const MUL: u64 = {MUL};"]
     if upstream is None:
@@ -279,6 +279,8 @@ def crate_source(upstream, size, test_value):
         out += [f"pub fn f{i}(x: u64) -> u64 {{",
                 f"    x.wrapping_mul(MUL).wrapping_add({i + 1})", "}", ""]
     start = "SEED" if upstream is None else f"{upstream}::value()"
+    if proc_macro:
+        start = f"cb_macro::passthrough!({start})"
     out += ["pub fn value() -> u64 {", f"    let mut acc = {start};"]
     out += [f"    acc = f{i}(acc);" for i in range(size)]
     out += ["    acc", "}"]
@@ -325,7 +327,7 @@ def write_vendored_crate(vendor, size):
     return checksum
 
 
-def write_builtin_fixture(template, deps, vendor, size, wide_members):
+def write_builtin_fixture(template, deps, vendor, size, wide_members, proc_macro):
     """Write the workspace template, the shared path crate and the vendored crate. Returns the expected values."""
     value_a = fold(SEED, size)
     value_b = fold(value_a, size)
@@ -343,9 +345,15 @@ def write_builtin_fixture(template, deps, vendor, size, wide_members):
     members = ("cb_app", "cb_core", "cb_left", "cb_right") + extra
     write_text(template / "Cargo.toml", '[workspace]\nresolver = "2"\nmembers = [' +
                ", ".join(f'"{member}"' for member in members) + "]\n")
-    write_text(template / "cb_core" / "Cargo.toml",
-               manifest("cb_core", 'cb_dep_b = { path = "../../fixture-deps/cb_dep_b" }'))
-    write_text(template / "cb_core" / "src" / "lib.rs", crate_source("cb_dep_b", size, value_core))
+    core_deps = 'cb_dep_b = { path = "../../fixture-deps/cb_dep_b" }'
+    if proc_macro:
+        write_text(deps / "cb_macro" / "Cargo.toml", manifest("cb_macro") + "\n[lib]\nproc-macro = true\n")
+        write_text(deps / "cb_macro" / "src" / "lib.rs",
+                   "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n"
+                   "#[proc_macro]\npub fn passthrough(input: TokenStream) -> TokenStream {\n    input\n}\n")
+        core_deps += '\ncb_macro = { path = "../../fixture-deps/cb_macro" }'
+    write_text(template / "cb_core" / "Cargo.toml", manifest("cb_core", core_deps))
+    write_text(template / "cb_core" / "src" / "lib.rs", crate_source("cb_dep_b", size, value_core, proc_macro))
     for name, delta, value in (("cb_left", 1, left), ("cb_right", 2, right)):
         write_text(template / name / "Cargo.toml", manifest(name, 'cb_core = { path = "../cb_core" }'))
         write_text(template / name / "src" / "lib.rs",
@@ -534,7 +542,8 @@ def merge_counts(counts):
 
 
 def flock_stats(trace):
-    fields = ("attempts", "try_conflicts", "waits", "wait_ns", "holds", "hold_ns", "unfinished")
+    fields = ("attempts", "try_conflicts", "waits", "wait_ns", "holds", "exclusive_hold_ns", "shared_hold_ns",
+              "unfinished")
     stats = {}
     held = {}
     conflicts = {}
@@ -544,10 +553,11 @@ def flock_stats(trace):
 
     def finish(key, start):
         if key in held:
-            kind, _, acquired = held.pop(key)
+            kind, mode, acquired = held.pop(key)
             row = counters(kind)
             row["holds"] += 1
-            row["hold_ns"] += start - acquired
+            field = "exclusive_hold_ns" if mode == fcntl.LOCK_EX else "shared_hold_ns"
+            row[field] += start - acquired
 
     records = []
     for line in trace.read_text(encoding="ascii").splitlines():
@@ -699,7 +709,7 @@ class Harness:
             (self.work / "tmp").mkdir()
         if self.builtin:
             self.expected = write_builtin_fixture(self.template, self.deps, self.vendor,
-                                                  self.args.size, self.args.wide_members)
+                                                  self.args.size, self.args.wide_members, self.args.proc_macro)
         else:
             shutil.copytree(self.args.fixture_dir, self.template, symlinks=True,
                             ignore=shutil.ignore_patterns(*SKIP_DIRS))
@@ -1044,7 +1054,8 @@ class Harness:
                     counts = locks[kind]
                     print(f"  {side.label:10} {kind:24} tries blocked={counts['try_conflicts']:g} "
                           f"waits={counts['waits']:g} wait={counts['wait_ns'] / 1e6:.2f}ms "
-                          f"holds={counts['holds']:g} hold={counts['hold_ns'] / 1e6:.2f}ms "
+                          f"holds={counts['holds']:g} exclusive={counts['exclusive_hold_ns'] / 1e6:.2f}ms "
+                          f"shared={counts['shared_hold_ns'] / 1e6:.2f}ms "
                           f"unfinished={counts['unfinished']:g}")
                 entry["sides"][side.label] = {"rounds": len(rounds), "locks": locks}
             table.append(entry)
@@ -1063,6 +1074,7 @@ class Harness:
             "kind": "run", "labels": LABELS, "argv": sys.argv, "rounds": self.args.rounds,
             "jobs": self.args.jobs, "size": self.args.size, "pin": self.pin,
             "wide_members": self.args.wide_members,
+            "proc_macro": self.args.proc_macro,
             "lock_trace": bool(self.args.lock_trace_library),
             "apfs": self.apfs.header() if self.apfs else None,
             "template_digest": self.template_digest, "deps_digest": self.deps_digest,
@@ -1141,6 +1153,7 @@ def parse_args():
     parser.add_argument("--edit-file", help="file, relative to the workspace, that the edit state appends to")
     parser.add_argument("--size", type=int, default=400, help="generated functions per crate of the generated fixture")
     parser.add_argument("--wide-members", type=int, default=0, help="extra library members in the generated workspace")
+    parser.add_argument("--proc-macro", action="store_true", help="include a shared host proc macro in the generated fixture")
     parser.add_argument("--ra-target", choices=("shared", "separate"), default="shared",
                         help="ra lanes use the workspace's target directory or their own")
     parser.add_argument("--cpus", default="none", help="none, auto or a taskset list (Linux only)")
@@ -1175,6 +1188,8 @@ def parse_args():
         parser.error("--count, --rounds and --size must be positive, --jobs not negative, --timeout positive")
     if args.wide_members < 0 or (args.wide_members and args.fixture_dir):
         parser.error("--wide-members is a nonnegative count for the generated fixture")
+    if args.proc_macro and args.fixture_dir:
+        parser.error("--proc-macro needs the generated fixture")
     if "custom" in args.scenarios and not args.lane:
         parser.error("the custom scenario needs --lane")
     if args.lane and "custom" not in args.scenarios:
