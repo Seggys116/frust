@@ -856,7 +856,8 @@ class Harness:
                 try:
                     trace = flock_stats(traces[index])
                 except FileNotFoundError as error:
-                    if lane.mode != "fmt":
+                    external = lane.mode == "fmt" or (sys.platform == "darwin" and lane.mode == "clippy")
+                    if not external:
                         problems.append(f"lane{index} lock trace unavailable: {error}")
                     lanes[-1]["flock"] = {}
                 except (OSError, ValueError) as error:

@@ -167,6 +167,14 @@ WRAPPER(close)(int fd) {
 }
 
 #ifdef __APPLE__
+// Keep the probe in Cargo so arm64e linker tools can start with their own ABI.
+__attribute__((constructor))
+static void keep_trace_in_this_process(void) {
+    if (getenv("FRUST_BENCH_FLOCK_LOG")) {
+        unsetenv("DYLD_INSERT_LIBRARIES");
+    }
+}
+
 __attribute__((used, section("__DATA,__interpose")))
 static const struct {
     const void *replacement;

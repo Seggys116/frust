@@ -253,6 +253,17 @@ jobs:
             --a "first=$cargo,$rustc" --b "second=$cargo,$rustc" --scenarios same-workspace --states cold \
             --count 1 --rounds 2 --jobs 1 --size 20 --timeout 60 --apfs-writes --summary-only \
             --work "$RUNNER_TEMP/apfs-check" --out "$RUNNER_TEMP/paired-write-probe.ndjson"
+      - name: Verify Cargo lock tracing through native linking
+        run: |
+          cargo=$(rustup which --toolchain "$OFFICIAL_RELEASE" cargo)
+          rustc=$(rustup which --toolchain "$OFFICIAL_RELEASE" rustc)
+          cc -std=c11 -O2 -fPIC -Wall -Wextra -dynamiclib qualification/bench-flock.c \
+            -o "$RUNNER_TEMP/probe-flock.dylib"
+          python3 -I qualification/concurrent-builds.py \
+            --a "first=$cargo,$rustc" --b "second=$cargo,$rustc" --scenarios same-workspace --states cold \
+            --count 2 --rounds 2 --jobs 2 --size 20 --timeout 60 --summary-only \
+            --lock-trace-library "$RUNNER_TEMP/probe-flock.dylib" \
+            --work "$RUNNER_TEMP/lock-check" --out "$RUNNER_TEMP/paired-lock-probe.ndjson"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -260,6 +271,7 @@ jobs:
           path: |
             ${{ runner.temp }}/write-probe.json
             ${{ runner.temp }}/paired-write-probe.ndjson
+            ${{ runner.temp }}/paired-lock-probe.ndjson
 
   toolchains:
     needs: plan

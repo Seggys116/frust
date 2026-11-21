@@ -351,7 +351,7 @@ The Benchmark workflow's regex job on each platform also compares overlapping co
 
 The same job captures thirty alternating pairs of version commands for `fcargo`, `frustc`, `fclippy`, `frustdoc`, `frustfmt` and `rust-analyzer`, with output parity checked on every pair. The contention and startup data are attached to the runner artifact separately from the official Rust release comparison.
 
-A separate diagnostic instruments `flock` and `close` in both toolchains. It counts nonblocking conflicts and records the duration of blocking calls after a conflict and of observed lock holds through unlock, conversion or close. Holds without a recorded end appear separately. The trace runs after the CPU and storage samples so the instrumentation overhead stays out of those comparisons.
+A separate diagnostic instruments `flock` and `close` in both toolchains. It counts nonblocking conflicts and records the duration of blocking calls after a conflict and of observed lock holds through unlock, conversion or close. Holds without a recorded end appear separately. On macOS the probe stays in the launched Cargo process so Xcode's linker tools can use their native ABI. The trace runs after the CPU and storage samples so the instrumentation overhead stays out of those comparisons.
 
 Overlapping checks of packages with a shared host proc macro have their own paired CPU and lock traces. The graph has no build scripts, so this exercises the units eligible for cooperative reuse in 0.6.0.
 
