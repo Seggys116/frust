@@ -44,7 +44,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 * The unit cache restores unpacked debug objects with dependency outputs, including the default macOS dev profile. The release suite compares restored Darwin objects byte for byte against an uncached build.
 * Benchmark CI compares concurrent builds and command startup against the matching fRust 0.5.2 archives. It records paired CPU time, peak RSS, lock wait counts, allocated bytes and Linux write volume.
-* Benchmark CI can build and measure native rustc PGO candidates for both macOS architectures. The candidates train on separate crates and require evidence that the profiles were generated, merged and used before the toolchain can be benchmarked.
+* Benchmark CI adds experimental native rustc PGO jobs on both macOS architectures. The instrumented compiler failed at startup before training in the attempted runs. The release uses the plain macOS recipe. [PGO experiment](docs/benchmarks.md#native-rustc-pgo-candidate-on-macos)
 
 ### Changed
 
