@@ -143,6 +143,14 @@ Run a full `cargo clean` after active invocations finish, as Cargo can remove th
 
 In the 19 November 2026 Linux check, all five regex metadata artifacts matched the ordinary Cargo path byte for byte. Twelve alternating warm checks per mode reported every artifact fresh. The syn workspace exercised ordinary scheduling for a graph with build-time dependencies and produced identical metadata with either setting.
 
+## Default parallel jobs
+
+When neither `-j`/`--jobs` nor `build.jobs` (including `CARGO_BUILD_JOBS`) is set, the patched Cargo (`support/patches/0009-frust-memory-aware-jobs.patch`) starts one job per logical CPU, as Cargo does. If the memory available to the process holds fewer than that many jobs at 1 GiB each, it starts one job per whole GiB available instead, and never fewer than one. Available memory is the smaller of the host's `MemAvailable` and the headroom under the lowest `memory.max` or `memory.high` in the process's cgroup v2 ancestry (current use less inactive file cache). A host with plenty of memory keeps the CPU count.
+
+An explicit count (positive, negative or `default`), an external jobserver in the environment, and any platform other than Linux keep Cargo's behavior. cgroup v1 limits are not read. `-v` prints a note when the default is lowered. Codegen, LTO and profile settings are not touched.
+
+The 1 GiB figure is about twice the largest single-process peak resident set recorded in `qualification/BASELINES.md` (537024 kB, release builds at fat LTO of four crate graphs on one Linux x86-64 host). Those figures are per process, not concurrent, and no build under a memory limit is recorded yet. `qualification/memory-jobs-bench.py` records CPU, wall time, `ru_maxrss` from `wait4`, the scope's `memory.peak` and OOM kills for one build under a limit.
+
 ## Native fat-LTO defaults
 
 When `fcargo` selects `frustc` for a native x86-64 GNU Linux build, local packages in release-derived profiles using fat LTO at opt level 3 default to incremental compilation and 16 codegen units. Use the project's ordinary release or custom profile command. Cargo honors explicit profile, package, environment, and command-line settings as well as its existing CI incremental policy.

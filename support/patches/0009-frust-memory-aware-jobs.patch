@@ -1,0 +1,465 @@
+diff --git a/src/compiler/build_config/memory_jobs.rs b/src/compiler/build_config/memory_jobs.rs
+new file mode 100644
+index 0000000..7baaaba
+--- /dev/null
++++ b/src/compiler/build_config/memory_jobs.rs
+@@ -0,0 +1,300 @@
++//! Memory-aware default for the number of parallel jobs.
++//!
++//! Cargo defaults to one job per logical CPU. When the memory that is
++//! actually available cannot hold that many compiler processes, the default
++//! is lowered so the build finishes instead of being killed or swapping.
++
++/// Memory budgeted for one parallel job, in bytes.
++///
++/// The largest single-process peak resident set recorded for a release build
++/// in `qualification/BASELINES.md` is 537024 kB (about 524 MiB). One GiB is
++/// roughly twice that. The measurements cover four crates, so the figure is
++/// a floor taken from that evidence, not a bound for every crate.
++const BYTES_PER_JOB: u64 = 1 << 30;
++
++/// The job count to use by default: `cpus`, unless `available_bytes` holds
++/// fewer than `cpus` jobs of [`BYTES_PER_JOB`], and never less than one.
++pub fn limited_jobs(cpus: u32, available_bytes: u64) -> u32 {
++    let by_memory = (available_bytes / BYTES_PER_JOB).max(1);
++    u32::try_from(by_memory).map_or(cpus, |jobs| jobs.min(cpus))
++}
++
++/// Bytes of memory a new build can use, or `None` when it cannot be
++/// determined. Only Linux reports a figure.
++pub fn available_memory() -> Option<u64> {
++    #[cfg(target_os = "linux")]
++    {
++        linux::available_memory()
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        None
++    }
++}
++
++#[cfg(target_os = "linux")]
++mod linux {
++    use std::fs;
++    use std::path::Path;
++
++    const CGROUP_ROOT: &str = "/sys/fs/cgroup";
++
++    /// The smaller of the host's `MemAvailable` and the headroom left by
++    /// the cgroup v2 limits that apply to this process.
++    pub fn available_memory() -> Option<u64> {
++        let host = fs::read_to_string("/proc/meminfo")
++            .ok()
++            .and_then(|meminfo| mem_available(&meminfo));
++        let cgroup = fs::read_to_string("/proc/self/cgroup")
++            .ok()
++            .and_then(|own| cgroup_headroom(Path::new(CGROUP_ROOT), cgroup_path(&own)?));
++        match (host, cgroup) {
++            (Some(host), Some(cgroup)) => Some(host.min(cgroup)),
++            (host, cgroup) => host.or(cgroup),
++        }
++    }
++
++    /// `MemAvailable` from `/proc/meminfo`, in bytes.
++    fn mem_available(meminfo: &str) -> Option<u64> {
++        let line = meminfo
++            .lines()
++            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
++        let kib: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
++        kib.checked_mul(1024)
++    }
++
++    /// The cgroup v2 path from `/proc/self/cgroup`. A v1 hierarchy has no
++    /// `0::` line and yields `None`.
++    fn cgroup_path(proc_cgroup: &str) -> Option<&str> {
++        proc_cgroup
++            .lines()
++            .find_map(|line| line.strip_prefix("0::"))
++    }
++
++    /// The smallest headroom among `cgroup` and its ancestors below `root`
++    /// that set a memory limit.
++    fn cgroup_headroom(root: &Path, cgroup: &str) -> Option<u64> {
++        let mut dir = root.join(cgroup.trim_start_matches('/'));
++        let mut smallest: Option<u64> = None;
++        loop {
++            if let Some(room) = level_headroom(&dir) {
++                smallest = Some(smallest.map_or(room, |current| current.min(room)));
++            }
++            if dir == root || !dir.pop() {
++                return smallest;
++            }
++        }
++    }
++
++    /// Headroom under one cgroup's `memory.max` or `memory.high`, whichever
++    /// is lower, or `None` when it sets neither.
++    fn level_headroom(dir: &Path) -> Option<u64> {
++        let read = |name: &str| fs::read_to_string(dir.join(name)).ok();
++        let max = read("memory.max").and_then(|text| parse_limit(&text));
++        let high = read("memory.high").and_then(|text| parse_limit(&text));
++        let limit = match (max, high) {
++            (Some(max), Some(high)) => max.min(high),
++            (max, high) => max.or(high)?,
++        };
++        let current: u64 = read("memory.current")?.trim().parse().ok()?;
++        let reclaimable = read("memory.stat")
++            .and_then(|stat| stat_value(&stat, "inactive_file"))
++            .unwrap_or(0);
++        Some(headroom(limit, current, reclaimable))
++    }
++
++    /// Bytes left under `limit`. Inactive file cache is reclaimable and is
++    /// not counted as use, as in the container working-set convention.
++    fn headroom(limit: u64, current: u64, reclaimable: u64) -> u64 {
++        limit.saturating_sub(current.saturating_sub(reclaimable))
++    }
++
++    /// A numeric cgroup limit; `max` means no limit.
++    fn parse_limit(text: &str) -> Option<u64> {
++        match text.trim() {
++            "max" => None,
++            number => number.parse().ok(),
++        }
++    }
++
++    /// The value of `key` in a `memory.stat` style `key value` listing.
++    fn stat_value(stat: &str, key: &str) -> Option<u64> {
++        stat.lines().find_map(|line| {
++            let (name, value) = line.split_once(' ')?;
++            if name != key {
++                return None;
++            }
++            value.trim().parse().ok()
++        })
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++
++        const GIB: u64 = 1 << 30;
++
++        fn write_level(dir: &Path, files: &[(&str, &str)]) {
++            fs::create_dir_all(dir).unwrap();
++            for (name, text) in files {
++                fs::write(dir.join(name), text).unwrap();
++            }
++        }
++
++        #[test]
++        fn meminfo_available_is_converted_to_bytes() {
++            let meminfo = "MemTotal:       65536000 kB\nMemFree:         1000 kB\nMemAvailable:   16384000 kB\nBuffers: 1 kB\n";
++            assert_eq!(mem_available(meminfo), Some(16_384_000 * 1024));
++        }
++
++        #[test]
++        fn meminfo_without_available_or_with_garbage_is_none() {
++            assert_eq!(mem_available("MemTotal: 1 kB\nMemFree: 1 kB\n"), None);
++            assert_eq!(mem_available("MemAvailable: lots kB\n"), None);
++            assert_eq!(mem_available("MemAvailable: 12\n"), None);
++            assert_eq!(mem_available(""), None);
++        }
++
++        #[test]
++        fn cgroup_path_reads_the_unified_hierarchy_only() {
++            assert_eq!(
++                cgroup_path("0::/user.slice/a.scope\n"),
++                Some("/user.slice/a.scope")
++            );
++            assert_eq!(cgroup_path("0::/\n"), Some("/"));
++            assert_eq!(cgroup_path("12:memory:/legacy\n11:cpu:/legacy\n"), None);
++            assert_eq!(
++                cgroup_path("12:memory:/legacy\n0::/unified\n"),
++                Some("/unified")
++            );
++        }
++
++        #[test]
++        fn limits_parse_numbers_and_treat_max_as_unset() {
++            assert_eq!(parse_limit("max\n"), None);
++            assert_eq!(parse_limit("4294967296\n"), Some(4 * GIB));
++            assert_eq!(parse_limit("garbage"), None);
++        }
++
++        #[test]
++        fn stat_value_finds_the_named_key() {
++            let stat = "anon 100\nfile 900\ninactive_file 700\nactive_file 200\n";
++            assert_eq!(stat_value(stat, "inactive_file"), Some(700));
++            assert_eq!(stat_value(stat, "file"), Some(900));
++            assert_eq!(stat_value(stat, "slab"), None);
++        }
++
++        #[test]
++        fn headroom_excludes_reclaimable_cache_and_never_underflows() {
++            assert_eq!(headroom(4 * GIB, GIB, 0), 3 * GIB);
++            assert_eq!(headroom(4 * GIB, 4 * GIB, 3 * GIB), 3 * GIB);
++            assert_eq!(headroom(GIB, 2 * GIB, 0), 0);
++            assert_eq!(headroom(GIB, GIB, 2 * GIB), GIB);
++        }
++
++        #[test]
++        fn nearest_limited_ancestor_wins() {
++            let root = tempfile::tempdir().unwrap();
++            let parent = root.path().join("a");
++            let child = parent.join("b");
++            write_level(
++                &parent,
++                &[
++                    ("memory.max", "2147483648\n"),
++                    ("memory.current", "1073741824\n"),
++                    ("memory.stat", "inactive_file 0\n"),
++                ],
++            );
++            write_level(
++                &child,
++                &[
++                    ("memory.max", "8589934592\n"),
++                    ("memory.current", "0\n"),
++                    ("memory.stat", "inactive_file 0\n"),
++                ],
++            );
++            // The child alone has 8 GiB, but its parent leaves only 1 GiB.
++            assert_eq!(cgroup_headroom(root.path(), "/a/b"), Some(GIB));
++        }
++
++        #[test]
++        fn unlimited_levels_and_the_root_contribute_nothing() {
++            let root = tempfile::tempdir().unwrap();
++            let leaf = root.path().join("a");
++            write_level(
++                &leaf,
++                &[
++                    ("memory.max", "max\n"),
++                    ("memory.high", "max\n"),
++                    ("memory.current", "123\n"),
++                ],
++            );
++            assert_eq!(cgroup_headroom(root.path(), "/a"), None);
++            assert_eq!(cgroup_headroom(root.path(), "/"), None);
++            assert_eq!(cgroup_headroom(root.path(), "/missing/dir"), None);
++        }
++
++        #[test]
++        fn memory_high_applies_when_lower_than_memory_max() {
++            let root = tempfile::tempdir().unwrap();
++            let leaf = root.path().join("a");
++            write_level(
++                &leaf,
++                &[
++                    ("memory.max", "8589934592\n"),
++                    ("memory.high", "3221225472\n"),
++                    ("memory.current", "1073741824\n"),
++                ],
++            );
++            assert_eq!(cgroup_headroom(root.path(), "/a"), Some(2 * GIB));
++        }
++
++        #[test]
++        fn a_limit_without_a_readable_current_value_is_ignored() {
++            let root = tempfile::tempdir().unwrap();
++            let leaf = root.path().join("a");
++            write_level(&leaf, &[("memory.max", "1073741824\n")]);
++            assert_eq!(cgroup_headroom(root.path(), "/a"), None);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const GIB: u64 = 1 << 30;
++
++    #[test]
++    fn plentiful_memory_keeps_the_cpu_default() {
++        assert_eq!(limited_jobs(16, 64 * GIB), 16);
++        assert_eq!(limited_jobs(16, 16 * GIB), 16);
++        assert_eq!(limited_jobs(1, 512 * GIB), 1);
++        assert_eq!(limited_jobs(16, u64::MAX), 16);
++    }
++
++    #[test]
++    fn tight_memory_lowers_jobs_to_whole_budgets() {
++        assert_eq!(limited_jobs(16, 4 * GIB), 4);
++        assert_eq!(limited_jobs(16, 4 * GIB + GIB - 1), 4);
++        assert_eq!(limited_jobs(16, 15 * GIB), 15);
++        assert_eq!(limited_jobs(64, 8 * GIB), 8);
++    }
++
++    #[test]
++    fn jobs_never_drop_below_one() {
++        assert_eq!(limited_jobs(16, 0), 1);
++        assert_eq!(limited_jobs(16, GIB - 1), 1);
++        assert_eq!(limited_jobs(1, 0), 1);
++    }
++
++    #[test]
++    fn the_limit_never_exceeds_the_cpu_count() {
++        for cpus in [1, 2, 7, 16, 255] {
++            for gib in [0, 1, 3, 16, 1024] {
++                assert!(limited_jobs(cpus, gib * GIB) <= cpus);
++                assert!(limited_jobs(cpus, gib * GIB) >= 1);
++            }
++        }
++    }
++}
+diff --git a/src/compiler/build_config.rs b/src/compiler/build_config.rs
+index 23e93f4..e9af171 100644
+--- a/src/compiler/build_config.rs
++++ b/src/compiler/build_config.rs
+@@ -10,6 +10,8 @@ use std::path::PathBuf;
+ use std::rc::Rc;
+ use std::thread::available_parallelism;
+ 
++mod memory_jobs;
++
+ /// Configuration information for a rustc build.
+ #[derive(Debug, Clone)]
+ pub struct BuildConfig {
+@@ -58,6 +60,56 @@ fn default_parallelism() -> CargoResult<u32> {
+         .get() as u32)
+ }
+ 
++/// The job count when neither `-j` nor `build.jobs` is set: one per logical
++/// CPU, lowered when the memory available to this process holds fewer jobs
++/// (see [`memory_jobs`]). An external jobserver already bounds concurrency,
++/// so it keeps the CPU count.
++fn implicit_jobs(gctx: &GlobalContext, cpus: u32) -> CargoResult<u32> {
++    if gctx.jobserver_from_env().is_some() {
++        return Ok(cpus);
++    }
++    let Some(available) = memory_jobs::available_memory() else {
++        return Ok(cpus);
++    };
++    let jobs = memory_jobs::limited_jobs(cpus, available);
++    if jobs < cpus {
++        gctx.shell().verbose(|shell| {
++            shell.note(format!(
++                "using {jobs} parallel jobs instead of {cpus} because about {} MiB of memory is available; \
++                 pass `-j` or set `build.jobs` to choose a count",
++                available >> 20
++            ))
++        })?;
++    }
++    Ok(jobs)
++}
++
++/// Resolves the job count from an explicit request. An explicit request,
++/// including a negative count relative to the CPUs and `default`, is never
++/// changed by memory; only an absent request calls `implicit`.
++fn resolve_jobs(
++    requested: Option<JobsConfig>,
++    cpus: impl Fn() -> CargoResult<u32>,
++    implicit: impl FnOnce(u32) -> CargoResult<u32>,
++) -> CargoResult<u32> {
++    match requested {
++        None => implicit(cpus()?),
++        Some(JobsConfig::Integer(j)) => match j {
++            0 => anyhow::bail!("jobs may not be 0"),
++            j if j < 0 => Ok((cpus()? as i32 + j).max(1) as u32),
++            j => Ok(j as u32),
++        },
++        Some(JobsConfig::String(j)) => match j.as_str() {
++            "default" => cpus(),
++            _ => {
++                anyhow::bail!(format!(
++                    "could not parse `{j}`. Number of parallel jobs should be `default` or a number."
++                ))
++            }
++        },
++    }
++}
++
+ impl BuildConfig {
+     /// Parses all config files to learn about build configuration. Currently
+     /// configured options are:
+@@ -83,24 +135,9 @@ impl BuildConfig {
+                  its environment, ignoring the `-j` parameter",
+             )?;
+         }
+-        let jobs = match jobs.or(cfg.jobs.clone()) {
+-            None => default_parallelism()?,
+-            Some(value) => match value {
+-                JobsConfig::Integer(j) => match j {
+-                    0 => anyhow::bail!("jobs may not be 0"),
+-                    j if j < 0 => (default_parallelism()? as i32 + j).max(1) as u32,
+-                    j => j as u32,
+-                },
+-                JobsConfig::String(j) => match j.as_str() {
+-                    "default" => default_parallelism()?,
+-                    _ => {
+-                        anyhow::bail!(format!(
+-                            "could not parse `{j}`. Number of parallel jobs should be `default` or a number."
+-                        ))
+-                    }
+-                },
+-            },
+-        };
++        let jobs = resolve_jobs(jobs.or(cfg.jobs.clone()), default_parallelism, |cpus| {
++            implicit_jobs(gctx, cpus)
++        })?;
+ 
+         // If sbom flag is set, it requires the unstable feature
+         let sbom = match (cfg.sbom, gctx.cli_unstable().sbom) {
+@@ -350,3 +387,60 @@ impl UserIntent {
+         )
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn cpus(count: u32) -> impl Fn() -> CargoResult<u32> {
++        move || Ok(count)
++    }
++
++    fn no_implicit(_: u32) -> CargoResult<u32> {
++        panic!("an explicit job request must not use the implicit default")
++    }
++
++    fn resolve(requested: Option<JobsConfig>, count: u32) -> CargoResult<u32> {
++        resolve_jobs(requested, cpus(count), no_implicit)
++    }
++
++    #[test]
++    fn explicit_counts_are_used_as_given() {
++        assert_eq!(resolve(Some(JobsConfig::Integer(3)), 16).unwrap(), 3);
++        assert_eq!(resolve(Some(JobsConfig::Integer(64)), 4).unwrap(), 64);
++    }
++
++    #[test]
++    fn negative_counts_are_relative_to_the_cpus() {
++        assert_eq!(resolve(Some(JobsConfig::Integer(-3)), 8).unwrap(), 5);
++        assert_eq!(resolve(Some(JobsConfig::Integer(-20)), 8).unwrap(), 1);
++    }
++
++    #[test]
++    fn default_is_the_cpu_count() {
++        let requested = Some(JobsConfig::String("default".to_string()));
++        assert_eq!(resolve(requested, 12).unwrap(), 12);
++    }
++
++    #[test]
++    fn invalid_requests_are_rejected() {
++        assert!(resolve(Some(JobsConfig::Integer(0)), 8).is_err());
++        assert!(resolve(Some(JobsConfig::String("many".to_string())), 8).is_err());
++    }
++
++    #[test]
++    fn an_absent_request_uses_the_implicit_default() {
++        let jobs = resolve_jobs(None, cpus(16), |cpus| Ok(cpus / 4)).unwrap();
++        assert_eq!(jobs, 4);
++    }
++
++    #[test]
++    fn explicit_requests_do_not_query_the_cpus_when_not_needed() {
++        let jobs = resolve_jobs(
++            Some(JobsConfig::Integer(2)),
++            || panic!("positive counts do not need the CPU count"),
++            no_implicit,
++        );
++        assert_eq!(jobs.unwrap(), 2);
++    }
++}
