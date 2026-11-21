@@ -1,0 +1,314 @@
+name: Probe macOS
+
+# Manual. Finds where fRust loses to official Rust on macOS, with data instead of a guess.
+#
+# The Benchmark workflow measures fRust at 100 to 121 percent of official CPU on macOS for no-op and edit
+# rebuilds, where the same fRust wins no-op builds by 10 to 15 percent on Linux. This probe builds one
+# cohort with seven configurations of the same release build on the same runner, in paired, interleaved,
+# order-rotated rounds (qualification/probe-bench.py has the details):
+#
+#   A official cargo and rustc          E fcargo, unit cache and central target off
+#   B fcargo, all defaults              F official cargo driving frustc
+#   C fcargo, FRUST_UNIT_CACHE=0        G fcargo defaults driving the official rustc
+#   D fcargo, FRUST_CENTRAL_TARGET=off
+#
+# The ratios of B, C, D, E, F and G against A and against each other say whether the difference comes from
+# the unit cache, the central target directory, cargo or the compiler. Scenarios are no-op rebuild, edit
+# rebuild (the frozen leaf edit) and cold build. The metric that carries the result is the hardware
+# instruction count that /usr/bin/time -l reports on macOS, which is far less noisy than CPU time on a shared
+# runner. Whether it covers the whole process tree depends on the macOS release, so the job prints the raw
+# `time -l` output of three probe commands before the measurement and the driver tests it too; when the
+# count does not cover the tree the report falls back to CPU time and says so.
+#
+# The toolchains are built and installed exactly as the compare job of the Benchmark workflow does it: the
+# fRust toolchain from the cache of the Toolchains workflow (rebuilt only when its recipe changed), packed
+# with package-release.sh and installed by frust-install --archive, the official toolchain from rustup
+# (minimal profile, pinned to OFFICIAL_RELEASE), and the cohort sources locked by qualification/cohorts.lock.
+# This workflow is separate and commits nothing. The driver stops cleanly at its time budget and the report
+# lists every scenario it cut short.
+on:
+  workflow_dispatch:
+    inputs:
+      cohorts:
+        description: Workloads, space separated (syn regex ripgrep). syn and regex are small and fast.
+        default: "syn regex"
+      platforms:
+        description: Platforms, space separated (macos-arm64 macos-x86_64)
+        default: "macos-arm64 macos-x86_64"
+      configs:
+        description: Configurations, space separated letters of A to G. A is the reference and is required.
+        default: "A B C D E F G"
+      noop-rounds:
+        description: Rounds of the no-op scenario, 0 skips it
+        default: "15"
+      edit-rounds:
+        description: Rounds of the edit scenario (frozen leaf edit), 0 skips it
+        default: "15"
+      cold-rounds:
+        description: Rounds of the cold scenario, 0 skips it
+        default: "5"
+      noops:
+        description: No-op builds per no-op round. The median is the sample.
+        default: "5"
+      budget-minutes:
+        description: Time budget of the measurement in minutes (10 to 150). The driver stops cleanly when the next round would pass it.
+        default: "120"
+      rebuild-toolchains:
+        description: Ignore cached toolchains and build them again
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probe-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The official toolchain of the comparison. It is installed with exactly this version.
+  OFFICIAL_RELEASE: "1.100.0"
+
+jobs:
+  # Validates the inputs and turns them into the toolchain builds and the matrix.
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      mac-builds: ${{ steps.plan.outputs.mac-builds }}
+    steps:
+      - id: plan
+        env:
+          COHORTS: ${{ inputs.cohorts }}
+          PLATFORMS: ${{ inputs.platforms }}
+          CONFIGS: ${{ inputs.configs }}
+          NOOP_ROUNDS: ${{ inputs.noop-rounds }}
+          EDIT_ROUNDS: ${{ inputs.edit-rounds }}
+          COLD_ROUNDS: ${{ inputs.cold-rounds }}
+          NOOPS: ${{ inputs.noops }}
+          BUDGET: ${{ inputs.budget-minutes }}
+        run: |
+          python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+
+          # Same platform entries as the Benchmark workflow. toolchain is the name of the artifact the
+          # Toolchains workflow uploads (toolchain-<toolchain>-<target>).
+          PLATFORMS = {
+              "macos-arm64": {
+                  "label": "macos-arm64", "os": "macos-latest", "target": "aarch64-apple-darwin",
+                  "toolchain": "frust",
+              },
+              "macos-x86_64": {
+                  "label": "macos-x86_64", "os": "macos-15-intel", "target": "x86_64-apple-darwin",
+                  "toolchain": "frust",
+              },
+          }
+          # The workloads of qualification/cohorts.lock that have a frozen leaf edit in qualification/edits.
+          WORKLOADS = ("syn", "regex", "ripgrep")
+          CONFIGS = tuple("ABCDEFG")
+
+
+          def choose(name, allowed):
+              chosen = []
+              for item in os.environ[name].split():
+                  if item not in allowed:
+                      raise SystemExit(f"unknown {name.lower()} entry {item!r}, expected one of {', '.join(allowed)}")
+                  if item not in chosen:
+                      chosen.append(item)
+              if not chosen:
+                  raise SystemExit(f"{name.lower()} is empty")
+              return chosen
+
+
+          def whole(name, low, high=None):
+              value = os.environ[name]
+              if not value.isdigit() or int(value) < low or (high is not None and int(value) > high):
+                  bound = f"at least {low}" if high is None else f"between {low} and {high}"
+                  raise SystemExit(f"{name.lower()} must be a whole number {bound}, got {value!r}")
+              return int(value)
+
+
+          platforms = choose("PLATFORMS", tuple(PLATFORMS))
+          workloads = choose("COHORTS", WORKLOADS)
+          configs = choose("CONFIGS", CONFIGS)
+          if "A" not in configs:
+              raise SystemExit("configs must include A: every ratio is against the official configuration")
+          rounds = [whole("NOOP_ROUNDS", 0), whole("EDIT_ROUNDS", 0), whole("COLD_ROUNDS", 0)]
+          if max(rounds) < 1:
+              raise SystemExit("noop-rounds, edit-rounds and cold-rounds are all 0: nothing to measure")
+          whole("NOOPS", 1)
+          whole("BUDGET", 10, 150)
+          matrix = [dict(PLATFORMS[p], workload=w) for p in platforms for w in workloads]
+          mac = [{"variant": "frust", "target": PLATFORMS[p]["target"], "os": PLATFORMS[p]["os"]} for p in platforms]
+
+
+          def dump(value):
+              return json.dumps(value, separators=(",", ":"))
+
+
+          print(f"matrix={dump(matrix)}")
+          print(f"mac-builds={dump(mac)}")
+          PY
+
+  # The macOS toolchains are the shipped fRust ones, built natively like the release does.
+  toolchains-macos:
+    needs: plan
+    uses: ./.github/workflows/toolchains.yml
+    with:
+      rebuild: ${{ inputs.rebuild-toolchains }}
+      codegen-cache: false
+      relr: false
+      builds: ${{ needs.plan.outputs.mac-builds }}
+
+  # One runner per platform and workload. All seven configurations of a pair run on the same runner, so
+  # ratios do not depend on the runner. Setup takes up to about 25 minutes, the measurement stops at the
+  # budget (at most 150 minutes), and the report and upload follow, inside the 240 minute job limit.
+  probe:
+    name: probe ${{ matrix.label }} ${{ matrix.workload }}
+    needs: [plan, toolchains-macos]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require the toolchain build
+        env:
+          RESULT: ${{ needs.toolchains-macos.result }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ $RESULT != success ]]; then
+            echo "::error::The fRust toolchain build for $TARGET finished as $RESULT"
+            exit 1
+          fi
+      - name: Choose the work directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench"
+          echo "WORK=$RUNNER_TEMP/bench" >> "$GITHUB_ENV"
+          df -h /
+      # frust-install is built here, with its target directory in the job's temporary area, and
+      # then installs the toolchain the way a user's copy is installed.
+      - uses: ./.github/actions/setup-rust
+      - name: Build frust-install
+        working-directory: crates
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/frust-install-target
+        run: cargo build --release --locked -p frust-rs --bin frust-install
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/toolchain
+      # The same script and arguments as the package job of the Release workflow, so the archive
+      # has the release layout: manifest with the release id, frust-install inside.
+      - name: Package the release files
+        env:
+          TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          command -v zstd > /dev/null || brew install zstd
+          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          files=$RUNNER_TEMP/release-files
+          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst" "$version" "$TARGET" \
+            "$RUNNER_TEMP/frust-install-target/release/frust-install" "$files"
+          rm -f "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst"
+          echo "RELEASE_ARCHIVE=$files/frust-toolchain-$TARGET.tar.gz" >> "$GITHUB_ENV"
+          ls -l "$files"
+      # The prefix is under the home directory, on the file system rustup uses for the official
+      # toolchain. Its current/bin is the fRust toolchain that the driver measures.
+      - name: Install the fRust toolchain with frust-install
+        run: |
+          prefix=$HOME/frust-bench-prefix
+          rm -rf "$prefix"
+          "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
+            --archive "$RELEASE_ARCHIVE" --checksum "$RELEASE_ARCHIVE.sha256" --prefix "$prefix"
+          rm -rf "$RUNNER_TEMP/release-files"
+          echo "FRUST_BIN=$prefix/current/bin" >> "$GITHUB_ENV"
+          "$prefix/current/bin/fcargo" -V
+          "$prefix/current/bin/frustc" -Vv
+          ls -l "$prefix/current/bin"
+      - name: Install the official toolchain
+        run: |
+          rustup toolchain install "$OFFICIAL_RELEASE" --profile minimal --no-self-update
+          cargo_path=$(rustup which --toolchain "$OFFICIAL_RELEASE" cargo)
+          bin=$(dirname "$cargo_path")
+          echo "OFFICIAL_BIN=$bin" >> "$GITHUB_ENV"
+          "$bin/cargo" -V
+          "$bin/rustc" -Vv
+      # fetch-cohort.sh calls sha256sum, which macOS does not ship.
+      - name: Provide sha256sum
+        run: |
+          if ! command -v sha256sum > /dev/null; then
+            mkdir -p "$RUNNER_TEMP/shims"
+            cat > "$RUNNER_TEMP/shims/sha256sum" <<'SHIM'
+          #!/bin/bash
+          exec shasum -a 256 "$@"
+          SHIM
+            chmod +x "$RUNNER_TEMP/shims/sha256sum"
+            echo "$RUNNER_TEMP/shims" >> "$GITHUB_PATH"
+          fi
+      # The registry is fetched with each toolchain's own Cargo, so every build runs --offline
+      # against sources their Cargo can find.
+      - name: Fetch the frozen cohort
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+        run: |
+          PATH="$OFFICIAL_BIN:$PATH" qualification/fetch-cohort.sh "$WORKLOAD" "$WORK/cohorts" "$OFFICIAL_BIN/cargo"
+          (cd "$WORK/cohorts/$WORKLOAD" && PATH="$FRUST_BIN:$PATH" "$FRUST_BIN/cargo" fetch --locked)
+      # The hardware counters that the metric rests on. time -l reports the resource usage of the process
+      # it waited for. The three commands show, for whoever reads the first run, whether the counters are
+      # there at all and whether the work of a grandchild process is included. The driver repeats the test
+      # and decides by itself.
+      - name: Show what time -l reports
+        run: |
+          sw_vers || true
+          echo "--- trivial command"
+          /usr/bin/time -l /usr/bin/true || echo "time -l failed with status $?"
+          echo "--- sh -c with a trivial child"
+          /usr/bin/time -l /bin/sh -c '/usr/bin/true; exit 0' || echo "time -l failed with status $?"
+          echo "--- sh -c with a heavy grandchild"
+          /usr/bin/time -l /bin/sh -c 'python3 -c "sum(range(10000000))"; exit 0' || echo "time -l failed with status $?"
+      - name: Measure
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+          LABEL: ${{ matrix.label }}
+          CONFIGS: ${{ inputs.configs }}
+          NOOP_ROUNDS: ${{ inputs.noop-rounds }}
+          EDIT_ROUNDS: ${{ inputs.edit-rounds }}
+          COLD_ROUNDS: ${{ inputs.cold-rounds }}
+          NOOPS: ${{ inputs.noops }}
+          BUDGET: ${{ inputs.budget-minutes }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 -I qualification/probe-bench.py run \
+            --official-cargo "$OFFICIAL_BIN/cargo" --official-rustc "$OFFICIAL_BIN/rustc" \
+            --expect-official-release "$OFFICIAL_RELEASE" \
+            --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$FRUST_BIN/frustc" \
+            --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --configs "$CONFIGS" \
+            --noop-rounds "$NOOP_ROUNDS" --edit-rounds "$EDIT_ROUNDS" --cold-rounds "$COLD_ROUNDS" \
+            --noops "$NOOPS" --time-budget-minutes "$BUDGET" \
+            --work "$WORK/run" --out "$RUNNER_TEMP/out/samples.jsonl" --report "$RUNNER_TEMP/out/results.md"
+      - name: Stage results
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/logs"
+          cp -R "$WORK/run/logs/." "$RUNNER_TEMP/out/logs/" || true
+          if [[ -f $RUNNER_TEMP/out/results.md ]]; then
+            cat "$RUNNER_TEMP/out/results.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          df -h /
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: probe-${{ matrix.label }}-${{ matrix.workload }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
