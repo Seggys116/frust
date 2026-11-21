@@ -236,11 +236,12 @@ mac_build_target() {
     cd "$mac_pkg" && "$bin/frust" build --offline --target "$target" --target-dir "$mac_target_dir" "$@"
 }
 
-# The platform each bundled Apple target must produce, as an egrep alternation. x86_64-apple-ios is
-# the simulator for Intel and is accepted with a legacy IOS command too, but never as macOS.
+# The platform each bundled Apple target must produce, as an egrep alternation. Rust's default iOS
+# deployment target is 10.0, below the 12.0 where Apple introduced LC_BUILD_VERSION, so aarch64-apple-ios
+# and x86_64-apple-ios carry the legacy LC_VERSION_MIN_IPHONEOS command. Never macOS.
 mac_expected_platform() {
     case $1 in
-        aarch64-apple-ios) echo 'IOS' ;;
+        aarch64-apple-ios) echo 'IOS|IOS-LEGACY' ;;
         aarch64-apple-ios-sim) echo 'IOSSIMULATOR' ;;
         x86_64-apple-ios) echo 'IOSSIMULATOR|IOS-LEGACY' ;;
         *-apple-ios-macabi) echo 'MACCATALYST' ;;
