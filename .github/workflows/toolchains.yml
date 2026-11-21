@@ -18,6 +18,12 @@ name: Toolchains
 # A builds entry is {variant, target, os} with an optional cpu, baseline or v3. cpu is only for the
 # fRust toolchain on x86_64-unknown-linux-gnu, and an entry without it is the baseline. The
 # archive and artifact of a v3 build are named frust-v3-<target>, the others <variant>-<target>.
+# An entry may also set pgo to rustc, for the fRust toolchain on the macOS targets only. That is a
+# candidate, never part of a release: .github/scripts/build-toolchain-pgo.sh builds the plain
+# recipe with a rustc profile trained natively in the same build and checks the evidence (see
+# docs/benchmarks.md). Its archive and artifact are named frust-pgo-<target>, its cache key adds the
+# hash of its own script, tools and training patch, and a cache hit says in the run summary that no
+# new PGO evidence was produced.
 on:
   workflow_dispatch:
     inputs:
@@ -34,7 +40,7 @@ on:
         type: boolean
         default: true
       builds:
-        description: JSON list of {variant, target, os, cpu (optional, baseline or v3)} to build
+        description: JSON list of {variant, target, os, cpu (optional, baseline or v3), pgo (optional, rustc, macOS fRust only)} to build
         default: '[{"variant":"control","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04"},{"variant":"frust","target":"x86_64-unknown-linux-gnu","os":"ubuntu-24.04","cpu":"v3"}]'
   workflow_call:
     inputs:
@@ -59,7 +65,7 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.variant }}${{ matrix.cpu == 'v3' && ' v3' || '' }} (${{ matrix.target }})
+    name: ${{ matrix.variant }}${{ matrix.cpu == 'v3' && ' v3' || '' }}${{ matrix.pgo == 'rustc' && ' pgo' || '' }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     # The upstream-matched recipe (one codegen unit, thin LTO) is slower to build than the stock one.
     # 355 keeps a few minutes of the 360 minute hosted-runner limit for GitHub's own job teardown.
@@ -80,8 +86,23 @@ jobs:
           VARIANT: ${{ matrix.variant }}
           TARGET: ${{ matrix.target }}
           CPU: ${{ matrix.cpu }}
+          PGO: ${{ matrix.pgo }}
         run: |
           name=$VARIANT
+          case $PGO in
+            '') ;;
+            rustc)
+              if [[ $VARIANT != frust || $TARGET != *-apple-darwin || -n $CPU ]]; then
+                echo "::error::pgo is only for the fRust toolchain on the macOS targets, not $VARIANT on $TARGET${CPU:+ ($CPU)}"
+                exit 1
+              fi
+              name=$VARIANT-pgo
+              ;;
+            *)
+              echo "::error::unknown pgo $PGO, expected rustc"
+              exit 1
+              ;;
+          esac
           case $CPU in
             '') ;;
             baseline | v3)
@@ -115,9 +136,13 @@ jobs:
           RECIPE: ${{ hashFiles('support/upstream.lock', 'support/bootstrap*.toml', '.github/scripts/build-toolchain.sh') }}
           PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/package-tools.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
           OPTIMIZED_INPUTS: ${{ hashFiles('support/optimize-linux-v2.sh', 'support/tools/**', 'support/patches/build/**', 'support/build-assets.lock', 'support/fetch-build-assets.sh', 'support/verify-pins.sh') }}
+          PGO: ${{ matrix.pgo }}
+          PGO_INPUTS: ${{ hashFiles('.github/scripts/build-toolchain-pgo.sh', 'support/tools/pgo-rustc-*.py', 'support/patches/build/**', 'qualification/cohorts.lock') }}
         run: |
           if [[ $VARIANT != frust ]]; then
             echo "value=toolchain-$NAME-$RECIPE" >> "$GITHUB_OUTPUT"
+          elif [[ $PGO == rustc ]]; then
+            echo "value=toolchain-$NAME-$RECIPE-$PATCHES-$PGO_INPUTS" >> "$GITHUB_OUTPUT"
           elif [[ $OPTIMIZED == true ]]; then
             echo "value=toolchain-$NAME-$RECIPE-$PATCHES-$OPTIMIZED_INPUTS" >> "$GITHUB_OUTPUT"
           else
@@ -204,10 +229,45 @@ jobs:
       - uses: ./.github/actions/setup-rust
         if: steps.cache.outputs.cache-hit != 'true' && matrix.variant == 'frust'
       - name: Build and pack
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.pgo != 'rustc'
         env:
           CPU: ${{ matrix.cpu }}
         run: .github/scripts/build-toolchain.sh "${{ matrix.variant }}" "$BUILD_DIR" "$ARCHIVE" "${{ matrix.target }}" "$CPU"
+      # The candidate recipe: instrumented build, native training, checked profile-use build. It packs
+      # only when its evidence passes, so a failed profile fails this job and uploads no archive.
+      - name: Build and pack with rustc PGO
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.pgo == 'rustc'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/build-toolchain-pgo.sh "$BUILD_DIR" "$ARCHIVE" "$TARGET"
+      # The summary, the evidence, the training logs and the build logs are what explain a profile that
+      # was refused or a toolchain that turned out slower, so they are kept for every run that built.
+      - name: PGO evidence summary
+        if: always() && matrix.pgo == 'rustc'
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          if [[ $CACHE_HIT == true ]]; then
+            echo "### Native rustc PGO candidate, ${{ matrix.target }}: served from the cache, so this run produced no PGO evidence. Run again with rebuild set to regenerate it." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f $BUILD_DIR/pgo/summary.md ]]; then
+            cat "$BUILD_DIR/pgo/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Native rustc PGO candidate, ${{ matrix.target }}: stopped before the first evidence summary was written. See the build log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.cache.outputs.cache-hit != 'true' && matrix.pgo == 'rustc'
+        with:
+          name: pgo-evidence-${{ steps.name.outputs.name }}-${{ matrix.target }}
+          path: |
+            ${{ env.BUILD_DIR }}/pgo/evidence.json
+            ${{ env.BUILD_DIR }}/pgo/summary.md
+            ${{ env.BUILD_DIR }}/pgo/MANIFEST
+            ${{ env.BUILD_DIR }}/pgo/profiles/rustc-pgo.profdata
+            ${{ env.BUILD_DIR }}/pgo/progress.log
+            ${{ env.BUILD_DIR }}/pgo/logs/*.log
+            ${{ env.BUILD_DIR }}/pgo/train/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       # What the build used and what it left, so a runner that runs short of disk is seen in the log
       # before it fails: clippy and rustfmt add two more tools to build and link than the 0.5.1 recipe did.
       - name: Disk after the build

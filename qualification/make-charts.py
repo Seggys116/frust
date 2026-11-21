@@ -10,8 +10,10 @@ the number of pairs. A scenario where fRust is not faster at the median, where i
 in every pair, or that has too few pairs is flagged in the table and in the chart, never dropped.
 
 Platforms are grouped by label. The two Linux variants have their own labels (linux-x86_64 and
-linux-x86_64-v3), each is compared with the official toolchain of its own runner, and when both are
-present the report adds a table with the two side by side. The page-cache probe records of each job
+linux-x86_64-v3), and so do the optional rustc-PGO candidates of macOS (macos-arm64-pgo and
+macos-x86_64-pgo). Each is compared with the official toolchain of its own runner, and when a
+variant and its baseline are both present the report adds a table with the two side by side. The
+page-cache probe records of each job
 ("folio", see ci-bench.py) become one row per job, and a job a runner skipped (a "skipped" record,
 written when the runner CPU cannot run the v3 toolchain) is listed in the run notes.
 
@@ -238,27 +240,32 @@ def cell(text):
     return str(text).replace("|", "/")
 
 
+VARIANT_SUFFIXES = ("-v3", "-pgo")
+
+
 def paired_variants(rows):
-    """(baseline label, v3 label) for every platform that was measured with both Linux variants."""
+    """(baseline label, variant label) for every platform measured with its baseline build and a variant
+    build: the Linux v3 build (-v3) or the rustc-PGO candidate (-pgo)."""
     labels = {row["label"] for row in rows}
-    return [(label[:-3], label) for label in sorted(labels) if label.endswith("-v3") and label[:-3] in labels]
+    return [(label[:-len(suffix)], label) for label in sorted(labels) for suffix in VARIANT_SUFFIXES
+            if label.endswith(suffix) and label[:-len(suffix)] in labels]
 
 
-def variant_table(rows, baseline, v3):
-    """Markdown lines putting the two variants of one platform side by side."""
+def variant_table(rows, baseline, variant):
+    """Markdown lines putting the two builds of one platform side by side."""
     by_key = {(row["label"], row["scenario"], row["workload"]): row for row in rows}
-    keys = sorted({key[1:] for key in by_key if key[0] in (baseline, v3)},
-                  key=lambda key: order_key(dict(by_key.get((baseline, *key)) or by_key[(v3, *key)], label="")))
-    out = ["", f"## {baseline} and {v3} side by side", "",
+    keys = sorted({key[1:] for key in by_key if key[0] in (baseline, variant)},
+                  key=lambda key: order_key(dict(by_key.get((baseline, *key)) or by_key[(variant, *key)], label="")))
+    out = ["", f"## {baseline} and {variant} side by side", "",
            "Each percentage is fRust CPU as a percent of the official CPU measured on the same runner as that "
            "variant, so every column is a comparison with official. The two variants ran on different runners, "
            "possibly with different CPU models (see Hosts), which is why the CPU times are not set against each "
            "other here.", "",
-           f"| Workload | Scenario | {baseline}: fRust as % of official | Pairs | {v3}: fRust as % of official | Pairs "
-           f"| Difference (percentage points) |",
+           f"| Workload | Scenario | {baseline}: fRust as % of official | Pairs | {variant}: fRust as % of official "
+           f"| Pairs | Difference (percentage points) |",
            "| --- | --- | --- | --- | --- | --- | --- |"]
     for scenario, workload in keys:
-        first, second = by_key.get((baseline, scenario, workload)), by_key.get((v3, scenario, workload))
+        first, second = by_key.get((baseline, scenario, workload)), by_key.get((variant, scenario, workload))
         difference = f"{(second['ratio'] - first['ratio']) * 100:+.1f}" if first and second else "-"
         out.append("| " + " | ".join(cell(part) for part in (
             workload, SCENARIO_NAMES.get(scenario, scenario),
@@ -337,8 +344,8 @@ def markdown(runs, skipped, rows, failures, notes, args):
     for key, count in host_summary(runs):
         out.append("| " + " | ".join(cell(part) for part in key) + f" | {count} |")
     out += folio_table(runs)
-    for baseline, v3 in paired_variants(rows):
-        out += variant_table(rows, baseline, v3)
+    for baseline, variant in paired_variants(rows):
+        out += variant_table(rows, baseline, variant)
     for label in labels:
         out += ["", f"## {label}", "",
                 "| Workload | Scenario | Official CPU | fRust CPU | fRust as % of official | Range over pairs "

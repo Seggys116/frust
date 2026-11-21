@@ -31,6 +31,13 @@ name: Benchmark
 # says so in a warning and in the run summary, runs nothing, and leaves a record that the report
 # lists in its run notes.
 #
+# Candidate platforms, never in the default list: macos-arm64-pgo and macos-x86_64-pgo measure the
+# optional rustc-PGO build of the macOS toolchain (.github/scripts/build-toolchain-pgo.sh, trained
+# natively in the same build) against official, exactly as macos-arm64 and macos-x86_64 do. They use
+# their own toolchains job, artifact (toolchain-frust-pgo-<target>), cache key and report label, so
+# the default comparison and the release toolchains are untouched. Each builds for about four hours
+# before it is measured, and a profile that fails its evidence checks fails that build.
+#
 # Unit cache store rules, which keep a cold fRust build from ever being served by an earlier pair
 # or round. The fRust store lives in a directory the driver owns (FRUST_HOME), never in the
 # runner's default cache directory. Cold: the store is deleted and checked empty before every
@@ -60,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64)
+        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo, off by default)
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -88,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.ref }}-${{ contains(inputs.platforms, '-pgo') && 'pgo' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -110,6 +117,7 @@ jobs:
       linux-builds: ${{ steps.plan.outputs.linux-builds }}
       v3-builds: ${{ steps.plan.outputs.v3-builds }}
       mac-builds: ${{ steps.plan.outputs.mac-builds }}
+      mac-pgo-builds: ${{ steps.plan.outputs.mac-pgo-builds }}
       run-linux: ${{ steps.plan.outputs.run-linux }}
     steps:
       - id: plan
@@ -144,6 +152,15 @@ jobs:
                   "label": "macos-x86_64", "os": "macos-15-intel", "target": "x86_64-apple-darwin",
                   "toolchain": "frust", "cpu": "",
               },
+              # Candidates: the rustc-PGO macOS build, in its own artifact (toolchain-frust-pgo-<target>).
+              "macos-arm64-pgo": {
+                  "label": "macos-arm64-pgo", "os": "macos-latest", "target": "aarch64-apple-darwin",
+                  "toolchain": "frust-pgo", "cpu": "", "pgo": "rustc",
+              },
+              "macos-x86_64-pgo": {
+                  "label": "macos-x86_64-pgo", "os": "macos-15-intel", "target": "x86_64-apple-darwin",
+                  "toolchain": "frust-pgo", "cpu": "", "pgo": "rustc",
+              },
           }
           CACHE_STATES = ("installed", "evicted")
           # The build-time cohort of qualification/PROTOCOL.md. Each has frozen edits in qualification/edits.
@@ -175,7 +192,14 @@ jobs:
           mac = [
               {"variant": "frust", "target": PLATFORMS[p]["target"], "os": PLATFORMS[p]["os"]}
               for p in platforms
-              if p.startswith("macos")
+              if p.startswith("macos") and not PLATFORMS[p].get("pgo")
+          ]
+          # The candidates are built by their own call of the Toolchains workflow, so that a refused
+          # profile or a timeout only affects the pgo platforms.
+          mac_pgo = [
+              {"variant": "frust", "target": PLATFORMS[p]["target"], "os": PLATFORMS[p]["os"], "pgo": PLATFORMS[p]["pgo"]}
+              for p in platforms
+              if PLATFORMS[p].get("pgo")
           ]
           linux_target, linux_os = PLATFORMS["linux"]["target"], PLATFORMS["linux"]["os"]
           linux = [{"variant": "frust", "target": linux_target, "os": linux_os}]
@@ -194,6 +218,7 @@ jobs:
           print(f"linux-builds={dump(linux)}")
           print(f"v3-builds={dump(v3)}")
           print(f"mac-builds={dump(mac)}")
+          print(f"mac-pgo-builds={dump(mac_pgo)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
           PY
 
@@ -231,6 +256,18 @@ jobs:
       codegen-cache: false
       relr: false
       builds: ${{ needs.plan.outputs.mac-builds }}
+
+  # The rustc-PGO candidates of the macOS platforms (macos-arm64-pgo, macos-x86_64-pgo). Their own
+  # call, like the v3 one, so that a refused profile or a timeout only affects the pgo platforms.
+  toolchains-macos-pgo:
+    needs: plan
+    if: ${{ needs.plan.outputs.mac-pgo-builds != '[]' }}
+    uses: ./.github/workflows/toolchains.yml
+    with:
+      rebuild: ${{ inputs.rebuild-toolchains }}
+      codegen-cache: false
+      relr: false
+      builds: ${{ needs.plan.outputs.mac-pgo-builds }}
 
   # One runner per series. Both toolchains of a pair run on the same runner, so the ratio is
   # not affected by differences between runners.
@@ -435,7 +472,7 @@ jobs:
   # report lists every such stop, so a short series is never mistaken for a full one.
   compare:
     name: compare ${{ matrix.label }} ${{ matrix.workload }}
-    needs: [plan, toolchains, toolchains-v3, toolchains-macos]
+    needs: [plan, toolchains, toolchains-v3, toolchains-macos, toolchains-macos-pgo]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
@@ -479,7 +516,7 @@ jobs:
       - name: Require the toolchain build
         if: steps.cpu.outputs.runnable != 'false'
         env:
-          RESULT: ${{ runner.os == 'Linux' && (matrix.toolchain == 'frust-v3' && needs.toolchains-v3.result || needs.toolchains.result) || needs.toolchains-macos.result }}
+          RESULT: ${{ runner.os == 'Linux' && (matrix.toolchain == 'frust-v3' && needs.toolchains-v3.result || needs.toolchains.result) || (matrix.pgo == 'rustc' && needs.toolchains-macos-pgo.result || needs.toolchains-macos.result) }}
           TARGET: ${{ matrix.target }}
           TOOLCHAIN: ${{ matrix.toolchain }}
         run: |
