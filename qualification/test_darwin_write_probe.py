@@ -96,9 +96,10 @@ class WriteRecord(unittest.TestCase):
     def test_ignores_other_calls(self):
         self.assertIsNone(probe.write_record("12:00:00.000001  open  /tmp/x  0.000010 W python3.1"))
 
-    def test_ignores_unresolved_null_device_writes(self):
+    def test_ignores_unresolved_subsector_device_writes(self):
         line = self.LINE.format(kind="WrData", size="5c", device="/dev/NOTFOUND")
         self.assertIsNone(probe.write_record(line.replace(" /x ", " /dev/null ")))
+        self.assertIsNone(probe.write_record(line.replace(" /x ", " ")))
 
     def test_rejects_unnamed_device_and_failed_writes(self):
         with self.assertRaises(probe.TraceError):
@@ -110,6 +111,18 @@ class WriteRecord(unittest.TestCase):
         for line in ("fs_usage: buffer overrun, events generated too quickly", "sudo: a password is required"):
             with self.assertRaises(probe.TraceError):
                 probe.write_record(line)
+
+
+class ImageDetach(unittest.TestCase):
+    def test_busy_image_can_already_be_unmounted(self):
+        mount = Path("/empty/validation-volume")
+        attached = {"system-entities": [{"dev-entry": device} for device in DEVICES]}
+        busy = probe.ProbeError("resource busy")
+        with (mock.patch.object(Path, "is_mount", return_value=False),
+              mock.patch.object(probe, "locate_image", return_value=attached),
+              mock.patch.object(probe, "command", side_effect=[busy, b""]) as command):
+            probe.detach_image(Path("validation.sparseimage"), DEVICES[0], mount)
+        self.assertEqual(command.call_args_list, [mock.call("hdiutil", "detach", DEVICES[0])] * 2)
 
 
 class TraceLogReader(unittest.TestCase):

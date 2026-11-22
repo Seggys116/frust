@@ -117,18 +117,35 @@ def detach_image(image, device, mount):
         if "resource busy" not in str(error).casefold():
             raise
         owned = locate_image(image)
+        mounted = mount.is_mount()
+        if not owned and not mounted:
+            return
         if not owned or whole_device(image_entities(owned)) != device:
             raise ProbeError(f"cannot confirm ownership of busy image device {device}") from error
         volumes = [item["dev-entry"] for item in owned["system-entities"]
                    if item.get("mount-point") == str(mount) and DEVICE.fullmatch(item.get("dev-entry", ""))]
-        if len(volumes) != 1:
+        if not volumes and mounted:
+            info = plistlib.loads(command("diskutil", "info", "-plist", str(mount)))
+            volume = info.get("DeviceNode")
+            if volume in image_entities(owned) and info.get("MountPoint") == str(mount):
+                volumes = [volume]
+        if len(volumes) > 1 or (not volumes and mounted):
             raise ProbeError(f"cannot identify one owned volume at {mount}") from error
-        command("diskutil", "unmount", volumes[0])
-        owned = locate_image(image)
-        if owned:
+        if mounted:
+            command("diskutil", "unmount", volumes[0])
+        for attempt in range(3):
+            owned = locate_image(image)
+            if not owned:
+                return
             if whole_device(image_entities(owned)) != device:
                 raise ProbeError(f"owned image device changed after unmounting {mount}") from error
-            command("hdiutil", "detach", device)
+            try:
+                command("hdiutil", "detach", device)
+                return
+            except ProbeError as retry:
+                if attempt == 2 or "resource busy" not in str(retry).casefold():
+                    raise
+                time.sleep(0.2)
 
 
 def write_record(line):
@@ -139,11 +156,13 @@ def write_record(line):
         if not fields:
             raise TraceError(f"unrecognized or failed disk write: {line.strip()}")
         count, device = fields.groups()
+        size = int(count, 16)
         if device == "/dev/NOTFOUND":
-            if re.match(r"\s+/dev/null(?:\s|$)", line[fields.end():]):
+            # The private APFS image only issues sector-aligned block I/O.
+            if size % 512:
                 return None
             raise TraceError(f"disk write on a device fs_usage could not name: {line.strip()}")
-        return write[1], int(count, 16), device
+        return write[1], size, device
     if (line.lstrip().startswith(("fs_usage:", "sudo:"))
             or (not TIMESTAMP.match(line) and TRACE_ERROR.search(line))):
         raise TraceError(f"disk trace rejected: {line.strip()}")
