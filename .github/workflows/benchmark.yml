@@ -67,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-fingerprint for warm no-op measurements on both Macs, macos-write-probe for storage calibration, macos-pgo-probe for compiler launch diagnostics, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
+        description: Platforms for the official comparison (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-arm64-fingerprint or macos-x86_64-fingerprint for warm no-op measurements, macos-write-probe for storage calibration, macos-pgo-probe for compiler launch diagnostics, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || inputs.platforms == 'macos-pgo-probe' && 'pgo-probe' || inputs.platforms == 'macos-fingerprint' && 'fingerprint' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || inputs.platforms == 'macos-pgo-probe' && 'pgo-probe' || endsWith(inputs.platforms, '-fingerprint') && 'fingerprint' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -191,14 +191,11 @@ jobs:
           write_probe = selection == "macos-write-probe"
           pgo_probe = selection == "macos-pgo-probe"
           apfs_only = selection in ("macos-arm64-apfs", "macos-x86_64-apfs")
-          fingerprint_only = selection == "macos-fingerprint"
+          fingerprint_only = selection in ("macos-arm64-fingerprint", "macos-x86_64-fingerprint")
           if (write_probe or pgo_probe or apfs_only or fingerprint_only) and os.environ["PROTOCOL"] == "true":
               raise SystemExit(f"{selection} needs protocol=false")
-          if apfs_only:
-              platforms = [selection.removesuffix("-apfs")]
-              workloads = ["regex"]
-          elif fingerprint_only:
-              platforms = ["macos-arm64", "macos-x86_64"]
+          if apfs_only or fingerprint_only:
+              platforms = [selection.rsplit("-", 1)[0]]
               workloads = ["regex"]
           else:
               platforms = [] if write_probe or pgo_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
