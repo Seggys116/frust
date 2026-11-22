@@ -5,10 +5,12 @@ name: Toolchains
 # v3 (compiler and tools built for x86-64-v3). Both are built by support/optimize-linux-v2.sh from the
 # stored PGO and BOLT profiles, with the clang, LLVM tools and profile bundles that
 # support/fetch-build-assets.sh downloads as listed in support/build-assets.lock (docs/build-assets.md).
-# The unpatched control, and the fRust toolchain on macOS, use the plain recipe with the optimization
-# settings of upstream's official dist builds for their platform (support/bootstrap-*.toml), except
-# PGO and BOLT. PGO profiles can be supplied to that plain recipe through FRUST_PGO_PROFILES (see
-# build-toolchain.sh), this workflow does not set it.
+# The unpatched control uses the plain recipe with the optimization settings of upstream's official dist
+# builds for its platform (support/bootstrap-*.toml), except PGO and BOLT. The fRust toolchain on macOS uses
+# the same recipe with the compiler built by PGO from the stored profile bundle of its target, a build asset
+# listed in support/build-assets.lock (.github/scripts/build-toolchain-pgo.sh stored, docs/build-assets.md);
+# it never trains. The bundles are made by the macOS profiles workflow. PGO profiles can also be supplied to
+# the plain recipe through FRUST_PGO_PROFILES (see build-toolchain.sh), this workflow does not set it.
 # Every fRust toolchain includes clippy and rustfmt (built by bootstrap against its own compiler). Each is
 # then launched with no ambient state, which runs a build, rustdoc, clippy and rustfmt, and on Linux it also
 # passes the fat-LTO, codegen-unit and warm-fresh parity proof, both variants. The archive that users get is
@@ -19,11 +21,12 @@ name: Toolchains
 # fRust toolchain on x86_64-unknown-linux-gnu, and an entry without it is the baseline. The
 # archive and artifact of a v3 build are named frust-v3-<target>, the others <variant>-<target>.
 # An entry may also set pgo to rustc, for the fRust toolchain on the macOS targets only. That is a
-# candidate, never part of a release: .github/scripts/build-toolchain-pgo.sh builds the plain
+# candidate, never part of a release: .github/scripts/build-toolchain-pgo.sh candidate builds the plain
 # recipe with a rustc profile trained natively in the same build and checks the evidence (see
 # docs/benchmarks.md). Its archive and artifact are named frust-pgo-<target>, its cache key adds the
 # hash of its own script, tools and training patch, and a cache hit says in the run summary that no
-# new PGO evidence was produced.
+# new PGO evidence was produced. The shipped macOS build (no pgo) checks the same evidence on its
+# stored profile, and its cache key adds the lines of the lock for its target.
 on:
   workflow_dispatch:
     inputs:
@@ -77,6 +80,9 @@ jobs:
     env:
       # The fRust toolchain on Linux x86-64 is the one built by the optimized recipe.
       OPTIMIZED: ${{ matrix.variant == 'frust' && matrix.target == 'x86_64-unknown-linux-gnu' && 'true' || 'false' }}
+      # The fRust toolchain on macOS is the one built from the stored PGO profile (unless it is the
+      # train-in-the-build candidate).
+      STORED: ${{ matrix.variant == 'frust' && endsWith(matrix.target, '-apple-darwin') && matrix.pgo != 'rustc' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v7
       # NAME tells the builds of one target apart in archive, artifact and cache names. Only the v3
@@ -137,12 +143,19 @@ jobs:
           PATCHES: ${{ hashFiles('support/patches/*.patch', 'support/patches/rustc/*.patch', 'support/package-toolchain.sh', 'support/package-tools.sh', 'support/apply-patches.sh', 'support/apply-rustc-patches.sh', 'crates/**/*.rs', 'crates/**/Cargo.*') }}
           OPTIMIZED_INPUTS: ${{ hashFiles('support/optimize-linux-v2.sh', 'support/tools/**', 'support/patches/build/**', 'support/build-assets.lock', 'support/fetch-build-assets.sh', 'support/verify-pins.sh') }}
           PGO: ${{ matrix.pgo }}
+          STORED: ${{ env.STORED }}
           PGO_INPUTS: ${{ hashFiles('.github/scripts/build-toolchain-pgo.sh', 'support/tools/pgo-rustc-*.py', 'support/patches/build/**', 'qualification/cohorts.lock') }}
+          STORED_INPUTS: ${{ hashFiles('.github/scripts/build-toolchain-pgo.sh', 'support/tools/pgo-rustc-*.py', 'support/fetch-build-assets.sh') }}
+          TARGET: ${{ matrix.target }}
         run: |
           if [[ $VARIANT != frust ]]; then
             echo "value=toolchain-$NAME-$RECIPE" >> "$GITHUB_OUTPUT"
           elif [[ $PGO == rustc ]]; then
             echo "value=toolchain-$NAME-$RECIPE-$PATCHES-$PGO_INPUTS" >> "$GITHUB_OUTPUT"
+          elif [[ $STORED == true ]]; then
+            # Only the lock lines of this target, so a new Linux asset does not rebuild the macOS toolchains.
+            lock=$(grep -- "-$TARGET" support/build-assets.lock | shasum -a 256 | cut -c1-16)
+            echo "value=toolchain-$NAME-$RECIPE-$PATCHES-$STORED_INPUTS-$lock" >> "$GITHUB_OUTPUT"
           elif [[ $OPTIMIZED == true ]]; then
             echo "value=toolchain-$NAME-$RECIPE-$PATCHES-$OPTIMIZED_INPUTS" >> "$GITHUB_OUTPUT"
           else
@@ -239,23 +252,23 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true' && matrix.pgo == 'rustc'
         env:
           TARGET: ${{ matrix.target }}
-        run: .github/scripts/build-toolchain-pgo.sh "$BUILD_DIR" "$ARCHIVE" "$TARGET"
+        run: .github/scripts/build-toolchain-pgo.sh candidate "$BUILD_DIR" "$ARCHIVE" "$TARGET"
       # The summary, the evidence, the training logs and the build logs are what explain a profile that
       # was refused or a toolchain that turned out slower, so they are kept for every run that built.
       - name: PGO evidence summary
-        if: always() && matrix.pgo == 'rustc'
+        if: always() && (matrix.pgo == 'rustc' || env.STORED == 'true')
         env:
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
         run: |
           if [[ $CACHE_HIT == true ]]; then
-            echo "### Native rustc PGO candidate, ${{ matrix.target }}: served from the cache, so this run produced no PGO evidence. Run again with rebuild set to regenerate it." >> "$GITHUB_STEP_SUMMARY"
+            echo "### rustc PGO, ${{ matrix.target }}: served from the cache, so this run produced no PGO evidence. Run again with rebuild set to regenerate it." >> "$GITHUB_STEP_SUMMARY"
           elif [[ -f $BUILD_DIR/pgo/summary.md ]]; then
             cat "$BUILD_DIR/pgo/summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Native rustc PGO candidate, ${{ matrix.target }}: stopped before the first evidence summary was written. See the build log." >> "$GITHUB_STEP_SUMMARY"
+            echo "### rustc PGO, ${{ matrix.target }}: stopped before the first evidence summary was written. See the build log." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v7
-        if: always() && steps.cache.outputs.cache-hit != 'true' && matrix.pgo == 'rustc'
+        if: always() && steps.cache.outputs.cache-hit != 'true' && (matrix.pgo == 'rustc' || env.STORED == 'true')
         with:
           name: pgo-evidence-${{ steps.name.outputs.name }}-${{ matrix.target }}
           path: |

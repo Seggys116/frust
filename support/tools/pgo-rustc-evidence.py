@@ -121,15 +121,25 @@ def driver(args):
 def summary(args):
     data = load(args.evidence)
     train = data.get("train", {})
-    lines = ["### Native rustc PGO candidate", ""]
+    stored = train.get("source") == "stored"
+    lines = [f"### {args.title}", ""]
     lines.append(f"Target `{train.get('host', 'unknown')}` on a `{train.get('machine', 'unknown')}` machine; "
                  f"profile tool {'; '.join(train.get('llvm_profdata', [])) or 'unknown'}.")
     merged = train.get("merged", {})
-    lines.append(f"Training: {len(train.get('crates_complete', []))} of {len(train.get('crates_requested', []))} crates "
-                 f"complete in every profile ({', '.join(train.get('profiles', []))}, scenarios {train.get('scenarios')}), "
-                 f"stopped by `{train.get('stopped_by') or 'completion'}`, {train.get('raw_files', 0)} raw files observed "
-                 f"({train.get('raw_bytes', 0) >> 20} MiB), {train.get('bad_raw_files', 0)} unusable, merged profile "
-                 f"{merged.get('functions', 0)} functions at level {merged.get('level')}.")
+    if stored:
+        parts = ", ".join(f"{name} {entry.get('functions', 0)} functions ({entry.get('bytes', 0) >> 20} MiB)"
+                          for name, entry in sorted(train.get("components", {}).items()))
+        lines.append(f"Stored profile bundle `{train.get('bundle')}`, trained on macOS {train.get('trained_on')} "
+                     f"over {len(train.get('crates_complete', []))} crates ({', '.join(train.get('profiles', []))}, "
+                     f"scenarios {train.get('scenarios')}), {train.get('raw_files', 0)} raw files: {parts}. "
+                     f"{len(train.get('changed_patches', []))} fRust patch(es) changed since it was trained.")
+    else:
+        lines.append(f"Training: {len(train.get('crates_complete', []))} of {len(train.get('crates_requested', []))} "
+                     f"crates complete in every profile ({', '.join(train.get('profiles', []))}, scenarios "
+                     f"{train.get('scenarios')}), stopped by `{train.get('stopped_by') or 'completion'}`, "
+                     f"{train.get('raw_files', 0)} raw files observed ({train.get('raw_bytes', 0) >> 20} MiB), "
+                     f"{train.get('bad_raw_files', 0)} unusable, merged profile {merged.get('functions', 0)} "
+                     f"functions at level {merged.get('level')}.")
     failed = [u for u in train.get("units", []) if not u["ok"]]
     for unit in failed:
         lines.append(f"- training unit {unit['crate']} {unit['profile']} failed: {unit['reason']}")
@@ -139,7 +149,8 @@ def summary(args):
     for key in ("instrumented_build", "instrumented_driver", "final_build", "profile_use_warnings", "final_driver"):
         entry = data.get(key)
         if entry is None:
-            lines.append(f"| {key} | not run | |")
+            if not stored:
+                lines.append(f"| {key} | not run | |")
             continue
         detail = {k: v for k, v in entry.items() if k != "failures"}
         lines.append(f"| {key} | {'FAILED' if entry['failures'] else 'ok'} | `{json.dumps(detail)}` |")
@@ -167,7 +178,8 @@ def main():
     drv = sub.add_parser("driver")
     drv.add_argument("file")
     drv.add_argument("--expect", choices=("instrumented", "plain"), required=True)
-    sub.add_parser("summary")
+    summ = sub.add_parser("summary")
+    summ.add_argument("--title", default="Native rustc PGO candidate")
     args = parser.parse_args()
     handler = {"generate-flags": flags, "use-flags": flags, "warnings": warnings, "driver": driver,
                "summary": summary}[args.command]

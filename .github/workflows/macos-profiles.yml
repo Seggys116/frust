@@ -1,0 +1,138 @@
+name: macOS profiles
+
+# Manual. Generates the stored rustc PGO profile bundles that the macOS toolchains are built with, one
+# per target, each on a native runner of its architecture (a profile is only valid on the machine that
+# collected it). Nothing here ships: a release builds with the bundles listed in
+# support/build-assets.lock and never trains. Run it again only when the pinned Rust commit, the compiler
+# build settings or the fRust compiler patches change enough that the stored profile stops fitting
+# (docs/build-assets.md).
+#
+#   gh workflow run macos-profiles.yml --ref main
+#
+# Each job builds the instrumented stage-2 rustc, checks that it starts, trains it natively on the
+# rustc-perf crates of support/patches/build (the measured cohorts stay out), merges the profile, and
+# with verify set builds the profile-use compiler once to prove that the profile fits it
+# (.github/scripts/build-toolchain-pgo.sh generate). The bundle is the artifact pgo-profiles-<target>,
+# a build asset named frust-pgo-profiles-<commit>-<target>.tar.zst, and exists only when every gate
+# passed. The job stays inside the 355 minute limit: about 45 minutes on Apple Silicon and 3 hours on
+# Intel in the experiments of docs/benchmarks.md.
+#
+# The workflow publishes nothing. The run summary prints the commands that add the bundles to the
+# build assets release and to the lock; a maintainer runs them.
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Targets to profile
+        type: choice
+        options: [both, aarch64-apple-darwin, x86_64-apple-darwin]
+        default: both
+      verify:
+        description: Build the profile-use compiler to prove that the profile fits it (recommended)
+        type: boolean
+        default: true
+      train-budget-minutes:
+        description: Training time budget per target, in minutes
+        type: string
+        default: "80"
+      release-tag:
+        description: Build assets release that the run summary names in its upload commands
+        type: string
+        default: build-assets-1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-profiles
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  profiles:
+    name: profiles (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.targets == 'aarch64-apple-darwin' && '[{"target":"aarch64-apple-darwin","os":"macos-latest"}]' || inputs.targets == 'x86_64-apple-darwin' && '[{"target":"x86_64-apple-darwin","os":"macos-15-intel"}]' || '[{"target":"aarch64-apple-darwin","os":"macos-latest"},{"target":"x86_64-apple-darwin","os":"macos-15-intel"}]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: name
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          commit=$(sed -n 's/^rust_commit=//p' support/upstream.lock)
+          name=frust-pgo-profiles-${commit:0:9}-$TARGET.tar.zst
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ARCHIVE=$RUNNER_TEMP/$name" >> "$GITHUB_ENV"
+      # The macOS runner disk is small. Keep the selected Xcode and drop the rest.
+      - name: Make room on macOS
+        run: |
+          selected=$(xcode-select -p | sed 's|/Contents/Developer$||')
+          for app in /Applications/Xcode*.app; do
+            [[ $app == "$selected" ]] || sudo rm -rf "$app"
+          done
+          sudo rm -rf "$HOME/Library/Android" "$HOME/Library/Developer/CoreSimulator"
+          mkdir -p "$RUNNER_TEMP/build"
+          echo "BUILD_DIR=$RUNNER_TEMP/build" >> "$GITHUB_ENV"
+          command -v zstd > /dev/null || brew install zstd
+          df -h /
+      - uses: ./.github/actions/setup-rust
+      - name: Train and export the profile bundle
+        env:
+          TARGET: ${{ matrix.target }}
+          FRUST_PGO_TRAIN_BUDGET_MINUTES: ${{ inputs.train-budget-minutes }}
+          FRUST_PGO_VERIFY: ${{ inputs.verify && '1' || '0' }}
+        run: .github/scripts/build-toolchain-pgo.sh generate "$BUILD_DIR" "$ARCHIVE" "$TARGET"
+      - name: Profile summary
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          NAME: ${{ steps.name.outputs.name }}
+          TAG: ${{ inputs.release-tag }}
+          VERIFY: ${{ inputs.verify }}
+        run: |
+          if [[ -f $BUILD_DIR/pgo/summary.md ]]; then
+            cat "$BUILD_DIR/pgo/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### macOS PGO profile generation, $TARGET: stopped before the first evidence summary was written. See the build log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f $ARCHIVE ]]; then
+            {
+              echo
+              echo "Bundle \`$NAME\`, $(wc -c < "$ARCHIVE" | tr -d ' ') bytes, sha256 \`$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)\`. Profile use verified in this job: $VERIFY."
+              echo
+              echo "To publish it, download the artifact \`pgo-profiles-$TARGET\` of this run and run, from a checkout of the repository:"
+              echo
+              echo '```'
+              echo "gh release upload $TAG $NAME"
+              echo "bash support/tools/lock-build-asset.sh $TAG $NAME"
+              echo "bash support/fetch-build-assets.sh \"\$(mktemp -d)\" $NAME"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pgo-evidence-profiles-${{ matrix.target }}
+          path: |
+            ${{ env.BUILD_DIR }}/pgo/evidence.json
+            ${{ env.BUILD_DIR }}/pgo/summary.md
+            ${{ env.BUILD_DIR }}/pgo/MANIFEST
+            ${{ env.BUILD_DIR }}/pgo/progress.log
+            ${{ env.BUILD_DIR }}/pgo/logs/*.log
+            ${{ env.BUILD_DIR }}/pgo/diagnostics/**
+            ${{ env.BUILD_DIR }}/pgo/train/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pgo-profiles-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error

@@ -31,12 +31,17 @@ name: Benchmark
 # says so in a warning and in the run summary, runs nothing, and leaves a record that the report
 # lists in its run notes.
 #
+# The macOS platforms macos-arm64 and macos-x86_64 measure the shipped macOS toolchains: the compiler
+# built by PGO from the stored profile bundle of the build assets (support/build-assets.lock,
+# docs/build-assets.md), so the bundles must be published first (the macOS profiles workflow).
+#
 # Candidate platforms, never in the default list: macos-arm64-pgo and macos-x86_64-pgo measure the
-# optional rustc-PGO build of the macOS toolchain (.github/scripts/build-toolchain-pgo.sh, trained
-# natively in the same build) against official, exactly as macos-arm64 and macos-x86_64 do. They use
-# their own toolchains job, artifact (toolchain-frust-pgo-<target>), cache key and report label, so
-# the default comparison and the release toolchains are untouched. Each builds for about four hours
-# before it is measured, and a profile that fails its evidence checks fails that build.
+# rustc-PGO build of the macOS toolchain trained natively in the same build
+# (.github/scripts/build-toolchain-pgo.sh candidate, no stored profile needed) against official,
+# exactly as macos-arm64 and macos-x86_64 do. They use their own toolchains job, artifact
+# (toolchain-frust-pgo-<target>), cache key and report label, so the default comparison and the
+# release toolchains are untouched. Each builds for about four hours before it is measured, and a
+# profile that fails its evidence checks fails that build.
 #
 # Unit cache store rules, which keep a cold fRust build from ever being served by an earlier pair
 # or round. The fRust store lives in a directory the driver owns (FRUST_HOME), never in the

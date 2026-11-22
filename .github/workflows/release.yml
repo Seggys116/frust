@@ -97,7 +97,9 @@ jobs:
           echo "CI passed: $(jq -r .html_url <<< "$run")"
 
   # The released toolchain has the experimental switches off, so parity is checked in that state.
-  # macOS arm64 and Intel are built natively on their own runners. Linux x86-64 is built twice,
+  # macOS arm64 and Intel are built natively on their own runners, with the compiler built by PGO from
+  # the stored profile bundles of support/build-assets.lock (a missing bundle fails the build instead
+  # of shipping without PGO). Linux x86-64 is built twice,
   # for the baseline CPU and for x86-64-v3, both with the launch check and the parity proof. Every
   # build includes clippy and rustfmt, and the launch check runs them.
   toolchains:

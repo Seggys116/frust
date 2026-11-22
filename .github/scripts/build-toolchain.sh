@@ -13,10 +13,14 @@
 # built by support/optimize-linux-v2.sh from stored PGO and BOLT profiles, with the clang, LLVM tools
 # and profile bundles that support/fetch-build-assets.sh downloads (docs/build-assets.md). The
 # optional cpu is baseline (the default, plain x86-64) or v3 (compiler and tools built for
-# x86-64-v3); it only applies to that recipe. FRUST_RECIPE=plain forces the generic recipe below for
-# it (no bundles needed, no PGO unless FRUST_PGO_PROFILES is set), FRUST_RECIPE=optimized insists on
-# the optimized one. FRUST_OFFICIAL_TOOLCHAIN names the official Rust that builds Cargo there
-# (default: the rustup toolchain of rust_release in support/upstream.lock).
+# x86-64-v3); it only applies to that recipe. The shipped fRust toolchains for aarch64-apple-darwin
+# and x86_64-apple-darwin are the other exception: the plain recipe with the compiler built by PGO from
+# the stored profile bundle frust-pgo-profiles-<commit>-<target> of the same build assets, which
+# .github/scripts/build-toolchain-pgo.sh stored checks against this build before it uses them.
+# FRUST_RECIPE=plain forces the generic recipe below (no bundles needed, no PGO unless FRUST_PGO_PROFILES
+# is set), FRUST_RECIPE=optimized insists on the Linux recipe, FRUST_RECIPE=pgo on the macOS one.
+# FRUST_OFFICIAL_TOOLCHAIN names the official Rust that builds Cargo on Linux (default: the rustup
+# toolchain of rust_release in support/upstream.lock). The control is always the plain recipe.
 #
 # Optional profile-guided optimization. When FRUST_PGO_PROFILES names a directory, the profiles in
 # it are passed to bootstrap as pgo.<component>.use. The directory must hold a MANIFEST file with
@@ -53,11 +57,24 @@ esac
 recipe=${FRUST_RECIPE:-auto}
 case $recipe in
     auto)
-        if [[ $variant == frust && $host == x86_64-unknown-linux-gnu ]]; then recipe=optimized; else recipe=plain; fi
+        if [[ $variant == frust && $host == x86_64-unknown-linux-gnu ]]; then
+            recipe=optimized
+        elif [[ $variant == frust && $platform == macos ]]; then
+            recipe=pgo
+        else
+            recipe=plain
+        fi
         ;;
-    plain | optimized) ;;
-    *) echo "unknown FRUST_RECIPE $recipe, expected auto, plain or optimized" >&2; exit 2 ;;
+    plain | optimized | pgo) ;;
+    *) echo "unknown FRUST_RECIPE $recipe, expected auto, plain, optimized or pgo" >&2; exit 2 ;;
 esac
+if [[ $recipe == pgo ]]; then
+    [[ $variant == frust && $platform == macos ]] || {
+        echo "the pgo recipe builds the fRust toolchain for the macOS targets only" >&2
+        exit 2
+    }
+    [[ -z $cpu || $cpu == baseline ]] || { echo "cpu $cpu is only for the Linux recipe" >&2; exit 2; }
+fi
 if [[ $recipe == optimized ]]; then
     [[ $variant == frust && $host == x86_64-unknown-linux-gnu ]] || {
         echo "the optimized recipe builds the fRust toolchain for x86_64-unknown-linux-gnu only" >&2
@@ -242,8 +259,32 @@ build_optimized() {
     echo "packed frust ($cpu) for $host into $out"
 }
 
+# The macOS recipe: rustc PGO from the stored profile bundle of this Rust commit and target. Nothing is
+# trained. The bundle is a build asset like the Linux profiles (docs/build-assets.md); without it in
+# support/build-assets.lock the build stops here, since shipping a macOS toolchain without its profile
+# would silently give up what the recipe is for. FRUST_RECIPE=plain builds without PGO.
+build_pgo() {
+    local asset dirs profiles
+    asset=frust-pgo-profiles-$(get rust_commit | cut -c1-9)-$host.tar.zst
+    if ! grep -q "^$asset " "${FRUST_BUILD_ASSETS_LOCK:-$root/support/build-assets.lock}"; then
+        echo "support/build-assets.lock has no $asset. Generate and publish the macOS profiles first" \
+            "(the macOS profiles workflow, docs/build-assets.md), or set FRUST_RECIPE=plain to build without PGO" >&2
+        exit 2
+    fi
+    mkdir -p "$work/tmp"
+    dirs=$(TMPDIR=$work/tmp bash "$root/support/fetch-build-assets.sh" "$work/assets" "$asset")
+    profiles=$(awk -v name="$asset" '$1 == name { print $2 }' <<< "$dirs")
+    [[ -d $profiles ]] || { echo "fetch-build-assets.sh did not unpack $asset" >&2; exit 2; }
+    echo "pgo recipe for $host: profiles $profiles"
+    "$root/.github/scripts/build-toolchain-pgo.sh" stored "$work" "$out" "$host" "$profiles"
+}
+
 if [[ $recipe == optimized ]]; then
     build_optimized
+    exit 0
+fi
+if [[ $recipe == pgo ]]; then
+    build_pgo
     exit 0
 fi
 
