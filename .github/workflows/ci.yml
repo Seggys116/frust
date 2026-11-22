@@ -109,6 +109,12 @@ jobs:
             qualification/memory-jobs-bench.py qualification/tool-startup-bench.py qualification/darwin-write-probe.py
       - name: APFS trace barriers hold against a fake tracer
         run: python3 -I qualification/test_darwin_write_probe.py
+      # Known values for the t quantiles, trimmed means, intervals and sign test, and synthetic benchmark results
+      # with known ratios put through make-charts.py, so a change to the instrument cannot quietly call noise a win.
+      - name: Benchmark statistics and report behave on synthetic data
+        run: |
+          python3 -I qualification/test_paired_stats.py
+          python3 -I qualification/test_make_charts.py
 
   upstream:
     name: upstream pins and patches

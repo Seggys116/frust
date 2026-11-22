@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """Paired build CPU comparison of official Rust against fRust with its unit cache, for CI.
 
-One run measures one cohort application on one host. Every round builds the application
-with both toolchains, one after the other, and alternates which goes first. Scenarios, all
-with the frozen release profile of qualification/PROTOCOL.md on both sides:
+One run measures one cohort application on one host. Every round builds the application with both
+toolchains, and the two builds of a scenario are taken back to back: the toolchain that goes first
+alternates from scenario to scenario and from round to round, so each scenario has half of its pairs in
+each order and an order effect cancels instead of biasing the ratio. Shared hosts drift on a scale of
+minutes (a neighbour starts or stops, the CPU is slowed or boosted), and a pair taken seconds apart sees far
+less of that than one whose two halves are separated by a whole sequence of builds. Scenarios, all with the
+frozen release profile of qualification/PROTOCOL.md on both sides:
 
   cold         empty target, and for fRust an empty unit cache store
   clean        target removed; the fRust store was filled by this round's cold build
-  noop         immediate rebuild, median of --noops builds
-  edit-<kind>  rebuild of a copy of the clean target after the frozen edit of that kind
+  noop         immediate rebuilds of the clean target, alternating between the toolchains; the sample
+               of a round is the series of --noops builds of each, and entry i of the two series is an
+               adjacent pair
+  edit-<kind>  rebuild of a copy of the clean target after the frozen edit of that kind; --stride
+               KIND=N measures a kind only every N rounds (the clean target it needs is built either way)
 
-The official toolchain has no store. The fRust store lives in a per-toolchain directory under
---work that FRUST_HOME points at, and it is deleted and checked empty before every cold build,
-so no cold build can be served by an earlier round. A cold fRust build that leaves the store
-empty is a failure, because the store would not be isolated and the clean series meaningless.
+Each toolchain keeps its own target for the whole round, so the pair members never share state. The
+official toolchain has no store. The fRust store lives in a per-toolchain directory under --work that
+FRUST_HOME points at, and it is deleted and checked empty before every cold build, so no cold build can
+be served by an earlier round. A cold fRust build that leaves the store empty is a failure, because the
+store would not be isolated and the clean series meaningless.
 
-An unmeasured official build runs first, so unpacking the fetched registry sources is not charged
-to whichever toolchain builds first in round 0.
+Before the first round each toolchain builds once, unmeasured by the statistics but recorded as a
+"warm-up" line: official unpacks the fetched registry sources, and both pay the first launch of
+freshly installed executables (on macOS the security scan of new binaries), so none of that is charged to
+round 0. Before every round the driver waits, for at most --quiesce-seconds, until the machine is idle
+(system CPU idle at least --quiesce-idle), and writes the outcome as a "quiet" line, so a round that ran
+on a busy machine says so. Dirty pages are written out with sync before every timed build, so the removal
+of the previous target is not paid for by the next build.
 
 With --noop-only, each toolchain builds its own target once before timing. The timed no-op pairs
 alternate directly on those warm targets, and a run fails if either Cargo compiles a unit.
@@ -34,8 +47,10 @@ pinned with taskset. macOS has no taskset, so there nothing is pinned and the me
 says so. The Toolchain class and the helpers come from run-store-bench.py.
 
 The output is JSON lines: one meta record (host, toolchains, commit, cohort, pinning, cache
-state), the folio records, then one sample record per build and a stop record when the time
-budget ended the run early.
+state, design), the folio records, then one sample record per build (a noop sample is the series of
+a round) and a stop record when the time budget ended the run early. Every sample carries the order of
+its pair (position 0 went first), a running slot number, the seconds since the run began, the 1 minute load
+average when it started and, on Linux, the CPU steal time it overlapped.
 """
 import argparse
 import contextlib
@@ -205,6 +220,71 @@ def log_counts(log):
     return len(re.findall(r"^\s*Compiling ", text, re.M)), dict(sorted(events.items()))
 
 
+TOP_CPU = re.compile(r"CPU usage:\s*([0-9.]+)% user,\s*([0-9.]+)% sys,\s*([0-9.]+)% idle")
+
+
+def parse_top_idle(text):
+    """Idle fraction (0 to 1) from the last 'CPU usage' line of macOS top output, or None."""
+    found = TOP_CPU.findall(text)
+    return float(found[-1][2]) / 100.0 if found else None
+
+
+def read_proc_stat():
+    """(idle jiffies, total jiffies, steal jiffies) of all CPUs from /proc/stat, or None."""
+    try:
+        first = pathlib.Path("/proc/stat").read_text().splitlines()[0].split()
+    except (OSError, IndexError):
+        return None
+    if first[0] != "cpu":
+        return None
+    values = [int(part) for part in first[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    steal = values[7] if len(values) > 7 else 0
+    return idle, sum(values[:8]), steal
+
+
+def idle_fraction(seconds=2.0):
+    """Fraction of CPU time the whole machine spent idle over the next seconds, or None when unknown."""
+    if sys.platform.startswith("linux"):
+        before = read_proc_stat()
+        if before is None:
+            return None
+        time.sleep(seconds)
+        after = read_proc_stat()
+        total = after[1] - before[1]
+        return (after[0] - before[0]) / total if total > 0 else None
+    if sys.platform == "darwin":
+        done = subprocess.run(["top", "-l", "2", "-n", "0", "-s", str(max(1, round(seconds)))],
+                              capture_output=True, text=True)
+        return parse_top_idle(done.stdout) if done.returncode == 0 else None
+    return None
+
+
+def steal_seconds():
+    """Cumulative CPU steal time of this machine in seconds (Linux), or None."""
+    state = read_proc_stat()
+    if state is None:
+        return None
+    return state[2] / float(os.sysconf("SC_CLK_TCK"))
+
+
+def wait_until_quiet(idle_target, max_wait, window=2.0):
+    """Wait until the machine has been idle at least idle_target for two windows in a row, for at most
+    max_wait seconds. Returns (quiet, seconds waited, last idle fraction, idle samples taken)."""
+    started = time.monotonic()
+    streak, last, samples = 0, None, 0
+    while True:
+        last = idle_fraction(window)
+        if last is None:
+            return None, time.monotonic() - started, None, samples
+        samples += 1
+        streak = streak + 1 if last >= idle_target else 0
+        if streak >= 2:
+            return True, time.monotonic() - started, last, samples
+        if time.monotonic() - started >= max_wait:
+            return False, time.monotonic() - started, last, samples
+
+
 class CiToolchain(STORE.Toolchain):
     """run-store-bench's Toolchain with the frozen profile, FRUST_HOME isolation and optional pinning."""
 
@@ -287,21 +367,46 @@ class Bench:
         self.logs = self.work / "logs"
         self.logs.mkdir(parents=True, exist_ok=True)
         self.workload = self.app.name
+        self.began = time.monotonic()
+        self.slot = 0
+        self.stride = dict(args.stride_map)
 
     def emit(self, record):
         with open(self.args.out, "a") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def target(self, chain):
+        return self.work / f"{chain.name}-target"
+
+    def settle(self):
+        """Write out dirty pages, so the deletion or copy that came before is not paid for by the next
+        build, and give background work a moment to start and finish."""
+        os.sync()
+        if self.args.settle:
+            time.sleep(self.args.settle)
+
+    def stamp(self):
+        """Fields that say when and on what load a sample was taken."""
+        load = os.getloadavg()[0] if hasattr(os, "getloadavg") else None
+        return dict(slot=self.slot, t=round(time.monotonic() - self.began, 3), load1=load, steal_before=steal_seconds())
+
     def measure(self, chain, scenario, round_number, position, target):
         log = self.logs / f"{self.workload}-r{round_number}-{chain.name}-{scenario}.log"
         store_before = STORE.allocated(chain.store) if chain.uses_store else 0
+        self.settle()
+        stamp = self.stamp()
         cpu, wall, rss, status = chain.build(self.app, True, target, log)
+        steal_after = steal_seconds()
         compiled, events = log_counts(log)
         record = dict(type="sample", schema=SCHEMA, toolchain=chain.name, scenario=scenario,
                       round=round_number, position=position, app=self.workload, profile="release",
                       cpu=cpu, wall=wall, rss_kib=rss, status=status, compiled=compiled, cache_events=events,
                       target_bytes=STORE.allocated(target), store_before_bytes=store_before,
-                      store_bytes=STORE.allocated(chain.store) if chain.uses_store else 0)
+                      store_bytes=STORE.allocated(chain.store) if chain.uses_store else 0, **stamp)
+        if stamp["steal_before"] is not None and steal_after is not None:
+            record["steal"] = round(steal_after - stamp["steal_before"], 3)
+        del record["steal_before"]
+        self.slot += 1
         self.emit(record)
         if status != 0:
             sys.exit(f"{chain.name} {scenario} failed; see {log}")
@@ -309,57 +414,113 @@ class Bench:
               f"compiled={compiled} store={record['store_bytes']}", flush=True)
         return record
 
-    def noop(self, chain, round_number, position, target):
-        log = self.logs / f"{self.workload}-r{round_number}-{chain.name}-noop.log"
-        cpus, walls, rss_peak, compiled_max = [], [], 0, 0
-        for _ in range(self.args.noops):
-            cpu, wall, rss, status = chain.build(self.app, True, target, log)
-            if status != 0:
-                sys.exit(f"{chain.name} noop failed; see {log}")
-            compiled, _ = log_counts(log)
-            if self.args.noop_only and compiled:
-                sys.exit(f"{chain.name} compiled during a timed no-op; see {log}")
-            cpus.append(cpu)
-            walls.append(wall)
-            rss_peak = max(rss_peak, rss)
-            compiled_max = max(compiled_max, compiled)
-        record = dict(type="sample", schema=SCHEMA, toolchain=chain.name, scenario="noop",
-                      round=round_number, position=position, app=self.workload, profile="release",
-                      cpu=statistics.median(cpus), wall=statistics.median(walls), rss_kib=rss_peak,
-                      status=0, compiled=compiled_max, runs=len(cpus), cpu_samples=cpus)
-        self.emit(record)
-        print(f"{chain.name:8} {'noop':12} r{round_number} cpu={record['cpu']:8.4f} "
-              f"(median of {len(cpus)}, compiled={compiled_max})", flush=True)
+    def pair(self, order, scenario, round_number, target_of):
+        """Measure one scenario with both toolchains, back to back, in the given order."""
+        records = {}
+        for position, chain in enumerate(order):
+            records[chain.name] = self.measure(chain, scenario, round_number, position, target_of(chain))
+        return records
 
-    def sequence(self, chain, round_number, position):
-        target = self.work / f"{chain.name}-target"
-        scratch = self.work / f"{chain.name}-edit-target"
-        shutil.rmtree(target, ignore_errors=True)
-        # Nothing from an earlier round may serve the cold build.
-        chain.reset_store()
-        if chain.uses_store and STORE.allocated(chain.store) != 0:
-            sys.exit(f"could not empty the {chain.name} store {chain.store}")
-        cold = self.measure(chain, "cold", round_number, position, target)
-        if chain.uses_store and cold["store_bytes"] == 0:
-            sys.exit(f"the cold {chain.name} build wrote nothing to {chain.store}; the unit cache is not "
+    def noop_pair(self, order, round_number):
+        """Alternate no-op builds of the two toolchains. Entry i of the two series is an adjacent pair, and
+        which toolchain goes first alternates with i, so the series is balanced within the round."""
+        logs = {chain.name: self.logs / f"{self.workload}-r{round_number}-{chain.name}-noop.log" for chain in order}
+        series = {chain.name: dict(cpu=[], wall=[], rss=0, compiled=0) for chain in order}
+        self.settle()
+        stamp = self.stamp()
+        for index in range(self.args.noops):
+            for chain in (order if index % 2 == 0 else order[::-1]):
+                cpu, wall, rss, status = chain.build(self.app, True, self.target(chain), logs[chain.name])
+                if status != 0:
+                    sys.exit(f"{chain.name} noop failed; see {logs[chain.name]}")
+                compiled, _ = log_counts(logs[chain.name])
+                if self.args.noop_only and compiled:
+                    sys.exit(f"{chain.name} compiled during a timed no-op; see {logs[chain.name]}")
+                entry = series[chain.name]
+                entry["cpu"].append(cpu)
+                entry["wall"].append(wall)
+                entry["rss"] = max(entry["rss"], rss)
+                entry["compiled"] = max(entry["compiled"], compiled)
+        for position, chain in enumerate(order):
+            entry = series[chain.name]
+            record = dict(type="sample", schema=SCHEMA, toolchain=chain.name, scenario="noop",
+                          round=round_number, position=position, app=self.workload, profile="release",
+                          cpu=statistics.median(entry["cpu"]), wall=statistics.median(entry["wall"]),
+                          rss_kib=entry["rss"], status=0, compiled=entry["compiled"], runs=len(entry["cpu"]),
+                          cpu_samples=entry["cpu"], interleaved=True,
+                          **{key: value for key, value in stamp.items() if key != "steal_before"})
+            self.emit(record)
+            print(f"{chain.name:8} {'noop':12} r{round_number} cpu={record['cpu']:8.4f} "
+                  f"(median of {len(entry['cpu'])}, compiled={entry['compiled']})", flush=True)
+        self.slot += 1
+
+    def orders(self, round_number):
+        """The toolchain order of each pair slot of a round: it flips every slot and every round."""
+        def order(slot):
+            return [self.official, self.frust] if (round_number + slot) % 2 == 0 else [self.frust, self.official]
+        return order
+
+    def round(self, round_number):
+        order_of = self.orders(round_number)
+        slot = 0
+        chains = (self.official, self.frust)
+        for chain in chains:
+            shutil.rmtree(self.target(chain), ignore_errors=True)
+            # Nothing from an earlier round may serve the cold build.
+            chain.reset_store()
+            if chain.uses_store and STORE.allocated(chain.store) != 0:
+                sys.exit(f"could not empty the {chain.name} store {chain.store}")
+        cold = self.pair(order_of(slot), "cold", round_number, self.target)
+        slot += 1
+        if self.frust.uses_store and cold["frust"]["store_bytes"] == 0:
+            sys.exit(f"the cold frust build wrote nothing to {self.frust.store}; the unit cache is not "
                      "using the isolated store, so cold and clean results would be wrong")
-        shutil.rmtree(target, ignore_errors=True)
-        self.measure(chain, "clean", round_number, position, target)
-        self.noop(chain, round_number, position, target)
+        for chain in chains:
+            shutil.rmtree(self.target(chain), ignore_errors=True)
+        self.pair(order_of(slot), "clean", round_number, self.target)
+        slot += 1
+        self.noop_pair(order_of(slot), round_number)
+        slot += 1
         for edit in self.edits:
-            shutil.rmtree(scratch, ignore_errors=True)
-            copy_tree(target, scratch)
+            every = self.stride.get(f"edit-{edit.kind}", 1)
+            if round_number % every:
+                continue
+            order = order_of(slot)
+            slot += 1
+            scratch = {chain.name: self.work / f"{chain.name}-edit-target" for chain in chains}
+            for chain in chains:
+                shutil.rmtree(scratch[chain.name], ignore_errors=True)
+                copy_tree(self.target(chain), scratch[chain.name])
             with edit.applied():
-                self.measure(chain, f"edit-{edit.kind}", round_number, position, scratch)
-            shutil.rmtree(scratch, ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
+                self.pair(order, f"edit-{edit.kind}", round_number, lambda chain: scratch[chain.name])
+            for chain in chains:
+                shutil.rmtree(scratch[chain.name], ignore_errors=True)
+        for chain in chains:
+            shutil.rmtree(self.target(chain), ignore_errors=True)
 
-    def warm_up(self, chain, target):
+    def warm_up(self, chain, target, store=True):
         log = self.logs / f"{self.workload}-{chain.name}-warm-up.log"
+        if store:
+            chain.reset_store()
+        shutil.rmtree(target, ignore_errors=True)
+        self.settle()
         cpu, wall, _, status = chain.build(self.app, True, target, log)
         self.emit(dict(type="warm-up", schema=SCHEMA, toolchain=chain.name, cpu=cpu, wall=wall, status=status))
+        print(f"{chain.name:8} {'warm-up':12} cpu={cpu:8.2f} wall={wall:7.2f} (not in the pairs)", flush=True)
         if status != 0:
             sys.exit(f"{chain.name} warm-up build failed; see {log}")
+
+    def quiet(self, round_number):
+        """Wait for an idle machine and record how that went."""
+        if not self.args.quiesce_seconds:
+            return
+        quiet, waited, idle, samples = wait_until_quiet(self.args.quiesce_idle, self.args.quiesce_seconds)
+        self.emit(dict(type="quiet", schema=SCHEMA, round=round_number, quiet=quiet, waited=round(waited, 1),
+                       idle=None if idle is None else round(idle, 4), samples=samples,
+                       target=self.args.quiesce_idle))
+        state = {True: "quiet", False: "STILL BUSY", None: "idle not measurable"}[quiet]
+        print(f"round {round_number}: {state} after {waited:.0f} s"
+              + ("" if idle is None else f" (idle {idle * 100:.1f}%)"), flush=True)
 
     def probe_folio(self, phase):
         """Record how each toolchain's driver and LLVM text is mapped during a compile (Linux only).
@@ -393,12 +554,12 @@ class Bench:
                       f"not fit in the {self.args.time_budget_minutes} minute budget", flush=True)
                 break
             began = time.monotonic()
-            order = [self.official, self.frust] if round_number % 2 == 0 else [self.frust, self.official]
-            for position, chain in enumerate(order):
-                if self.args.noop_only:
-                    self.noop(chain, round_number, position, self.work / f"{chain.name}-target")
-                else:
-                    self.sequence(chain, round_number, position)
+            self.quiet(round_number)
+            if self.args.noop_only:
+                order = self.orders(round_number)(0)
+                self.noop_pair(order, round_number)
+            else:
+                self.round(round_number)
             durations.append(time.monotonic() - began)
 
     def run(self):
@@ -406,17 +567,19 @@ class Bench:
         started = time.monotonic()
         chains = (self.official, self.frust)
         try:
+            self.quiet(-1)
             if self.args.noop_only:
                 for chain in chains:
-                    target = self.work / f"{chain.name}-target"
+                    target = self.target(chain)
                     shutil.rmtree(target, ignore_errors=True)
                     chain.reset_store()
                     self.warm_up(chain, target)
             else:
-                # Unpack registry sources before the first timed build.
+                # Unpack registry sources, and let both toolchains run once, before the first timed build.
                 target = self.work / "warm-up-target"
                 try:
-                    self.warm_up(self.official, target)
+                    for chain in chains:
+                        self.warm_up(chain, target)
                 finally:
                     shutil.rmtree(target, ignore_errors=True)
             self.probe_folio("before")
@@ -427,9 +590,18 @@ class Bench:
         finally:
             for chain in chains:
                 if self.args.noop_only:
-                    shutil.rmtree(self.work / f"{chain.name}-target", ignore_errors=True)
+                    shutil.rmtree(self.target(chain), ignore_errors=True)
                 shutil.rmtree(chain.store, ignore_errors=True)
                 shutil.rmtree(chain.xdg_cache, ignore_errors=True)
+
+
+def busiest_processes(count=12):
+    """The processes using the most CPU right now, as recorded evidence of what else runs on the host."""
+    if sys.platform == "darwin":
+        text = capture(["ps", "-Ao", "pcpu=,comm=", "-r"])
+    else:
+        text = capture(["ps", "-eo", "pcpu=,comm=", "--sort=-pcpu"])
+    return "\n".join(text.splitlines()[:count]) if text else None
 
 
 def tool_versions(cargo, rustc):
@@ -453,8 +625,19 @@ def parse_args():
     parser.add_argument("--app", required=True, help="cohort application directory, named after its workload")
     parser.add_argument("--label", required=True, help="platform label recorded in the results")
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--noops", type=int, default=5)
+    parser.add_argument("--noops", type=int, default=5,
+                        help="no-op builds of each toolchain per round, alternating between the two")
     parser.add_argument("--noop-only", action="store_true", help="time adjacent pairs on warmed targets")
+    parser.add_argument("--stride", action="append", default=[], metavar="SCENARIO=N",
+                        help="measure an edit scenario (for example edit-wide=3) only every N rounds")
+    parser.add_argument("--settle", type=float, default=1.0,
+                        help="seconds to wait after sync before every timed build (default 1)")
+    parser.add_argument("--quiesce-seconds", type=float, default=90.0,
+                        help="longest wait for an idle machine before each round, 0 to not wait (default 90)")
+    parser.add_argument("--quiesce-idle", type=float, default=0.9,
+                        help="idle CPU fraction that counts as quiet (default 0.9)")
+    parser.add_argument("--note-file", help="text file recorded in the meta record, for example what the "
+                                            "workflow did to quieten the runner")
     parser.add_argument("--edits", default="auto", help="auto (the frozen edits of the workload), none, or a comma list")
     parser.add_argument("--cpus", default="auto", help="taskset CPU list on Linux, auto or none")
     parser.add_argument("--jobs", type=int, default=0, help="cargo -j, 0 for one per CPU in use")
@@ -467,6 +650,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.stride_map = {}
+    for item in args.stride:
+        name, _, every = item.partition("=")
+        if not name.startswith("edit-") or not every.isdigit() or int(every) < 1:
+            sys.exit(f"--stride wants edit-KIND=N with N at least 1, got {item!r}")
+        args.stride_map[name] = int(every)
     app = pathlib.Path(args.app).resolve()
     if not app.is_dir():
         sys.exit(f"no cohort application at {app}")
@@ -517,6 +706,11 @@ def main():
         pinning=dict(cpus=pin, note=pin_note), jobs=jobs, logical_cpus_in_use=cpu_count,
         profile=PROFILE, rounds_requested=args.rounds, noops=args.noops, noop_only=args.noop_only, edits=list(kinds),
         time_budget_minutes=args.time_budget_minutes, unit_cache=args.frust_store,
+        design=dict(name="alternating-pairs-2", order="the first toolchain flips every pair slot and every round",
+                    strides=args.stride_map, settle=args.settle, quiesce_seconds=args.quiesce_seconds,
+                    quiesce_idle=args.quiesce_idle, warm_up="both toolchains build once before round 0"),
+        notes=pathlib.Path(args.note_file).read_text(errors="replace")[-4000:] if args.note_file else None,
+        background=busiest_processes(),
         cache_state=args.cache_state, toolchain_prefixes=dict(official=str(official.prefix), frust=str(frust.prefix)),
         frust_env=extra, toolchains=versions,
         commit=os.environ.get("GITHUB_SHA") or git_head(ROOT),
