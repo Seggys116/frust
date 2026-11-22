@@ -1,0 +1,264 @@
+diff --git a/build.rs b/build.rs
+index c03ea57..5c62b75 100644
+--- a/build.rs
++++ b/build.rs
+@@ -8,6 +8,7 @@ fn main() {
+     commit_info();
+     compress_man();
+     windows_manifest();
++    lazy_curl_link_args();
+     #[expect(
+         clippy::disallowed_methods,
+         reason = "not `cargo`, not needing to load from config"
+@@ -160,3 +161,25 @@ fn windows_manifest() {
+         println!("cargo:rustc-link-arg-bin=cargo=/WX");
+     }
+ }
++
++/// Wraps libcurl's initializers so that `src/bin/cargo/lazy_curl.rs` can defer the global
++/// initialization until the first handle is created.
++#[expect(
++    clippy::disallowed_methods,
++    reason = "not `cargo`, not needing to load from config"
++)]
++fn lazy_curl_link_args() {
++    use std::env;
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
++        && env::var_os("CARGO_FEATURE_HTTP_TRANSPORT_CURL").is_some()
++    {
++        for function in [
++            "curl_global_init",
++            "curl_easy_init",
++            "curl_multi_init",
++            "curl_share_init",
++        ] {
++            println!("cargo:rustc-link-arg-bin=cargo=-Wl,--wrap={function}");
++        }
++    }
++}
+diff --git a/src/bin/cargo/cli.rs b/src/bin/cargo/cli.rs
+index 5aa9a94..4a20fde 100644
+--- a/src/bin/cargo/cli.rs
++++ b/src/bin/cargo/cli.rs
+@@ -25,11 +25,14 @@ pub fn main(gctx: &mut GlobalContext, args: Option<Vec<OsString>>) -> CliResult
+     // In general, try to avoid loading config values unless necessary (like
+     // the [alias] table).
+ 
+-    let command = cli(gctx);
+-    let args = match args {
+-        Some(args) => command.try_get_matches_from(args)?,
+-        None => command.try_get_matches()?,
++    // Building every builtin command's definition costs more than parsing the arguments of a
++    // small command. When the arguments name a builtin command, only that one is built.
++    let argv: Vec<OsString> = args.unwrap_or_else(|| std::env::args_os().collect());
++    let command = match selected_builtin(&argv) {
++        Some(selected) => cli_with_subcommands(gctx, vec![selected]),
++        None => cli(gctx),
+     };
++    let args = command.try_get_matches_from(argv)?;
+ 
+     // Update the process-level notion of cwd
+     if let Some(new_cwd) = args.get_one::<std::path::PathBuf>("directory") {
+@@ -570,7 +573,36 @@ impl GlobalArgs {
+ }
+ 
+ #[tracing::instrument(skip_all)]
++/// The builtin command that `argv` selects, when it can be found without a full parse.
++///
++/// Only global options with known shapes may precede the command. Help, version and list
++/// requests, option values this scan does not know and anything else unusual return `None`, and
++/// the caller builds every command as before.
++fn selected_builtin(argv: &[OsString]) -> Option<Command> {
++    let mut rest = argv.iter().skip(1);
++    while let Some(arg) = rest.next() {
++        let arg = arg.to_str()?;
++        match arg {
++            "--" => return None,
++            "--color" | "--config" | "-Z" | "-C" => {
++                rest.next()?;
++            }
++            "-v" | "-vv" | "-vvv" | "-q" | "--verbose" | "--quiet" | "--locked" | "--offline"
++            | "--frozen" => {}
++            _ if arg.starts_with("--color=") || arg.starts_with("--config=") => {}
++            _ if arg.starts_with("-Z") && arg.len() > 2 => {}
++            _ if arg.starts_with('-') => return None,
++            name => return commands::builtin_named(name),
++        }
++    }
++    None
++}
++
+ pub fn cli(gctx: &GlobalContext) -> Command {
++    cli_with_subcommands(gctx, commands::builtin())
++}
++
++fn cli_with_subcommands(gctx: &GlobalContext, subcommands: Vec<Command>) -> Command {
+     // Don't let config errors get in the way of parsing arguments
+     let term = gctx.get::<TermConfig>(["term"]).unwrap_or_default();
+     let color = term
+@@ -739,7 +771,7 @@ See '<bright-cyan,bold>cargo help</> <cyan><<command>></>' for more information
+             }
+             candidates
+         }))
+-        .subcommands(commands::builtin())
++        .subcommands(subcommands)
+ }
+ 
+ fn get_toolchains_from_rustup() -> Vec<String> {
+diff --git a/src/bin/cargo/commands/mod.rs b/src/bin/cargo/commands/mod.rs
+index b507226..e793c97 100644
+--- a/src/bin/cargo/commands/mod.rs
++++ b/src/bin/cargo/commands/mod.rs
+@@ -44,6 +44,56 @@ pub fn builtin() -> Vec<Command> {
+     ]
+ }
+ 
++/// Builds the clap definition of one builtin command without building the others.
++///
++/// Returns `None` for names that are not builtin commands.
++pub fn builtin_named(name: &str) -> Option<Command> {
++    let command = match name {
++        "add" => add::cli(),
++        "bench" => bench::cli(),
++        "build" => build::cli(),
++        "check" => check::cli(),
++        "clean" => clean::cli(),
++        "config" => config::cli(),
++        "doc" => doc::cli(),
++        "fetch" => fetch::cli(),
++        "fix" => fix::cli(),
++        "generate-lockfile" => generate_lockfile::cli(),
++        "git-checkout" => git_checkout::cli(),
++        "help" => help::cli(),
++        "info" => info::cli(),
++        "init" => init::cli(),
++        "install" => install::cli(),
++        "locate-project" => locate_project::cli(),
++        "login" => login::cli(),
++        "logout" => logout::cli(),
++        "metadata" => metadata::cli(),
++        "new" => new::cli(),
++        "owner" => owner::cli(),
++        "package" => package::cli(),
++        "pkgid" => pkgid::cli(),
++        "publish" => publish::cli(),
++        "read-manifest" => read_manifest::cli(),
++        "remove" => remove::cli(),
++        "report" => report::cli(),
++        "run" => run::cli(),
++        "rustc" => rustc::cli(),
++        "rustdoc" => rustdoc::cli(),
++        "search" => search::cli(),
++        "test" => test::cli(),
++        "tree" => tree::cli(),
++        "uninstall" => uninstall::cli(),
++        "update" => update::cli(),
++        "vendor" => vendor::cli(),
++        "verify-project" => verify_project::cli(),
++        "version" => version::cli(),
++        "yank" => yank::cli(),
++        _ => return None,
++    };
++    // `builtin_exec` and the list in `builtin` define the same names.
++    (command.get_name() == name).then_some(command)
++}
++
+ pub type Exec = fn(&mut GlobalContext, &ArgMatches) -> CliResult;
+ 
+ pub fn builtin_exec(cmd: &str) -> Option<Exec> {
+diff --git a/src/bin/cargo/lazy_curl.rs b/src/bin/cargo/lazy_curl.rs
+new file mode 100644
+index 0000000..b05739e
+--- /dev/null
++++ b/src/bin/cargo/lazy_curl.rs
+@@ -0,0 +1,61 @@
++//! Defers libcurl's global initialization until a handle is created.
++//!
++//! The `curl` crate calls `curl_global_init` from a constructor that runs before `main`. That
++//! initializes OpenSSL, which loads its error strings and builds its name tables. Most Cargo
++//! commands never open a network connection, so this was paid on every start. The linker wraps
++//! `curl_global_init` (see `build.rs`), so the constructor only records the requested flags. The
++//! first call that creates a libcurl handle runs the real initialization exactly once, from a
++//! `Once`, which keeps it thread safe.
++
++use std::ffi::{c_int, c_long, c_void};
++use std::sync::Once;
++use std::sync::atomic::{AtomicI64, Ordering};
++
++/// `CURL_GLOBAL_ALL`, which is what the `curl` crate asks for.
++const CURL_GLOBAL_ALL: c_long = 3;
++
++unsafe extern "C" {
++    fn __real_curl_global_init(flags: c_long) -> c_int;
++    fn __real_curl_easy_init() -> *mut c_void;
++    fn __real_curl_multi_init() -> *mut c_void;
++    fn __real_curl_share_init() -> *mut c_void;
++}
++
++static FLAGS: AtomicI64 = AtomicI64::new(CURL_GLOBAL_ALL as i64);
++static INIT: Once = Once::new();
++
++fn ensure_initialized() {
++    INIT.call_once(|| {
++        let flags = FLAGS.load(Ordering::SeqCst) as c_long;
++        // SAFETY: this is libcurl's own initializer, called once before any handle exists.
++        let code = unsafe { __real_curl_global_init(flags) };
++        assert_eq!(code, 0, "libcurl global initialization failed");
++    });
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn __wrap_curl_global_init(flags: c_long) -> c_int {
++    FLAGS.store(flags as i64, Ordering::SeqCst);
++    0
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn __wrap_curl_easy_init() -> *mut c_void {
++    ensure_initialized();
++    // SAFETY: forwards to libcurl after initialization.
++    unsafe { __real_curl_easy_init() }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn __wrap_curl_multi_init() -> *mut c_void {
++    ensure_initialized();
++    // SAFETY: forwards to libcurl after initialization.
++    unsafe { __real_curl_multi_init() }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn __wrap_curl_share_init() -> *mut c_void {
++    ensure_initialized();
++    // SAFETY: forwards to libcurl after initialization.
++    unsafe { __real_curl_share_init() }
++}
+diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
+index 95f521b..140a566 100644
+--- a/src/bin/cargo/main.rs
++++ b/src/bin/cargo/main.rs
+@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
+ 
+ mod cli;
+ mod commands;
++#[cfg(all(target_os = "linux", feature = "http-transport-curl"))]
++mod lazy_curl;
+ 
+ use crate::command_prelude::*;
+ 
+diff --git a/src/workspace/global_cache_tracker.rs b/src/workspace/global_cache_tracker.rs
+index 27adaa6..0c6ad3b 100644
+--- a/src/workspace/global_cache_tracker.rs
++++ b/src/workspace/global_cache_tracker.rs
+@@ -1621,6 +1621,11 @@ impl DeferredGlobalLastUse {
+     }
+ 
+     fn save_with_gctx(&mut self, gctx: &GlobalContext) -> CargoResult<()> {
++        // Opening the database costs a connection, a schema check and the package cache lock
++        // held for all of it. Without pending timestamps there is nothing to write.
++        if self.is_empty() {
++            return Ok(());
++        }
+         let mut tracker = gctx.global_cache_tracker()?;
+         self.save(&mut tracker)
+     }
