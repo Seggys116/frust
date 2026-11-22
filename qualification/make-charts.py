@@ -412,7 +412,10 @@ def needed_text(row):
         return "n/a"
     have = min((row.get("pairs_per_stratum") or {"": row["pairs"]}).values())
     if needed <= have:
-        return f"at least {have} (sign test or order decides)"
+        interval = row.get("interval")
+        if interval and (interval[1] < 1.0 or interval[0] > 1.0):
+            return f"none for the interval; the sign test (p={row['sign_p']:.3f}) does not agree"
+        return f"about {have} (the estimate is at parity)"
     return f"{pairs_text(needed)} per workload"
 
 
