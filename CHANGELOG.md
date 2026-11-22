@@ -55,7 +55,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 * Benchmark CI reports paired intervals for CPU comparisons with official Rust and for resource comparisons with fRust 0.6.0.
 * The APFS write trace observes marker writes at the start and end of each window and waits for the device to go quiet. All 24 calibration bursts passed on each macOS runner. Five Intel bursts had writes after the old one-second cutoff. [APFS calibration](https://github.com/Seggys116/frust/actions/runs/45014543999)
-* The macOS PGO experiment records native startup failures and tests instrumented dylib and executable shapes on both architectures. The experimental compiler build uses Rust instrumentation.
+* The experimental macOS PGO build completed native training and profile-use rebuilds on both architectures. It uses Rust instrumentation and uploads the merged profiles and build evidence. [Native PGO run](https://github.com/Seggys116/frust/actions/runs/45017675275)
+* Wide warm checks used 84.4% to 87.7% of fRust 0.6.0's peak process RSS across the four platforms. Warm proc-macro checks spent less CPU on contended locks, with total CPU intervals spanning parity. Both Macs recorded complete APFS traces and used less occupied space in all four states. Write-volume gains varied by state. [Resource results](docs/benchmarks.md#resource-results-for-the-061-candidate)
 
 ## [0.6.0] - 2026-11-22
 

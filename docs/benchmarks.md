@@ -262,6 +262,8 @@ On 21 November 2026, both instrumented compilers failed when bootstrap tried to 
 
 On 22 November, the Apple Silicon crash probe stopped in LLVM's value-profile runtime during jemalloc initialization before `main`. Builds that suppressed automatic Clang instrumentation of C and C++ dependencies passed both startup probes on Apple Silicon and Intel. Both jobs stopped at the build-log check before training. The checker now removes terminal color codes and finds 238 instrumented compiler commands in each recorded log. [Crash probe](https://github.com/Seggys116/frust/actions/runs/45012907986) · [Rust-only instrumentation](https://github.com/Seggys116/frust/actions/runs/45013193306)
 
+The next native build completed training and packaging on both architectures. Each runner trained all 14 crates and merged 4,558 raw profiles without rejecting any. The merged profiles contain 97,830 functions on Apple Silicon and 97,674 on Intel. Each final build logged 239 profile-use compiler commands and zero visible hash mismatches. Both final driver libraries passed the check for removed instrumentation. The merged profiles and manifests are part of the run's evidence artifacts. [Native PGO build](https://github.com/Seggys116/frust/actions/runs/45017675275)
+
 When the instrumented compiler fails its first launch, `build-toolchain-pgo.sh` runs `support/tools/pgo-rustc-launch-diagnostics.py launch` before it exits. The launch gate and the evidence gates are unchanged. The tool records a native lldb backtrace (180 second limit), the Mach-O segment and `__llvm_*` section layout of `rustc` and `librustc_driver` with a check of every file extent, the crash report of a fresh process, and a differential of fresh launches that varies `DYLD_LIBRARY_PATH`, the environment, the working directory and `LLVM_PROFILE_FILE`. These land in `pgo-evidence-frust-pgo-<target>` under `diagnostics/`.
 
 `-f protocol=false -f platforms=macos-pgo-probe` runs a short probe on both macOS runners and builds nothing else. Official Rust 1.100.0 compiles an rlib, a dylib and an executable with the instrumentation flags that the instrumented build log of run 44940641452 shows for `rustc_driver` and `rustc_main`, as variants that add or drop profile generation, value profiling, dylib ThinLTO and the rpath flags, plus a 12000-function scale. Each variant runs with the embedded profile path and with `LLVM_PROFILE_FILE`. The probe records its exit or signal, its output against the uninstrumented control, and the raw profiles it wrote, checks that they merge, and uploads `pgo-probe-<os>` even when a variant fails. It is evidence about the flags on a small shape. It does not show that a PGO toolchain works.
@@ -337,6 +339,8 @@ The frozen pair protocol jobs (`qualification/run-pairs.py`, control against fRu
 - A job starts no round that would end after 285 minutes of measuring, so jobs stay inside the six hour limit of a hosted runner once the setup before the measurement (building and installing the toolchains, fetching the cohort) and the closing probe and upload are added. The default is eight rounds. A run cut short by the budget records a stop line, the report lists it in its run notes and flags the scenarios that have fewer pairs than requested, so a short series is visible as one.
 
 Use `platforms=macos-arm64-fingerprint` or `platforms=macos-x86_64-fingerprint` with `protocol=false` to warm one regex target per toolchain and time adjacent no-op pairs. Use `noops=1` to measure one invocation on each side per pair. The job fails if a timed command compiles anything. It compares the defaults with official Rust and records two additional series with the unit cache off. One runs the same fCargo and compiler bytes under the `rustc` and `frustc` names to isolate content checks. The other compares official Rust with fCargo under mtime checks. Both diagnostic series are attached under `fingerprint-diagnostic` in the raw comparison artifacts.
+
+On 22 November 2026, the Apple Silicon regex comparison recorded 121.8% of official CPU for the default fRust no-op, with a 95% paired interval of 120.2–123.3%. The same fCargo and compiler bytes used 122.7% CPU with content checks relative to mtime checks (121.6–123.5%). With mtime checks on both sides, fCargo used 98.6% of official Cargo CPU (97.1–99.8%). Each series completed 120 pairs with no compilation. Full content checks remain enabled because a metadata shortcut missed a same-size edit through a memory mapping. [Apple Silicon no-op run](https://github.com/Seggys116/frust/actions/runs/45025370631)
 
 ### Recorded environment
 
@@ -424,6 +428,25 @@ On Apple Silicon, the 388-member warm check used 53.76 → 45.76 MiB of peak pro
 On Intel macOS, peak process RSS in the wide warm check fell from 36.09 to 30.33 MiB, improving in all six pairs. The cold proc-macro overlap also went from two build-directory lock waits to zero, with summed wait time of 987.0 → 0 ms. The small warm proc-macro case used 92.82 → 102.10 ms of CPU, with every pair slower. [Intel resource run](https://github.com/Seggys116/frust/actions/runs/44956439829)
 
 The Intel APFS run captured the full calibration payload. During the build series, one cold build timed out and several cold and clean-rebuild traces missed write events. Intel write volume remains unresolved. The six clean-rebuild pairs recorded 2.0% higher occupied APFS space by the median paired ratio, with all six pairs using more space. [Intel APFS run](https://github.com/Seggys116/frust/actions/runs/44961162136)
+
+## Resource results for the 0.6.1 candidate
+
+Benchmark CI compared the candidate at `a1a345b` with the matching fRust 0.6.0 archive on each runner on 22 November 2026. Cooperative checks were enabled on both sides of the 388-member fixture. The wide check and proc-macro overlap each have 12 pairs. Percentages are median paired ratios with 95% intervals in brackets. Lock rows give paired differences. Lock hold duration is the summed time that locks were held exclusively. [Raw resource results](https://github.com/Seggys116/frust/actions/runs/45018513595)
+
+| Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
+| --- | --- | --- | --- | --- |
+| Wide warm check CPU | 89.3% [87.9, 90.4] | 88.0% [87.0, 89.6] | 91.9% [90.0, 96.3] | 85.1% [79.1, 97.3] |
+| Wide warm check peak process RSS | 87.2% [87.1, 88.2] | 87.7% [87.4, 88.3] | 84.4% [84.1, 84.6] | 87.1% [85.8, 88.4] |
+| Warm proc-macro check CPU | 97.4% [95.2, 101.0] | 100.0% [95.6, 100.7] | 99.5% [93.3, 105.3] | 96.0% [83.9, 103.5] |
+| Warm proc-macro lock waits | −4.5 [−6, −3] | −3 [−4, −3] | −3 [−4, −2] | −5 [−5, −4] |
+| Warm proc-macro contended lock CPU (µs) | −25.2 [−53.5, −4.4] | −9.9 [−18.8, −5.4] | −23.0 [−27.2, −19.5] | −146.5 [−188.8, −90.1] |
+| Warm proc-macro exclusive lock hold (ms) | −0.25 [−0.28, −0.20] | −0.19 [−0.23, −0.14] | −1.05 [−2.42, −0.68] | −2.85 [−4.88, −0.18] |
+| Cold dev build writes | 99.5% [99.4, 99.5] | 99.5% [99.5, 99.5] | 97.3% [92.3, 101.0] | 97.4% [94.9, 102.7] |
+| Cold dev build occupied space | 99.4% [99.4, 99.4] | 99.4% [99.4, 99.4] | 97.0% [96.9, 97.4] | 96.8% [95.8, 97.3] |
+
+Both Linux variants used 70.8% of 0.6.0's allocated bytes and 71.1% of its written bytes for cold checks in the 97-dependency fixture. Those figures were the same in all 12 pairs on each variant. The warm test, Clippy, doc and fmt combination on v3 used 101.9% CPU (100.4–103.9%). [Raw resource results](https://github.com/Seggys116/frust/actions/runs/45018513595)
+
+Both Macs recorded 48 valid APFS trace windows. Occupied space fell in all four states in the private image. Intel edit builds used 98.8% of 0.6.0's write volume (98.1–99.5%). The other write intervals included parity. A separate Apple Silicon run recorded a cold write reduction of 2.6% (0.6–4.7%), while the main run's cold interval included parity. [Main APFS comparison](https://github.com/Seggys116/frust/actions/runs/45018513595) · [Apple Silicon repeat](https://github.com/Seggys116/frust/actions/runs/45025112546)
 
 ## Rules for new measurements
 
