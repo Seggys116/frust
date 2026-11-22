@@ -67,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe for calibration, macos-pgo-probe for a short native diagnostic of instrumented compiler shapes on both macOS hosts, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
+        description: Platforms for the official comparison (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-fingerprint for warm no-op measurements on both Macs, macos-write-probe for storage calibration, macos-pgo-probe for compiler launch diagnostics, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || inputs.platforms == 'macos-pgo-probe' && 'pgo-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || inputs.platforms == 'macos-pgo-probe' && 'pgo-probe' || inputs.platforms == 'macos-fingerprint' && 'fingerprint' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -121,6 +121,7 @@ jobs:
       mac-pgo-builds: ${{ steps.plan.outputs.mac-pgo-builds }}
       run-linux: ${{ steps.plan.outputs.run-linux }}
       apfs-only: ${{ steps.plan.outputs.apfs-only }}
+      fingerprint-only: ${{ steps.plan.outputs.fingerprint-only }}
     steps:
       - id: plan
         env:
@@ -190,10 +191,14 @@ jobs:
           write_probe = selection == "macos-write-probe"
           pgo_probe = selection == "macos-pgo-probe"
           apfs_only = selection in ("macos-arm64-apfs", "macos-x86_64-apfs")
-          if (write_probe or pgo_probe or apfs_only) and os.environ["PROTOCOL"] == "true":
+          fingerprint_only = selection == "macos-fingerprint"
+          if (write_probe or pgo_probe or apfs_only or fingerprint_only) and os.environ["PROTOCOL"] == "true":
               raise SystemExit(f"{selection} needs protocol=false")
           if apfs_only:
               platforms = [selection.removesuffix("-apfs")]
+              workloads = ["regex"]
+          elif fingerprint_only:
+              platforms = ["macos-arm64", "macos-x86_64"]
               workloads = ["regex"]
           else:
               platforms = [] if write_probe or pgo_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
@@ -233,6 +238,7 @@ jobs:
           print(f"mac-pgo-builds={dump(mac_pgo)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
           print(f"apfs-only={dump(apfs_only)}")
+          print(f"fingerprint-only={dump(fingerprint_only)}")
           PY
 
   macos-write-probe:
@@ -742,22 +748,25 @@ jobs:
           ROUNDS: ${{ inputs.rounds }}
           NOOPS: ${{ inputs.noops }}
           CACHE_STATE: ${{ inputs.cache-state }}
+          FINGERPRINT_ONLY: ${{ needs.plan.outputs.fingerprint-only }}
         run: |
           if [[ $CACHE_STATE == evicted && $RUNNER_OS != Linux ]]; then
             echo "::notice title=cache-state evicted ignored::Evicting the page cache needs Linux. $LABEL ran with the toolchains as installed."
             CACHE_STATE=installed
           fi
           mkdir -p "$RUNNER_TEMP/out"
+          scenario=()
+          if [[ $FINGERPRINT_ONLY == true ]]; then scenario+=(--noop-only); fi
           python3 -I qualification/ci-bench.py \
             --official-cargo "$OFFICIAL_BIN/cargo" --official-rustc "$OFFICIAL_BIN/rustc" \
             --expect-official-release "$OFFICIAL_RELEASE" \
             --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$FRUST_BIN/frustc" \
             --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
-            --cache-state "$CACHE_STATE" \
+            --cache-state "$CACHE_STATE" "${scenario[@]}" \
             --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --rounds "$ROUNDS" --noops "$NOOPS" \
             --time-budget-minutes 285 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
       - name: Measure the native cost of content fingerprints
-        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && runner.os == 'macOS' && matrix.workload == 'regex' && inputs.cohorts == 'regex' && needs.plan.outputs.apfs-only != 'true' }}
+        if: needs.plan.outputs.fingerprint-only == 'true'
         timeout-minutes: 20
         env:
           LABEL: ${{ matrix.label }}
@@ -767,23 +776,27 @@ jobs:
           cmp -s "$FRUST_BIN/rustc" "$FRUST_BIN/frustc"
           out=$RUNNER_TEMP/out/fingerprint-diagnostic
           mkdir -p "$out"
-          status=0
-          python3 -I qualification/ci-bench.py \
-            --official-cargo "$FRUST_BIN/fcargo" --official-rustc "$FRUST_BIN/rustc" \
-            --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$FRUST_BIN/frustc" \
-            --expect-official-release "$OFFICIAL_RELEASE" --frust-store off --edits none \
-            --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
-            --app "$WORK/cohorts/regex" --label "$LABEL-fingerprint" --rounds "$ROUNDS" --noops "$NOOPS" \
-            --time-budget-minutes 17 --work "$WORK/fingerprint" --out "$out/samples.ndjson" \
-            > "$out/measure.txt" 2>&1 || status=$?
-          if [[ $status != 0 ]]; then tail -n 30 "$out/measure.txt"; fi
-          exit "$status"
+          measure_pair() {
+            local name=$1 first_cargo=$2 first_rustc=$3 second_rustc=$4 status=0
+            python3 -I qualification/ci-bench.py \
+              --official-cargo "$first_cargo" --official-rustc "$first_rustc" \
+              --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$second_rustc" \
+              --expect-official-release "$OFFICIAL_RELEASE" --frust-store off --noop-only \
+              --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
+              --app "$WORK/cohorts/regex" --label "$LABEL-$name" --rounds "$ROUNDS" --noops "$NOOPS" \
+              --time-budget-minutes 8 --work "$WORK/$name" --out "$out/$name.ndjson" \
+              > "$out/$name.txt" 2>&1 || status=$?
+            if [[ $status != 0 ]]; then tail -n 30 "$out/$name.txt"; fi
+            return "$status"
+          }
+          measure_pair fingerprint "$FRUST_BIN/fcargo" "$FRUST_BIN/rustc" "$FRUST_BIN/frustc"
+          measure_pair mtime "$OFFICIAL_BIN/cargo" "$OFFICIAL_BIN/rustc" "$FRUST_BIN/rustc"
       # Use the preceding fRust release as the control for resource changes. Both runs use the
       # same fixture paths and cache diagnostics. The .ndjson file keeps this series out of the
       # report's official CPU comparison, which reads *.jsonl.
       - name: Install the control release for resource measurements
         id: resource-control
-        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && matrix.workload == 'regex' }}
+        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && matrix.workload == 'regex' && needs.plan.outputs.fingerprint-only != 'true' }}
         env:
           CPU: ${{ matrix.cpu }}
         run: |

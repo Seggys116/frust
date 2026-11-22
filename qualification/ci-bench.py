@@ -18,6 +18,9 @@ empty is a failure, because the store would not be isolated and the clean series
 An unmeasured official build runs first, so unpacking the fetched registry sources is not charged
 to whichever toolchain builds first in round 0.
 
+With --noop-only, each toolchain builds its own target once before timing. The timed no-op pairs
+alternate directly on those warm targets, and a run fails if either Cargo compiles a unit.
+
 Page-cache state (Linux). Whether the compiler maps librustc_driver and libLLVM text with 2 MiB
 pages depends on how those files entered the page cache (qualification/toolchain-folio-state.py),
 so the run records it for both toolchains, as "folio" records, before the first timed build and
@@ -314,6 +317,8 @@ class Bench:
             if status != 0:
                 sys.exit(f"{chain.name} noop failed; see {log}")
             compiled, _ = log_counts(log)
+            if self.args.noop_only and compiled:
+                sys.exit(f"{chain.name} compiled during a timed no-op; see {log}")
             cpus.append(cpu)
             walls.append(wall)
             rss_peak = max(rss_peak, rss)
@@ -349,15 +354,12 @@ class Bench:
             shutil.rmtree(scratch, ignore_errors=True)
         shutil.rmtree(target, ignore_errors=True)
 
-    def warm_up(self):
-        """Unpack the registry sources once, unmeasured, so round 0 is not charged for it on one side only."""
-        target = self.work / "warm-up-target"
-        log = self.logs / f"{self.workload}-warm-up.log"
-        cpu, wall, _, status = self.official.build(self.app, True, target, log)
-        shutil.rmtree(target, ignore_errors=True)
-        self.emit(dict(type="warm-up", schema=SCHEMA, toolchain=self.official.name, cpu=cpu, wall=wall, status=status))
+    def warm_up(self, chain, target):
+        log = self.logs / f"{self.workload}-{chain.name}-warm-up.log"
+        cpu, wall, _, status = chain.build(self.app, True, target, log)
+        self.emit(dict(type="warm-up", schema=SCHEMA, toolchain=chain.name, cpu=cpu, wall=wall, status=status))
         if status != 0:
-            sys.exit(f"official warm-up build failed; see {log}")
+            sys.exit(f"{chain.name} warm-up build failed; see {log}")
 
     def probe_folio(self, phase):
         """Record how each toolchain's driver and LLVM text is mapped during a compile (Linux only).
@@ -393,23 +395,41 @@ class Bench:
             began = time.monotonic()
             order = [self.official, self.frust] if round_number % 2 == 0 else [self.frust, self.official]
             for position, chain in enumerate(order):
-                self.sequence(chain, round_number, position)
+                if self.args.noop_only:
+                    self.noop(chain, round_number, position, self.work / f"{chain.name}-target")
+                else:
+                    self.sequence(chain, round_number, position)
             durations.append(time.monotonic() - began)
 
     def run(self):
         budget = self.args.time_budget_minutes * 60
         started = time.monotonic()
-        self.warm_up()
-        self.probe_folio("before")
-        durations = []
+        chains = (self.official, self.frust)
         try:
-            self.rounds(budget, started, durations)
+            if self.args.noop_only:
+                for chain in chains:
+                    target = self.work / f"{chain.name}-target"
+                    shutil.rmtree(target, ignore_errors=True)
+                    chain.reset_store()
+                    self.warm_up(chain, target)
+            else:
+                # Unpack registry sources before the first timed build.
+                target = self.work / "warm-up-target"
+                try:
+                    self.warm_up(self.official, target)
+                finally:
+                    shutil.rmtree(target, ignore_errors=True)
+            self.probe_folio("before")
+            try:
+                self.rounds(budget, started, [])
+            finally:
+                self.probe_folio("after")
         finally:
-            self.probe_folio("after")
-        for chain in (self.official, self.frust):
-            chain.reset_store()
-            shutil.rmtree(chain.store, ignore_errors=True)
-            shutil.rmtree(chain.xdg_cache, ignore_errors=True)
+            for chain in chains:
+                if self.args.noop_only:
+                    shutil.rmtree(self.work / f"{chain.name}-target", ignore_errors=True)
+                shutil.rmtree(chain.store, ignore_errors=True)
+                shutil.rmtree(chain.xdg_cache, ignore_errors=True)
 
 
 def tool_versions(cargo, rustc):
@@ -434,6 +454,7 @@ def parse_args():
     parser.add_argument("--label", required=True, help="platform label recorded in the results")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--noops", type=int, default=5)
+    parser.add_argument("--noop-only", action="store_true", help="time adjacent pairs on warmed targets")
     parser.add_argument("--edits", default="auto", help="auto (the frozen edits of the workload), none, or a comma list")
     parser.add_argument("--cpus", default="auto", help="taskset CPU list on Linux, auto or none")
     parser.add_argument("--jobs", type=int, default=0, help="cargo -j, 0 for one per CPU in use")
@@ -481,10 +502,10 @@ def main():
                  f"expected {args.expect_official_release}")
 
     workload = app.name
-    if args.edits == "auto":
-        kinds = EDITS.get(workload, ())
-    elif args.edits == "none":
+    if args.noop_only or args.edits == "none":
         kinds = ()
+    elif args.edits == "auto":
+        kinds = EDITS.get(workload, ())
     else:
         kinds = tuple(part for part in args.edits.split(",") if part)
     edits = [Edit(app, workload, kind) for kind in kinds]
@@ -494,7 +515,7 @@ def main():
     meta = dict(
         type="meta", schema=SCHEMA, label=args.label, workload=workload, host=host,
         pinning=dict(cpus=pin, note=pin_note), jobs=jobs, logical_cpus_in_use=cpu_count,
-        profile=PROFILE, rounds_requested=args.rounds, noops=args.noops, edits=list(kinds),
+        profile=PROFILE, rounds_requested=args.rounds, noops=args.noops, noop_only=args.noop_only, edits=list(kinds),
         time_budget_minutes=args.time_budget_minutes, unit_cache=args.frust_store,
         cache_state=args.cache_state, toolchain_prefixes=dict(official=str(official.prefix), frust=str(frust.prefix)),
         frust_env=extra, toolchains=versions,
