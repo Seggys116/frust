@@ -63,6 +63,8 @@ Incremental compilation is stock rustc's. A source edit invalidates compiler que
 
 The Cargo patch `0002-frustc-content-fingerprint.patch` changes Cargo's freshness check only when its compiler path is named `frustc`. After each such compile, Cargo stores a BLAKE3 checksum and length for dep-info inputs that rustc did not already checksum, and the next build compares them. A same-size edit whose timestamp was restored is therefore rebuilt. A file saved while the compiler ran gets no checksum, so the next build treats it as dirty. With `rustc` Cargo keeps its timestamp check.
 
+Cargo also records the device, inode, change time and length of a regular file when these agree before and after hashing. On supported local filesystems it can reuse the recorded checksum if those fields still match during the same boot. A changed identity, a symlink or older dep-info without a record takes the full checksum path.
+
 ## Release code generation and linking
 
 The requested optimization profile governs code generation. Any reuse before the whole-program step comes from stock rustc's incremental compilation, and fat LTO then optimizes the merged module. A pre-optimization cache that tried to add reuse before that step failed the paired Linux gate and was dropped, so fRust does not add reuse there. A changed whole-program input still runs the LTO pipeline.
