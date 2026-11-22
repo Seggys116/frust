@@ -642,7 +642,7 @@ def probe(args):
     sysroot = run([args.rustc, "--print", "sysroot"], timeout=30)["stdout"].strip()
     profdata = Path(sysroot) / "lib/rustlib" / host / "bin/llvm-profdata"
     context = {"rustc": args.rustc, "host": host, "deployment": DEPLOYMENT.get(host, "11.0"), "work": work, "out": out,
-               "sysroot_lib": f"{sysroot}/lib", "profdata": str(profdata) if profdata.exists() else None,
+               "sysroot_lib": f"{sysroot}/lib/rustlib/{host}/lib", "profdata": str(profdata) if profdata.exists() else None,
                "expected": {}, "compile_timeout": args.compile_timeout}
     wanted = set(args.variants.split(",")) if args.variants else None
     deadline = time.monotonic() + args.budget_minutes * 60
