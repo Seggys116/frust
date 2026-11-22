@@ -1,0 +1,351 @@
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 631772d..2d46c87 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -62,7 +62,7 @@ use std::env;
+ use std::ffi::{OsStr, OsString};
+ use std::fmt::Display;
+ use std::fs::{self, File};
+-use std::io::{BufRead, BufWriter, Write};
++use std::io::{self, BufRead, BufWriter, Read, Write};
+ use std::ops::{Deref, Range};
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, LazyLock};
+@@ -414,6 +414,10 @@ fn rustc(
+     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+ 
+     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
++    output_options.shared_empty = cfg!(unix).then(|| {
++        let build_dir = build_runner.files().layout(unit.kind).build_dir();
++        build_dir.root().join(SHARED_EMPTY_UNUSED_EXTERNS)
++    });
+     let package_id = unit.pkg.package_id();
+     let target = Target::clone(&unit.target);
+     let mode = unit.mode;
+@@ -618,6 +622,8 @@ fn rustc(
+                 format!("could not compile {name}{errors}{warnings}")
+             })
+         };
++        let finished = output_options.finish_cache(result.is_ok());
++        let result = result.and(finished);
+ 
+         if let Err(e) = result {
+             if let Some(diagnostic) = failed_scrape_diagnostic {
+@@ -2154,6 +2160,11 @@ struct OutputOptions {
+     warnings_seen: usize,
+     /// Tracks the number of errors we've seen so far.
+     errors_seen: usize,
++    /// Build-directory copy of [`EMPTY_UNUSED_EXTERNS`] that a cache holding only that
++    /// report may hard-link to; `None` keeps every cache private.
++    shared_empty: Option<PathBuf>,
++    /// Whether [`EMPTY_UNUSED_EXTERNS`] is withheld from a not yet created cache file.
++    held_empty: bool,
+ }
+ 
+ impl OutputOptions {
+@@ -2177,6 +2188,8 @@ impl OutputOptions {
+             show_diagnostics,
+             warnings_seen: 0,
+             errors_seen: 0,
++            shared_empty: None,
++            held_empty: false,
+         }
+     }
+ 
+@@ -2186,6 +2199,48 @@ impl OutputOptions {
+         }
+     }
+ 
++    /// Appends one line to the message cache. A first line that is exactly
++    /// [`EMPTY_UNUSED_EXTERNS`] is withheld until a second line or [`Self::finish_cache`].
++    fn cache_line(&mut self, line: &str) -> CargoResult<()> {
++        let Some((path, cell)) = &mut self.cache_cell else {
++            return Ok(());
++        };
++        if cell.get().is_none()
++            && !self.held_empty
++            && self.shared_empty.is_some()
++            && line == EMPTY_UNUSED_EXTERNS
++        {
++            self.held_empty = true;
++            return Ok(());
++        }
++        let f = cell.try_borrow_mut_with(|| create_message_cache(path))?;
++        if std::mem::take(&mut self.held_empty) {
++            f.write_all(EMPTY_UNUSED_EXTERNS.as_bytes())?;
++            f.write_all(b"\n")?;
++        }
++        debug_assert!(!line.contains('\n'));
++        f.write_all(line.as_bytes())?;
++        f.write_all(&[b'\n'])?;
++        Ok(())
++    }
++
++    /// Writes a withheld report, as a link to the shared copy when `share` is set
++    /// and the link verifies, or else as a private file.
++    fn finish_cache(&mut self, share: bool) -> CargoResult<()> {
++        if !std::mem::take(&mut self.held_empty) {
++            return Ok(());
++        }
++        let (Some((path, _)), Some(shared)) = (&self.cache_cell, &self.shared_empty) else {
++            return Ok(());
++        };
++        if share && link_shared_empty(shared, path) {
++            return Ok(());
++        }
++        let mut f = create_message_cache(path)?;
++        f.write_all(format!("{EMPTY_UNUSED_EXTERNS}\n").as_bytes())?;
++        Ok(())
++    }
++
+     fn for_fresh(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OutputOptions {
+         let cache_cell = None;
+ 
+@@ -2201,6 +2256,8 @@ impl OutputOptions {
+             show_diagnostics,
+             warnings_seen: 0,
+             errors_seen: 0,
++            shared_empty: None,
++            held_empty: false,
+         }
+     }
+ }
+@@ -2252,18 +2309,83 @@ fn on_stderr_line(
+     options: &mut OutputOptions,
+ ) -> CargoResult<()> {
+     if on_stderr_line_inner(state, line, package_id, manifest, target, options)? {
+-        // Check if caching is enabled.
+-        if let Some((path, cell)) = &mut options.cache_cell {
+-            // Cache the output, which will be replayed later when Fresh.
+-            let f = cell.try_borrow_mut_with(|| paths::create(path))?;
+-            debug_assert!(!line.contains('\n'));
+-            f.write_all(line.as_bytes())?;
+-            f.write_all(&[b'\n'])?;
+-        }
++        // Cache the output, which will be replayed later when Fresh.
++        options.cache_line(line)?;
+     }
+     Ok(())
+ }
+ 
++/// rustc's unused-externs report for a crate using every extern, under the
++/// `--force-warn=unused_crate_dependencies` Cargo passes last.
++const EMPTY_UNUSED_EXTERNS: &str =
++    r#"{"$message_type":"unused_extern","lint_level":"force-warn","unused_extern_names":[]}"#;
++const SHARED_EMPTY_UNUSED_EXTERNS: &str = ".frust-empty-unused-externs-v1";
++
++/// Creates a message cache file, replacing rather than writing through an existing entry.
++fn create_message_cache(path: &Path) -> CargoResult<File> {
++    let create = || File::options().write(true).create_new(true).open(path);
++    let file = match create() {
++        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
++            paths::remove_file(path)?;
++            create()
++        }
++        file => file,
++    };
++    file.with_context(|| format!("failed to create file `{}`", path.display()))
++}
++
++/// Hard-links `path` to the shared empty report, creating it if missing. Returns
++/// `false`, leaving `path` absent or replaceable, unless the link holds exactly the report.
++fn link_shared_empty(shared: &Path, path: &Path) -> bool {
++    let linked = match fs::hard_link(shared, path) {
++        Err(e) if e.kind() == io::ErrorKind::NotFound => {
++            publish_shared_empty(shared).and_then(|()| fs::hard_link(shared, path))
++        }
++        linked => linked,
++    };
++    match linked {
++        Ok(()) if holds_empty_report(path) => true,
++        Ok(()) => {
++            drop(fs::remove_file(path));
++            false
++        }
++        Err(e) => {
++            debug!("message cache `{}` not shared: {e}", path.display());
++            false
++        }
++    }
++}
++
++/// Publishes a complete, read-only shared report without replacing an existing one.
++fn publish_shared_empty(shared: &Path) -> io::Result<()> {
++    let dir = shared.parent().unwrap_or(Path::new("."));
++    let mut builder = tempfile::Builder::new();
++    builder.prefix(".frust-empty-unused-externs-");
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        builder.permissions(fs::Permissions::from_mode(0o444));
++    }
++    let mut tmp = builder.tempfile_in(dir)?;
++    tmp.write_all(format!("{EMPTY_UNUSED_EXTERNS}\n").as_bytes())?;
++    match tmp.persist_noclobber(shared) {
++        Err(e) if e.error.kind() != io::ErrorKind::AlreadyExists => Err(e.error),
++        _ => Ok(()),
++    }
++}
++
++/// Whether `path` is a regular file whose bytes are exactly the empty report line.
++fn holds_empty_report(path: &Path) -> bool {
++    let expected = EMPTY_UNUSED_EXTERNS.len() as u64 + 1;
++    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == expected) {
++        return false;
++    }
++    let mut bytes = Vec::with_capacity(expected as usize + 1);
++    File::open(path)
++        .and_then(|file| file.take(expected + 1).read_to_end(&mut bytes))
++        .is_ok_and(|_| bytes.strip_suffix(b"\n") == Some(EMPTY_UNUSED_EXTERNS.as_bytes()))
++}
++
+ /// Returns true if the line should be cached.
+ fn on_stderr_line_inner(
+     state: &JobState<'_, '_>,
+@@ -2798,3 +2920,146 @@ fn rustdoc_dep_info_loc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Path
+     loc.set_extension("d");
+     loc
+ }
++
++#[cfg(all(test, unix))]
++mod frust_empty_report_tests {
++    use super::*;
++    use std::os::unix::fs::MetadataExt;
++
++    const WARNING: &str = r#"{"$message_type":"diagnostic","level":"warning"}"#;
++
++    fn options(dir: &Path, name: &str) -> OutputOptions {
++        OutputOptions {
++            format: MessageFormat::Human,
++            cache_cell: Some((dir.join(name), OnceCell::new())),
++            show_diagnostics: true,
++            warnings_seen: 0,
++            errors_seen: 0,
++            shared_empty: Some(dir.join(SHARED_EMPTY_UNUSED_EXTERNS)),
++            held_empty: false,
++        }
++    }
++
++    fn cache(dir: &Path, name: &str, lines: &[&str], share: bool) -> fs::Metadata {
++        let mut options = options(dir, name);
++        options.clear_cache();
++        for line in lines {
++            options.cache_line(line).unwrap();
++        }
++        options.finish_cache(share).unwrap();
++        drop(options);
++        fs::symlink_metadata(dir.join(name)).unwrap()
++    }
++
++    fn empty() -> String {
++        format!("{EMPTY_UNUSED_EXTERNS}\n")
++    }
++
++    #[test]
++    fn empty_reports_link_one_read_only_copy() {
++        let dir = tempfile::tempdir().unwrap();
++        let a = cache(dir.path(), "a", &[EMPTY_UNUSED_EXTERNS], true);
++        let b = cache(dir.path(), "b", &[EMPTY_UNUSED_EXTERNS], true);
++        let shared = fs::metadata(dir.path().join(SHARED_EMPTY_UNUSED_EXTERNS)).unwrap();
++        assert_eq!(
++            (a.ino(), b.ino(), shared.nlink()),
++            (shared.ino(), shared.ino(), 3)
++        );
++        assert!(shared.permissions().readonly());
++        for name in ["a", "b"] {
++            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), empty());
++        }
++        assert_eq!(
++            fs::read_dir(dir.path()).unwrap().count(),
++            3,
++            "no temporary files left"
++        );
++    }
++
++    #[test]
++    fn other_messages_keep_private_bytes_in_order() {
++        let dir = tempfile::tempdir().unwrap();
++        let cases: [(&str, &[&str]); 4] = [
++            ("held", &[EMPTY_UNUSED_EXTERNS, WARNING]),
++            ("after", &[WARNING, EMPTY_UNUSED_EXTERNS]),
++            ("twice", &[EMPTY_UNUSED_EXTERNS, EMPTY_UNUSED_EXTERNS]),
++            (
++                "named",
++                &[
++                    r#"{"$message_type":"unused_extern","lint_level":"force-warn","unused_extern_names":["dep"]}"#,
++                ],
++            ),
++        ];
++        for (name, lines) in cases {
++            let meta = cache(dir.path(), name, lines, true);
++            assert_eq!(meta.nlink(), 1, "{name}");
++            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
++            assert_eq!(
++                fs::read_to_string(dir.path().join(name)).unwrap(),
++                text,
++                "{name}"
++            );
++        }
++        assert!(!dir.path().join(SHARED_EMPTY_UNUSED_EXTERNS).exists());
++        let mut silent = options(dir.path(), "silent");
++        silent.finish_cache(true).unwrap();
++        assert!(!dir.path().join("silent").exists());
++    }
++
++    #[test]
++    fn failures_and_conflicts_fall_back_to_private_files() {
++        let dir = tempfile::tempdir().unwrap();
++        let failed = cache(dir.path(), "failed", &[EMPTY_UNUSED_EXTERNS], false);
++        assert_eq!(failed.nlink(), 1);
++        let shared = dir.path().join(SHARED_EMPTY_UNUSED_EXTERNS);
++        for (name, setup) in [("conflict", 0), ("symlink", 1), ("directory", 2)] {
++            drop(fs::remove_file(&shared));
++            match setup {
++                0 => fs::write(&shared, "{}\n").unwrap(),
++                1 => {
++                    fs::write(dir.path().join("decoy"), "{}\n").unwrap();
++                    std::os::unix::fs::symlink(dir.path().join("decoy"), &shared).unwrap()
++                }
++                _ => fs::create_dir(&shared).unwrap(),
++            }
++            let meta = cache(dir.path(), name, &[EMPTY_UNUSED_EXTERNS], true);
++            assert!(meta.is_file() && meta.nlink() == 1, "{name}");
++            assert_eq!(
++                fs::read_to_string(dir.path().join(name)).unwrap(),
++                empty(),
++                "{name}"
++            );
++        }
++        assert_eq!(
++            fs::read_to_string(dir.path().join("failed")).unwrap(),
++            empty()
++        );
++        let mut unshared = options(dir.path(), "unshared");
++        unshared.shared_empty = None;
++        unshared.cache_line(EMPTY_UNUSED_EXTERNS).unwrap();
++        assert_eq!(
++            fs::read_to_string(dir.path().join("unshared")).unwrap(),
++            empty()
++        );
++    }
++
++    #[test]
++    fn rewriting_a_linked_cache_leaves_the_shared_copy_intact() {
++        let dir = tempfile::tempdir().unwrap();
++        let shared = dir.path().join(SHARED_EMPTY_UNUSED_EXTERNS);
++        cache(dir.path(), "a", &[EMPTY_UNUSED_EXTERNS], true);
++        cache(dir.path(), "b", &[EMPTY_UNUSED_EXTERNS], true);
++        cache(dir.path(), "a", &[WARNING], true);
++        let mut stale = options(dir.path(), "b");
++        stale.cache_line(WARNING).unwrap();
++        drop(stale);
++        for name in ["a", "b"] {
++            assert_eq!(
++                fs::read_to_string(dir.path().join(name)).unwrap(),
++                format!("{WARNING}\n")
++            );
++        }
++        assert_eq!(fs::read_to_string(&shared).unwrap(), empty());
++        assert_eq!(fs::metadata(&shared).unwrap().nlink(), 1);
++    }
++}

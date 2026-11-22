@@ -1,0 +1,272 @@
+diff --git a/src/compiler/job_queue/job.rs b/src/compiler/job_queue/job.rs
+index bf104c9..a666bdc 100644
+--- a/src/compiler/job_queue/job.rs
++++ b/src/compiler/job_queue/job.rs
+@@ -5,7 +5,7 @@ use std::mem;
+ 
+ use super::JobState;
+ use crate::compiler::fingerprint::DirtyReason;
+-use crate::compiler::locking::LockManager;
++use crate::compiler::{BuildRunner, Unit};
+ use crate::compiler::unit_join::{Readiness, UnitJoin};
+ use crate::util::CargoResult;
+ 
+@@ -14,7 +14,7 @@ use crate::util::CargoResult;
+ pub struct Job {
+     work: Work,
+     fresh: Freshness,
+-    join: Option<(UnitJoin, Work)>,
++    join: Option<UnitJoin>,
+ }
+ 
+ /// The basic unit of work.
+@@ -97,26 +97,45 @@ impl Job {
+         self.work = prev.then(next);
+     }
+ 
+-    pub(in crate::compiler) fn join_when_ready(&mut self, join: UnitJoin, replay: Work) {
+-        self.join = Some((join, replay));
++    pub(in crate::compiler) fn join_when_ready(&mut self, join: UnitJoin) {
++        self.join = Some(join);
+     }
+ 
+     pub(super) fn is_cooperative(&self) -> bool {
+         self.join.is_some()
+     }
+ 
+-    pub(super) fn prepare_to_run(&mut self, locks: &LockManager) -> CargoResult<bool> {
+-        let Some((join, _)) = &self.join else {
++    /// Settles a cooperative job once its unit lock is available, building the work
++    /// that readiness calls for. Returns `false` while the unit is still contended.
++    pub(super) fn prepare_to_run(
++        &mut self,
++        build_runner: &mut BuildRunner<'_, '_>,
++        unit: &Unit,
++    ) -> CargoResult<bool> {
++        let Some(join) = &self.join else {
+             return Ok(true);
+         };
+-        match join.readiness(locks)? {
++        let readiness = join.readiness(&build_runner.lock_manager)?;
++        let reuse = matches!(readiness, Readiness::Reuse);
++        let work = match readiness {
+             Readiness::Waiting => return Ok(false),
+-            Readiness::Reuse => {
+-                let (_, replay) = self.join.take().unwrap();
+-                self.work = replay;
+-                self.fresh = Freshness::Fresh;
++            Readiness::Reuse => join.reuse_work(build_runner, unit),
++            Readiness::Build => join.build_work(build_runner, unit),
++        };
++        let work = match work {
++            Ok(work) => work,
++            Err(err) => {
++                // The unit never starts, so peers must not wait on its lock.
++                drop(build_runner.lock_manager.unlock(&join.lock));
++                return Err(err);
+             }
+-            Readiness::Build => self.join = None,
++        };
++        self.join = None;
++        if reuse {
++            self.work = work;
++            self.fresh = Freshness::Fresh;
++        } else {
++            self.before(work);
+         }
+         Ok(true)
+     }
+diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
+index 0686c9c..7c37527 100644
+--- a/src/compiler/job_queue/mod.rs
++++ b/src/compiler/job_queue/mod.rs
+@@ -591,7 +591,8 @@ impl<'gctx> DrainState<'gctx> {
+         let mut index = self.pending_queue.len();
+         while self.has_extra_tokens() && index > 0 {
+             index -= 1;
+-            if !self.pending_queue[index].1.prepare_to_run(&build_runner.lock_manager)? {
++            let (unit, job, _) = &mut self.pending_queue[index];
++            if !job.prepare_to_run(build_runner, unit)? {
+                 continue;
+             }
+             let (unit, job, _) = self.pending_queue.remove(index);
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 079e747..631772d 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -249,16 +249,29 @@ fn compile<'gctx>(
+         } else {
+             let force = exec.force_rebuild(unit) || force_rebuild;
+             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+-            job.before(if job.freshness().is_dirty() {
+-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+-                    rustdoc(build_runner, unit)?
++            // A joinable cooperative unit builds its rustc work only once it must compile.
++            let probe = match &lock {
++                Some(_)
++                    if cooperative
++                        && job.freshness().is_dirty()
++                        && joinable(build_runner, unit, force)? =>
++                {
++                    JoinProbe::new(build_runner, unit)?
++                }
++                _ => None,
++            };
++            if probe.is_none() {
++                job.before(if job.freshness().is_dirty() {
++                    let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
++                        rustdoc(build_runner, unit)?
++                    } else {
++                        rustc(build_runner, unit, exec)?
++                    };
++                    work.then(link_targets(build_runner, unit, false)?)
+                 } else {
+-                    rustc(build_runner, unit, exec)?
+-                };
+-                work.then(link_targets(build_runner, unit, false)?)
+-            } else {
+-                replay_and_link(build_runner, unit)?
+-            });
++                    replay_and_link(build_runner, unit)?
++                });
++            }
+ 
+             // Guard dirty work with a unit lock and retain shared access after it completes.
+             if job.freshness().is_dirty() {
+@@ -270,22 +283,20 @@ fn compile<'gctx>(
+                     // We will hold this shared lock for the remainder of compilation to prevent
+                     // other cargo from re-compiling while we are still using the unit.
+                     if cooperative {
+-                        job.before(fingerprint::invalidate_before_build(build_runner, unit));
++                        // A joined unit invalidates in its deferred build work.
++                        if probe.is_none() {
++                            job.before(fingerprint::invalidate_before_build(build_runner, unit));
++                        }
+                     } else {
+                         build_runner.lock_manager.unlock(&lock)?;
+                     }
+-                    let probe = if cooperative && joinable(build_runner, unit, force)? {
+-                        JoinProbe::new(build_runner, unit)?
+-                    } else {
+-                        None
+-                    };
+                     if let Some(probe) = probe {
+                         // Wait for a producer and reuse its result when it is current.
+-                        let joined = replay_and_link(build_runner, unit)?;
+-                        job.join_when_ready(
+-                            unit_join::UnitJoin { lock: lock.clone(), probe },
+-                            joined,
+-                        );
++                        job.join_when_ready(unit_join::UnitJoin {
++                            lock: lock.clone(),
++                            probe,
++                            exec: Arc::clone(exec),
++                        });
+                     } else {
+                         job.before(prebuild_lock_exclusive(lock.clone()));
+                     }
+@@ -307,6 +318,17 @@ fn compile<'gctx>(
+     Ok(())
+ }
+ 
++/// Builds the work a cooperative unit runs once it holds its unit lock exclusively.
++fn joined_build(
++    build_runner: &mut BuildRunner<'_, '_>,
++    unit: &Unit,
++    exec: &Arc<dyn Executor>,
++) -> CargoResult<Work> {
++    let invalidate = fingerprint::invalidate_before_build(build_runner, unit);
++    let work = rustc(build_runner, unit, exec)?;
++    Ok(invalidate.then(work).then(link_targets(build_runner, unit, false)?))
++}
++
+ /// Builds the work that replays a unit's recorded output and links its targets
+ /// without compiling it.
+ fn replay_and_link(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Work> {
+@@ -461,6 +483,7 @@ fn rustc(
+         &rustc,
+     );
+     return Ok(Work::new(move |state| {
++        output_options.clear_cache();
+         // Artifacts are in a different location than typical units,
+         // hence we must assure the crate- and target-dependent
+         // directory is present.
+@@ -1201,6 +1224,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
+     }
+ 
+     Ok(Work::new(move |state| {
++        output_options.clear_cache();
+         add_custom_flags(
+             &mut rustdoc,
+             &build_script_outputs.lock().unwrap(),
+@@ -2141,8 +2165,6 @@ impl OutputOptions {
+ 
+     fn for_dirty(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OutputOptions {
+         let path = build_runner.files().message_cache_path(unit);
+-        // Remove old cache, ignore ENOENT, which is the common case.
+-        drop(fs::remove_file(&path));
+         let cache_cell = Some((path, OnceCell::new()));
+ 
+         let show_diagnostics = true;
+@@ -2158,6 +2180,12 @@ impl OutputOptions {
+         }
+     }
+ 
++    fn clear_cache(&self) {
++        if let Some((path, _)) = &self.cache_cell {
++            drop(fs::remove_file(path));
++        }
++    }
++
+     fn for_fresh(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OutputOptions {
+         let cache_cell = None;
+ 
+diff --git a/src/compiler/unit_join.rs b/src/compiler/unit_join.rs
+index 9bf037b..bc35452 100644
+--- a/src/compiler/unit_join.rs
++++ b/src/compiler/unit_join.rs
+@@ -6,9 +6,12 @@
+ //! Checks with build scripts use the normal path. Host libraries and proc macros, which a
+ //! check builds in full, join only when every output stays in the unit directory.
+ 
++use std::sync::Arc;
++
+ use super::build_context::BuildContext;
++use super::job_queue::Work;
+ use super::locking::{LockKey, LockManager};
+-use super::{CompileMode, CrateType, Unit, UserIntent};
++use super::{BuildRunner, CompileMode, CrateType, Executor, Unit, UserIntent};
+ use crate::compiler::fingerprint::JoinProbe;
+ use crate::util::errors::CargoResult;
+ use crate::workspace::TargetKind;
+@@ -110,6 +113,7 @@ pub(super) enum Readiness {
+ pub(super) struct UnitJoin {
+     pub lock: LockKey,
+     pub probe: JoinProbe,
++    pub exec: Arc<dyn Executor>,
+ }
+ 
+ impl UnitJoin {
+@@ -132,4 +136,22 @@ impl UnitJoin {
+             Ok(Readiness::Build)
+         }
+     }
++
++    /// Builds the replay and link work for a unit another process finished.
++    pub fn reuse_work(
++        &self,
++        build_runner: &mut BuildRunner<'_, '_>,
++        unit: &Unit,
++    ) -> CargoResult<Work> {
++        super::replay_and_link(build_runner, unit)
++    }
++
++    /// Builds the compile work for a unit this process holds exclusively.
++    pub fn build_work(
++        &self,
++        build_runner: &mut BuildRunner<'_, '_>,
++        unit: &Unit,
++    ) -> CargoResult<Work> {
++        super::joined_build(build_runner, unit, &self.exec)
++    }
+ }

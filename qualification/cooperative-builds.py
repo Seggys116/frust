@@ -107,6 +107,9 @@ def check_pair(root, args, cargo_options, second_packages, scenario=None,
     root.mkdir()
     create_workspace(root, proc_macro, build_script)
     first_packages = ("left",)
+    if scenario == "identical":
+        with (root / "left" / "src" / "lib.rs").open("a") as source:
+            source.write("pub fn warning_fixture() { let frust_replay_probe = 0; }\n")
     if scenario == "conflict":
         first_packages = ("shared", "independent")
         for member in first_packages:
@@ -200,6 +203,10 @@ def check_pair(root, args, cargo_options, second_packages, scenario=None,
                 raise RuntimeError("warm Cargo check failed")
             left_count = sum(1 for _ in root.glob("*.left.*"))
             warm_is_fresh = left_count == 1 and not any(root.glob("warm.*.*"))
+            for request in ("first", "second", "warm"):
+                messages = (root / f"{request}.log").read_text()
+                if "unused variable: `frust_replay_probe`" not in messages:
+                    raise RuntimeError(f"{request} did not report the cached warning")
             print(f"{root.name}: downstream compiler invocations {left_count}", flush=True)
         count = sum(1 for _ in root.glob(f"*.{held}.*"))
         print(f"{root.name}: shared compiler invocations {count}", flush=True)
