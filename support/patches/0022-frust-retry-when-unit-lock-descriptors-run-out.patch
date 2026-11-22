@@ -1,0 +1,38 @@
+diff --git a/src/compiler/locking.rs b/src/compiler/locking.rs
+--- a/src/compiler/locking.rs
++++ b/src/compiler/locking.rs
+@@ -71,7 +71,18 @@
+         let mut locks = self.locks.write().unwrap();
+         if !locks.contains_key(&key) {
+             let fs = Filesystem::new(key.0.clone());
+-            locks.insert(key.clone(), fs.open_rw_unlocked_create(&key.0)?);
++            let lock = fs.open_rw_unlocked_create(&key.0).map_err(|error| {
++                if error.chain().any(|cause| {
++                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
++                        matches!(io.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
++                    })
++                }) {
++                    super::unit_join::RetrySerial.into()
++                } else {
++                    error
++                }
++            })?;
++            locks.insert(key.clone(), lock);
+         }
+         Ok(key)
+     }
+diff --git a/src/compiler/unit_join.rs b/src/compiler/unit_join.rs
+--- a/src/compiler/unit_join.rs
++++ b/src/compiler/unit_join.rs
+@@ -16,9 +16,9 @@
+ use crate::util::errors::CargoResult;
+ use crate::workspace::TargetKind;
+ 
+-/// A cooperative check must release its reader locks before making progress.
++/// A cooperative check must release its unit locks and resume under the build lock.
+ #[derive(Debug, thiserror::Error)]
+-#[error("cooperative check stalled while retaining unit locks")]
++#[error("cooperative check requires the exclusive build lock")]
+ pub(crate) struct RetrySerial;
+ 
+ /// Whether this process may join units built by another Cargo process.
