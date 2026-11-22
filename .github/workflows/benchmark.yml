@@ -102,6 +102,7 @@ env:
   CARGO_TERM_COLOR: always
   # The official toolchain of the comparison. It is installed with exactly this version.
   OFFICIAL_RELEASE: "1.100.0"
+  RESOURCE_CONTROL_RELEASE: "0.6.0"
   FRUST_ENV: >-
     --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=1
     --frust-env FRUST_EXPERIMENTAL_RELR=1
@@ -722,11 +723,22 @@ jobs:
           CPU: ${{ matrix.cpu }}
         run: |
           FRUST_VARIANT=${CPU:-auto} "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
-            --version 0.5.2 --prefix "$HOME/frust-bench-control"
+            --version "$RESOURCE_CONTROL_RELEASE" --prefix "$HOME/frust-bench-control"
+          python3 -I - "$HOME/frust-bench-control/current/manifest.json" "$RESOURCE_CONTROL_RELEASE" "$CPU" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path, expected, variant = sys.argv[1:]
+          manifest = json.loads(Path(path).read_text())
+          if manifest["version"] != expected or (variant and manifest.get("variant") != variant):
+              raise SystemExit("resource control archive does not match the requested release and variant")
+          print(f"Resource control fRust {expected} for {manifest['target']} {variant}".rstrip())
+          PY
           mkdir -p "$RUNNER_TEMP/out/contention"
       - name: Measure contention
         if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
-        timeout-minutes: 30
+        timeout-minutes: 45
         env:
           LABEL: ${{ matrix.label }}
         run: |
@@ -738,7 +750,7 @@ jobs:
             --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
             --env FRUST_UNIT_CACHE=1 --env FRUST_UNIT_CACHE_DEBUG=1 \
             --env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --env FRUST_EXPERIMENTAL_RELR=0 \
-            --preset ci --states cold,warm,cache,edit --count 3 --rounds 8 --jobs 2 \
+            --preset ci --states cold,warm,cache,edit --count 3 --rounds 12 --jobs 2 \
             --size 200 --timeout 600 --summary-only \
             --work "$WORK/contention" --out "$out/concurrent-builds.ndjson" > "$out/summary.txt" 2>&1 || status=$?
           if [[ $status == 0 ]]; then
@@ -772,7 +784,7 @@ jobs:
           status=0
           python3 -I qualification/concurrent-builds.py \
             --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
-            --env FRUST_UNIT_CACHE=1 --preset ci --states cold,warm --count 3 --rounds 6 --jobs 2 --size 50 \
+            --env FRUST_UNIT_CACHE=1 --preset ci --states cold,warm --count 3 --rounds 8 --jobs 2 --size 50 \
             --timeout 60 --summary-only --lock-trace-library "$library" --work "$WORK/lock-trace" \
             --out "$out/locks.ndjson" > "$out/locks.txt" 2>&1 || status=$?
           {
@@ -784,7 +796,7 @@ jobs:
           exit "$status"
       - name: Measure overlapping proc-macro checks
         if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           baseline=$HOME/frust-bench-control/current/bin
           out=$RUNNER_TEMP/out/contention
@@ -792,7 +804,7 @@ jobs:
           candidate=frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc
           states=cold,warm,edit
           flags=(--a "$control" --b "$candidate"
-                 --proc-macro --scenarios overlap --mode check --states "$states" --count 3 --rounds 6
+                 --proc-macro --scenarios overlap --mode check --states "$states" --count 3 --rounds 12
                  --jobs 2 --size 50 --timeout 60 --summary-only)
           status=0
           python3 -I qualification/concurrent-builds.py "${flags[@]}" --work "$WORK/proc-macro" \
@@ -820,7 +832,7 @@ jobs:
           python3 -I qualification/concurrent-builds.py \
             --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
             --env FRUST_EXPERIMENTAL_UNIT_JOIN=1 --scenarios same-workspace --mode check --states warm \
-            --count 2 --rounds 6 --jobs 2 --size 20 --wide-members 384 --timeout 120 --summary-only \
+            --count 2 --rounds 12 --jobs 2 --size 20 --wide-members 384 --timeout 120 --summary-only \
             --work "$WORK/wide-check" --out "$out/wide-check.ndjson" > "$out/wide-check.txt" 2>&1 || status=$?
           {
             echo "### Cooperative checks, 388 workspace members (exit $status)"
@@ -858,7 +870,7 @@ jobs:
           python3 -I qualification/concurrent-builds.py \
             --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
             --env FRUST_UNIT_CACHE=1 --env FRUST_UNIT_CACHE_DEBUG=1 --env CARGO_INCREMENTAL=0 \
-            --scenarios independent --mode check --states cold,cache --count 1 --rounds 6 --jobs 2 --size 8 \
+            --scenarios independent --mode check --states cold,cache --count 1 --rounds 12 --jobs 2 --size 8 \
             --extra-vendored 96 --timeout 120 --summary-only --work "$WORK/cache-accounting" \
             --out "$out/cache-accounting.ndjson" > "$out/cache-accounting.txt" 2>&1 || status=$?
           {

@@ -71,9 +71,9 @@ static bool mark_seen(int fd, bool remember) {
     return (old & mask) != 0;
 }
 
-static uint64_t now_ns(void) {
+static uint64_t now_ns(clockid_t clock) {
     struct timespec stamp;
-    if (clock_gettime(CLOCK_MONOTONIC, &stamp) != 0) {
+    if (clock_gettime(clock, &stamp) != 0) {
         return 0;
     }
     return (uint64_t)stamp.tv_sec * UINT64_C(1000000000) + (uint64_t)stamp.tv_nsec;
@@ -91,13 +91,13 @@ static size_t describe_fd(int fd, char path[PATH_MAX]) {
 }
 
 static void record(const char *log, int fd, char op, int flags, uint64_t start,
-                   uint64_t end, int result, int error, const char *path, size_t path_len) {
+                   uint64_t end, int result, int error, uint64_t cpu, const char *path, size_t path_len) {
     if (!start || end < start) {
         return;
     }
     char line[128 + 2 * PATH_MAX];
-    int prefix = snprintf(line, 128, "%ld\t%d\t%c\t%d\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t",
-                          (long)getpid(), fd, op, flags, start, end, result, error);
+    int prefix = snprintf(line, 128, "%ld\t%d\t%c\t%d\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t%" PRIu64 "\t",
+                          (long)getpid(), fd, op, flags, start, end, result, error, cpu);
     if (prefix < 0 || prefix >= 128) {
         return;
     }
@@ -135,13 +135,16 @@ WRAPPER(flock)(int fd, int flags) {
 
     char path[PATH_MAX];
     size_t path_len = describe_fd(fd, path);
-    uint64_t start = now_ns();
+    uint64_t start = now_ns(CLOCK_MONOTONIC);
+    uint64_t cpu_start = now_ns(CLOCK_THREAD_CPUTIME_ID);
     errno = incoming;
     int result = real_flock(fd, flags);
     int error = errno;
-    uint64_t end = now_ns();
+    uint64_t cpu_end = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t end = now_ns(CLOCK_MONOTONIC);
+    uint64_t cpu = cpu_start && cpu_end >= cpu_start ? cpu_end - cpu_start : UINT64_MAX;
     (void)mark_seen(fd, true);
-    record(log, fd, 'F', flags, start, end, result, result == 0 ? 0 : error, path, path_len);
+    record(log, fd, 'F', flags, start, end, result, result == 0 ? 0 : error, cpu, path, path_len);
     errno = error;
     return result;
 }
@@ -156,12 +159,12 @@ WRAPPER(close)(int fd) {
         errno = incoming;
         return real_close(fd);
     }
-    uint64_t start = now_ns();
+    uint64_t start = now_ns(CLOCK_MONOTONIC);
     errno = incoming;
     int result = real_close(fd);
     int error = errno;
-    uint64_t end = now_ns();
-    record(log, fd, 'C', 0, start, end, result, result == 0 ? 0 : error, NULL, 0);
+    uint64_t end = now_ns(CLOCK_MONOTONIC);
+    record(log, fd, 'C', 0, start, end, result, result == 0 ? 0 : error, 0, NULL, 0);
     errno = error;
     return result;
 }

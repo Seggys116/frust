@@ -90,6 +90,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import runpy
 import shutil
 import signal
 import statistics
@@ -102,6 +103,7 @@ import time
 sys.dont_write_bytecode = True
 
 REPO = Path(__file__).resolve().parents[1]
+PAIRED = runpy.run_path(Path(__file__).with_name("paired_stats.py"))
 FIXED_MTIME = 1577836800
 MODES = ("build", "check", "test", "clippy", "doc", "fmt")
 LANE_MODES = MODES + ("ra",)
@@ -139,7 +141,7 @@ CACHE_WRITTEN = re.compile(r"frust-unit-cache: stats [^\r\n]*?\bwritten=([0-9.]+
 # Metrics the summary reports per side, and those it also turns into paired ratios. Wall is in neither.
 SUMMARY_METRICS = ("cpu_total", "max_rss_bytes", "total_bytes", "target_bytes", "store_bytes", "write_bytes",
                    "lock_waits_total", "cache_written_mib")
-RATIO_METRICS = ("cpu_total", "max_rss_bytes", "total_bytes", "write_bytes")
+RATIO_METRICS = ("cpu_total", "max_rss_bytes", "total_bytes", "write_bytes", "lock_waits_total")
 APFS_METRICS = ("apfs_write_bytes", "apfs_metadata_bytes", "apfs_footprint_bytes")
 LABELS = {
     "cpu": "ru_utime+ru_stime from wait4 for the command and the descendants it reaped; waiting on a "
@@ -550,9 +552,22 @@ def merge_counts(counts):
     return merged
 
 
+def paired_metric(values, parity, want):
+    interval = PAIRED["median_interval"](values)
+    evidence = PAIRED["interval_result"](interval, parity) if len(values) == want else "incomplete"
+    return {"median": statistics.median(values), "min": min(values), "max": max(values),
+            "pairs": len(values), "confidence95": interval, "evidence": evidence}
+
+
+def paired_display(metric):
+    interval = metric["confidence95"]
+    bound = "unavailable" if interval is None else f"{interval[0]:.4g} to {interval[1]:.4g}"
+    return f"{metric['median']:.4g} (95% interval {bound}, n={metric['pairs']}, {metric['evidence']})"
+
+
 def flock_stats(trace):
-    fields = ("attempts", "try_conflicts", "waits", "wait_ns", "holds", "exclusive_hold_ns", "shared_hold_ns",
-              "unfinished")
+    fields = ("attempts", "try_conflicts", "waits", "wait_ns", "contended_cpu_ns", "holds",
+              "exclusive_hold_ns", "shared_hold_ns", "unfinished")
     stats = {}
     held = {}
     conflicts = {}
@@ -570,10 +585,10 @@ def flock_stats(trace):
 
     records = []
     for line in trace.read_text(encoding="ascii").splitlines():
-        pid, fd, op, flags, start, end, result, error, path = line.split("\t")
+        pid, fd, op, flags, start, end, result, error, cpu, path = line.split("\t")
         key = (int(pid), int(fd))
-        records.append((int(end), int(start), key, op, int(flags), int(result), int(error), path))
-    for end, start, key, op, flags, result, error, path in sorted(records):
+        records.append((int(end), int(start), key, op, int(flags), int(result), int(error), int(cpu), path))
+    for end, start, key, op, flags, result, error, cpu, path in sorted(records):
         if op == "C":
             if result == 0:
                 finish(key, start)
@@ -581,6 +596,8 @@ def flock_stats(trace):
             continue
         if op != "F" or end < start:
             raise ValueError("invalid flock trace record")
+        if cpu == 2**64 - 1:
+            raise ValueError("flock trace is missing thread CPU time")
         name = Path(os.fsdecode(bytes.fromhex(path))).name if path != "-" else "unknown"
         if re.fullmatch(r"[a-f0-9]{64}\.lock", name):
             name = "cache-entry"
@@ -597,10 +614,12 @@ def flock_stats(trace):
             if conflicts.get(key) == (path, mode) and not flags & fcntl.LOCK_NB:
                 row["waits"] += 1
                 row["wait_ns"] += end - start
+                row["contended_cpu_ns"] += cpu
             held.setdefault(key, (name, mode, end))
         conflicts.pop(key, None)
         if result != 0 and flags & fcntl.LOCK_NB and error in (errno.EAGAIN, errno.EWOULDBLOCK):
             row["try_conflicts"] += 1
+            row["contended_cpu_ns"] += cpu
             conflicts[key] = (path, mode)
     for kind, _, _ in held.values():
         counters(kind)["unfinished"] += 1
@@ -1002,7 +1021,8 @@ class Harness:
             ok = {s.label: {r["round"]: r for r in self.records
                             if r["ok"] and r["side"] == s.label and (r["scenario"], r["count"], r["state"]) == cell.key()}
                   for s in self.sides}
-            entry = {"scenario": cell.scenario, "count": cell.count, "state": cell.state, "sides": {}, "ratios": {}}
+            entry = {"scenario": cell.scenario, "count": cell.count, "state": cell.state, "sides": {},
+                     "ratios": {}, "deltas": {}}
             for side in self.sides:
                 rows = list(ok[side.label].values())
                 entry["sides"][side.label] = {"ok_rounds": len(rows),
@@ -1010,12 +1030,13 @@ class Harness:
             shared = sorted(set(ok[a.label]) & set(ok[b.label]))
             for metric in ratio_metrics:
                 pairs = [(ok[a.label][r][metric], ok[b.label][r][metric]) for r in shared]
-                pairs = [(x, y) for x, y in pairs if x and y is not None]
+                pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
                 if pairs:
-                    ratios = [y / x for x, y in pairs]
-                    entry["ratios"][metric] = {"median": statistics.median(ratios), "min": min(ratios),
-                                               "max": max(ratios), "pairs": len(pairs),
-                                               "b_lower": sum(1 for x, y in pairs if y < x)}
+                    entry["deltas"][metric] = paired_metric([y - x for x, y in pairs], 0, self.args.rounds)
+                ratios = [y / x for x, y in pairs if x]
+                if ratios:
+                    entry["ratios"][metric] = {**paired_metric(ratios, 1.0, self.args.rounds),
+                                               "b_lower": sum(ratio < 1.0 for ratio in ratios)}
             entries.append(entry)
         return {"kind": "summary", "a": a.label, "b": b.label, "cells": entries}
 
@@ -1025,8 +1046,7 @@ class Harness:
             return
         data = self.summary_data(cells)
         self.write_record(data)
-        print(f"\nmedians over rounds; ratios are {data['b']}/{data['a']} paired by round, "
-              f"median (min..max) [pairs, {data['b']} lower]; wall time is not compared")
+        print(f"\npaired rounds, ratios {data['b']}/{data['a']} and differences {data['b']} - {data['a']}")
         for entry in data["cells"]:
             print(f"{entry['scenario']} n={entry['count']} {entry['state']}")
             for label, row in entry["sides"].items():
@@ -1042,34 +1062,52 @@ class Harness:
                           f"target={mib(row['target_bytes'])} store={mib(row['store_bytes'])} "
                           f"total={mib(row['total_bytes'])} [{row['ok_rounds']} ok]")
             for metric, ratio in entry["ratios"].items():
-                print(f"  ratio {metric:14} {ratio['median']:.3f} ({ratio['min']:.3f}..{ratio['max']:.3f}) "
-                      f"[{ratio['pairs']}, {ratio['b_lower']}]")
+                print(f"  ratio {metric:22} {paired_display(ratio)}")
+            for metric, delta in entry["deltas"].items():
+                if metric not in entry["ratios"] or entry["ratios"][metric]["pairs"] != delta["pairs"]:
+                    print(f"  delta {metric:22} {paired_display(delta)}")
 
     def lock_summary(self, cells):
         table = []
         for cell in cells:
-            entry = {"scenario": cell.scenario, "count": cell.count, "state": cell.state, "sides": {}}
+            entry = {"scenario": cell.scenario, "count": cell.count, "state": cell.state, "sides": {}, "deltas": {}}
             print(cell.name())
+            by_side = {}
             for side in self.sides:
                 rows = [r for r in self.records if r["ok"] and r["side"] == side.label
                         and (r["scenario"], r["count"], r["state"]) == cell.key()]
-                rounds = []
+                rounds = {}
                 for row in rows:
                     traces = [lane.get("flock", {}) for lane in row["lanes"]]
-                    rounds.append({kind: merge_counts(trace.get(kind) for trace in traces)
-                                   for kind in set().union(*traces)})
+                    rounds[row["round"]] = {kind: merge_counts(trace.get(kind) for trace in traces)
+                                            for kind in set().union(*traces)}
+                by_side[side.label] = rounds
                 locks = {}
-                for kind in sorted(set().union(*rounds)):
-                    fields = next(row[kind].keys() for row in rounds if kind in row)
-                    locks[kind] = {key: statistics.median(row.get(kind, {}).get(key, 0) for row in rounds)
+                for kind in sorted(set().union(*rounds.values())):
+                    fields = next(row[kind].keys() for row in rounds.values() if kind in row)
+                    locks[kind] = {key: statistics.median(row.get(kind, {}).get(key, 0) for row in rounds.values())
                                    for key in fields}
                     counts = locks[kind]
                     print(f"  {side.label:10} {kind:24} tries blocked={counts['try_conflicts']:g} "
                           f"waits={counts['waits']:g} wait={counts['wait_ns'] / 1e6:.2f}ms "
+                          f"contended CPU={counts['contended_cpu_ns'] / 1e3:.2f}us "
                           f"holds={counts['holds']:g} exclusive={counts['exclusive_hold_ns'] / 1e6:.2f}ms "
                           f"shared={counts['shared_hold_ns'] / 1e6:.2f}ms "
                           f"unfinished={counts['unfinished']:g}")
                 entry["sides"][side.label] = {"rounds": len(rounds), "locks": locks}
+            control, frust = (by_side[side.label] for side in self.sides)
+            shared = control.keys() & frust.keys()
+            if shared:
+                kinds = set().union(*(control[r].keys() | frust[r].keys() for r in shared))
+                for kind in sorted(kinds):
+                    deltas = {}
+                    for metric in ("waits", "try_conflicts", "contended_cpu_ns"):
+                        differences = [frust[r].get(kind, {}).get(metric, 0) - control[r].get(kind, {}).get(metric, 0)
+                                       for r in shared]
+                        deltas[metric] = paired_metric(differences, 0, self.args.rounds)
+                    entry["deltas"][kind] = deltas
+                    print(f"  {kind:24} wait delta {paired_display(deltas['waits'])} "
+                          f"contended CPU delta in ns {paired_display(deltas['contended_cpu_ns'])}")
             table.append(entry)
         self.write_record({"kind": "lock-summary", "cells": table})
 

@@ -6,8 +6,7 @@ Usage: make-charts.py INPUT... --out DIR [--run TEXT] [--min-pairs N]
 INPUT is a results file or a directory searched for *.jsonl. Each file is one job: a meta record
 followed by sample records. For every platform, workload and scenario the report pairs the
 official and fRust build of the same round and states the median of the paired CPU ratios with
-the number of pairs. A scenario where fRust is not faster at the median, where it is not faster
-in every pair, or that has too few pairs is flagged in the table and in the chart, never dropped.
+the number of pairs and a confidence interval. Incomplete and inconclusive scenarios stay visible.
 
 Platforms are grouped by label. The two Linux variants have their own labels (linux-x86_64 and
 linux-x86_64-v3), and so do the optional rustc-PGO candidates of macOS (macos-arm64-pgo and
@@ -25,10 +24,12 @@ import json
 import math
 import os
 import pathlib
+import runpy
 import statistics
 import sys
 from xml.sax.saxutils import escape
 
+PAIRED = runpy.run_path(pathlib.Path(__file__).with_name("paired_stats.py"))
 SCHEMA = "frust-compare-1"
 SCENARIOS = ("cold", "clean", "noop", "edit-leaf", "edit-wide", "edit-holdout")
 SCENARIO_NAMES = {
@@ -145,26 +146,36 @@ def median_events(items, key):
     return statistics.median(values) if values else 0
 
 
+def geometric_mean(ratios):
+    return math.exp(statistics.fmean(map(math.log, ratios))) if all(ratios) else 0.0
+
+
+def confidence(ratios, want, min_pairs):
+    interval = PAIRED["median_interval"](ratios)
+    result = PAIRED["interval_result"](interval, 1.0)
+    if len(ratios) < max(min_pairs, want):
+        result = "incomplete"
+    return interval, result
+
+
 def summarize(pairs, requested, min_pairs):
     rows = []
     for (label, workload, scenario), items in sorted(pairs.items()):
         ratios = [item["ratio"] for item in items]
         median = statistics.median(ratios)
-        flags = []
-        if median >= 1.0:
-            flags.append("NOT FASTER")
+        want = requested.get((label, workload), 0)
+        interval, result = confidence(ratios, want, min_pairs)
+        flags = [] if result == "lower" else [f"paired evidence {result}"]
         faster = sum(1 for ratio in ratios if ratio < 1.0)
-        if faster < len(ratios) and median < 1.0:
-            flags.append(f"slower in {len(ratios) - faster} of {len(ratios)} pairs")
         if len(ratios) < min_pairs:
             flags.append(f"few pairs (minimum {min_pairs})")
-        want = requested.get((label, workload), 0)
         if want and len(ratios) < want:
             flags.append(f"{len(ratios)} of {want} requested rounds")
         if scenario == "noop":
             rebuilt = max(max(item["compiled_official"], item["compiled_frust"]) for item in items)
             if rebuilt:
                 flags.append(f"no-op compiled up to {rebuilt} units")
+                result = "recompiled"
         cache = None
         if scenario in ("cold", "clean") and any(item["events"] for item in items):
             cache = f"{median_events(items, 'hit'):g} / {median_events(items, 'miss'):g}"
@@ -173,6 +184,7 @@ def summarize(pairs, requested, min_pairs):
             official_cpu=statistics.median(item["official"] for item in items),
             frust_cpu=statistics.median(item["frust"] for item in items),
             ratio=median, ratio_min=min(ratios), ratio_max=max(ratios), faster=faster,
+            confidence95=interval, evidence=result,
             faster_text=f"{faster} of {len(ratios)}", cache_hit_miss=cache, flags=flags, aggregate=False,
         ))
     # Geometric mean of the per-workload median ratios, one row per platform and scenario.
@@ -183,18 +195,29 @@ def summarize(pairs, requested, min_pairs):
         if len(members) < 2:
             continue
         ratios = [row["ratio"] for row in members]
-        mean = math.exp(sum(math.log(ratio) for ratio in ratios) / len(ratios)) if min(ratios) > 0 else 0.0
         faster = sum(1 for ratio in ratios if ratio < 1.0)
-        flags = ["NOT FASTER"] if mean >= 1.0 else []
-        if faster < len(ratios):
-            flags.append(f"not faster for {len(ratios) - faster} of {len(ratios)} workloads")
+        bounds = [
+            PAIRED["median_interval"]([pair["ratio"] for pair in pairs[label, row["workload"], scenario]],
+                                      simultaneous=len(members))
+            for row in members
+        ]
+        interval = tuple(geometric_mean(side) for side in zip(*bounds)) if all(bounds) else None
+        result = PAIRED["interval_result"](interval, 1.0)
+        if any(row["evidence"] in ("incomplete", "recompiled") for row in members):
+            result = "incomplete"
+        flags = [] if result == "lower" else [f"paired evidence {result}"]
         rows.append(dict(
             label=label, workload=AGGREGATE, scenario=scenario, pairs=sum(row["pairs"] for row in members),
-            official_cpu=None, frust_cpu=None, ratio=mean, ratio_min=min(ratios), ratio_max=max(ratios),
+            official_cpu=None, frust_cpu=None, ratio=geometric_mean(ratios), ratio_min=min(ratios), ratio_max=max(ratios),
+            confidence95=interval, evidence=result,
             faster=faster, faster_text=f"{faster} of {len(ratios)} workloads", cache_hit_miss=None,
             flags=flags, aggregate=True,
         ))
     return rows
+
+
+def format_interval(interval):
+    return "n/a" if interval is None else " to ".join(percent(bound) for bound in interval)
 
 
 def order_key(row):
@@ -349,16 +372,18 @@ def markdown(runs, skipped, rows, failures, notes, args):
     for label in labels:
         out += ["", f"## {label}", "",
                 "| Workload | Scenario | Official CPU | fRust CPU | fRust as % of official | Range over pairs "
-                "| Faster in | Pairs | fRust store hit / miss | Flags |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+                "| 95% paired interval | Faster in | Pairs | fRust store hit / miss | Flags |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
         for row in sorted((r for r in rows if r["label"] == label), key=order_key):
             out.append("| " + " | ".join(cell(part) for part in (
                 row["workload"], SCENARIO_NAMES.get(row["scenario"], row["scenario"]), seconds(row["official_cpu"]),
                 seconds(row["frust_cpu"]), percent(row["ratio"]),
-                f"{percent(row['ratio_min'])} to {percent(row['ratio_max'])}", row["faster_text"], row["pairs"],
+                f"{percent(row['ratio_min'])} to {percent(row['ratio_max'])}",
+                format_interval(row["confidence95"]), row["faster_text"], row["pairs"],
                 row["cache_hit_miss"] or "-", ", ".join(row["flags"]) or "none")) + " |")
-    out += ["", "The row named `all workloads` is the geometric mean of that scenario's per-workload medians; its "
-            "Pairs column is the total over workloads. Store hit / miss is the median number of unit cache "
+    out += ["", "The `all workloads` row is the geometric mean of the workload medians. Its interval combines "
+            "Bonferroni-adjusted bounds on those medians. A lower result requires the upper bound to be below 100%. "
+            "Use the per-workload rows to check for regressions and missing data. Store hit / miss is the median number of unit cache "
             "decisions per fRust build, counted from the cache's debug output.", "", "## Flags", ""]
     flagged = [row for row in sorted(rows, key=order_key) if row["flags"]]
     if flagged:
@@ -368,8 +393,7 @@ def markdown(runs, skipped, rows, failures, notes, args):
             out.append(f"- {row['label']}, {row['workload']}, {SCENARIO_NAMES.get(row['scenario'], row['scenario'])}: "
                        f"{percent(row['ratio'])} of official over {row['pairs']} pairs. {'; '.join(row['flags'])}.")
     else:
-        out.append("No scenario is flagged: at the median fRust used less CPU than official in every row, in every "
-                   "pair, with at least the minimum number of pairs.")
+        out.append("All measured intervals fall below 100%, with the requested number of pairs.")
     if failures:
         out += ["", "## Failed builds", ""]
         for (label, workload), count in sorted(failures.items()):
@@ -387,9 +411,9 @@ def markdown(runs, skipped, rows, failures, notes, args):
 FONT = "system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
 STYLE = (
     ".bg{fill:#ffffff}.t{fill:#1f2328}.m{fill:#59636e}.grid{stroke:#d1d9e0}.ref{stroke:#1f2328}"
-    ".ok{fill:#1f6feb}.bad{fill:#cf5a0a}"
+    ".ok{fill:#1f6feb}.bad{fill:#cf5a0a}.unresolved{fill:#8c959f}"
     "@media (prefers-color-scheme: dark){.bg{fill:#0d1117}.t{fill:#e6edf3}.m{fill:#9198a1}.grid{stroke:#30363d}"
-    ".ref{stroke:#e6edf3}.ok{fill:#58a6ff}.bad{fill:#ff9b54}}"
+    ".ref{stroke:#e6edf3}.ok{fill:#58a6ff}.bad{fill:#ff9b54}.unresolved{fill:#6e7681}}"
 )
 
 
@@ -413,7 +437,7 @@ def chart(label, rows, versions):
         y += head_h
         for row in (r for r in rows if r["scenario"] == scenario):
             pct = row["ratio"] * 100
-            colour = "bad" if row["ratio"] >= 1.0 else "ok"
+            colour = {"higher": "bad", "lower": "ok"}.get(row["evidence"], "unresolved")
             name = AGGREGATE + " (geometric mean)" if row["aggregate"] else row["workload"]
             text = f"{pct:.1f}%  n={row['pairs']}"
             if row["flags"]:
@@ -441,8 +465,7 @@ def chart(label, rows, versions):
         f'<text class="t" x="16" y="26" font-size="16" font-weight="bold">{escape(title)}</text>',
         f'<text class="m" x="16" y="46" font-size="12">Median of paired ratios, n = pairs. The dashed line is 100% '
         f'(equal CPU).</text>',
-        f'<text class="m" x="16" y="62" font-size="12">Bars left of the line: fRust used less CPU. A bar that reaches '
-        f'it or passes it is marked NOT FASTER.</text>',
+        f'<text class="m" x="16" y="62" font-size="12">Colour indicates whether the 95% interval falls below or above parity.</text>',
         f'<text class="m" x="16" y="78" font-size="12">CPU is user plus system time of the whole cargo process tree.</text>',
     ]
     parts = [

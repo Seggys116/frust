@@ -326,7 +326,7 @@ The frozen pair protocol jobs (`qualification/run-pairs.py`, control against fRu
 - A pair is one round. The two toolchains build one after the other on the same runner, and the order alternates between rounds. Each round also resets the store and the target, so rounds are independent. One unmeasured official build runs before the first round, so unpacking the fetched registry sources is not charged to whichever toolchain happens to build first.
 - On Linux both sides run under `taskset` on every available CPU with `-j` equal to that count. macOS has no `taskset`, so nothing is pinned there, `-j` is the logical CPU count, and the metadata record says so. macOS runners are virtual machines on shared hosts and their timing is noisier.
 - The reported figure per scenario is the median of the per-pair ratios of fRust CPU to official CPU, as a percent, with the number of pairs, the range of the pair ratios and the number of pairs in which fRust was faster. The medians of the two CPU columns are shown for scale. A summary row per scenario is the geometric mean of the per-workload medians.
-- A scenario is flagged, in the table and in the chart, when the median is not below 100 percent, when fRust was slower in some pairs, when fewer than three pairs were taken, when fewer pairs were taken than requested, or when a no-op rebuild compiled units. Nothing is dropped because it is unfavourable.
+- The report includes a two-sided 95% interval from ordered paired ratios. The bounds come from the exact binomial sign distribution. An all-workloads interval combines Bonferroni-adjusted workload bounds, so it reflects uncertainty in the geometric mean. Evidence of a win requires an upper bound below parity. Incomplete pairs and no-op rebuilds that compiled units are flagged.
 - Builds that exit non-zero are recorded, excluded from the pairs and listed in the report.
 - A job starts no round that would end after 285 minutes of measuring, so jobs stay inside the six hour limit of a hosted runner once the setup before the measurement (building and installing the toolchains, fetching the cohort) and the closing probe and upload are added. The default is eight rounds. A run cut short by the budget records a stop line, the report lists it in its run notes and flags the scenarios that have fewer pairs than requested, so a short series is visible as one.
 
@@ -347,15 +347,15 @@ Every `compare` job uploads its raw JSON lines (samples and page-cache records) 
 
 ### Contention and tool startup
 
-The Benchmark workflow's regex job on each platform also compares overlapping commands against the corresponding fRust 0.5.2 archive. It alternates eight pairs at the same workspace paths and records process-tree CPU, peak process RSS, lock wait messages and the allocated footprint of targets and caches. Linux records write bytes from `wait4` in 512-byte units. Both platforms report the unit-cache write counter separately. The matrix includes dev and release builds, check storms, and cold, warm, restored and edited targets.
+The Benchmark workflow's regex job on each platform also compares overlapping commands against the matching fRust 0.6.0 archive. It alternates twelve pairs at the same workspace paths and records process-tree CPU, peak process RSS, lock wait messages and the allocated footprint of targets and caches. Linux reports write bytes charged by the kernel to the process tree in 512-byte units. Both platforms report the unit-cache write counter separately. The report gives paired intervals for ratios and absolute differences. Differences include pairs where either side's measurement is zero. The matrix includes dev and release builds, check storms, and cold, warm, restored and edited targets.
 
 The same job captures thirty alternating pairs of version commands for `fcargo`, `frustc`, `fclippy`, `frustdoc`, `frustfmt` and `rust-analyzer`, with output parity checked on every pair. The contention and startup data are attached to the runner artifact separately from the official Rust release comparison.
 
-A separate diagnostic instruments `flock` and `close` in both toolchains. It counts nonblocking conflicts and records the duration of blocking calls after a conflict and of observed lock holds through unlock, conversion or close. Holds without a recorded end appear separately. On macOS the probe stays in the launched Cargo process so Xcode's linker tools can use their native ABI. The trace runs after the CPU and storage samples so the instrumentation overhead stays out of those comparisons.
+A separate diagnostic instruments `flock` and `close` in both toolchains. It records nonblocking conflicts, blocking waits, thread CPU spent in contended calls and elapsed lock hold durations. Holds without a recorded end appear separately. On macOS the probe stays in the launched Cargo process so Xcode's linker tools can use their native ABI. The trace runs after the ordinary CPU and storage samples.
 
 Overlapping checks of packages with a shared host proc macro have their own paired CPU and lock traces. The graph has no build scripts, so this exercises the units eligible for cooperative reuse in 0.6.0.
 
-The wide-graph check runs two concurrent warm checks of 388 workspace members. It enables cooperative checking in both toolchains and measures paired CPU time and peak process RSS over six rounds.
+The wide-graph check runs two concurrent warm checks of 388 workspace members. It enables cooperative checking in both toolchains and measures paired CPU time and peak process RSS over twelve rounds.
 
 Dispatch Benchmark with `protocol=false` and `platforms=macos-write-probe` to test write accounting on both macOS runners. The probe uses a private APFS disk image and checks fresh writes, rewrites, clones and idle activity. Its output reports completed writes to a virtual device and the APFS allocation delta for each phase.
 
@@ -363,7 +363,7 @@ The macOS regex jobs also run six paired storage trials on a private APFS image.
 
 Dispatch Benchmark with `protocol=false` and `platforms=macos-arm64-apfs` or `platforms=macos-x86_64-apfs` to run only the paired storage trials on that architecture. If a completed calibration misses the required payload or records too much idle or clone activity, it logs the phase counters and repeats calibration up to twice before failing the job.
 
-The Linux regex jobs use a check graph with 97 checksummed dependencies to measure cache accounting writes. Six pairs start with an empty store and six rebuild a clean target from the warmed store. These checks disable incremental compilation.
+The Linux regex jobs use a check graph with 97 checksummed dependencies to measure cache accounting writes. Twelve pairs start with an empty store and twelve rebuild a clean target from the warmed store. These checks disable incremental compilation.
 
 ## Results of the CI comparison
 
