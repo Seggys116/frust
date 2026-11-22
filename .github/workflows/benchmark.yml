@@ -54,6 +54,18 @@ name: Benchmark
 # model, OS, toolchain versions and commit, and both toolchains of a pair run on the same runner,
 # so the ratio does not depend on the runner. A result here is a reproducible check of the
 # pipeline and of the ratios on that hardware. It does not replace dated host evidence.
+#
+# Deciding with noisy runners. The two builds of a pair run back to back and the toolchain that goes
+# first flips every pair slot and every round (qualification/ci-bench.py), so drift of the host is
+# shared by the pair and an order effect cancels. Every job quietens its runner before it measures
+# (.github/scripts/quiet-runner.sh; the macOS work directory is named *.noindex so Spotlight skips it) and
+# records what that did. The report (qualification/make-charts.py) judges each cell with a trimmed mean of
+# the paired log ratios, an interval that is the wider of Yuen's and a stratified bootstrap, and an exact
+# sign test, and it writes verdict.json: the release bar is met only when every cell of cold build, clean
+# rebuild, no-op rebuild and leaf edit is a win on all four platforms. rounds defaults to auto, which
+# gives each job as many rounds as its platform needs for a decision and lets the 285 minute measuring
+# budget stop the slow ones; rounds may also be written N or NxS, which runs S shards of N rounds on
+# separate runners and pools their pairs. The default dispatch is the one to run for a verdict.
 on:
   workflow_dispatch:
     inputs:
@@ -75,11 +87,11 @@ on:
         description: Platforms for the official comparison (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-arm64-fingerprint or macos-x86_64-fingerprint for warm no-op measurements, macos-write-probe for storage calibration, macos-pgo-probe for compiler launch diagnostics, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
-        description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
-        default: "8"
+        description: Rounds per job of the official comparison, one pair per scenario each. auto (30 on Linux, up to 40 on macOS), N, or NxS for S shards of N rounds on separate runners whose pairs are pooled. A job stops cleanly at its time budget and the report says so.
+        default: "auto"
       noops:
-        description: No-op builds per round in the official comparison. The median is the sample.
-        default: "5"
+        description: No-op builds of each toolchain per round in the official comparison, alternating between the two. auto is 21 (1 for the fingerprint diagnostic).
+        default: "auto"
       cache-state:
         description: Page-cache state of the toolchains in the official comparison. evicted drops both toolchains' library pages before every build (Linux only)
         type: choice
@@ -124,6 +136,7 @@ jobs:
       v3-builds: ${{ steps.plan.outputs.v3-builds }}
       mac-builds: ${{ steps.plan.outputs.mac-builds }}
       mac-pgo-builds: ${{ steps.plan.outputs.mac-pgo-builds }}
+      packages: ${{ steps.plan.outputs.packages }}
       run-linux: ${{ steps.plan.outputs.run-linux }}
       apfs-only: ${{ steps.plan.outputs.apfs-only }}
       fingerprint-only: ${{ steps.plan.outputs.fingerprint-only }}
@@ -140,6 +153,7 @@ jobs:
           python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
+          import re
 
           # toolchain is the name of the artifact the Toolchains workflow uploads (toolchain-<toolchain>-<target>)
           # and cpu is what package-release.sh records as the variant; it is empty where there is no choice.
@@ -189,9 +203,12 @@ jobs:
 
           if os.environ["CACHE_STATE"] not in CACHE_STATES:
               raise SystemExit(f"unknown cache-state {os.environ['CACHE_STATE']!r}, expected one of {', '.join(CACHE_STATES)}")
-          for name in ("ROUNDS", "NOOPS"):
-              if not os.environ[name].isdigit() or int(os.environ[name]) < 1:
-                  raise SystemExit(f"{name.lower()} must be a whole number of at least 1, got {os.environ[name]!r}")
+          rounds_spec = re.fullmatch(r"(auto|[1-9][0-9]*)(?:x([1-9][0-9]?))?", os.environ["ROUNDS"].strip().lower())
+          if not rounds_spec:
+              raise SystemExit(f"rounds must be auto, a whole number of at least 1, or NxS such as 40x2, got {os.environ['ROUNDS']!r}")
+          noops_spec = os.environ["NOOPS"].strip().lower()
+          if noops_spec != "auto" and (not noops_spec.isdigit() or int(noops_spec) < 1):
+              raise SystemExit(f"noops must be auto or a whole number of at least 1, got {os.environ['NOOPS']!r}")
           selection = os.environ["PLATFORMS"].strip()
           write_probe = selection == "macos-write-probe"
           pgo_probe = selection == "macos-pgo-probe"
@@ -205,9 +222,38 @@ jobs:
           else:
               platforms = [] if write_probe or pgo_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
               workloads = choose("COHORTS", WORKLOADS, not platforms)
+          # Rounds a job takes when rounds is auto. Linux pairs agree within a couple of percent, so 30 settle
+          # them. A hosted macOS runner is a shared virtual machine whose pairs scatter widely, so it takes
+          # as many as the measuring budget allows up to 40. The fingerprint diagnostic times adjacent no-op
+          # builds, which are cheap, and wants a hundred or more.
+          # Every edit of the wide kind is measured every second round on macOS, to buy rounds for the cells of
+          # the bar. The clean target that the edits start from is built every round either way.
+          shards = int(rounds_spec.group(2) or 1)
+
+          def entry(platform, workload, shard):
+              macos = platform.startswith("macos")
+              if rounds_spec.group(1) != "auto":
+                  rounds = int(rounds_spec.group(1))
+              elif fingerprint_only:
+                  rounds = 120
+              else:
+                  rounds = 40 if macos else 30
+              if noops_spec != "auto":
+                  noops = int(noops_spec)
+              else:
+                  noops = 1 if fingerprint_only else 21
+              return dict(
+                  PLATFORMS[platform], workload=workload, rounds=rounds, noops=noops, shard=shard, shards=shards,
+                  suffix="" if shards == 1 else f"-s{shard}", stride="edit-wide=2" if macos else "",
+              )
+
+
           matrix = [
-              dict(PLATFORMS[platform], workload=workload) for platform in platforms for workload in workloads
+              entry(platform, workload, shard)
+              for platform in platforms for workload in workloads for shard in range(shards)
           ]
+          # One release archive per platform, shared by the compare jobs of its workloads.
+          packages = [dict(PLATFORMS[platform]) for platform in platforms]
           mac = [
               {"variant": "frust", "target": PLATFORMS[p]["target"], "os": PLATFORMS[p]["os"]}
               for p in platforms
@@ -238,6 +284,7 @@ jobs:
           print(f"v3-builds={dump(v3)}")
           print(f"mac-builds={dump(mac)}")
           print(f"mac-pgo-builds={dump(mac_pgo)}")
+          print(f"packages={dump(packages)}")
           print(f"run-linux={'true' if 'linux' in platforms else 'false'}")
           print(f"apfs-only={dump(apfs_only)}")
           print(f"fingerprint-only={dump(fingerprint_only)}")
@@ -575,6 +622,75 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+  # The release archive of each platform, made once, by the script and arguments of the package job of the
+  # Release workflow, and shared by every compare job of that platform. Packing a toolchain (the official
+  # components, a gzip of more than a gigabyte, the manifest) used to run in each of the four workload jobs
+  # of a platform; now it runs once, and all four install the same bytes with the same frust-install, which
+  # is also what makes their results poolable. frust-install is built here too, with its target directory in
+  # the job's temporary area.
+  package:
+    name: package ${{ matrix.label }}
+    needs: [plan, toolchains, toolchains-v3, toolchains-macos, toolchains-macos-pgo]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.packages != '[]' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require the toolchain build
+        env:
+          RESULT: ${{ runner.os == 'Linux' && (matrix.toolchain == 'frust-v3' && needs.toolchains-v3.result || needs.toolchains.result) || (matrix.pgo == 'rustc' && needs.toolchains-macos-pgo.result || needs.toolchains-macos.result) }}
+          TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          if [[ $RESULT != success ]]; then
+            echo "::error::The $TOOLCHAIN toolchain build for $TARGET finished as $RESULT"
+            exit 1
+          fi
+      - uses: ./.github/actions/setup-rust
+      - name: Build frust-install
+        working-directory: crates
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/frust-install-target
+        run: cargo build --release --locked -p frust-rs --bin frust-install
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/toolchain
+      # The archive carries the official components of its platform, which package-release.sh downloads
+      # and checks against the pins of support/official-components.lock. The downloads are cached.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/official-components
+          key: official-components-${{ matrix.target }}-${{ hashFiles('support/official-components.lock') }}
+      - name: Package the release files
+        env:
+          TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          FRUST_OFFICIAL_CACHE: ${{ runner.temp }}/official-components
+          CPU: ${{ matrix.cpu }}
+        run: |
+          command -v zstd > /dev/null || brew install zstd
+          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          files=$RUNNER_TEMP/release-files
+          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst" "$version" "$TARGET" \
+            "$RUNNER_TEMP/frust-install-target/release/frust-install" "$files" ${CPU:+"$CPU"}
+          cp "$RUNNER_TEMP/frust-install-target/release/frust-install" "$files/frust-install"
+          rm -f "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst"
+          ls -l "$files"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.label }}
+          path: ${{ runner.temp }}/release-files
+          compression-level: 0
+          retention-days: 7
+
   # Official Rust against the fRust toolchain with its unit cache. One job per platform and
   # workload, so the largest job (rounds of cold, clean, no-op and edit builds with fat LTO)
   # stays well inside the six hour limit. The driver stops starting rounds at 285 minutes, which
@@ -582,8 +698,8 @@ jobs:
   # it inside the 350 minute job limit, and the results then say how many pairs were taken. The
   # report lists every such stop, so a short series is never mistaken for a full one.
   compare:
-    name: compare ${{ matrix.label }} ${{ matrix.workload }}
-    needs: [plan, toolchains, toolchains-v3, toolchains-macos, toolchains-macos-pgo]
+    name: compare ${{ matrix.label }} ${{ matrix.workload }}${{ matrix.suffix && format(' shard {0}', matrix.shard) || '' }}
+    needs: [plan, package, toolchains, toolchains-v3, toolchains-macos, toolchains-macos-pgo]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
@@ -644,51 +760,18 @@ jobs:
             sudo chown "$USER" /mnt/bench
             echo "WORK=/mnt/bench" >> "$GITHUB_ENV"
           else
-            mkdir -p "$RUNNER_TEMP/bench"
-            echo "WORK=$RUNNER_TEMP/bench" >> "$GITHUB_ENV"
+            # A directory named *.noindex is skipped by Spotlight, which would otherwise index every
+            # file the builds write.
+            mkdir -p "$RUNNER_TEMP/bench.noindex"
+            echo "WORK=$RUNNER_TEMP/bench.noindex" >> "$GITHUB_ENV"
           fi
-      # frust-install is built here, with its target directory in the job's temporary area, and
-      # then installs the toolchain the way a user's copy is installed.
-      - uses: ./.github/actions/setup-rust
-        if: steps.cpu.outputs.runnable != 'false'
-      - name: Build frust-install
-        if: steps.cpu.outputs.runnable != 'false'
-        working-directory: crates
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/frust-install-target
-        run: cargo build --release --locked -p frust-rs --bin frust-install
+      # The release archive that the package job of this run made from the toolchain build, with the frust-install
+      # it built (see the package job). frust-install installs the archive the way a user's copy is installed.
       - uses: actions/download-artifact@v8
         if: steps.cpu.outputs.runnable != 'false'
         with:
-          name: toolchain-${{ matrix.toolchain }}-${{ matrix.target }}
-          path: ${{ runner.temp }}/toolchain
-      # The archive carries the official components of its platform, which package-release.sh downloads
-      # and checks against the pins of support/official-components.lock. The downloads are cached.
-      - uses: actions/cache@v6
-        if: steps.cpu.outputs.runnable != 'false'
-        with:
-          path: ${{ runner.temp }}/official-components
-          key: official-components-${{ matrix.target }}-${{ hashFiles('support/official-components.lock') }}
-      # The same script and arguments as the package job of the Release workflow, so the archive
-      # has the release layout: manifest with the release id and variant, frust-install inside.
-      - name: Package the release files
-        if: steps.cpu.outputs.runnable != 'false'
-        env:
-          TARGET: ${{ matrix.target }}
-          TOOLCHAIN: ${{ matrix.toolchain }}
-          FRUST_OFFICIAL_CACHE: ${{ runner.temp }}/official-components
-          CPU: ${{ matrix.cpu }}
-        run: |
-          command -v zstd > /dev/null || brew install zstd
-          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          files=$RUNNER_TEMP/release-files
-          .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst" "$version" "$TARGET" \
-            "$RUNNER_TEMP/frust-install-target/release/frust-install" "$files" ${CPU:+"$CPU"}
-          rm -f "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst"
-          suffix=
-          if [[ $CPU == v3 ]]; then suffix=-v3; fi
-          echo "RELEASE_ARCHIVE=$files/frust-toolchain-$TARGET$suffix.tar.gz" >> "$GITHUB_ENV"
-          ls -l "$files"
+          name: release-${{ matrix.label }}
+          path: ${{ runner.temp }}/release-files
       # The prefix is under the home directory, on the file system rustup uses for the official
       # toolchain. Its current/bin is the fRust toolchain that the driver measures.
       - name: Install the fRust toolchain with frust-install
@@ -696,12 +779,18 @@ jobs:
         if: steps.cpu.outputs.runnable != 'false'
         env:
           CPU: ${{ matrix.cpu }}
+          TARGET: ${{ matrix.target }}
         run: |
+          files=$RUNNER_TEMP/release-files
+          chmod +x "$files/frust-install"
+          suffix=
+          if [[ $CPU == v3 ]]; then suffix=-v3; fi
+          archive=$files/frust-toolchain-$TARGET$suffix.tar.gz
           prefix=$HOME/frust-bench-prefix
           rm -rf "$prefix"
-          "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
-            --archive "$RELEASE_ARCHIVE" --checksum "$RELEASE_ARCHIVE.sha256" --prefix "$prefix"
-          rm -rf "$RUNNER_TEMP/release-files"
+          "$files/frust-install" install --archive "$archive" --checksum "$archive.sha256" --prefix "$prefix"
+          rm -f "$archive" "$archive.sha256" "$files"/*.id
+          echo "FRUST_INSTALL=$files/frust-install" >> "$GITHUB_ENV"
           if [[ -n $CPU ]]; then
             grep -F "\"variant\":\"$CPU\"" "$prefix/current/manifest.json"
           fi
@@ -739,6 +828,11 @@ jobs:
         run: |
           PATH="$OFFICIAL_BIN:$PATH" qualification/fetch-cohort.sh "$WORKLOAD" "$WORK/cohorts" "$OFFICIAL_BIN/cargo"
           (cd "$WORK/cohorts/$WORKLOAD" && PATH="$FRUST_BIN:$PATH" "$FRUST_BIN/cargo" fetch --locked)
+      # Background services that spend CPU or disk while a benchmark runs are stopped, and the script's note of
+      # what it did, and of what was still busy afterwards, goes into the results.
+      - name: Quieten the runner
+        if: steps.cpu.outputs.runnable != 'false' && needs.plan.outputs.apfs-only != 'true'
+        run: .github/scripts/quiet-runner.sh "$RUNNER_TEMP/quiet-note.txt"
       # The experimental switches are off: the comparison measures the shipped defaults. The driver
       # records the page-cache state of both toolchains before the first timed build and after the
       # last, and under cache-state evicted drops both toolchains' library pages before every build.
@@ -747,8 +841,9 @@ jobs:
         env:
           WORKLOAD: ${{ matrix.workload }}
           LABEL: ${{ matrix.label }}
-          ROUNDS: ${{ inputs.rounds }}
-          NOOPS: ${{ inputs.noops }}
+          ROUNDS: ${{ matrix.rounds }}
+          NOOPS: ${{ matrix.noops }}
+          STRIDE: ${{ matrix.stride }}
           CACHE_STATE: ${{ inputs.cache-state }}
           FINGERPRINT_ONLY: ${{ needs.plan.outputs.fingerprint-only }}
         run: |
@@ -759,6 +854,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           scenario=()
           if [[ $FINGERPRINT_ONLY == true ]]; then scenario+=(--noop-only); fi
+          if [[ -n $STRIDE ]]; then scenario+=(--stride "$STRIDE"); fi
           python3 -I qualification/ci-bench.py \
             --official-cargo "$OFFICIAL_BIN/cargo" --official-rustc "$OFFICIAL_BIN/rustc" \
             --expect-official-release "$OFFICIAL_RELEASE" \
@@ -766,14 +862,15 @@ jobs:
             --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
             --cache-state "$CACHE_STATE" "${scenario[@]}" \
             --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --rounds "$ROUNDS" --noops "$NOOPS" \
+            --note-file "$RUNNER_TEMP/quiet-note.txt" \
             --time-budget-minutes 285 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
       - name: Measure the native cost of content fingerprints
         if: needs.plan.outputs.fingerprint-only == 'true'
         timeout-minutes: 20
         env:
           LABEL: ${{ matrix.label }}
-          ROUNDS: ${{ inputs.rounds }}
-          NOOPS: ${{ inputs.noops }}
+          ROUNDS: ${{ matrix.rounds }}
+          NOOPS: ${{ matrix.noops }}
         run: |
           cmp -s "$FRUST_BIN/rustc" "$FRUST_BIN/frustc"
           out=$RUNNER_TEMP/out/fingerprint-diagnostic
@@ -798,11 +895,11 @@ jobs:
       # report's official CPU comparison, which reads *.jsonl.
       - name: Install the control release for resource measurements
         id: resource-control
-        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && matrix.workload == 'regex' && needs.plan.outputs.fingerprint-only != 'true' }}
+        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && matrix.workload == 'regex' && matrix.shard == 0 && needs.plan.outputs.fingerprint-only != 'true' }}
         env:
           CPU: ${{ matrix.cpu }}
         run: |
-          FRUST_VARIANT=${CPU:-auto} "$RUNNER_TEMP/frust-install-target/release/frust-install" install \
+          FRUST_VARIANT=${CPU:-auto} "$FRUST_INSTALL" install \
             --version "$RESOURCE_CONTROL_RELEASE" --prefix "$HOME/frust-bench-control"
           python3 -I - "$HOME/frust-bench-control/current/manifest.json" "$RESOURCE_CONTROL_RELEASE" "$CPU" <<'PY'
           import json
@@ -988,7 +1085,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: compare-${{ matrix.label }}-${{ matrix.workload }}
+          name: compare-${{ matrix.label }}-${{ matrix.workload }}${{ matrix.suffix }}
           path: ${{ runner.temp }}/out
           retention-days: 90
 
@@ -1009,9 +1106,20 @@ jobs:
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 -I qualification/make-charts.py "$RUNNER_TEMP/raw" --out "$RUNNER_TEMP/report" --run "$RUN_URL" --min-pairs 3
+          python3 -I qualification/make-charts.py "$RUNNER_TEMP/raw" --out "$RUNNER_TEMP/report" --run "$RUN_URL" --min-pairs 10
           cat "$RUNNER_TEMP/report/results.md" >> "$GITHUB_STEP_SUMMARY"
           ls -l "$RUNNER_TEMP/report"
+          # The decision is data, not an exit code: a dispatch for a smoke test or a diagnostic is not a failure.
+          python3 -I - "$RUNNER_TEMP/report/verdict.json" <<'PY'
+          import json
+          import sys
+
+          verdict = json.load(open(sys.argv[1]))
+          state = "met" if verdict["bar_met"] else "not met"
+          print(f"::notice title=release bar {state}::{len(verdict['failing'])} failing and {len(verdict['missing'])} missing cells of {len(verdict['cells'])}")
+          for item in verdict["failing"] + verdict["missing"]:
+              print(f"::warning title=release bar::{item}")
+          PY
       - uses: actions/upload-artifact@v7
         with:
           name: benchmark-report
