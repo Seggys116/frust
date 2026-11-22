@@ -756,6 +756,28 @@ jobs:
             --cache-state "$CACHE_STATE" \
             --app "$WORK/cohorts/$WORKLOAD" --label "$LABEL" --rounds "$ROUNDS" --noops "$NOOPS" \
             --time-budget-minutes 285 --work "$WORK/run" --out "$RUNNER_TEMP/out/results.jsonl"
+      - name: Measure the native cost of content fingerprints
+        if: ${{ !cancelled() && steps.install-frust.outcome == 'success' && runner.os == 'macOS' && matrix.workload == 'regex' && inputs.cohorts == 'regex' && needs.plan.outputs.apfs-only != 'true' }}
+        timeout-minutes: 20
+        env:
+          LABEL: ${{ matrix.label }}
+          ROUNDS: ${{ inputs.rounds }}
+          NOOPS: ${{ inputs.noops }}
+        run: |
+          cmp -s "$FRUST_BIN/rustc" "$FRUST_BIN/frustc"
+          out=$RUNNER_TEMP/out/fingerprint-diagnostic
+          mkdir -p "$out"
+          status=0
+          python3 -I qualification/ci-bench.py \
+            --official-cargo "$FRUST_BIN/fcargo" --official-rustc "$FRUST_BIN/rustc" \
+            --frust-cargo "$FRUST_BIN/fcargo" --frust-rustc "$FRUST_BIN/frustc" \
+            --expect-official-release "$OFFICIAL_RELEASE" --frust-store off --edits none \
+            --frust-env FRUST_EXPERIMENTAL_CODEGEN_CACHE=0 --frust-env FRUST_EXPERIMENTAL_RELR=0 \
+            --app "$WORK/cohorts/regex" --label "$LABEL-fingerprint" --rounds "$ROUNDS" --noops "$NOOPS" \
+            --time-budget-minutes 17 --work "$WORK/fingerprint" --out "$out/samples.ndjson" \
+            > "$out/measure.txt" 2>&1 || status=$?
+          if [[ $status != 0 ]]; then tail -n 30 "$out/measure.txt"; fi
+          exit "$status"
       # Use the preceding fRust release as the control for resource changes. Both runs use the
       # same fixture paths and cache diagnostics. The .ndjson file keeps this series out of the
       # report's official CPU comparison, which reads *.jsonl.

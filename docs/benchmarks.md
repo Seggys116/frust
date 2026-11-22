@@ -357,6 +357,8 @@ The Benchmark workflow's regex job on each platform also compares overlapping co
 
 The same job captures thirty alternating pairs of version commands for `fcargo`, `frustc`, `fclippy`, `frustdoc`, `frustfmt` and `rust-analyzer`, with output parity checked on every pair. The contention and startup data are attached to the runner artifact separately from the official Rust release comparison.
 
+A macOS dispatch with `cohorts=regex` also measures the cost of content fingerprints. Both sides use the same `fcargo` and byte-identical compiler, with the unit cache off. The `rustc` name selects timestamp checks and `frustc` selects content checks. The paired samples are in `fingerprint-diagnostic/samples.ndjson`.
+
 A separate diagnostic instruments `flock` and `close` in both toolchains. It records nonblocking conflicts, blocking waits, thread CPU spent in contended calls and elapsed lock hold durations. Holds without a recorded end appear separately. On macOS the probe stays in the launched Cargo process so Xcode's linker tools can use their native ABI. The trace runs after the ordinary CPU and storage samples.
 
 Overlapping checks of packages with a shared host proc macro have their own paired CPU and lock traces. The graph has no build scripts, so this exercises the units eligible for cooperative reuse in 0.6.0.
