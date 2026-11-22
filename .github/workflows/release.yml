@@ -164,6 +164,8 @@ jobs:
       - name: Prepare the runner
         run: |
           command -v zstd > /dev/null || brew install zstd
+          # pigz compresses the archive on every core; package-release.sh falls back to gzip without it.
+          command -v pigz > /dev/null || { if [[ $RUNNER_OS == macOS ]]; then brew install pigz; else sudo apt-get install -y --no-install-recommends pigz; fi; }
           echo "FRUST_OFFICIAL_CACHE=$RUNNER_TEMP/official-components" >> "$GITHUB_ENV"
       # The official packages are pinned by hash, so a cached download is used only when it still matches
       # (fetch-official-components.sh checks), and a changed lock gets a new cache key.

@@ -677,6 +677,8 @@ jobs:
           CPU: ${{ matrix.cpu }}
         run: |
           command -v zstd > /dev/null || brew install zstd
+          # pigz compresses the archive on every core; package-release.sh falls back to gzip without it.
+          command -v pigz > /dev/null || { if [[ $RUNNER_OS == macOS ]]; then brew install pigz; else sudo apt-get install -y --no-install-recommends pigz; fi; }
           version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("crates/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           files=$RUNNER_TEMP/release-files
           .github/scripts/package-release.sh "$RUNNER_TEMP/toolchain/$TOOLCHAIN-$TARGET.tar.zst" "$version" "$TARGET" \

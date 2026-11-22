@@ -376,7 +376,7 @@ Each raw result file starts with a meta record: platform label, runner CPU model
 
 ### Output
 
-Every `compare` job uploads its raw JSON lines (samples and page-cache records) and cargo logs as `compare-<platform>-<workload>`. The `report` job downloads them all and uploads `benchmark-report`, with `results.md`, `summary.json` and one `chart-<platform>.svg` per platform. Each chart has one horizontal bar per scenario and workload, with 100 percent marked. The report has a table of the page-cache state of both toolchains per job, and where both Linux variants were measured, a table that sets the two side by side, each as a percent of its own official toolchain. The job also writes the table to the run summary and commits nothing.
+Every `compare` job uploads its raw JSON lines (samples, quiet and page-cache records) and cargo logs as `compare-<platform>-<workload>`, with a `-s<shard>` suffix when the run is sharded. The `report` job downloads them all and uploads `benchmark-report`, with `results.md`, `summary.json`, `verdict.json` and one `chart-<platform>.svg` per platform. Each chart has one horizontal bar per scenario and workload, with 100 percent marked. The report has a table of the page-cache state of both toolchains per job, and where both Linux variants were measured, a table that sets the two side by side, each as a percent of its own official toolchain. The job also writes the table to the run summary and commits nothing.
 
 ### Limits
 
