@@ -1,0 +1,42 @@
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index 84624f3..7fdd73a 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -2121,13 +2121,7 @@ impl GlobalContext {
+     }
+ 
+     pub(crate) fn acquire_package_cache_read_lock(&self) -> CargoResult<CacheLock<'_>> {
+-        // A nested reader can reuse the download lock without reversing lock order.
+-        let mode = if self.package_cache_lock.is_locked(CacheLockMode::DownloadExclusive) {
+-            CacheLockMode::DownloadExclusive
+-        } else {
+-            CacheLockMode::Shared
+-        };
+-        self.acquire_package_cache_lock(mode)
++        self.package_cache_lock.lock_read(self)
+     }
+ 
+     /// Acquires a lock on the global "package cache", returning `None` if
+diff --git a/src/util/cache_lock.rs b/src/util/cache_lock.rs
+index 068e1bb..1c8c927 100644
+--- a/src/util/cache_lock.rs
++++ b/src/util/cache_lock.rs
+@@ -499,6 +499,18 @@ impl CacheLocker {
+         Ok(CacheLock { mode, locker: self })
+     }
+ 
++    pub(crate) fn lock_read(&self, gctx: &GlobalContext) -> CargoResult<CacheLock<'_>> {
++        let mut state = self.state.lock().unwrap();
++        // Reuse a held download lock without reversing the order of the two locks.
++        let mode = if state.cache_lock.count > 0 {
++            CacheLockMode::DownloadExclusive
++        } else {
++            CacheLockMode::Shared
++        };
++        let _ = state.lock(gctx, mode, Blocking)?;
++        Ok(CacheLock { mode, locker: self })
++    }
++
+     /// Acquires a lock with the given mode, returning `None` if another cargo
+     /// is holding the lock.
+     pub fn try_lock(
