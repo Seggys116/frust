@@ -1,0 +1,301 @@
+diff --git a/src/frust_unit_cache.rs b/src/frust_unit_cache.rs
+index 170baac..a98f494 100644
+--- a/src/frust_unit_cache.rs
++++ b/src/frust_unit_cache.rs
+@@ -7,6 +7,7 @@
+ // The cache is configured by process environment, as the other fRust modules do.
+ #![allow(clippy::disallowed_methods)]
+ 
++use std::borrow::Cow;
+ use std::collections::BTreeMap;
+ use std::ffi::{OsStr, OsString};
+ use std::fs::{self, File, OpenOptions, TryLockError};
+@@ -53,6 +54,7 @@ const FLUSH_BYTES: u64 = 64 << 20;
+ const COPY_BUF: usize = 256 * 1024;
+ /// Streaming buffer for hashing and copying files in one pass.
+ const HASH_BUF: usize = 1024 * 1024;
++const INLINE_TEXT_BYTES: usize = 1024;
+ 
+ /// Set by Cargo or build scripts but never part of what rustc output depends on.
+ const ENV_EXCLUDED: &[&str] =
+@@ -178,8 +180,12 @@ struct Entry {
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     debug_objects: Vec<DebugObject>,
+     dep_info: Blob,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    inline_dep_info: Option<String>,
+     /// Cargo's message-cache lines (only `unused_extern_names` reports); empty when none.
+     messages: Blob,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    inline_messages: Option<String>,
+     env_deps: Vec<EnvDep>,
+     file_deps: Vec<FileDep>,
+     bound_dir: Option<String>,
+@@ -652,11 +658,11 @@ impl UnitCache {
+         let blobs = self.blobs_for_outputs(&entry, split).ok_or(Fail::Corrupt("output-set"))?;
+         // The small blobs are read and verified as they are consumed; the outputs are verified
+         // in the pass that stages them, so no blob is read twice.
+-        let dep_text = read_blob(&entry_dir, &entry.dep_info)?;
+-        let dep_text = String::from_utf8(dep_text).map_err(|_| Fail::Corrupt("dep-info-invalid"))?;
+-        let messages = clean_messages(&read_blob(&entry_dir, &entry.messages)?)
++        let dep_bytes = read_blob(&entry_dir, &entry.dep_info, entry.inline_dep_info.as_deref())?;
++        let dep_text = str::from_utf8(&dep_bytes).map_err(|_| Fail::Corrupt("dep-info-invalid"))?;
++        let messages = clean_messages(&read_blob(&entry_dir, &entry.messages, entry.inline_messages.as_deref())?)
+             .ok_or(Fail::Corrupt("messages-invalid"))?;
+-        let rmeta = self.restore(&entry_dir, &dep_text, &blobs, stamp)?;
++        let rmeta = self.restore(&entry_dir, dep_text, &blobs, stamp)?;
+         Ok(Restored { rmeta, messages })
+     }
+ 
+@@ -929,12 +935,14 @@ fn clean_messages(bytes: &[u8]) -> Option<Vec<String>> {
+         .collect()
+ }
+ 
+-/// The blobs that exist as files in the entry directory. A debug object kept as a range of an
+-/// output has none, so it is neither verified, checked for existence nor counted as size.
++/// The blobs backed by separate files. Inline text and archive ranges are verified at restore.
+ fn entry_blobs(entry: &Entry) -> impl Iterator<Item = &Blob> {
+     entry.outputs.iter()
+         .chain(entry.debug_objects.iter().filter(|obj| obj.archive.is_none()).map(|obj| &obj.blob))
+-        .chain([&entry.dep_info, &entry.messages])
++        .chain([
++            entry.inline_dep_info.is_none().then_some(&entry.dep_info),
++            entry.inline_messages.is_none().then_some(&entry.messages),
++        ].into_iter().flatten())
+ }
+ 
+ /// The output a ranged debug object lives in, when the range is well formed and inside it.
+@@ -1021,7 +1029,11 @@ fn entry_names_valid(entry: &Entry) -> bool {
+         None => true,
+         Some(range) => blob_ok(&obj.blob) && range_container(entry, obj, range).is_some(),
+     });
+-    is_hex64(&entry.key) && entry_blobs(entry).all(blob_ok) && ranges_ok
++    is_hex64(&entry.key)
++        && blob_ok(&entry.dep_info)
++        && blob_ok(&entry.messages)
++        && entry_blobs(entry).all(blob_ok)
++        && ranges_ok
+ }
+ 
+ fn is_hex64(text: &str) -> bool {
+@@ -1577,20 +1589,25 @@ fn clone_or_copy(src: &Path, dst: &Path, expected: &str, stamp: FileTime) -> io:
+ }
+ 
+ /// Reads a small blob whole, checking its size and BLAKE3 before anything uses the bytes.
+-fn read_blob(entry_dir: &Path, blob: &Blob) -> Result<Vec<u8>, Fail> {
+-    let mut file = File::open(entry_dir.join(&blob.blake3)).map_err(|err| match err.kind() {
+-        io::ErrorKind::NotFound => Fail::Corrupt("blob-missing"),
+-        _ => Fail::Reason("restore-failed"),
+-    })?;
+-    let mut bytes = Vec::new();
+-    if let Ok(len) = file.metadata().map(|meta| meta.len()) {
+-        if len != blob.size {
+-            return Err(Fail::Corrupt("blob-size"));
++fn read_blob<'a>(entry_dir: &Path, blob: &Blob, inline: Option<&'a str>) -> Result<Cow<'a, [u8]>, Fail> {
++    let bytes = if let Some(text) = inline {
++        Cow::Borrowed(text.as_bytes())
++    } else {
++        let mut file = File::open(entry_dir.join(&blob.blake3)).map_err(|err| match err.kind() {
++            io::ErrorKind::NotFound => Fail::Corrupt("blob-missing"),
++            _ => Fail::Reason("restore-failed"),
++        })?;
++        let mut bytes = Vec::new();
++        if let Ok(len) = file.metadata().map(|meta| meta.len()) {
++            if len != blob.size {
++                return Err(Fail::Corrupt("blob-size"));
++            }
++            let len = usize::try_from(len).map_err(|_| Fail::Corrupt("blob-size"))?;
++            bytes.try_reserve_exact(len).map_err(|_| Fail::Reason("restore-failed"))?;
+         }
+-        let len = usize::try_from(len).map_err(|_| Fail::Corrupt("blob-size"))?;
+-        bytes.try_reserve_exact(len).map_err(|_| Fail::Reason("restore-failed"))?;
+-    }
+-    file.read_to_end(&mut bytes).map_err(|_| Fail::Reason("restore-failed"))?;
++        file.read_to_end(&mut bytes).map_err(|_| Fail::Reason("restore-failed"))?;
++        Cow::Owned(bytes)
++    };
+     stat_bytes(&STATS.hashed_bytes, bytes.len() as u64);
+     if bytes.len() as u64 != blob.size {
+         return Err(Fail::Corrupt("blob-size"));
+@@ -2011,8 +2028,8 @@ impl Store {
+             });
+         }
+         let manifest_timer = stat_start();
+-        let dep_blob = put_blob(entry_dir, &dep_info.0, dep_info.1.as_slice())?;
+-        let messages_blob = put_blob(entry_dir, "messages", messages.as_slice())?;
++        let (dep_blob, inline_dep_info) = put_text_blob(entry_dir, &dep_info.0, dep_info.1)?;
++        let (messages_blob, inline_messages) = put_text_blob(entry_dir, "messages", messages)?;
+         let entry = Entry {
+             schema: MANIFEST_SCHEMA,
+             kind: unit_kind(),
+@@ -2021,7 +2038,9 @@ impl Store {
+             outputs: blobs,
+             debug_objects: objects,
+             dep_info: dep_blob,
++            inline_dep_info,
+             messages: messages_blob,
++            inline_messages,
+             env_deps: recorded.env_deps,
+             file_deps: recorded.file_deps,
+             bound_dir: recorded.bound_dir,
+@@ -2316,7 +2335,27 @@ fn entry_size(entry: &Entry) -> u64 {
+     entry_blobs(entry)
+         .filter(|blob| seen.insert(blob.blake3.as_str()))
+         .map(|blob| blob.size)
+-        .sum()
++        .sum::<u64>()
++        + [entry.inline_dep_info.as_ref(), entry.inline_messages.as_ref()]
++            .into_iter()
++            .flatten()
++            .map(|text| text.len() as u64)
++            .sum::<u64>()
++}
++
++fn put_text_blob(entry_dir: &Path, name: &str, bytes: Vec<u8>) -> io::Result<(Blob, Option<String>)> {
++    if bytes.len() > INLINE_TEXT_BYTES {
++        return put_blob(entry_dir, name, bytes.as_slice()).map(|blob| (blob, None));
++    }
++    match String::from_utf8(bytes) {
++        Ok(text) => {
++            let size = text.len() as u64;
++            let blake3 = blake3::hash(text.as_bytes()).to_hex().to_string();
++            stat_bytes(&STATS.hashed_bytes, size);
++            Ok((Blob { name: name.to_string(), size, blake3 }, Some(text)))
++        }
++        Err(err) => put_blob(entry_dir, name, err.as_bytes()).map(|blob| (blob, None)),
++    }
+ }
+ 
+ /// Copies `input` into a temporary file while hashing it, then publishes it under its hash.
+@@ -2818,13 +2857,13 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn missing_blob_and_wrong_size_are_misses() {
++    fn missing_output_blob_is_a_miss() {
+         let (tmp, store) = fixture();
+         let cache = unit_cache(tmp.path(), "a", &store);
+         let cmd = command(&cache);
+         let key = populate(&cache, &cmd, &[], &[]);
+         let entry = read_entry(&store, &key);
+-        fs::remove_file(store.entry_dir(&key).join(&entry.dep_info.blake3)).unwrap();
++        fs::remove_file(store.entry_dir(&key).join(&entry.outputs[0].blake3)).unwrap();
+         assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-missing"))));
+         assert!(matches!(cache.lookup(&cmd), Lookup::Miss(_)));
+         assert!(!store.entry_dir(&key).exists());
+@@ -2890,7 +2929,7 @@ mod tests {
+         names.sort();
+         assert!(names.contains(&MANIFEST.to_string()), "{names:?}");
+         assert!(names.iter().all(|name| !name.starts_with("tmp-")), "{names:?}");
+-        assert_eq!(names.len(), 5, "manifest plus rlib, rmeta, dep-info and messages blobs: {names:?}");
++        assert_eq!(names.len(), 3, "manifest, rlib and rmeta: {names:?}");
+         remove_outputs(&cache);
+         assert!(is_hit(&cache.lookup(&cmd)));
+     }
+@@ -2909,7 +2948,7 @@ mod tests {
+             .unwrap();
+         assert_eq!(size, 9 + 3);
+         let blobs = fs::read_dir(store.entry_dir(&key)).unwrap().count();
+-        assert_eq!(blobs, 4, "manifest, one shared output blob, dep-info and empty messages");
++        assert_eq!(blobs, 2, "manifest and one shared output blob");
+         let again = store.write_entry(&key, "tc", &outputs, dep_info(), Vec::new(), Recorded::default(), &[]);
+         assert!(again.unwrap().is_none(), "an existing entry is never rewritten");
+     }
+@@ -3336,6 +3375,7 @@ mod tests {
+         let (_, hash) = hash_file(&bad).unwrap();
+         fs::rename(&bad, store.entry_dir(&key).join(hex(&hash))).unwrap();
+         entry.messages = Blob { name: "messages".to_string(), size: 9, blake3: hex(&hash) };
++        entry.inline_messages = None;
+         fs::write(store.entry_dir(&key).join(MANIFEST), serde_json::to_vec(&entry).unwrap()).unwrap();
+         assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("messages-invalid"))));
+     }
+@@ -3734,8 +3774,10 @@ mod tests {
+             assert_eq!(output.nlink(), 2);
+             assert_eq!(output.permissions().mode() & 0o200, 0o200, "the shared inode stays writable");
+         }
+-        // Non-output blobs are private files and read-only as before.
+-        let dep = fs::metadata(store.entry_dir(&key).join(&entry.dep_info.blake3)).unwrap();
++        let dir = store.entry_dir(&key);
++        let (blob, inline) = put_text_blob(&dir, "large.d", vec![b'd'; INLINE_TEXT_BYTES + 1]).unwrap();
++        assert!(inline.is_none());
++        let dep = fs::metadata(dir.join(&blob.blake3)).unwrap();
+         assert_eq!(dep.permissions().mode() & 0o222, 0);
+         assert_eq!(dep.nlink(), 1);
+     }
+@@ -3851,20 +3893,24 @@ mod tests {
+         let cache = unit_cache(tmp.path(), "a", &store);
+         let cmd = command(&cache);
+         let key = populate(&cache, &cmd, &[], &[]);
+-        let entry = read_entry(&store, &key);
+-        let dep = store.entry_dir(&key).join(&entry.dep_info.blake3);
+-        let mut perms = fs::metadata(&dep).unwrap().permissions();
+-        perms.set_readonly(false);
+-        fs::set_permissions(&dep, perms).unwrap();
+-        let original = fs::read(&dep).unwrap();
++        let dir = store.entry_dir(&key);
++        let mut entry = read_entry(&store, &key);
++        let original = entry.inline_dep_info.take().expect("small dep-info is inline");
++        let rewrite = |entry: &Entry| fs::write(dir.join(MANIFEST), serde_json::to_vec(entry).unwrap()).unwrap();
++        assert!(!dir.join(&entry.dep_info.blake3).exists());
++        assert!(!dir.join(&entry.messages.blake3).exists());
+ 
+-        let mut flipped = original.clone();
+-        flipped[0] ^= 1;
+-        fs::write(&dep, &flipped).unwrap();
++        entry.inline_dep_info = Some("x".repeat(original.len()));
++        rewrite(&entry);
+         assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-hash"))));
+-        fs::write(&dep, &original[..original.len() - 1]).unwrap();
++        entry.inline_dep_info = Some("".to_owned());
++        rewrite(&entry);
+         assert!(matches!(cache.try_restore(&key, &cmd), Err(Fail::Corrupt("blob-size"))));
+-        fs::write(&dep, &original).unwrap();
++        entry.inline_dep_info = None;
++        entry.inline_messages = None;
++        fs::write(dir.join(&entry.dep_info.blake3), &original).unwrap();
++        fs::write(dir.join(&entry.messages.blake3), "").unwrap();
++        rewrite(&entry);
+         remove_outputs(&cache);
+         assert!(cache.try_restore(&key, &cmd).is_ok());
+     }
+@@ -4035,13 +4081,20 @@ mod tests {
+         fs::write(store.entry_dir(key).join(MANIFEST), serde_json::to_vec(&entry).unwrap()).unwrap();
+     }
+ 
+-    fn stored_file_bytes(store: &Store, key: &str) -> u64 {
++    fn stored_blob_bytes(store: &Store, key: &str) -> u64 {
++        let entry = read_entry(store, key);
++        let inline_bytes = [entry.inline_dep_info, entry.inline_messages]
++            .into_iter()
++            .flatten()
++            .map(|text| text.len() as u64)
++            .sum::<u64>();
+         fs::read_dir(store.entry_dir(key))
+             .unwrap()
+             .flatten()
+             .filter(|item| item.file_name() != MANIFEST)
+             .map(|item| item.metadata().unwrap().len())
+-            .sum()
++            .sum::<u64>()
++            + inline_bytes
+     }
+ 
+     fn leftover_staging(cache: &UnitCache) -> Vec<String> {
+@@ -4075,7 +4128,7 @@ mod tests {
+             assert!(!dir.join(&obj.blob.blake3).exists(), "no second copy of the bytes");
+         }
+         // Only blob data counts: the ranges add nothing to the entry's size.
+-        assert_eq!(entry_size(&entry), stored_file_bytes(&store, &key));
++        assert_eq!(entry_size(&entry), stored_blob_bytes(&store, &key));
+         assert!(entry_names_valid(&entry));
+         let report = store.gc();
+         assert_eq!(report.total_before, entry_size(&entry));
+@@ -4251,7 +4304,7 @@ mod tests {
+             // The member inside the archive is not recorded as a range once a blob holds it.
+             let ranged = by_name.iter().filter(|obj| obj.archive.is_some()).count();
+             assert_eq!(ranged, usize::from(inside < outside));
+-            assert_eq!(entry_size(&entry), stored_file_bytes(&store, &key));
++            assert_eq!(entry_size(&entry), stored_blob_bytes(&store, &key));
+             assert_restores_sidecars(&cache, &cmd, &sidecars);
+         }
+     }
