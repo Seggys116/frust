@@ -33,7 +33,13 @@ mkdir -p "$logs"
 step() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$pgo/progress.log"; }
 trap 'step "FAILED at line $LINENO"' ERR
 
-build_env=("MACOSX_DEPLOYMENT_TARGET=$deployment" "MACOSX_STD_DEPLOYMENT_TARGET=$deployment")
+# Apple Clang and the pinned Rust LLVM can write incompatible profile records (rust-lang/rust#163640).
+target_env=${host//-/_}
+cflags=CFLAGS_$target_env
+cxxflags=CXXFLAGS_$target_env
+no_c_pgo='-fno-profile-generate -fno-profile-use'
+build_env=("MACOSX_DEPLOYMENT_TARGET=$deployment" "MACOSX_STD_DEPLOYMENT_TARGET=$deployment"
+    "$cflags=${!cflags-} $no_c_pgo" "$cxxflags=${!cxxflags-} $no_c_pgo")
 overrides=()
 for file in "$root/support/bootstrap-common.toml" "$root/support/bootstrap-macos.toml"; do
     while IFS= read -r line || [[ -n $line ]]; do
