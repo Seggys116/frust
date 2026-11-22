@@ -642,20 +642,31 @@ class ApfsWrites:
 
     def header(self):
         return {"calibration": self.calibration, "data_device": self.data_device, "container": self.container,
-                "write_scope": "completed virtual-volume writes plus container metadata, including the post-build sync",
+                "write_scope": "completed virtual-volume writes plus container metadata, from a traced marker write "
+                               "before the commands to a traced marker write and quiet period after them; the markers' "
+                               "own data is excluded and their commit metadata is included",
                 "footprint_scope": "occupied APFS blocks above the fixture setup, with both stores cleared before seeding"}
 
     def run(self, tag, jobs, timeout):
         results = []
-        sample = self.probe.sample(self.root, self.mount, self.devices, tag,
-                                   lambda: results.extend(run_commands(jobs, timeout)))
+        try:
+            sample = self.probe.sample(self.root, self.mount, self.devices, tag,
+                                       lambda: results.extend(run_commands(jobs, timeout)))
+        except self.probe.TraceError as error:
+            # An untraceable window still has to run its commands so the cell keeps its state, but it reports no bytes.
+            if not results:
+                results.extend(run_commands(jobs, timeout))
+            zero = {device: dict.fromkeys(self.probe.KINDS, 0) for device in self.devices}
+            return results, {"apfs_write_bytes": 0, "apfs_metadata_bytes": 0, "apfs_trace_problem": str(error),
+                             "apfs_footprint_bytes": self.initial_available - self.probe.available_bytes(self.mount),
+                             "apfs_allocated_bytes_delta": 0, "apfs_write_bytes_by_device": zero}
         devices = sample["write_bytes_by_device"]
         metadata = devices[self.data_device]["WrMeta"] + devices[self.container]["WrMeta"]
         write_bytes = devices[self.data_device]["WrData"] + devices[self.data_device]["PgOut"] + metadata
         return results, {"apfs_write_bytes": write_bytes, "apfs_metadata_bytes": metadata,
                          "apfs_footprint_bytes": self.initial_available - self.probe.available_bytes(self.mount),
                          "apfs_allocated_bytes_delta": sample["allocated_bytes_delta"],
-                         "apfs_write_bytes_by_device": devices}
+                         "apfs_write_bytes_by_device": devices, "apfs_trace": sample["trace"]}
 
 
 class Harness:
@@ -839,7 +850,9 @@ class Harness:
                 traces.append(trace)
         if self.apfs:
             results, apfs_metrics = self.apfs.run(tag, jobs, self.args.timeout)
-            if cell.state in ("cold", "cache") and not apfs_metrics["apfs_write_bytes"]:
+            if "apfs_trace_problem" in apfs_metrics:
+                problems.append(f"incomplete APFS write trace: {apfs_metrics['apfs_trace_problem']}")
+            elif cell.state in ("cold", "cache") and not apfs_metrics["apfs_write_bytes"]:
                 problems.append(f"the {cell.state} build had no observed APFS writes")
         else:
             results, apfs_metrics = run_commands(jobs, self.args.timeout), {}

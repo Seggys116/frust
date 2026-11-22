@@ -107,6 +107,8 @@ jobs:
           python3 -I -m py_compile qualification/run-pairs.py qualification/run-runtime.py qualification/make_corpus.py \
             qualification/ci-bench.py qualification/make-charts.py qualification/concurrent-builds.py \
             qualification/memory-jobs-bench.py qualification/tool-startup-bench.py qualification/darwin-write-probe.py
+      - name: APFS trace barriers hold against a fake tracer
+        run: python3 -I qualification/test_darwin_write_probe.py
 
   upstream:
     name: upstream pins and patches

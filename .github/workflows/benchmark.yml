@@ -240,7 +240,7 @@ jobs:
     needs: plan
     if: inputs.platforms == 'macos-write-probe'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -251,7 +251,7 @@ jobs:
         run: |
           result=$RUNNER_TEMP/write-probe.json
           status=0
-          python3 -I qualification/darwin-write-probe.py --work "$RUNNER_TEMP" > "$result" || status=$?
+          python3 -I qualification/darwin-write-probe.py --work "$RUNNER_TEMP" --soak 24 > "$result" || status=$?
           cat "$result"
           exit "$status"
       - name: Verify the paired APFS benchmark
@@ -886,7 +886,7 @@ jobs:
           exit "$status"
       - name: Measure APFS write bytes and allocated blocks
         if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && runner.os == 'macOS' }}
-        timeout-minutes: 18
+        timeout-minutes: 30
         run: |
           baseline=$HOME/frust-bench-control/current/bin
           out=$RUNNER_TEMP/out/contention
