@@ -5,6 +5,7 @@ import argparse
 from collections import namedtuple
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -590,6 +591,22 @@ def restored_build_is_fresh(ctx):
                              f"{describe(again)}")
         expect(not again.events or all(e.kind == "skip" for e in again.events),
                f"no-op build {round_number} consulted the cache\n{describe(again)}")
+
+
+@case
+def mapped_source_edit_rebuilds(ctx):
+    source = ctx.project("mmap-edit") / "src" / "main.rs"
+    source.write_bytes(b'fn main() { println!("one"); }\n')
+    options = {"env": {"FRUST_UNIT_CACHE": "0"}}
+    with source.open("r+b") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mapped:
+        original = mapped[:]
+        mapped[:] = original
+        time.sleep(0.25)
+        first = ctx.build("mmap-edit", "t1", **options)
+        expect(first.stdout.strip() == "one", "initial build did not print one")
+        mapped[:] = original.replace(b'"one"', b'"two"')
+        edited = ctx.build("mmap-edit", "t1", **options)
+        expect(edited.stdout.strip() == "two", "the second build reused the old executable")
 
 
 @case

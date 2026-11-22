@@ -1,0 +1,38 @@
+diff --git a/crates/cargo-util/src/paths.rs b/crates/cargo-util/src/paths.rs
+index a827420..b54d93f 100644
+--- a/crates/cargo-util/src/paths.rs
++++ b/crates/cargo-util/src/paths.rs
+@@ -383,6 +383,10 @@ pub fn set_invocation_time(path: &Path) -> Result<FileTime> {
+     // note that if `FileTime::from_system_time(SystemTime::now());` is determined to be sufficient,
+     // then this can be removed.
+     let timestamp = path.join("invoked.timestamp");
++    // On Unix, creating or truncating the marker sets its file modification time.
++    #[cfg(unix)]
++    write(&timestamp, [])?;
++    #[cfg(not(unix))]
+     write(
+         &timestamp,
+         "This file has an mtime of when this was started.",
+@@ -891,6 +895,22 @@ mod tests {
+     use super::write;
+     use super::write_atomic;
+ 
++    #[cfg(unix)]
++    #[test]
++    fn empty_invocation_marker_refreshes_time() {
++        let dir = tempfile::tempdir().unwrap();
++        let marker = dir.path().join("invoked.timestamp");
++        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
++        for content in [b"legacy marker".as_slice(), b"".as_slice()] {
++            write(&marker, content).unwrap();
++            filetime::set_file_mtime(&marker, old).unwrap();
++            let stamp = super::set_invocation_time(dir.path()).unwrap();
++            assert!(stamp > old);
++            assert_eq!(stamp, super::mtime(&marker).unwrap());
++            assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
++        }
++    }
++
+     #[test]
+     fn test_normalize_path() {
+         let cases = &[
