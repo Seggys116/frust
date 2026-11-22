@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 COUNTERS_SECTION = "__llvm_prf_cnts"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 MISMATCH = re.compile(r"hash mismatch\)\s+(\S+)", re.I)
 MISSING = re.compile(r"no profile data available for function\s+(\S+)", re.I)
 MALFORMED = re.compile(r"malformed instrumentation profile", re.I)
@@ -38,7 +39,7 @@ def record(path, key, value, failures):
 
 
 def read_lines(log):
-    return Path(log).read_text(errors="replace").splitlines()
+    return ANSI.sub("", Path(log).read_text(errors="replace")).splitlines()
 
 
 def flags(args):
