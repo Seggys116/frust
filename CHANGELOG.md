@@ -57,6 +57,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * The APFS write trace observes marker writes at the start and end of each window and waits for the device to go quiet. All 24 calibration bursts passed on each macOS runner. Five Intel bursts had writes after the old one-second cutoff. [APFS calibration](https://github.com/Seggys116/frust/actions/runs/45014543999)
 * The experimental macOS PGO build completed native training and profile-use rebuilds on both architectures. It uses Rust instrumentation and uploads the merged profiles and build evidence. [Native PGO run](https://github.com/Seggys116/frust/actions/runs/45017675275)
 * Wide warm checks used 84.4% to 87.7% of fRust 0.6.0's peak process RSS across the four platforms. Warm proc-macro checks spent less CPU on contended locks, with total CPU intervals spanning parity. Both Macs recorded complete APFS traces and used less occupied space in all four states. Write-volume gains varied by state. [Resource results](docs/benchmarks.md#resource-results-for-the-061-candidate)
+* The platform geometric means for clean rebuilds used 43.4% to 61.5% of official Rust 1.100.0 CPU. The Linux no-op means were 89.5% and 90.1%. Cold and leaf-edit aggregate intervals included parity on all four platforms. Targeted regex no-ops used 121.8% of official CPU on Apple Silicon and 105.4% on Intel, establishing a regression on each. The candidate misses the across-platform performance gate. [Build CPU results](docs/benchmarks.md#build-cpu-for-the-061-candidate)
 
 ## [0.6.0] - 2026-11-22
 

@@ -437,9 +437,26 @@ On Intel macOS, peak process RSS in the wide warm check fell from 36.09 to 30.33
 
 The Intel APFS run captured the full calibration payload. During the build series, one cold build timed out and several cold and clean-rebuild traces missed write events. Intel write volume remains unresolved. The six clean-rebuild pairs recorded 2.0% higher occupied APFS space by the median paired ratio, with all six pairs using more space. [Intel APFS run](https://github.com/Seggys116/frust/actions/runs/44961162136)
 
+## Build CPU for the 0.6.1 candidate
+
+Benchmark CI compared the four archives with official Rust 1.100.0 on 22 November 2026. The main run used `a1a345b`. The Intel `fd` runner stopped before it could upload results, and a dedicated retry at `a9fc098` used the same toolchain build inputs. The combined results contain 1,520 alternating pairs across 76 workload and scenario cells. Each cell has 20 pairs, and each no-op sample is the median of 21 builds that compiled no units. [Main run](https://github.com/Seggys116/frust/actions/runs/45018513595) · [Intel fd retry](https://github.com/Seggys116/frust/actions/runs/45053394795)
+
+Each platform column gives fRust CPU as a percent of official. The table uses the geometric mean of the workload medians for each scenario with its 95% interval in brackets. The `fd` holdout row has one workload. [Measurement and statistics](#measurement-and-statistics)
+
+| Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 | Pairs per platform |
+| --- | --- | --- | --- | --- | --- |
+| Cold build | 100.3% [99.1, 101.3] | 99.4% [97.6, 100.8] | 101.2% [95.9, 105.1] | 100.1% [94.7, 109.3] | 80 |
+| Clean rebuild | 45.5% [44.9, 45.9] | 43.4% [42.7, 44.2] | 61.5% [58.2, 64.2] | 58.3% [55.2, 62.3] | 80 |
+| No-op rebuild | 89.5% [87.2, 91.9] | 90.1% [88.4, 91.7] | 104.8% [99.7, 115.0] | 101.3% [94.3, 117.1] | 80 |
+| Edit rebuild, leaf | 100.1% [99.1, 101.3] | 99.6% [98.3, 102.1] | 100.9% [96.9, 103.9] | 101.4% [91.3, 116.2] | 60 |
+| Edit rebuild, wide | 100.1% [98.4, 101.0] | 100.2% [98.8, 102.5] | 101.0% [95.0, 106.2] | 100.3% [88.8, 110.8] | 60 |
+| Edit rebuild, fd holdout | 99.4% [98.5, 100.2] | 99.7% [99.0, 101.3] | 100.8% [90.9, 103.8] | 100.2% [100.0, 111.4] | 20 |
+
+All 16 clean-rebuild cells and all eight Linux no-op cells used less CPU. The cold and edit aggregates included parity. Linux v3 ripgrep cold builds used 97.1% of official CPU (93.8–99.1%). No-op intervals were above parity for ripgrep, syn and regex on Apple Silicon and for fd on Intel. The Apple Silicon regex leaf edit used 101.2% (100.1–103.4%). The adjacent-pair regex diagnostic confirmed a no-op regression on both Macs and isolated the content-check cost. The candidate misses the across-platform performance gate. [Apple Silicon diagnostic](https://github.com/Seggys116/frust/actions/runs/45025370631) · [Intel diagnostic](https://github.com/Seggys116/frust/actions/runs/45028935430)
+
 ## Resource results for the 0.6.1 candidate
 
-Benchmark CI compared the candidate at `a1a345b` with the matching fRust 0.6.0 archive on each runner on 22 November 2026. Cooperative checks were enabled on both sides of the 388-member fixture. The wide check and proc-macro overlap each have 12 pairs. Percentages are median paired ratios with 95% intervals in brackets. Lock rows give paired differences. Lock hold duration is the summed time that locks were held exclusively. [Raw resource results](https://github.com/Seggys116/frust/actions/runs/45018513595)
+Benchmark CI compared the candidate at `a1a345b` with the matching fRust 0.6.0 archive on each runner on 22 November 2026. Cooperative checks were enabled on both sides of the 388-member fixture. The wide check and proc-macro overlap each have 12 pairs. Percentages are median paired ratios with 95% intervals in brackets. Lock rows give paired differences from the `.package-cache` `flock` calls. Hold duration sums the time that each process held that lock exclusively. [Raw resource results](https://github.com/Seggys116/frust/actions/runs/45018513595)
 
 | Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
 | --- | --- | --- | --- | --- |
@@ -454,7 +471,7 @@ Benchmark CI compared the candidate at `a1a345b` with the matching fRust 0.6.0 a
 
 Both Linux variants used 70.8% of 0.6.0's allocated bytes and 71.1% of its written bytes for cold checks in the 97-dependency fixture. Those figures were the same in all 12 pairs on each variant. The warm test, Clippy, doc and fmt combination on v3 used 101.9% CPU (100.4–103.9%). [Raw resource results](https://github.com/Seggys116/frust/actions/runs/45018513595)
 
-Both Macs recorded 48 valid APFS trace windows. Occupied space fell in all four states in the private image. Intel edit builds used 98.8% of 0.6.0's write volume (98.1–99.5%). The other write intervals included parity. A separate Apple Silicon run recorded a cold write reduction of 2.6% (0.6–4.7%), while the main run's cold interval included parity. [Main APFS comparison](https://github.com/Seggys116/frust/actions/runs/45018513595) · [Apple Silicon repeat](https://github.com/Seggys116/frust/actions/runs/45025112546)
+Each Mac recorded 48 valid APFS trace windows. Occupied space fell in all four states in the private image. Intel edit builds used 98.8% of 0.6.0's write volume (98.1–99.5%). The other write intervals included parity. A separate Apple Silicon run recorded a cold write reduction of 2.6% (0.6–4.7%), while the main run's cold interval included parity. [Main APFS comparison](https://github.com/Seggys116/frust/actions/runs/45018513595) · [Apple Silicon repeat](https://github.com/Seggys116/frust/actions/runs/45025112546)
 
 ## Rules for new measurements
 

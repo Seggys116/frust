@@ -90,18 +90,18 @@ Eligible `fcargo check` runs in one workspace share compiled units on Linux and 
 
 ## Results
 
-The 21 November Benchmark CI run measured the fRust 0.6.0 toolchain against official Rust 1.100.0 for release builds of ripgrep, syn, regex and fd. The table uses the median of eight CPU-time pairs per scenario and workload, then the geometric mean over workloads. Lower is better and 100% is equal. [Benchmark results and method](docs/benchmarks.md#results-of-the-ci-comparison)
+The 22 November Benchmark CI runs measured the fRust 0.6.1 candidate against official Rust 1.100.0 for release builds of ripgrep, syn, regex and fd. The table uses the median of 20 CPU-time pairs per scenario and workload, then the geometric mean over workloads. Lower is better and 100% is equal. [Benchmark results and intervals](docs/benchmarks.md#build-cpu-for-the-061-candidate)
 
 | Scenario | Linux x86-64 | Linux x86-64-v3 | macOS arm64 | macOS x86-64 |
 |---|---|---|---|---|
-| Clean rebuild | 45.2% | 43.0% | 63.2% | 55.5% |
-| No-op rebuild | 89.4% | 90.8% | 107.8% | 95.3% |
-| Cold build | 100.0% | 100.1% | 100.1% | 100.6% |
-| Edit rebuild | 99.4% | 98.6% | 101.8% | 94.7% |
+| Clean rebuild | 45.5% | 43.4% | 61.5% | 58.3% |
+| No-op rebuild | 89.5% | 90.1% | 104.8% | 101.3% |
+| Cold build | 100.3% | 99.4% | 101.2% | 100.1% |
+| Edit rebuild | 100.1% | 99.6% | 100.9% | 101.4% |
 
-Clean rebuilds restore dependencies from the unit cache, including unpacked debug objects in the default macOS dev profile. The comparison found no consistent CPU improvement for cold builds or edits. On macOS, no-op results also varied too widely to establish a win. The edit row uses the leaf edit.
+Clean rebuilds used less CPU in every workload. Both Linux variants used less CPU on no-op rebuilds. Cold and leaf-edit intervals included parity on all four platforms, and targeted regex no-ops were slower on both Macs. The candidate misses the across-platform performance gate. The edit row uses the leaf edit.
 
-Against fRust 0.5.2, wide cooperative checks used less peak RSS on all four platforms. Eligible overlapping proc-macro checks avoided the build-directory wait. Disk write gains depend on the workload, and Intel macOS write volume remains unresolved. CI showed no general reduction in allocated footprint. Caching the default macOS dev artifacts uses additional space. [Resource comparisons](docs/benchmarks.md#changes-from-frust-052)
+Against fRust 0.6.0, wide warm checks used 84.4% to 87.7% of peak process RSS and overlapping proc-macro checks spent less CPU on contended locks. Both Macs used less occupied APFS space in all four tested states. Disk write gains varied by workload and state. [Resource comparisons](docs/benchmarks.md#resource-results-for-the-061-candidate)
 
 <p align="center"><img src=".github/assets/divider.svg" alt="" width="880"></p>
 
