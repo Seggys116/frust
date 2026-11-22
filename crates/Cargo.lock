@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "frust-rs"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "frust-rs-core",
 ]
 
 [[package]]
 name = "frust-rs-core"
-version = "0.6.0"
+version = "0.6.1"
