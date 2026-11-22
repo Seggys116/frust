@@ -4,7 +4,6 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
-* 22 November 2026: the macOS rustc PGO build now collects an lldb backtrace, Mach-O profile section layout, a crash report and a launch differential when the instrumented compiler fails its first launch, and the Benchmark workflow has a `macos-pgo-probe` platform that compiles and runs small instrumented dylib and executable shapes with the stage-2 flags on both macOS hosts. The launch and evidence gates are unchanged. No PGO toolchain is shipped.
 * 20 November 2026: the interface-hash cutoff was judged on the full paired Linux cohort and not kept. Build-time gates passed and the runtime aggregate and stripped-size gates failed, because the three application binaries matched stock. No candidate has passed every frozen Linux budget. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: prelink-span reuse (`frust-0ef1bc386-prelinkspan1`) was judged on the same cohort and not kept. The leaf build budgets passed. Disk, the runtime aggregate, and stripped size failed. The three application binaries matched stock. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 20 November 2026: an x86-64-v3 codegen preflight on that compiler, with the hotfreq16 flags and opt-in RELR, was not kept. Oxipng's median ratio was 0.94419073. The three-workload runtime geomean was 0.98290005, and rustfmt's median was 1.01459543. Stripped size beat 0.97 only while RELR stayed on. No full judge was run. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
@@ -38,7 +37,26 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * 21 November 2026: post-link BOLT after a fat-LTO link was preflighted and not kept. The rewrite used `--use-old-text --no-huge-pages --align-text=4096 --lite=false --use-gnu-stack`, and ripgrep was trained on the fixed string `epsilon` rather than the timed needle. Stripped sizes grew to 4110536/4024992, 1354288/1338440, and 3949408/3835192. Shipped `frust-gates` exited 1: runtime geomean 1.00346372, upper 1.00621331, size geomean 1.020932. Leaf collection was stopped after the runtime and size misses. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: `-sink-common-insts` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Stripped sizes grew to 4082336/4024992, 1382560/1338440, and 3996104/3835192. Shipped `frust-gates` exited 1: runtime geomean 1.00555891, upper 1.00902087, size geomean 1.02965759. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
 * 21 November 2026: `-enable-knowledge-retention` was preflighted on fat LTO, with the licmcap layout flags repeated as user `-C llvm-args`, and not kept. Every stripped file stayed under stock (4019392/4024992, 1336456/1338440, 3827128/3835192). Shipped `frust-gates` exited 1: runtime geomean 0.99701744, upper 1.00079480, size geomean 0.99834120. The 630-pair cohort was not started. See `qualification/GATE-REPORT.md` and `docs/benchmarks.md`.
-* 22 November 2026: the APFS write probe now brackets each `fs_usage` window with marker files whose writes must reach the log, waits for the image to go quiet, rejects windows that account for fewer bytes than the allocation delta, and adds a 24-burst soak to `platforms=macos-write-probe`. The Intel run 44961162136 had 5 of 48 windows with no traced writes and 9 more below the allocation delta, while the Apple Silicon run 44948421455 had none, so the earlier tracer start and flush waits were not reliable on Intel. The new barriers pass a fake-tracer test on Linux and have not yet run on macOS, so the Intel write volume stays unresolved.
+
+## [0.6.1] - 2026-11-22
+
+### Changed
+
+* Cooperative checks prepare compiler commands after acquiring the unit lock and checking whether another process already built the unit. Warm checks replay the recorded diagnostics.
+* Cargo downloads that only read already loaded, path or vendored packages use the shared package cache lock. Registry and Git downloads and cache bookkeeping still take the exclusive download lock.
+* The unit cache embeds short dep-info and diagnostic text in the manifest, with the same length and digest checks as separate blobs. Existing cache entries still restore.
+* Cargo stores identical empty unused-externs reports once per build directory on filesystems that support hard links. Other diagnostics have their own files.
+* Cargo's build invocation markers are empty on Unix. Their filesystem modification time still records when each build started.
+
+### Fixed
+
+* Cooperative checks retry under the build-directory lock if the system runs out of file descriptors while opening a unit lock.
+
+### Benchmarking
+
+* Benchmark CI reports paired intervals for CPU comparisons with official Rust and for resource comparisons with fRust 0.6.0.
+* The APFS write trace observes marker writes at the start and end of each window and waits for the device to go quiet. All 24 calibration bursts passed on each macOS runner. Five Intel bursts had writes after the old one-second cutoff. [APFS calibration](https://github.com/Seggys116/frust/actions/runs/45014543999)
+* The macOS PGO experiment records native startup failures and tests instrumented dylib and executable shapes on both architectures. The experimental compiler build uses Rust instrumentation.
 
 ## [0.6.0] - 2026-11-22
 
