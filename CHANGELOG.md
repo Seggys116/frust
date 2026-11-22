@@ -45,7 +45,6 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 * Cooperative checks prepare compiler commands after acquiring the unit lock and checking whether another process already built the unit. Warm checks replay the recorded diagnostics.
 * Cargo downloads that only read already loaded, path or vendored packages use the shared package cache lock. Registry and Git downloads and cache bookkeeping still take the exclusive download lock.
 * The unit cache embeds short dep-info and diagnostic text in the manifest, with the same length and digest checks as separate blobs. Existing cache entries still restore.
-* Cargo stores identical empty unused-externs reports once per build directory on filesystems that support hard links. Other diagnostics have their own files.
 * Cargo's build invocation markers are empty on Unix. Their filesystem modification time still records when each build started.
 
 ### Fixed
