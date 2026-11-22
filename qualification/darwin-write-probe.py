@@ -140,6 +140,8 @@ def write_record(line):
             raise TraceError(f"unrecognized or failed disk write: {line.strip()}")
         count, device = fields.groups()
         if device == "/dev/NOTFOUND":
+            if re.match(r"\s+/dev/null(?:\s|$)", line[fields.end():]):
+                return None
             raise TraceError(f"disk write on a device fs_usage could not name: {line.strip()}")
         return write[1], int(count, 16), device
     if (line.lstrip().startswith(("fs_usage:", "sudo:"))

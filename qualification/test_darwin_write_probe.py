@@ -96,6 +96,10 @@ class WriteRecord(unittest.TestCase):
     def test_ignores_other_calls(self):
         self.assertIsNone(probe.write_record("12:00:00.000001  open  /tmp/x  0.000010 W python3.1"))
 
+    def test_ignores_unresolved_null_device_writes(self):
+        line = self.LINE.format(kind="WrData", size="5c", device="/dev/NOTFOUND")
+        self.assertIsNone(probe.write_record(line.replace(" /x ", " /dev/null ")))
+
     def test_rejects_unnamed_device_and_failed_writes(self):
         with self.assertRaises(probe.TraceError):
             probe.write_record(self.LINE.format(kind="WrData", size="5000", device="/dev/NOTFOUND"))
