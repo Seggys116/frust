@@ -1,0 +1,184 @@
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index bf83910..84624f3 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -2120,6 +2120,16 @@ impl GlobalContext {
+         self.package_cache_lock.lock(self, mode)
+     }
+ 
++    pub(crate) fn acquire_package_cache_read_lock(&self) -> CargoResult<CacheLock<'_>> {
++        // A nested reader can reuse the download lock without reversing lock order.
++        let mode = if self.package_cache_lock.is_locked(CacheLockMode::DownloadExclusive) {
++            CacheLockMode::DownloadExclusive
++        } else {
++            CacheLockMode::Shared
++        };
++        self.acquire_package_cache_lock(mode)
++    }
++
+     /// Acquires a lock on the global "package cache", returning `None` if
+     /// another cargo holds the lock.
+     ///
+diff --git a/src/sources/directory.rs b/src/sources/directory.rs
+index 21a8c1e..bcb4a2c 100644
+--- a/src/sources/directory.rs
++++ b/src/sources/directory.rs
+@@ -229,6 +229,10 @@ impl<'gctx> Source for DirectorySource<'gctx> {
+         panic!("no downloads to do")
+     }
+ 
++    fn downloads_locally(&self) -> bool {
++        true
++    }
++
+     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {
+         Ok(pkg.package_id().version().to_string())
+     }
+diff --git a/src/sources/path.rs b/src/sources/path.rs
+index 4c53888..4e20123 100644
+--- a/src/sources/path.rs
++++ b/src/sources/path.rs
+@@ -196,6 +196,10 @@ impl<'gctx> Source for PathSource<'gctx> {
+         panic!("no download should have started")
+     }
+ 
++    fn downloads_locally(&self) -> bool {
++        true
++    }
++
+     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {
+         let (max, max_path) = self.last_modified_file(pkg)?;
+         // Note that we try to strip the prefix of this package to get a
+@@ -393,6 +397,10 @@ impl<'gctx> Source for RecursivePathSource<'gctx> {
+         panic!("no download should have started")
+     }
+ 
++    fn downloads_locally(&self) -> bool {
++        true
++    }
++
+     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {
+         let (max, max_path) = self.last_modified_file(pkg)?;
+         // Note that we try to strip the prefix of this package to get a
+diff --git a/src/sources/replaced.rs b/src/sources/replaced.rs
+index 14e891a..917fd64 100644
+--- a/src/sources/replaced.rs
++++ b/src/sources/replaced.rs
+@@ -155,4 +155,8 @@ impl<'gctx> Source for ReplacedSource<'gctx> {
+     fn is_replaced(&self) -> bool {
+         !self.is_builtin_replacement()
+     }
++
++    fn downloads_locally(&self) -> bool {
++        self.inner.downloads_locally()
++    }
+ }
+diff --git a/src/sources/source.rs b/src/sources/source.rs
+index 071c3b9..420684e 100644
+--- a/src/sources/source.rs
++++ b/src/sources/source.rs
+@@ -125,6 +125,12 @@ pub trait Source {
+     fn is_replaced(&self) -> bool {
+         false
+     }
++
++    /// Returns whether `download` only reads local files already loaded by
++    /// this source without modifying the global package cache.
++    fn downloads_locally(&self) -> bool {
++        false
++    }
+ }
+ 
+ /// Defines how a dependency query will be performed for a [`Source`].
+@@ -229,6 +235,10 @@ impl<'a, T: Source + ?Sized + 'a> Source for &'a mut T {
+     fn is_replaced(&self) -> bool {
+         (**self).is_replaced()
+     }
++
++    fn downloads_locally(&self) -> bool {
++        (**self).downloads_locally()
++    }
+ }
+ 
+ /// A [`HashMap`] of [`SourceId`] to `Box<Source>`.
+diff --git a/src/workspace/package.rs b/src/workspace/package.rs
+index 378e9fd..9cccccf 100644
+--- a/src/workspace/package.rs
++++ b/src/workspace/package.rs
+@@ -308,8 +308,8 @@ pub struct Downloads<'a, 'gctx> {
+     pending: Cell<u64>,
+     /// Time when downloading started.
+     start: Instant,
+-    /// Global filesystem lock to ensure only one Cargo is downloading one at a time.
+     _lock: CacheLock<'gctx>,
++    write_cache: bool,
+ }
+ 
+ impl<'a, 'gctx> Downloads<'a, 'gctx> {
+@@ -317,6 +317,14 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
+         set: &'a PackageSet<'gctx>,
+         ids: impl IntoIterator<Item = PackageId>,
+     ) -> CargoResult<Vec<&'a Package>> {
++        let ids: Vec<PackageId> = ids.into_iter().collect();
++        let write_cache = set.needs_cache_write_lock(&ids)?;
++        let lock = if write_cache {
++            set.gctx
++                .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?
++        } else {
++            set.gctx.acquire_package_cache_read_lock()?
++        };
+         let progress = RefCell::new(Progress::with_style(
+             "Downloading",
+             ProgressStyle::Ratio,
+@@ -331,9 +339,8 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
+             downloaded_bytes: Cell::new(0),
+             pending: Cell::new(0),
+             start: Instant::now(),
+-            _lock: set
+-                .gctx
+-                .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?,
++            _lock: lock,
++            write_cache,
+         };
+         dl.run(ids).await
+     }
+@@ -360,10 +367,12 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
+             }
+         }
+         self.print_summary()?;
+-        self.set
+-            .gctx
+-            .deferred_global_last_use()?
+-            .save_no_error(self.set.gctx);
++        if self.write_cache {
++            self.set
++                .gctx
++                .deferred_global_last_use()?
++                .save_no_error(self.set.gctx);
++        }
+         Ok(out)
+     }
+ 
+@@ -615,6 +624,22 @@ impl<'gctx> PackageSet<'gctx> {
+         return crate::util::block_on(Downloads::download(self, ids));
+     }
+ 
++    /// Whether fetching `ids` may touch the package cache: an unloaded package
++    /// from a non-local source, an unknown id, or pending last-use data.
++    fn needs_cache_write_lock(&self, ids: &[PackageId]) -> CargoResult<bool> {
++        if !self.gctx.deferred_global_last_use()?.is_empty() {
++            return Ok(true);
++        }
++        let sources = self.sources.borrow();
++        Ok(ids.iter().any(|id| match self.packages.get(id) {
++            Some(slot) if slot.get().is_some() => false,
++            Some(_) => sources
++                .get(id.source_id())
++                .is_none_or(|source| !source.downloads_locally()),
++            None => true,
++        }))
++    }
++
+     /// Downloads any packages accessible from the give root ids.
+     #[tracing::instrument(skip_all)]
+     pub fn download_accessible(
