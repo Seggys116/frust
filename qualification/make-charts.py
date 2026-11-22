@@ -254,6 +254,7 @@ def host_summary(runs):
             meta.get("commit") or "unknown", meta.get("unit_cache") or "unknown",
             meta.get("cache_state") or "not recorded",
             json.dumps(meta.get("frust_env") or {}, sort_keys=True),
+            str(meta.get("jobs") or "unknown"),
         )
         hosts[key] = hosts.get(key, 0) + 1
     return sorted(hosts.items())
@@ -361,8 +362,8 @@ def markdown(runs, skipped, rows, failures, notes, args):
         "## Hosts",
         "",
         "| Platform | CPU | Cores (physical/logical) | OS | Pinning | Official rustc | Official cargo | fRust rustc "
-        "| fRust cargo | Commit | Unit cache | Cache state | fRust env | Jobs |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| fRust cargo | Commit | Unit cache | Cache state | fRust env | Cargo -j | Result files |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for key, count in host_summary(runs):
         out.append("| " + " | ".join(cell(part) for part in key) + f" | {count} |")
