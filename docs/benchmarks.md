@@ -340,7 +340,15 @@ The frozen pair protocol jobs (`qualification/run-pairs.py`, control against fRu
 
 Use `platforms=macos-arm64-fingerprint` or `platforms=macos-x86_64-fingerprint` with `protocol=false` to warm one regex target per toolchain and time adjacent no-op pairs. Use `noops=1` to measure one invocation on each side per pair. The job fails if a timed command compiles anything. It compares the defaults with official Rust and records two additional series with the unit cache off. One runs the same fCargo and compiler bytes under the `rustc` and `frustc` names to isolate content checks. The other compares official Rust with fCargo under mtime checks. Both diagnostic series are attached under `fingerprint-diagnostic` in the raw comparison artifacts.
 
-On 22 November 2026, the Apple Silicon regex comparison recorded 121.8% of official CPU for the default fRust no-op, with a 95% paired interval of 120.2–123.3%. The same fCargo and compiler bytes used 122.7% CPU with content checks relative to mtime checks (121.6–123.5%). With mtime checks on both sides, fCargo used 98.6% of official Cargo CPU (97.1–99.8%). Each series completed 120 pairs with no compilation. Full content checks remain enabled because a metadata shortcut missed a same-size edit through a memory mapping. [Apple Silicon no-op run](https://github.com/Seggys116/frust/actions/runs/45025370631)
+On 22 November 2026, each regex series completed 120 pairs with no compilation. The table gives median paired CPU ratios with 95% intervals in brackets. [Apple Silicon no-op run](https://github.com/Seggys116/frust/actions/runs/45025370631) · [Intel no-op run](https://github.com/Seggys116/frust/actions/runs/45028935430)
+
+| Comparison | macOS arm64 | macOS x86-64 |
+| --- | --- | --- |
+| Default fRust vs official Rust | 121.8% [120.2, 123.3] | 105.4% [104.6, 106.0] |
+| Same fCargo with content vs mtime checks | 122.7% [121.6, 123.5] | 109.3% [107.7, 110.5] |
+| fCargo vs official Cargo with mtime checks | 98.6% [97.1, 99.8] | 97.2% [96.5, 98.0] |
+
+Full content checks remain enabled because a metadata shortcut missed a same-size edit through a memory mapping.
 
 ### Recorded environment
 
