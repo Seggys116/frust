@@ -42,7 +42,12 @@ pgo=$work/pgo
 logs=$pgo/logs
 evidence=$pgo/evidence.json
 profile=$pgo/profiles/rustc-pgo.profdata
+cargo_profile=$pgo/profiles/cargo-pgo.profdata
 tools=$root/support/tools
+# Cargo can get a profile of its own: trained in generate and candidate builds when FRUST_PGO_CARGO=1
+# (off by default until a macOS run has proven it), and used by a stored build when the bundle holds one.
+with_cargo=0
+if [[ ${FRUST_PGO_CARGO:-0} == 1 ]]; then with_cargo=1; fi
 
 get() {
     awk -F= -v k="$1" '$1 == k { print substr($0, index($0, "=") + 1); exit }' "$lock"
@@ -115,6 +120,11 @@ if [[ $mode == stored ]]; then
         --evidence "$evidence" || fail=1
     finish_if_failed
     profile=$stored_dir/rustc-pgo.profdata
+    with_cargo=0
+    if [[ -f $stored_dir/cargo-pgo.profdata ]]; then
+        with_cargo=1
+        cargo_profile=$stored_dir/cargo-pgo.profdata
+    fi
 fi
 
 src=$work/rust
@@ -176,6 +186,7 @@ driver() {
 }
 
 stage2=$build/$host/stage2
+cargo_bin=$build/$host/stage2-tools-bin/cargo
 probe_runtime() {
     local file
     for file in "$stage2/bin/rustc" "$stage2/lib/"librustc_driver-*.dylib; do
@@ -212,19 +223,29 @@ launch_diagnostics() {
 
 # Stages 1 and 2: the instrumented compiler, then native training. Leaves the merged profile in $profile.
 train() {
-    local generate instrumented_jobs instrumented_status stage0 perf train_jobs
+    local generate instrumented_targets instrumented_jobs instrumented_status stage0 perf train_jobs
     generate=(--set "pgo.rustc.generate=\"$pgo/build-raw\"")
+    instrumented_targets=(compiler)
+    if ((with_cargo)); then
+        generate+=(--set "pgo.cargo.generate=\"$pgo/cargo-build-raw\"")
+        instrumented_targets+=(cargo)
+    fi
     instrumented_jobs=$jobs
     if ((memory_gb < 8 && jobs > 2)); then instrumented_jobs=2; fi
     step "stage 1: instrumented stage-2 rustc using $instrumented_jobs jobs; log $logs/instrumented-build.log"
     instrumented_status=0
-    FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-build.log" "${generate[@]}" compiler || instrumented_status=$?
+    FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-build.log" "${generate[@]}" "${instrumented_targets[@]}" || instrumented_status=$?
     if [[ -x $stage2/bin/rustc ]]; then
         probe_runtime 2>&1 | tee "$logs/instrumented-launch.log" || { fail=1; launch_diagnostics; }
+    fi
+    if ((with_cargo)) && [[ -x $cargo_bin ]]; then
+        # The instrumented Cargo must start before it is trained, like the compiler.
+        { "$cargo_bin" --version && otool -L "$cargo_bin"; } 2>&1 | tee "$logs/instrumented-cargo-launch.log" || fail=1
     fi
     if ((instrumented_status != 0 || fail != 0)); then exit 1; fi
     check generate-flags "$logs/instrumented-build.log"
     check driver "$(driver)" --expect instrumented
+    if ((with_cargo)); then check driver "$cargo_bin" --expect instrumented --key instrumented_cargo; fi
     finish_if_failed
     FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-std.log" "${generate[@]}" library
 
@@ -250,6 +271,19 @@ train() {
         --unit-timeout-minutes "${FRUST_PGO_UNIT_TIMEOUT_MINUTES:-25}" --min-crates "${FRUST_PGO_MIN_CRATES:-4}" \
         --exclude-cohorts "$root/qualification/cohorts.lock" 2>&1 | tee "$logs/train.log" || fail=1
     finish_if_failed
+    if ((with_cargo)); then
+        step "stage 2b: training the instrumented Cargo with $train_jobs job(s); unit logs in $pgo/train-cargo/logs"
+        python3 -I "$tools/pgo-cargo-train.py" \
+            --cargo "$cargo_bin" --fetch-cargo "$stage0/bin/cargo" --rustc "$stage0/bin/rustc" \
+            --perf-dir "$perf" --llvm-profdata "$profdata" \
+            --crates "${FRUST_PGO_CARGO_CRATES:-serde-1.0.219,clap_derive-4.5.32,html5ever-0.31.0,hyper-1.6.0,eza-0.21.2}" \
+            --work "$pgo/train-cargo" --output "$cargo_profile" --evidence "$evidence" --jobs "$train_jobs" \
+            --noops "${FRUST_PGO_CARGO_NOOPS:-4}" --budget-minutes "${FRUST_PGO_CARGO_BUDGET_MINUTES:-30}" \
+            --unit-timeout-minutes "${FRUST_PGO_UNIT_TIMEOUT_MINUTES:-25}" \
+            --min-crates "${FRUST_PGO_CARGO_MIN_CRATES:-3}" \
+            --exclude-cohorts "$root/qualification/cohorts.lock" 2>&1 | tee "$logs/train-cargo.log" || fail=1
+        finish_if_failed
+    fi
     rm -rf "$perf"
 }
 
@@ -257,14 +291,24 @@ train() {
 # A build that follows training starts from the stages 0 and 1 it left; the instrumented stage-2
 # outputs must not reach the package.
 use_build() {
-    local log=$1
+    local log cargo_set also
+    log=$1
+    cargo_set=()
+    also=()
     shift
     rm -rf "$build/$host/stage2-rustc" "$build/$host/stage2"
-    xbuild "$log" --set "pgo.rustc.use=\"$profile\"" "$@"
-    check use-flags "$log" "$profile"
+    if ((with_cargo)); then
+        # An instrumented Cargo of the training stage must not survive either.
+        rm -rf "$build/$host/stage2-tools" "$build/$host/stage2-tools-bin"
+        cargo_set=(--set "pgo.cargo.use=\"$cargo_profile\"")
+        also=(--also "$cargo_profile")
+    fi
+    xbuild "$log" --set "pgo.rustc.use=\"$profile\"" ${cargo_set[@]+"${cargo_set[@]}"} "$@"
+    check use-flags "$log" "$profile" ${also[@]+"${also[@]}"}
     check warnings "$log" --max-mismatch "${FRUST_PGO_MAX_MISMATCH_PERCENT:-5}" \
         --max-missing "${FRUST_PGO_MAX_MISSING_PERCENT:-50}"
     check driver "$(driver)" --expect plain
+    if ((with_cargo)); then check driver "$cargo_bin" --expect plain --key final_cargo; fi
     finish_if_failed
 }
 
@@ -273,15 +317,21 @@ if [[ $mode != stored ]]; then train; fi
 if [[ $mode == generate ]]; then
     if [[ ${FRUST_PGO_VERIFY:-1} != 0 ]]; then
         step "verifying the profile with a profile-use compiler build; log $logs/verify-build.log"
-        use_build "$logs/verify-build.log" compiler
+        if ((with_cargo)); then
+            use_build "$logs/verify-build.log" compiler cargo
+        else
+            use_build "$logs/verify-build.log" compiler
+        fi
     else
         step "FRUST_PGO_VERIFY=0: the profile was not used in a build"
     fi
     bundle=$pgo/bundle
+    components=(--component "rustc=$profile")
+    if ((with_cargo)); then components+=(--component "cargo=$cargo_profile"); fi
     python3 -I "$tools/pgo-rustc-bundle.py" export "$root" "$bundle" --host "$host" \
         --rust-commit "$(get rust_commit)" --llvm-version "$(get llvm_version)" --llvm-profdata "$profdata" \
         --evidence "$evidence" --rustc-perf "$(git -C "$src" rev-parse HEAD:src/tools/rustc-perf)" \
-        --component "rustc=$profile"
+        "${components[@]}"
     (cd "$bundle" && COPYFILE_DISABLE=1 tar -cf - *) | zstd -19 -T0 -q > "$out"
     cp "$bundle/MANIFEST" "$pgo/MANIFEST"
     step "packed the profile bundle for $host into $out ($(wc -c < "$out" | tr -d ' ') bytes)"
@@ -308,6 +358,7 @@ else
         echo "llvm-profdata $(sed -n 2p <<< "$profdata_version" | sed 's/^ *//')"
         echo "profile-sha256 $(shasum -a 256 "$profile" | cut -d' ' -f1)"
         echo "profile-bytes $(wc -c < "$profile" | tr -d ' ')"
+        if ((with_cargo)); then echo "cargo-profile-sha256 $(shasum -a 256 "$cargo_profile" | cut -d' ' -f1)"; fi
         echo "training-crates $crates"
         echo "patches-sha256"
         shasum -a 256 "$root"/support/patches/rustc/*.patch "$root"/support/patches/*.patch "$root"/support/patches/build/*.patch \

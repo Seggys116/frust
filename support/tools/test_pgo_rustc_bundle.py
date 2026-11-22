@@ -142,6 +142,40 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("0002-new.patch", result.stdout)
 
+    def add_cargo(self, gates_failed=()):
+        data = json.loads(self.evidence.read_text())
+        data["train_cargo"] = {"crates_complete": ["a"], "raw_files": 5, "gates_failed": list(gates_failed)}
+        self.evidence.write_text(json.dumps(data))
+        self.cargo_profile = self.dir / "cargo.profdata"
+        self.cargo_profile.write_bytes(b"cargo profile bytes")
+
+    def export_with_cargo(self):
+        return self.run_tool("export", str(self.root), str(self.bundle), "--host", MACHINE, "--rust-commit", COMMIT,
+                             "--llvm-version", LLVM, "--llvm-profdata", str(self.tool), "--evidence", str(self.evidence),
+                             "--component", f"rustc={self.profile}", "--component", f"cargo={self.cargo_profile}")
+
+    def test_cargo_component_roundtrip(self):
+        self.add_cargo()
+        self.assertEqual(self.export_with_cargo().returncode, 0)
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        evidence = json.loads((self.dir / "use-evidence.json").read_text())["train"]
+        self.assertEqual(sorted(evidence["components"]), ["cargo", "rustc"])
+        (self.bundle / "cargo-pgo.profdata").write_bytes(b"tampered")
+        self.refused(self.check(), "does not match")
+
+    def test_cargo_component_needs_passing_evidence(self):
+        self.add_cargo(gates_failed=["only 1 crate"])
+        self.refused(self.export_with_cargo(), "no passing training evidence")
+
+    def test_bundle_with_unlisted_profile_file_is_refused(self):
+        self.add_cargo()
+        self.export_with_cargo()
+        manifest = self.bundle / "MANIFEST"
+        manifest.write_text("\n".join(line for line in manifest.read_text().splitlines()
+                                       if not line.startswith("profile cargo")) + "\n")
+        self.refused(self.check(), "SHA256SUMS lists")
+
     def test_export_refuses_failed_training_and_foreign_evidence(self):
         data = json.loads(self.evidence.read_text())
         data["train"]["gates_failed"] = ["only 1 crate"]

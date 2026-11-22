@@ -9,13 +9,15 @@ name: macOS profiles
 #
 #   gh workflow run macos-profiles.yml --ref main
 #
-# Each job builds the instrumented stage-2 rustc, checks that it starts, trains it natively on the
-# rustc-perf crates of support/patches/build (the measured cohorts stay out), merges the profile, and
-# with verify set builds the profile-use compiler once to prove that the profile fits it
-# (.github/scripts/build-toolchain-pgo.sh generate). The bundle is the artifact pgo-profiles-<target>,
+# Each job builds the instrumented stage-2 rustc and Cargo, checks that they start, trains the compiler
+# natively on the rustc-perf crates of support/patches/build (the measured cohorts stay out) and Cargo on
+# build scenarios of some of them, merges the profiles, and with verify set builds the profile-use
+# compiler and Cargo once to prove that the profiles fit them (.github/scripts/build-toolchain-pgo.sh
+# generate). The bundle is the artifact pgo-profiles-<target>,
 # a build asset named frust-pgo-profiles-<commit>-<target>.tar.zst, and exists only when every gate
-# passed. The job stays inside the 355 minute limit: about 45 minutes on Apple Silicon and 3 hours on
-# Intel in the experiments of docs/benchmarks.md.
+# passed. The job stays inside the 355 minute limit: the compiler part took about 45 minutes on Apple
+# Silicon and 3 hours on Intel in the experiments of docs/benchmarks.md, and Cargo adds its own build and
+# up to 30 minutes of training.
 #
 # The workflow publishes nothing. The run summary prints the commands that add the bundles to the
 # build assets release and to the lock; a maintainer runs them.
@@ -31,8 +33,12 @@ on:
         description: Build the profile-use compiler to prove that the profile fits it (recommended)
         type: boolean
         default: true
+      cargo-profile:
+        description: Also train Cargo (experimental, a second profile in the bundle that the Cargo build uses)
+        type: boolean
+        default: false
       train-budget-minutes:
-        description: Training time budget per target, in minutes
+        description: Compiler training time budget per target, in minutes
         type: string
         default: "80"
       release-tag:
@@ -87,6 +93,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           FRUST_PGO_TRAIN_BUDGET_MINUTES: ${{ inputs.train-budget-minutes }}
           FRUST_PGO_VERIFY: ${{ inputs.verify && '1' || '0' }}
+          FRUST_PGO_CARGO: ${{ inputs.cargo-profile && '1' || '0' }}
         run: .github/scripts/build-toolchain-pgo.sh generate "$BUILD_DIR" "$ARCHIVE" "$TARGET"
       - name: Profile summary
         if: always()

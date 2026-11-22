@@ -167,6 +167,13 @@ def export(args):
         profile_lines.append(f"profile {name} {target.name} {digest} {target.stat().st_size} {summary['functions']}")
     (out / "SHA256SUMS").write_text("".join(sums))
     version = tool_version(args.llvm_profdata)
+    trained_cargo = load(args.evidence).get("train_cargo", {})
+    cargo_lines = []
+    if "cargo" in components:
+        if trained_cargo.get("gates_failed") or not trained_cargo.get("crates_complete"):
+            sys.exit("the cargo profile has no passing training evidence, so it is not exported")
+        cargo_lines = [f"cargo-training-crates {','.join(trained_cargo.get('crates_complete', []))}",
+                       f"cargo-training-raw-files {trained_cargo.get('raw_files', 0)}"]
     lines = [
         f"bundle-version {BUNDLE_VERSION}",
         f"target {args.host}",
@@ -183,6 +190,7 @@ def export(args):
         f"training-scenarios {train.get('scenarios', '')}",
         f"training-raw-files {train.get('raw_files', 0)}",
         f"training-seconds {train.get('seconds', 0)}",
+        *cargo_lines,
         *profile_lines,
         "patches-sha256",
         *[f"  {digest}  {name}" for digest, name in patch_hashes(args.root)],

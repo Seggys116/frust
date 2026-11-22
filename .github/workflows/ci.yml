@@ -153,8 +153,10 @@ jobs:
         run: |
           export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache"
           python3 -I -m py_compile support/tools/*.py
-      - name: Stored PGO profile bundle checks
-        run: python3 -I support/tools/test_pgo_rustc_bundle.py
+      - name: Stored PGO profile bundle and evidence checks
+        run: |
+          python3 -I support/tools/test_pgo_rustc_bundle.py
+          python3 -I support/tools/test_pgo_rustc_evidence.py
 
   # fetch-official-components.sh is what package-release.sh runs to add the official packages to a
   # toolchain. This runs it for real, for each bundle, into an empty tree: every package is downloaded,

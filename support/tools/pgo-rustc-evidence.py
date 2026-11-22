@@ -56,11 +56,16 @@ def flags(args):
         return record(args.evidence, "instrumented_build", {"profile_generate_commands": generate,
                                                             "profile_use_commands": use}, failures)
     used = sum(1 for line in lines if f"-Cprofile-use={args.profile}" in line)
-    other = sum(1 for line in lines if "-Cprofile-use=" in line) - used
+    # Commands of the components that have a profile of their own (Cargo) carry that one instead.
+    also = {path: sum(1 for line in lines if f"-Cprofile-use={path}" in line) for path in args.also}
+    other = sum(1 for line in lines if "-Cprofile-use=" in line) - used - sum(also.values())
     warn_flag = sum(1 for line in lines if "-pgo-warn-missing-function" in line)
     failures = []
     if used < args.min:
         failures.append(f"only {used} compiler command(s) carry -Cprofile-use={args.profile}, {args.min} required")
+    for path, count in also.items():
+        if count < args.min_also:
+            failures.append(f"only {count} compiler command(s) carry -Cprofile-use={path}, {args.min_also} required")
     if other:
         failures.append(f"{other} compiler command(s) carry a different -Cprofile-use profile")
     if generate:
@@ -68,9 +73,20 @@ def flags(args):
     if not warn_flag:
         failures.append("no command carries -Cllvm-args=-pgo-warn-missing-function, so the log is not verbose and "
                         "the profile diagnostics below cannot be trusted")
-    return record(args.evidence, "final_build", {"profile_use_commands": used, "other_profile_commands": other,
-                                                 "profile_generate_commands": generate,
-                                                 "warn_flag_commands": warn_flag}, failures)
+    detail = {"profile_use_commands": used, "other_profile_commands": other, "profile_generate_commands": generate,
+              "warn_flag_commands": warn_flag}
+    if also:
+        detail["also_profile_use_commands"] = {Path(path).name: count for path, count in also.items()}
+    return record(args.evidence, "final_build", detail, failures)
+
+
+def profile_functions(data):
+    """Functions of every profile the build uses: the stored components, or the merged training profiles."""
+    components = data.get("train", {}).get("components")
+    if components:
+        return sum(entry.get("functions", 0) for entry in components.values())
+    return (data.get("train", {}).get("merged", {}).get("functions", 0)
+            + data.get("train_cargo", {}).get("merged", {}).get("functions", 0))
 
 
 def warnings(args):
@@ -78,7 +94,7 @@ def warnings(args):
     mismatch = {m.group(1) for line in lines for m in [MISMATCH.search(line)] if m}
     missing = {m.group(1) for line in lines for m in [MISSING.search(line)] if m}
     malformed = sum(1 for line in lines if MALFORMED.search(line))
-    functions = load(args.evidence).get("train", {}).get("merged", {}).get("functions", 0)
+    functions = profile_functions(load(args.evidence))
     result = {"mismatch_functions": len(mismatch), "missing_functions": len(missing), "malformed_lines": malformed,
               "profile_functions": functions, "visible_scope": "in-tree compiler crates; Cargo hides registry-crate warnings"}
     failures = []
@@ -115,6 +131,8 @@ def driver(args):
     if args.expect == "plain" and found:
         failures.append(f"{args.file} still carries {found} {COUNTERS_SECTION} reference(s), so it is instrumented")
     key = "instrumented_driver" if args.expect == "instrumented" else "final_driver"
+    if args.key:
+        key = args.key
     return record(args.evidence, key, {"file": Path(args.file).name, "counter_sections": found}, failures)
 
 
@@ -145,11 +163,23 @@ def summary(args):
         lines.append(f"- training unit {unit['crate']} {unit['profile']} failed: {unit['reason']}")
     if train.get("skipped_units"):
         lines.append(f"- {len(train['skipped_units'])} unit(s) not run ({train.get('stopped_by')}).")
+    cargo = data.get("train_cargo")
+    if cargo:
+        lines.append(f"Cargo training: {len(cargo.get('crates_complete', []))} of {len(cargo.get('crates_requested', []))} "
+                     f"crates complete, stopped by `{cargo.get('stopped_by') or 'completion'}`, {cargo.get('raw_files', 0)} "
+                     f"raw files observed ({cargo.get('raw_bytes', 0) >> 20} MiB), merged profile "
+                     f"{cargo.get('merged', {}).get('functions', 0)} functions.")
+        for unit in cargo.get("units", []):
+            if not unit["ok"]:
+                lines.append(f"- Cargo training unit {unit['crate']} failed: {unit['reason']}")
+        for gate in cargo.get("gates_failed", []):
+            lines.append(f"- Cargo training gate failed: {gate}")
     lines += ["", "| Check | Result | Detail |", "| --- | --- | --- |"]
-    for key in ("instrumented_build", "instrumented_driver", "final_build", "profile_use_warnings", "final_driver"):
+    for key in ("instrumented_build", "instrumented_driver", "instrumented_cargo", "final_build",
+                "profile_use_warnings", "final_driver", "final_cargo"):
         entry = data.get(key)
         if entry is None:
-            if not stored:
+            if not stored and not key.endswith("_cargo"):
                 lines.append(f"| {key} | not run | |")
             continue
         detail = {k: v for k, v in entry.items() if k != "failures"}
@@ -171,6 +201,8 @@ def main():
     use.add_argument("log")
     use.add_argument("profile")
     use.add_argument("--min", type=int, default=50)
+    use.add_argument("--also", action="append", default=[], help="another profile that some commands use (Cargo)")
+    use.add_argument("--min-also", type=int, default=20)
     warn = sub.add_parser("warnings")
     warn.add_argument("log")
     warn.add_argument("--max-mismatch", type=float, default=5.0)
@@ -178,6 +210,7 @@ def main():
     drv = sub.add_parser("driver")
     drv.add_argument("file")
     drv.add_argument("--expect", choices=("instrumented", "plain"), required=True)
+    drv.add_argument("--key", default="", help="evidence key (default instrumented_driver or final_driver)")
     summ = sub.add_parser("summary")
     summ.add_argument("--title", default="Native rustc PGO candidate")
     args = parser.parse_args()
