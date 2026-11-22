@@ -884,6 +884,26 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: Measure tests, linting, documentation and formatting together
+        if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && needs.plan.outputs.apfs-only != 'true' }}
+        timeout-minutes: 15
+        run: |
+          baseline=$HOME/frust-bench-control/current/bin
+          out=$RUNNER_TEMP/out/contention
+          status=0
+          python3 -I qualification/concurrent-builds.py \
+            --a "control=$baseline/fcargo,$baseline/frustc" --b "frust=$FRUST_BIN/fcargo,$FRUST_BIN/frustc" \
+            --lane test --lane clippy --lane doc --lane fmt --states cold,warm,cache \
+            --count 4 --rounds 12 --jobs 2 --size 50 --timeout 120 --summary-only \
+            --work "$WORK/concurrent-tools" --out "$out/concurrent-tools.ndjson" \
+            > "$out/concurrent-tools.txt" 2>&1 || status=$?
+          {
+            echo "### Concurrent tests, linting, documentation and formatting (exit $status)"
+            echo '```'
+            cat "$out/concurrent-tools.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Measure APFS write bytes and allocated blocks
         if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && runner.os == 'macOS' }}
         timeout-minutes: 30
