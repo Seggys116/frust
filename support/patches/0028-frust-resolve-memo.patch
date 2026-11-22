@@ -1,0 +1,463 @@
+diff --git a/src/frust_resolve_memo.rs b/src/frust_resolve_memo.rs
+new file mode 100644
+index 0000000..18ac989
+--- /dev/null
++++ b/src/frust_resolve_memo.rs
+@@ -0,0 +1,182 @@
++//! Remembers that `Cargo.lock` was already up to date for an exact set of inputs.
++//!
++//! A build begins by resolving the whole workspace with every feature on, only to write
++//! `Cargo.lock` when something changed, and then resolves again for the packages and features
++//! requested. When nothing changed since a build that found `Cargo.lock` current, the first
++//! resolution reads the registry index for every locked package to arrive at a graph that equals
++//! the lock file. Its result is the lock file itself.
++//!
++//! After the first resolution of a build leaves the lock file unchanged, fRust's Cargo stores a
++//! digest of everything that resolution depends on in the build directory. A later build
++//! whose digest matches loads `Cargo.lock` as the whole-workspace resolve and performs only the
++//! second, requested resolution, which still consults the registry for the packages it needs.
++//! Any difference in the digest runs both resolutions as before, so an edited manifest, a
++//! changed lock file, other configuration or a different Cargo build is never answered from the
++//! memo.
++//!
++//! The digest covers the Cargo build, the lock file text and its location, the manifest of the
++//! workspace root and of every member, the manifest (and the manifests above it, for inherited
++//! fields) of every other path package in the lock file, the merged configuration values, the
++//! `CARGO_*` environment and the unstable flags. The offline and locked flags are not part of it: a lock file that is current needs no network and no update either way. Registry and git
++//! packages are identified by version, checksum and revision in `Cargo.lock`, so the index is not
++//! part of it: locked packages are not re-resolved against newer index entries. A workspace with
++//! `[patch]`, `[replace]` or `paths` overrides never uses the memo.
++//!
++//! `FRUST_RESOLVE_MEMO=off` disables it. `FRUST_RESOLVE_MEMO=verify` still resolves the whole
++//! workspace and fails when that disagrees with a recorded memo, for tests.
++
++use std::collections::BTreeSet;
++use std::fs;
++use std::io::Write as _;
++use std::path::{Path, PathBuf};
++
++use crate::context::GlobalContext;
++use crate::resolver::Resolve;
++use crate::workspace::Workspace;
++
++const MEMO_FORMAT: &str = "frust-resolve-memo-1";
++const ENV: &str = "FRUST_RESOLVE_MEMO";
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub(crate) enum Mode {
++    Off,
++    On,
++    Verify,
++}
++
++pub(crate) fn mode(gctx: &GlobalContext) -> Mode {
++    if gctx.get_env_os("FRUST_INVOCATION").is_none_or(|value| value != "fcargo") {
++        return Mode::Off;
++    }
++    match gctx.get_env_os(ENV).and_then(|value| value.to_str()) {
++        Some("off" | "0") => Mode::Off,
++        Some("verify") => Mode::Verify,
++        _ => Mode::On,
++    }
++}
++
++/// A digest of the inputs of the whole-workspace resolution and where it is remembered.
++pub(crate) struct Memo {
++    path: PathBuf,
++    key: [u8; 32],
++}
++
++impl Memo {
++    /// The memo for this workspace, or `None` when the workspace is not eligible or an input
++    /// could not be read. `lock` is the text of `Cargo.lock` and `resolve` the whole-workspace
++    /// resolve it decodes to, or that was resolved from it.
++    pub(crate) fn for_workspace(
++        ws: &Workspace<'_>,
++        lock: &str,
++        resolve: &Resolve,
++    ) -> Option<Memo> {
++        let gctx = ws.gctx();
++        if ws.is_ephemeral() || !ws.require_optional_deps() {
++            return None;
++        }
++        if !ws.root_replace().is_empty() || !ws.root_patch().ok()?.is_empty() {
++            return None;
++        }
++        if gctx.paths_overrides().ok()?.is_some() {
++            return None;
++        }
++        let key = digest(ws, lock, resolve)?;
++        let target = ws.build_dir().into_path_unlocked();
++        let mut identity = blake3::Hasher::new();
++        identity.update(ws.root_manifest().as_os_str().as_encoded_bytes());
++        let id = identity.finalize().to_hex();
++        let path = target.join(format!(".frust-resolve-memo-{}", &id.as_str()[..16]));
++        Some(Memo { path, key })
++    }
++
++    /// Whether a build with exactly these inputs found `Cargo.lock` up to date.
++    pub(crate) fn is_recorded(&self) -> bool {
++        fs::read(&self.path).is_ok_and(|stored| stored == self.key)
++    }
++
++    /// Remembers the digest and says whether it did. A missing build directory, a read-only
++    /// directory or any other failure only means the next build resolves in full.
++    pub(crate) fn record(&self) -> bool {
++        let Some(dir) = self.path.parent().filter(|dir| dir.is_dir()) else {
++            return false;
++        };
++        let Some(name) = self.path.file_name().and_then(|name| name.to_str()) else {
++            return false;
++        };
++        let staged = dir.join(format!("{name}.{}", std::process::id()));
++        let written = fs::File::create(&staged).and_then(|mut file| file.write_all(&self.key));
++        if written.is_err() || fs::rename(&staged, &self.path).is_err() {
++            let _ = fs::remove_file(&staged);
++            return false;
++        }
++        true
++    }
++}
++
++struct Digest(blake3::Hasher);
++
++impl Digest {
++    fn put(&mut self, tag: &str, bytes: &[u8]) {
++        self.0.update(&(tag.len() as u64).to_le_bytes());
++        self.0.update(tag.as_bytes());
++        self.0.update(&(bytes.len() as u64).to_le_bytes());
++        self.0.update(bytes);
++    }
++
++    fn put_path(&mut self, tag: &str, path: &Path) {
++        self.put(tag, path.as_os_str().as_encoded_bytes());
++    }
++}
++
++fn digest(ws: &Workspace<'_>, lock: &str, resolve: &Resolve) -> Option<[u8; 32]> {
++    let gctx = ws.gctx();
++    let mut digest = Digest(blake3::Hasher::new());
++    digest.put("format", MEMO_FORMAT.as_bytes());
++    digest.put("cargo", crate::version().to_string().as_bytes());
++    digest.put_path("lock-root", ws.lock_root().as_path_unlocked());
++    digest.put("lock", lock.as_bytes());
++
++    // Manifests the resolution reads from disk.
++    let mut manifests: BTreeSet<PathBuf> = BTreeSet::new();
++    manifests.insert(ws.root_manifest().to_path_buf());
++    for member in ws.members() {
++        manifests.insert(member.manifest_path().to_path_buf());
++    }
++    for id in resolve.iter() {
++        let source = id.source_id();
++        if !source.is_path() || ws.is_member_id(id) {
++            continue;
++        }
++        let dir = source.url().to_file_path().ok()?;
++        manifests.insert(dir.join("Cargo.toml"));
++        // A package outside the workspace can inherit fields from a workspace above it.
++        for ancestor in dir.ancestors().skip(1) {
++            let candidate = ancestor.join("Cargo.toml");
++            if candidate.is_file() {
++                manifests.insert(candidate);
++            }
++        }
++    }
++    for path in &manifests {
++        digest.put_path("manifest", path);
++        digest.put("manifest-bytes", &fs::read(path).ok()?);
++    }
++
++    // Configuration files and `--config` values, in a stable order.
++    let values = gctx.values().ok()?;
++    let mut keys: Vec<&String> = values.keys().collect();
++    keys.sort();
++    for key in keys {
++        digest.put("config", key.as_bytes());
++        digest.put("config-value", format!("{:?}", values[key]).as_bytes());
++    }
++    let mut environment: Vec<(&str, &str)> =
++        gctx.env().filter(|(key, _)| key.starts_with("CARGO")).collect();
++    environment.sort_unstable();
++    for (key, value) in environment {
++        digest.put("env", key.as_bytes());
++        digest.put("env-value", value.as_bytes());
++    }
++    digest.put("unstable", format!("{:?}", gctx.cli_unstable()).as_bytes());
++    Some(*digest.0.finalize().as_bytes())
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9a61ffc..3fc1f1a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -166,6 +166,7 @@ pub mod compiler;
+ pub mod context;
+ mod frust_json_text;
+ mod frust_paths;
++mod frust_resolve_memo;
+ mod frust_unit_cache;
+ pub mod diagnostics;
+ pub mod ops;
+diff --git a/src/ops/lockfile.rs b/src/ops/lockfile.rs
+index 6a27714..2b9d27e 100644
+--- a/src/ops/lockfile.rs
++++ b/src/ops/lockfile.rs
+@@ -13,6 +13,13 @@ pub const LOCKFILE_NAME: &str = "Cargo.lock";
+ 
+ #[tracing::instrument(skip_all)]
+ pub fn load_pkg_lockfile(ws: &Workspace<'_>) -> CargoResult<Option<Resolve>> {
++    Ok(load_pkg_lockfile_with_text(ws)?.map(|(_text, resolve)| resolve))
++}
++
++/// Loads `Cargo.lock` and returns its text along with the resolve it decodes to.
++pub(crate) fn load_pkg_lockfile_with_text(
++    ws: &Workspace<'_>,
++) -> CargoResult<Option<(String, Resolve)>> {
+     let lock_root = ws.lock_root();
+     if !lock_root.as_path_unlocked().join(LOCKFILE_NAME).exists() {
+         return Ok(None);
+@@ -24,12 +31,12 @@ pub fn load_pkg_lockfile(ws: &Workspace<'_>) -> CargoResult<Option<Resolve>> {
+     f.read_to_string(&mut s)
+         .with_context(|| format!("failed to read file: {}", f.path().display()))?;
+ 
+-    let resolve = (|| -> CargoResult<Option<Resolve>> {
++    let resolve = (|| -> CargoResult<Resolve> {
+         let v: TomlLockfile = toml::from_str(&s)?;
+-        Ok(Some(into_resolve(v, &s, ws)?))
++        into_resolve(v, &s, ws)
+     })()
+     .with_context(|| format!("failed to parse lock file at: {}", f.path().display()))?;
+-    Ok(resolve)
++    Ok(Some((s, resolve)))
+ }
+ 
+ /// Generate a toml String of Cargo.lock from a Resolve.
+diff --git a/src/ops/mod.rs b/src/ops/mod.rs
+index 19ba876..d4fa773 100644
+--- a/src/ops/mod.rs
++++ b/src/ops/mod.rs
+@@ -35,6 +35,7 @@ pub use self::cargo_update::print_lockfile_changes;
+ pub use self::cargo_update::update_lockfile;
+ pub use self::cargo_vendor::{VendorOptions, vendor};
+ pub use self::common_for_install_and_uninstall::{InstallTracker, resolve_root};
++pub(crate) use self::lockfile::load_pkg_lockfile_with_text;
+ pub use self::lockfile::{load_pkg_lockfile, resolve_to_string, write_pkg_lockfile};
+ pub use self::registry::OwnersOptions;
+ pub use self::registry::PublishOpts;
+diff --git a/src/ops/resolve.rs b/src/ops/resolve.rs
+index 1347ccc..ec9e3d5 100644
+--- a/src/ops/resolve.rs
++++ b/src/ops/resolve.rs
+@@ -56,6 +56,7 @@
+ //! [`Downloads`]: crate::workspace::package::Downloads
+ 
+ use crate::compiler::{CompileKind, RustcTargetData};
++use crate::frust_resolve_memo::{self, Memo};
+ use crate::context::FeatureUnification;
+ use crate::ops;
+ use crate::resolver::PublishAgePolicy;
+@@ -165,10 +166,85 @@ pub fn resolve_ws_with_opts<'gctx>(
+         FeatureUnification::Selected | FeatureUnification::Package => specs,
+     };
+     let mut registry = ws.package_registry()?;
+-    let (resolve, resolved_with_overrides) = if ws.require_optional_deps() {
++    // When an earlier build found `Cargo.lock` current for these exact inputs, the whole-workspace
++    // resolve is the lock file itself. See `frust_resolve_memo`.
++    let memo_mode = if ws.require_optional_deps() && !dry_run {
++        frust_resolve_memo::mode(ws.gctx())
++    } else {
++        frust_resolve_memo::Mode::Off
++    };
++    // The lock file as loaded for the memo, kept so a full resolution does not parse it again.
++    let mut loaded_lock: Option<Resolve> = None;
++    let mut memo: Option<Memo> = None;
++    let mut memo_recorded = false;
++    if memo_mode != frust_resolve_memo::Mode::Off {
++        if let Some((text, locked)) = ops::load_pkg_lockfile_with_text(ws)? {
++            memo = Memo::for_workspace(ws, &text, &locked);
++            memo_recorded = memo.as_ref().is_some_and(Memo::is_recorded);
++            tracing::debug!(
++                target: "frust_resolve_memo",
++                "{}",
++                match (&memo, memo_recorded) {
++                    (None, _) => "not eligible",
++                    (Some(_), true) => "hit",
++                    (Some(_), false) => "miss",
++                }
++            );
++            loaded_lock = Some(locked);
++        }
++    }
++    let (resolve, resolved_with_overrides) = if memo_recorded
++        && memo_mode != frust_resolve_memo::Mode::Verify
++    {
++        let locked = loaded_lock.take().expect("the memo was built from a loaded lock file");
++        add_overrides(&mut registry, ws)?;
++        // `Cargo.lock` was verified against the dev-dependencies as well, so a build that does not
++        // compile dev units can leave them out of its own resolve. The original feature resolver
++        // unifies features from dev-dependencies, so it keeps them.
++        let dev_deps = has_dev_units == HasDevUnits::Yes
++            || ws.resolve_behavior() == crate::resolver::ResolveBehavior::V1;
++        let resolved_with_overrides = resolve_with_previous_dev_deps(
++            &mut registry,
++            ws,
++            cli_features,
++            Some(&locked),
++            None,
++            &specs_to_resolve,
++            true,
++            dev_deps,
++        )?;
++        (Some(locked), resolved_with_overrides)
++    } else if ws.require_optional_deps() {
+         // First, resolve the root_package's *listed* dependencies, as well as
+         // downloading and updating all remotes and such.
+-        let resolve = resolve_with_registry(ws, &mut registry, dry_run)?;
++        let (resolve, lock_status) =
++            resolve_with_registry_checked(ws, &mut registry, dry_run, loaded_lock.take())?;
++        if memo_recorded && lock_status != LockStatus::Unchanged {
++            anyhow::bail!(
++                "fRust's resolve memo said Cargo.lock was current, but resolving the workspace \
++                 changed it; set FRUST_RESOLVE_MEMO=off and report this"
++            );
++        }
++        if memo_mode != frust_resolve_memo::Mode::Off && !memo_recorded {
++            // `Cargo.lock` now equals this resolve, whether it was already current or has just
++            // been written, so remember the inputs as they are now.
++            let current = match lock_status {
++                LockStatus::Unchanged => memo,
++                LockStatus::Written => ws
++                    .lock_root()
++                    .open_ro_shared(ops::lockfile::LOCKFILE_NAME, ws.gctx(), "Cargo.lock file")
++                    .ok()
++                    .and_then(|mut file| {
++                        let mut text = String::new();
++                        std::io::Read::read_to_string(&mut file, &mut text).ok()?;
++                        Memo::for_workspace(ws, &text, &resolve)
++                    }),
++                LockStatus::Unchecked => None,
++            };
++            if current.is_some_and(|memo| memo.record()) {
++                tracing::debug!(target: "frust_resolve_memo", "recorded");
++            }
++        }
+         // No need to add patches again, `resolve_with_registry` has done it.
+         let add_patches = false;
+ 
+@@ -347,13 +423,37 @@ pub fn resolve_ws_with_opts<'gctx>(
+     })
+ }
+ 
+-#[tracing::instrument(skip_all)]
+ fn resolve_with_registry<'gctx>(
+     ws: &Workspace<'gctx>,
+     registry: &mut PackageRegistry<'gctx>,
+     dry_run: bool,
+ ) -> CargoResult<Resolve> {
+-    let prev = ops::load_pkg_lockfile(ws)?;
++    Ok(resolve_with_registry_checked(ws, registry, dry_run, None)?.0)
++}
++
++/// What happened to `Cargo.lock` when the workspace was resolved.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum LockStatus {
++    /// It was compared with the resolve and found current.
++    Unchanged,
++    /// It was rewritten to match the resolve.
++    Written,
++    /// It was not compared: an ephemeral workspace or a dry run.
++    Unchecked,
++}
++
++/// Like [`resolve_with_registry`], and says what happened to the lock file.
++#[tracing::instrument(skip_all)]
++fn resolve_with_registry_checked<'gctx>(
++    ws: &Workspace<'gctx>,
++    registry: &mut PackageRegistry<'gctx>,
++    dry_run: bool,
++    loaded_lock: Option<Resolve>,
++) -> CargoResult<(Resolve, LockStatus)> {
++    let prev = match loaded_lock {
++        Some(prev) => Some(prev),
++        None => ops::load_pkg_lockfile(ws)?,
++    };
+     let mut resolve = resolve_with_previous(
+         registry,
+         ws,
+@@ -365,9 +465,16 @@ fn resolve_with_registry<'gctx>(
+         true,
+     )?;
+ 
++    let mut lock_status = LockStatus::Unchecked;
+     let print = if !ws.is_ephemeral() && ws.require_optional_deps() {
+         if !dry_run {
+-            ops::write_pkg_lockfile(ws, &mut resolve)?
++            let changed = ops::write_pkg_lockfile(ws, &mut resolve)?;
++            lock_status = if changed || prev.is_none() {
++                LockStatus::Written
++            } else {
++                LockStatus::Unchanged
++            };
++            changed
+         } else {
+             true
+         }
+@@ -381,7 +488,7 @@ fn resolve_with_registry<'gctx>(
+     if print {
+         ops::print_lockfile_changes(ws, prev.as_ref(), &resolve, registry)?;
+     }
+-    Ok(resolve)
++    Ok((resolve, lock_status))
+ }
+ 
+ /// Resolves all dependencies for a package using an optional previous instance
+@@ -400,7 +507,6 @@ fn resolve_with_registry<'gctx>(
+ ///
+ /// If `register_patches` is true, then entries from the `[patch]` table in
+ /// the manifest will be added to the given `PackageRegistry`.
+-#[tracing::instrument(skip_all)]
+ pub fn resolve_with_previous<'gctx>(
+     registry: &mut PackageRegistry<'gctx>,
+     ws: &Workspace<'gctx>,
+@@ -410,6 +516,32 @@ pub fn resolve_with_previous<'gctx>(
+     keep_previous: Option<Keep<'_>>,
+     specs: &[PackageIdSpec],
+     register_patches: bool,
++) -> CargoResult<Resolve> {
++    let dev_deps = ws.require_optional_deps() || has_dev_units == HasDevUnits::Yes;
++    resolve_with_previous_dev_deps(
++        registry,
++        ws,
++        cli_features,
++        previous,
++        keep_previous,
++        specs,
++        register_patches,
++        dev_deps,
++    )
++}
++
++/// [`resolve_with_previous`] with the choice of resolving the dev-dependencies of the
++/// resolved members made by the caller.
++#[tracing::instrument(skip_all)]
++fn resolve_with_previous_dev_deps<'gctx>(
++    registry: &mut PackageRegistry<'gctx>,
++    ws: &Workspace<'gctx>,
++    cli_features: &CliFeatures,
++    previous: Option<&Resolve>,
++    keep_previous: Option<Keep<'_>>,
++    specs: &[PackageIdSpec],
++    register_patches: bool,
++    dev_deps: bool,
+ ) -> CargoResult<Resolve> {
+     // We only want one Cargo at a time resolving a crate graph since this can
+     // involve a lot of frobbing of the global caches.
+@@ -466,8 +598,6 @@ pub fn resolve_with_previous<'gctx>(
+     // Refine `keep` with patches that should avoid locking.
+     let keep = |p: &PackageId| keep_previous(p) && !avoid_patch_ids.contains(p);
+ 
+-    let dev_deps = ws.require_optional_deps() || has_dev_units == HasDevUnits::Yes;
+-
+     if let Some(r) = previous {
+         trace!("previous: {:?}", r);
+ 

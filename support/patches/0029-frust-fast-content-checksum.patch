@@ -1,0 +1,620 @@
+diff --git a/src/compiler/fingerprint/dep_info.rs b/src/compiler/fingerprint/dep_info.rs
+index 207ec2b..41622b8 100644
+--- a/src/compiler/fingerprint/dep_info.rs
++++ b/src/compiler/fingerprint/dep_info.rs
+@@ -270,6 +270,14 @@ fn command_uses_frustc(cmd: &ProcessBuilder) -> bool {
+     is_frustc(cmd.get_program()) || cmd.get_args().any(|arg| is_frustc(arg))
+ }
+ 
++/// Source files up to this size are fingerprinted with XXH3, which needs the whole file in
++/// memory; larger ones keep BLAKE3, which streams.
++pub(crate) const XXH3_MAX_FILE_LEN: u64 = 8 * 1024 * 1024;
++
++/// Files below this size come back from one `read` whenever they are complete, so the read that
++/// would only confirm the end of the file is skipped for them.
++const SINGLE_READ_FILE_LEN: u64 = 64 * 1024;
++
+ fn frustc_checksum(
+     rustc_cwd: &Path,
+     file: &Path,
+@@ -281,7 +289,12 @@ fn frustc_checksum(
+     if FileTime::from_last_modification_time(&meta) > invocation_time {
+         return None;
+     }
+-    let checksum = Checksum::compute(ChecksumAlgo::Blake3, &handle).ok()?;
++    let algo = if meta.len() <= XXH3_MAX_FILE_LEN {
++        ChecksumAlgo::Xxh3
++    } else {
++        ChecksumAlgo::Blake3
++    };
++    let checksum = Checksum::compute(algo, &handle).ok()?;
+     let after = handle.metadata().ok()?;
+     if FileTime::from_last_modification_time(&after) > invocation_time || after.len() != meta.len() {
+         return None;
+@@ -289,6 +302,63 @@ fn frustc_checksum(
+     Some((meta.len(), checksum))
+ }
+ 
++/// What reading a file against its recorded length found.
++pub(crate) enum FileDigest {
++    /// The file has the recorded length. This is its checksum.
++    Checksum(Checksum),
++    /// The file's length differs from the recorded one. It is at least this long, and exactly
++    /// this long unless it is longer than the recorded length plus one.
++    Length(u64),
++}
++
++thread_local! {
++    static XXH3_READ_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// Reads `path` once into a reused buffer and returns its XXH3 checksum, or its length when that
++/// differs from `expected_len`. This replaces a metadata call, an open and a loop of 16 KiB reads
++/// by an open and, for most files, a single read. `expected_len` must not exceed
++/// [`XXH3_MAX_FILE_LEN`].
++pub(crate) fn xxh3_file_digest(path: &Path, expected_len: u64) -> io::Result<FileDigest> {
++    if expected_len > XXH3_MAX_FILE_LEN {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "recorded length exceeds the XXH3 limit",
++        ));
++    }
++    let mut file = File::open(path)?;
++    let expected = expected_len as usize;
++    let capacity = expected + 1;
++    XXH3_READ_BUFFER.with(|cell| {
++        let mut buffer = cell.borrow_mut();
++        if buffer.len() < capacity {
++            buffer.resize(capacity, 0);
++        }
++        let mut filled = 0;
++        loop {
++            match file.read(&mut buffer[filled..capacity]) {
++                Ok(0) => break,
++                Ok(count) => filled += count,
++                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
++                Err(error) => return Err(error),
++            }
++            if filled == capacity {
++                // Longer than recorded, so it differs whatever its content is.
++                return Ok(FileDigest::Length(filled as u64));
++            }
++            if filled == expected && expected_len < SINGLE_READ_FILE_LEN {
++                break;
++            }
++        }
++        if filled != expected {
++            return Ok(FileDigest::Length(filled as u64));
++        }
++        let mut value = [0; 32];
++        value[..16].copy_from_slice(&crate::frust_xxh3::xxh3_128(&buffer[..filled]));
++        Ok(FileDigest::Checksum(Checksum::new(ChecksumAlgo::Xxh3, value)))
++    })
++}
++
+ /// Parses the dep-info file coming out of rustc into a Cargo-specific format.
+ ///
+ /// This function will parse `rustc_dep_info` as a makefile-style dep info to
+@@ -556,12 +626,16 @@ fn make_absolute_path(
+ pub enum ChecksumAlgo {
+     Sha256,
+     Blake3,
++    /// XXH3 with 128 bits, which fRust's Cargo stores for source files up to
++    /// [`XXH3_MAX_FILE_LEN`] bytes. Not a rustc algorithm.
++    Xxh3,
+ }
+ 
+ impl ChecksumAlgo {
+     fn hash_len(&self) -> usize {
+         match self {
+             ChecksumAlgo::Sha256 | ChecksumAlgo::Blake3 => 32,
++            ChecksumAlgo::Xxh3 => 16,
+         }
+     }
+ }
+@@ -573,6 +647,7 @@ impl FromStr for ChecksumAlgo {
+         match s {
+             "sha256" => Ok(Self::Sha256),
+             "blake3" => Ok(Self::Blake3),
++            "xxh3" => Ok(Self::Xxh3),
+             _ => Err(InvalidChecksum::InvalidChecksumAlgo),
+         }
+     }
+@@ -583,6 +658,7 @@ impl fmt::Display for ChecksumAlgo {
+         f.write_str(match self {
+             ChecksumAlgo::Sha256 => "sha256",
+             ChecksumAlgo::Blake3 => "blake3",
++            ChecksumAlgo::Xxh3 => "xxh3",
+         })
+     }
+ }
+@@ -599,7 +675,7 @@ impl Checksum {
+         Self { algo, value }
+     }
+ 
+-    pub fn compute(algo: ChecksumAlgo, contents: impl Read) -> Result<Self, io::Error> {
++    pub fn compute(algo: ChecksumAlgo, mut contents: impl Read) -> Result<Self, io::Error> {
+         // Buffer size is the recommended amount to fully leverage SIMD instructions on AVX-512 as per
+         // blake3 documentation.
+         let mut buf = vec![0; 16 * 1024];
+@@ -642,6 +718,12 @@ impl Checksum {
+                     value,
+                 )?;
+             }
++            ChecksumAlgo::Xxh3 => {
++                // The hash needs the whole input at once. Callers keep it to files that fit.
++                let mut whole = Vec::new();
++                contents.read_to_end(&mut whole)?;
++                value.copy_from_slice(&crate::frust_xxh3::xxh3_128(&whole));
++            }
+             ChecksumAlgo::Blake3 => {
+                 digest(
+                     blake3::Hasher::new(),
+diff --git a/src/compiler/fingerprint/mod.rs b/src/compiler/fingerprint/mod.rs
+index 6e918a3..5f9ac19 100644
+--- a/src/compiler/fingerprint/mod.rs
++++ b/src/compiler/fingerprint/mod.rs
+@@ -2187,6 +2187,29 @@ where
+ 
+                 let path_checksum = match checksum_cache.entry(path_buf) {
+                     Entry::Occupied(o) => *o.get(),
++                    Entry::Vacant(v) if prior_checksum.algo() == dep_info::ChecksumAlgo::Xxh3 => {
++                        // fRust's own checksums come from one read of the file.
++                        match dep_info::xxh3_file_digest(path, file_len) {
++                            Ok(dep_info::FileDigest::Checksum(checksum)) => *v.insert(checksum),
++                            Ok(dep_info::FileDigest::Length(new_size)) => {
++                                return Some(StaleItem::FileSizeChanged {
++                                    path: path.to_path_buf(),
++                                    new_size,
++                                    old_size: file_len,
++                                });
++                            }
++                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                                return Some(StaleItem::MissingFile {
++                                    path: path.to_path_buf(),
++                                });
++                            }
++                            Err(_) => {
++                                return Some(StaleItem::UnableToReadFile {
++                                    path: path.to_path_buf(),
++                                });
++                            }
++                        }
++                    }
+                     Entry::Vacant(v) => {
+                         let Ok(current_file_len) = fs::metadata(&path).map(|m| m.len()) else {
+                             return Some(StaleItem::FailedToReadMetadata {
+diff --git a/src/frust_xxh3.rs b/src/frust_xxh3.rs
+new file mode 100644
+index 0000000..e0b89ce
+--- /dev/null
++++ b/src/frust_xxh3.rs
+@@ -0,0 +1,416 @@
++//! XXH3 with a 128-bit result, seed 0 and the default secret, over a whole buffer.
++//!
++//! fRust's Cargo uses it to fingerprint source files on every build. It reads and hashes a file at
++//! memory speed, several times faster than BLAKE3 on ARM and x86 without wide vector extensions,
++//! and every byte of the input decides the result. It is not a cryptographic hash. A
++//! fingerprint only has to notice that a file changed, and no party is trying to forge one.
++//! The output matches the reference implementation (xxHash 0.8) for every input length; the tests
++//! hold vectors for each length class.
++
++const PRIME32_1: u64 = 0x9E37_79B1;
++const PRIME32_2: u64 = 0x85EB_CA77;
++const PRIME32_3: u64 = 0xC2B2_AE3D;
++const PRIME64_1: u64 = 0x9E37_79B1_85EB_CA87;
++const PRIME64_2: u64 = 0xC2B2_AE3D_27D4_EB4F;
++const PRIME64_3: u64 = 0x1656_67B1_9E37_79F9;
++const PRIME64_4: u64 = 0x85EB_CA77_C2B2_AE63;
++const PRIME64_5: u64 = 0x27D4_EB2F_1656_67C5;
++const PRIME_MX1: u64 = 0x1656_6791_9E37_79F9;
++const PRIME_MX2: u64 = 0x9FB2_1C65_1E98_DF25;
++
++const SECRET_SIZE: usize = 192;
++const SECRET: [u8; SECRET_SIZE] = [
++    0xb8, 0xfe, 0x6c, 0x39, 0x23, 0xa4, 0x4b, 0xbe, 0x7c, 0x01, 0x81, 0x2c, 0xf7, 0x21, 0xad, 0x1c,
++    0xde, 0xd4, 0x6d, 0xe9, 0x83, 0x90, 0x97, 0xdb, 0x72, 0x40, 0xa4, 0xa4, 0xb7, 0xb3, 0x67, 0x1f,
++    0xcb, 0x79, 0xe6, 0x4e, 0xcc, 0xc0, 0xe5, 0x78, 0x82, 0x5a, 0xd0, 0x7d, 0xcc, 0xff, 0x72, 0x21,
++    0xb8, 0x08, 0x46, 0x74, 0xf7, 0x43, 0x24, 0x8e, 0xe0, 0x35, 0x90, 0xe6, 0x81, 0x3a, 0x26, 0x4c,
++    0x3c, 0x28, 0x52, 0xbb, 0x91, 0xc3, 0x00, 0xcb, 0x88, 0xd0, 0x65, 0x8b, 0x1b, 0x53, 0x2e, 0xa3,
++    0x71, 0x64, 0x48, 0x97, 0xa2, 0x0d, 0xf9, 0x4e, 0x38, 0x19, 0xef, 0x46, 0xa9, 0xde, 0xac, 0xd8,
++    0xa8, 0xfa, 0x76, 0x3f, 0xe3, 0x9c, 0x34, 0x3f, 0xf9, 0xdc, 0xbb, 0xc7, 0xc7, 0x0b, 0x4f, 0x1d,
++    0x8a, 0x51, 0xe0, 0x4b, 0xcd, 0xb4, 0x59, 0x31, 0xc8, 0x9f, 0x7e, 0xc9, 0xd9, 0x78, 0x73, 0x64,
++    0xea, 0xc5, 0xac, 0x83, 0x34, 0xd3, 0xeb, 0xc3, 0xc5, 0x81, 0xa0, 0xff, 0xfa, 0x13, 0x63, 0xeb,
++    0x17, 0x0d, 0xdd, 0x51, 0xb7, 0xf0, 0xda, 0x49, 0xd3, 0x16, 0x55, 0x26, 0x29, 0xd4, 0x68, 0x9e,
++    0x2b, 0x16, 0xbe, 0x58, 0x7d, 0x47, 0xa1, 0xfc, 0x8f, 0xf8, 0xb8, 0xd1, 0x7a, 0xd0, 0x31, 0xce,
++    0x45, 0xcb, 0x3a, 0x8f, 0x95, 0x16, 0x04, 0x28, 0xaf, 0xd7, 0xfb, 0xca, 0xbb, 0x4b, 0x40, 0x7e,
++];
++
++const STRIPE_LEN: usize = 64;
++const SECRET_CONSUME_RATE: usize = 8;
++const MID_SIZE_MAX: usize = 240;
++const SECRET_SIZE_MIN: usize = 136;
++const MID_SIZE_START_OFFSET: usize = 3;
++const MID_SIZE_LAST_OFFSET: usize = 17;
++const SECRET_MERGEACCS_START: usize = 11;
++
++#[inline(always)]
++fn read32(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
++}
++
++#[inline(always)]
++fn read64(bytes: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
++}
++
++#[inline(always)]
++fn mul128(a: u64, b: u64) -> (u64, u64) {
++    let product = u128::from(a) * u128::from(b);
++    (product as u64, (product >> 64) as u64)
++}
++
++#[inline(always)]
++fn mul128_fold64(a: u64, b: u64) -> u64 {
++    let (low, high) = mul128(a, b);
++    low ^ high
++}
++
++#[inline(always)]
++fn xorshift64(value: u64, shift: u32) -> u64 {
++    value ^ (value >> shift)
++}
++
++#[inline(always)]
++fn avalanche(mut h: u64) -> u64 {
++    h = xorshift64(h, 37);
++    h = h.wrapping_mul(PRIME_MX1);
++    xorshift64(h, 32)
++}
++
++#[inline(always)]
++fn avalanche64(mut h: u64) -> u64 {
++    h = xorshift64(h, 33);
++    h = h.wrapping_mul(PRIME64_2);
++    h = xorshift64(h, 29);
++    h = h.wrapping_mul(PRIME64_3);
++    xorshift64(h, 32)
++}
++
++fn len_1_to_3(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let c1 = u32::from(input[0]);
++    let c2 = u32::from(input[len >> 1]);
++    let c3 = u32::from(input[len - 1]);
++    let combined_low = (c1 << 16) | (c2 << 24) | c3 | ((len as u32) << 8);
++    let combined_high = combined_low.swap_bytes().rotate_left(13);
++    let bitflip_low = u64::from(read32(&SECRET, 0) ^ read32(&SECRET, 4));
++    let bitflip_high = u64::from(read32(&SECRET, 8) ^ read32(&SECRET, 12));
++    (
++        avalanche64(u64::from(combined_low) ^ bitflip_low),
++        avalanche64(u64::from(combined_high) ^ bitflip_high),
++    )
++}
++
++fn len_4_to_8(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let input_low = u64::from(read32(input, 0));
++    let input_high = u64::from(read32(input, len - 4));
++    let input64 = input_low.wrapping_add(input_high << 32);
++    let bitflip = read64(&SECRET, 16) ^ read64(&SECRET, 24);
++    let keyed = input64 ^ bitflip;
++    let (mut low, mut high) = mul128(keyed, PRIME64_1.wrapping_add((len as u64) << 2));
++    high = high.wrapping_add(low << 1);
++    low ^= high >> 3;
++    low = xorshift64(low, 35);
++    low = low.wrapping_mul(PRIME_MX2);
++    low = xorshift64(low, 28);
++    (low, avalanche(high))
++}
++
++fn len_9_to_16(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let bitflip_low = read64(&SECRET, 32) ^ read64(&SECRET, 40);
++    let bitflip_high = read64(&SECRET, 48) ^ read64(&SECRET, 56);
++    let input_low = read64(input, 0);
++    let mut input_high = read64(input, len - 8);
++    let (mut low, mut high) = mul128(input_low ^ input_high ^ bitflip_low, PRIME64_1);
++    low = low.wrapping_add(((len - 1) as u64) << 54);
++    input_high ^= bitflip_high;
++    high = high.wrapping_add(
++        input_high.wrapping_add((input_high & 0xFFFF_FFFF).wrapping_mul(PRIME32_2 - 1)),
++    );
++    low ^= high.swap_bytes();
++    let (low2, mut high2) = mul128(low, PRIME64_2);
++    high2 = high2.wrapping_add(high.wrapping_mul(PRIME64_2));
++    (avalanche(low2), avalanche(high2))
++}
++
++#[inline(always)]
++fn mix16(input: &[u8], at: usize, secret_at: usize) -> u64 {
++    let low = read64(input, at);
++    let high = read64(input, at + 8);
++    mul128_fold64(
++        low ^ read64(&SECRET, secret_at),
++        high ^ read64(&SECRET, secret_at + 8),
++    )
++}
++
++#[inline(always)]
++fn mix32(acc: (u64, u64), input: &[u8], at1: usize, at2: usize, secret_at: usize) -> (u64, u64) {
++    let mut low = acc.0.wrapping_add(mix16(input, at1, secret_at));
++    low ^= read64(input, at2).wrapping_add(read64(input, at2 + 8));
++    let mut high = acc.1.wrapping_add(mix16(input, at2, secret_at + 16));
++    high ^= read64(input, at1).wrapping_add(read64(input, at1 + 8));
++    (low, high)
++}
++
++fn finish_mid(acc: (u64, u64), len: usize) -> (u64, u64) {
++    let low = acc.0.wrapping_add(acc.1);
++    let high = acc
++        .0
++        .wrapping_mul(PRIME64_1)
++        .wrapping_add(acc.1.wrapping_mul(PRIME64_4))
++        .wrapping_add((len as u64).wrapping_mul(PRIME64_2));
++    (avalanche(low), 0u64.wrapping_sub(avalanche(high)))
++}
++
++fn len_17_to_128(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let mut acc = ((len as u64).wrapping_mul(PRIME64_1), 0u64);
++    if len > 32 {
++        if len > 64 {
++            if len > 96 {
++                acc = mix32(acc, input, 48, len - 64, 96);
++            }
++            acc = mix32(acc, input, 32, len - 48, 64);
++        }
++        acc = mix32(acc, input, 16, len - 32, 32);
++    }
++    acc = mix32(acc, input, 0, len - 16, 0);
++    finish_mid(acc, len)
++}
++
++fn len_129_to_240(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let rounds = len / 32;
++    let mut acc = ((len as u64).wrapping_mul(PRIME64_1), 0u64);
++    for i in 0..4 {
++        acc = mix32(acc, input, 32 * i, 32 * i + 16, 32 * i);
++    }
++    acc = (avalanche(acc.0), avalanche(acc.1));
++    for i in 4..rounds {
++        acc = mix32(
++            acc,
++            input,
++            32 * i,
++            32 * i + 16,
++            MID_SIZE_START_OFFSET + 32 * (i - 4),
++        );
++    }
++    acc = mix32(
++        acc,
++        input,
++        len - 16,
++        len - 32,
++        SECRET_SIZE_MIN - MID_SIZE_LAST_OFFSET - 16,
++    );
++    finish_mid(acc, len)
++}
++
++type Accumulators = [u64; 8];
++
++#[inline(always)]
++fn accumulate_stripe(acc: &mut Accumulators, input: &[u8], secret_at: usize) {
++    let stripe: &[u8; STRIPE_LEN] = input[..STRIPE_LEN].try_into().unwrap();
++    let key: &[u8; STRIPE_LEN] = SECRET[secret_at..secret_at + STRIPE_LEN].try_into().unwrap();
++    let mut data = [0u64; 8];
++    let mut keyed = [0u64; 8];
++    for i in 0..8 {
++        data[i] = u64::from_le_bytes(stripe[8 * i..8 * i + 8].try_into().unwrap());
++        keyed[i] = data[i] ^ u64::from_le_bytes(key[8 * i..8 * i + 8].try_into().unwrap());
++    }
++    for i in 0..8 {
++        acc[i ^ 1] = acc[i ^ 1].wrapping_add(data[i]);
++        acc[i] = acc[i].wrapping_add((keyed[i] & 0xFFFF_FFFF).wrapping_mul(keyed[i] >> 32));
++    }
++}
++
++#[inline(always)]
++fn scramble(acc: &mut Accumulators) {
++    let at = SECRET_SIZE - STRIPE_LEN;
++    for (i, lane) in acc.iter_mut().enumerate() {
++        let mut value = xorshift64(*lane, 47);
++        value ^= read64(&SECRET, at + 8 * i);
++        *lane = value.wrapping_mul(PRIME32_1);
++    }
++}
++
++fn merge_accumulators(acc: &Accumulators, secret_at: usize, start: u64) -> u64 {
++    let mut result = start;
++    for i in 0..4 {
++        result = result.wrapping_add(mul128_fold64(
++            acc[2 * i] ^ read64(&SECRET, secret_at + 16 * i),
++            acc[2 * i + 1] ^ read64(&SECRET, secret_at + 16 * i + 8),
++        ));
++    }
++    avalanche(result)
++}
++
++fn long(input: &[u8]) -> (u64, u64) {
++    let len = input.len();
++    let mut acc: Accumulators = [
++        PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3, PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
++    ];
++    let stripes_per_block = (SECRET_SIZE - STRIPE_LEN) / SECRET_CONSUME_RATE;
++    let block_len = STRIPE_LEN * stripes_per_block;
++    let blocks = (len - 1) / block_len;
++    for block in 0..blocks {
++        let base = block * block_len;
++        for stripe in 0..stripes_per_block {
++            accumulate_stripe(
++                &mut acc,
++                &input[base + stripe * STRIPE_LEN..],
++                stripe * SECRET_CONSUME_RATE,
++            );
++        }
++        scramble(&mut acc);
++    }
++    let stripes = ((len - 1) - block_len * blocks) / STRIPE_LEN;
++    let base = blocks * block_len;
++    for stripe in 0..stripes {
++        accumulate_stripe(
++            &mut acc,
++            &input[base + stripe * STRIPE_LEN..],
++            stripe * SECRET_CONSUME_RATE,
++        );
++    }
++    accumulate_stripe(
++        &mut acc,
++        &input[len - STRIPE_LEN..],
++        SECRET_SIZE - STRIPE_LEN - 7,
++    );
++    (
++        merge_accumulators(
++            &acc,
++            SECRET_MERGEACCS_START,
++            (len as u64).wrapping_mul(PRIME64_1),
++        ),
++        merge_accumulators(
++            &acc,
++            SECRET_SIZE - STRIPE_LEN - SECRET_MERGEACCS_START,
++            !(len as u64).wrapping_mul(PRIME64_2),
++        ),
++    )
++}
++
++/// The 128-bit XXH3 hash of `input`: the low half in the first eight bytes and the high half in
++/// the last eight, both little endian.
++pub(crate) fn xxh3_128(input: &[u8]) -> [u8; 16] {
++    let (low, high) = match input.len() {
++        0 => {
++            let bitflip_low = read64(&SECRET, 64) ^ read64(&SECRET, 72);
++            let bitflip_high = read64(&SECRET, 80) ^ read64(&SECRET, 88);
++            (avalanche64(bitflip_low), avalanche64(bitflip_high))
++        }
++        1..=3 => len_1_to_3(input),
++        4..=8 => len_4_to_8(input),
++        9..=16 => len_9_to_16(input),
++        17..=128 => len_17_to_128(input),
++        129..=MID_SIZE_MAX => len_129_to_240(input),
++        _ => long(input),
++    };
++    let mut out = [0u8; 16];
++    out[..8].copy_from_slice(&low.to_le_bytes());
++    out[8..].copy_from_slice(&high.to_le_bytes());
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::xxh3_128;
++
++    /// Bytes of the reference test input: the sequence the xxHash sanity check generates.
++    fn pattern(len: usize) -> Vec<u8> {
++        let mut state: u64 = 2654435761;
++        (0..len)
++            .map(|_| {
++                let byte = (state >> 56) as u8;
++                state = state.wrapping_mul(0x9E37_79B1_85EB_CA87).wrapping_add(0x1234_5678_9ABC_DEF1);
++                byte
++            })
++            .collect()
++    }
++
++    fn hex(bytes: &[u8; 16]) -> String {
++        // The reference prints the high half first.
++        let mut text = String::new();
++        for byte in bytes[8..].iter().rev().chain(bytes[..8].iter().rev()) {
++            text.push_str(&format!("{byte:02x}"));
++        }
++        text
++    }
++
++    #[test]
++    fn matches_the_reference_for_every_length_class() {
++        // (length, XXH3_128bits_withSeed(pattern(length), 0) as printed by the reference).
++        let vectors: &[(usize, &str)] = VECTORS;
++        for &(len, expected) in vectors {
++            assert_eq!(hex(&xxh3_128(&pattern(len))), expected, "length {len}");
++        }
++    }
++
++    #[test]
++    fn every_single_byte_change_alters_the_hash() {
++        for len in [1usize, 3, 4, 9, 17, 64, 129, 240, 241, 1024, 1025, 3000] {
++            let base = pattern(len);
++            let reference = xxh3_128(&base);
++            for at in 0..len {
++                let mut edited = base.clone();
++                edited[at] ^= 0x01;
++                assert_ne!(xxh3_128(&edited), reference, "length {len} byte {at}");
++            }
++        }
++    }
++
++    const VECTORS: &[(usize, &str)] = &[
++        (0, "99aa06d3014798d86001c324468d497f"),
++        (1, "a6cd5e9392000f6ac44bdff4074eecdb"),
++        (2, "7371aa560d0ba26e43ca926a4fc55085"),
++        (3, "3a49b340b247fe81122b0a8b9a561cdc"),
++        (4, "12197f2ebb6289ad333a48646ecde1d4"),
++        (5, "b9c26cc176e2e3714e47fd0839dd0276"),
++        (8, "0d3a565a75a7c34b9e7a169ea6cb05d5"),
++        (9, "5562da837c5d27fd99b0d2a25a27bf1f"),
++        (12, "4f7c113d847c62d50b9f1e49780b9170"),
++        (16, "5c81283ae0874f07f12a4ad5a7beee65"),
++        (17, "74dc4a65143ac1d2f7384451513c20cf"),
++        (31, "b4e065806639d98d28de8cbfa43a7adc"),
++        (32, "014982d540866c2cad777f1f47437947"),
++        (33, "b189b19a8e99ab168d0ce0904a66f4a2"),
++        (64, "7d03f4328630d74f6db5b11b41d14a7f"),
++        (65, "6b89393b972c8aaa9fe926d3bf282ae8"),
++        (96, "8148f093fbb47afbd58cf5829c3cfebe"),
++        (97, "064251bfbf5a862471a646f09868fb76"),
++        (128, "c024057f088acf9bb9b35c00e817bc00"),
++        (129, "d8b4b760938249d2643e920cfb2e6f18"),
++        (160, "24d9828304e7390a2da178bd1c10bd72"),
++        (200, "d88066b6d622d17a86e5b8201f2f4e02"),
++        (239, "70dbe27502bad4dc6bbe0d56a52b5b0c"),
++        (240, "324a4c7e8349c56bc52365a166e10dbf"),
++        (241, "fb08883350c5cc6f19a100f48e4fe96e"),
++        (255, "28c3d10e06b7d9a6637dad6d149e1e70"),
++        (256, "8ab8766c120d1761e9cc5b1c15c8c412"),
++        (512, "0db1e3f24223fb00458ed3a9cf4d5313"),
++        (1000, "cd9e8c9deeaa56deb05ecff595ea1a75"),
++        (1023, "cdf75830f93943210d9f40d1f6028d66"),
++        (1024, "0c3e9d12838902f4dc611dd910858196"),
++        (1025, "2dc1a4f3f0fbd937a47ad38343f20b99"),
++        (1088, "0b9bae9134e75fc3c55d31e730e8da6b"),
++        (2047, "a1dba041129f3c1b519c7e67c9153a6e"),
++        (2048, "645061c519eb0077fcd8fa687f13c205"),
++        (2049, "ca20956aa395d00e81ac16f5ff17335a"),
++        (4096, "7cc27ed5ad2f63a016553b9ca8acf345"),
++        (10000, "3cd41ee5746531077e8233cadfa7e6ef"),
++    ];
++
++    #[test]
++    fn matches_the_reference_for_all_lengths_up_to_4100() {
++        // FNV-1a over the digests of lengths 0 through 4100, computed with the reference.
++        let mut fold: u64 = 0xcbf2_9ce4_8422_2325;
++        for len in 0..=4100 {
++            for byte in xxh3_128(&pattern(len)) {
++                fold = (fold ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
++            }
++        }
++        assert_eq!(format!("{fold:#x}"), "0x5016776d386f91d1");
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 3fc1f1a..2677984 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -168,6 +168,7 @@ mod frust_json_text;
+ mod frust_paths;
+ mod frust_resolve_memo;
+ mod frust_unit_cache;
++mod frust_xxh3;
+ pub mod diagnostics;
+ pub mod ops;
+ pub mod resolver;
