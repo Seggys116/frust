@@ -953,7 +953,7 @@ jobs:
             echo '```'
             cat "$out/apfs.txt"
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Measure cache accounting on a wide dependency graph
         if: ${{ !cancelled() && steps.resource-control.outcome == 'success' && runner.os == 'Linux' }}
