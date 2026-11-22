@@ -67,7 +67,7 @@ on:
         description: Workloads for the official comparison, space separated (ripgrep syn regex fd)
         default: "ripgrep syn regex fd"
       platforms:
-        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe for calibration or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
+        description: Platforms for the official comparison, space separated (linux linux-v3 macos-arm64 macos-x86_64; candidates macos-arm64-pgo macos-x86_64-pgo). Use macos-write-probe for calibration, macos-pgo-probe for a short native diagnostic of instrumented compiler shapes on both macOS hosts, or one macos-arm64-apfs or macos-x86_64-apfs for storage only.
         default: "linux linux-v3 macos-arm64 macos-x86_64"
       rounds:
         description: Rounds per scenario in the official comparison. One round is one pair. A job stops cleanly at its time budget and the report says so.
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
+  group: benchmark-${{ github.ref }}-${{ inputs.platforms == 'macos-write-probe' && 'write-probe' || inputs.platforms == 'macos-pgo-probe' && 'pgo-probe' || contains(inputs.platforms, '-pgo') && 'pgo' || (!inputs.protocol && (inputs.cohorts == 'regex' || endsWith(inputs.platforms, '-apfs'))) && 'resources' || 'release' }}
   cancel-in-progress: false
 
 env:
@@ -188,14 +188,15 @@ jobs:
                   raise SystemExit(f"{name.lower()} must be a whole number of at least 1, got {os.environ[name]!r}")
           selection = os.environ["PLATFORMS"].strip()
           write_probe = selection == "macos-write-probe"
+          pgo_probe = selection == "macos-pgo-probe"
           apfs_only = selection in ("macos-arm64-apfs", "macos-x86_64-apfs")
-          if (write_probe or apfs_only) and os.environ["PROTOCOL"] == "true":
+          if (write_probe or pgo_probe or apfs_only) and os.environ["PROTOCOL"] == "true":
               raise SystemExit(f"{selection} needs protocol=false")
           if apfs_only:
               platforms = [selection.removesuffix("-apfs")]
               workloads = ["regex"]
           else:
-              platforms = [] if write_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
+              platforms = [] if write_probe or pgo_probe else choose("PLATFORMS", tuple(PLATFORMS), True)
               workloads = choose("COHORTS", WORKLOADS, not platforms)
           matrix = [
               dict(PLATFORMS[platform], workload=workload) for platform in platforms for workload in workloads
@@ -281,6 +282,48 @@ jobs:
             ${{ runner.temp }}/write-probe.json
             ${{ runner.temp }}/paired-write-probe.ndjson
             ${{ runner.temp }}/paired-lock-probe.ndjson
+
+  # Short native diagnostic of the instrumented rustc shapes, on both macOS hosts (platforms=macos-pgo-probe,
+  # protocol=false). The official Rust of OFFICIAL_RELEASE compiles an rlib, a dylib and an executable with
+  # the stage-2 instrumentation flags of the PGO build, in variants that add or drop one flag group at a time
+  # (profile generation, value profiling, ThinLTO of dylibs, rpath and split-debuginfo, and a 12000 function
+  # scale). Each variant is run, and its exit status or signal, output and raw profiles are checked.
+  # Artifacts, including backtraces and crash reports of failed variants, are uploaded even when it fails.
+  macos-pgo-probe:
+    name: Probe instrumented rustc shapes (${{ matrix.os }})
+    needs: plan
+    if: inputs.platforms == 'macos-pgo-probe'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the official toolchain
+        run: rustup toolchain install "$OFFICIAL_RELEASE" --profile minimal --component llvm-tools --no-self-update
+      - name: Probe instrumented compiler shapes
+        run: |
+          out=$RUNNER_TEMP/pgo-probe-out
+          mkdir -p "$out"
+          rustc=$(rustup which --toolchain "$OFFICIAL_RELEASE" rustc)
+          status=0
+          python3 -I support/tools/pgo-rustc-launch-diagnostics.py probe --rustc "$rustc" --release "$OFFICIAL_RELEASE" \
+            --work "$RUNNER_TEMP/pgo-probe-work" --out "$out" --budget-minutes 25 > "$out/probe.log" 2>&1 || status=$?
+          cat "$out/probe.log"
+          if [[ -f $out/summary.md ]]; then cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          exit "$status"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pgo-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/pgo-probe-out
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove the probe work directory
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/pgo-probe-work"
 
   toolchains:
     needs: plan

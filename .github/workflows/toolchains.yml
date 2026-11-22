@@ -265,6 +265,7 @@ jobs:
             ${{ env.BUILD_DIR }}/pgo/profiles/rustc-pgo.profdata
             ${{ env.BUILD_DIR }}/pgo/progress.log
             ${{ env.BUILD_DIR }}/pgo/logs/*.log
+            ${{ env.BUILD_DIR }}/pgo/diagnostics/**
             ${{ env.BUILD_DIR }}/pgo/train/logs/*.log
           if-no-files-found: ignore
           retention-days: 14

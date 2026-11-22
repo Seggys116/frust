@@ -142,6 +142,16 @@ sys.exit(status)
 PY
 }
 
+# Evidence of a failed first launch: backtrace, profile sections, crash report and an environment
+# differential. It only records; the launch gate below still decides, and a failure here is ignored.
+launch_diagnostics() {
+    step "the instrumented rustc failed its first launch; collecting native diagnostics in $pgo/diagnostics"
+    python3 -I "$tools/pgo-rustc-launch-diagnostics.py" launch --rustc "$stage2/bin/rustc" --host "$host" \
+        --lib-path "$stage2/lib:$build/$host/ci-llvm/lib" --deployment "$deployment" --profile-dir "$pgo/build-raw" \
+        --build-log "$logs/instrumented-build.log" --out "$pgo/diagnostics" > "$logs/instrumented-launch-diagnostics.log" 2>&1 || true
+    if [[ -f $pgo/diagnostics/summary.md && ! -f $pgo/summary.md ]]; then cp "$pgo/diagnostics/summary.md" "$pgo/summary.md"; fi
+}
+
 generate=(--set "pgo.rustc.generate=\"$pgo/build-raw\"")
 instrumented_jobs=$jobs
 if ((memory_gb < 8 && jobs > 2)); then instrumented_jobs=2; fi
@@ -149,7 +159,7 @@ step "stage 1: instrumented stage-2 rustc using $instrumented_jobs jobs; log $lo
 instrumented_status=0
 FRUST_PGO_BUILD_JOBS=$instrumented_jobs xbuild "$logs/instrumented-build.log" "${generate[@]}" compiler || instrumented_status=$?
 if [[ -x $stage2/bin/rustc ]]; then
-    probe_runtime 2>&1 | tee "$logs/instrumented-launch.log" || fail=1
+    probe_runtime 2>&1 | tee "$logs/instrumented-launch.log" || { fail=1; launch_diagnostics; }
 fi
 if ((instrumented_status != 0 || fail != 0)); then exit 1; fi
 check generate-flags "$logs/instrumented-build.log"
